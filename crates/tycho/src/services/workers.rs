@@ -462,16 +462,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_worker_command_writes_the_brief_beside_the_worktree() {
-        let scratch = Scratch::new("command");
-        let (repositories, project) = fixture(&scratch);
+    /// Ports over a fresh clone, and a placed task whose worktree is that clone.
+    fn placed(scratch: &Scratch) -> (WorkerPorts, WorkerTaskRequest, Worktree) {
+        let (repositories, project) = fixture(scratch);
         let path = scratch.0.join("worktrees/cf7a/wu01/a1");
         let branch = unit_branch(&unit(), Attempt::FIRST).unwrap();
         let worktree = repositories
             .clone_worktree(&project, &path, &branch)
             .unwrap();
-        let ports = ports(repositories, project);
         let task = WorkerTaskRequest {
             brief: Brief::parse("Make widget::answer return 42.").unwrap(),
             max_turns: NonZeroU16::new(8),
@@ -480,6 +478,13 @@ mod tests {
                 control: SessionName::parse("cf7a.wu01.ctl.claude").unwrap(),
             }),
         };
+        (ports(repositories, project), task, worktree)
+    }
+
+    #[test]
+    fn the_worker_command_writes_the_brief_beside_the_worktree() {
+        let scratch = Scratch::new("command");
+        let (ports, task, worktree) = placed(&scratch);
         let session = SessionName::parse("cf7a.wu01.wrk.claude.a1f3").unwrap();
         let session_id = VendorSessionId::parse("3f0c6c1e-6b1a-4a51-9a0e-2a8c5d0c1a10").unwrap();
         let command = WorkerCommand {
@@ -502,19 +507,6 @@ mod tests {
         assert_eq!(parsed.worktree, worktree.path);
         assert_eq!(parsed.base, worktree.base);
         assert_eq!(parsed.brief, brief);
-        let victim = scratch.0.join("victim");
-        std::fs::create_dir_all(&victim).unwrap();
-        let briefs = scratch.0.join("worktrees/briefs");
-        std::fs::remove_dir_all(&briefs).unwrap();
-        std::os::unix::fs::symlink(&victim, &briefs).unwrap();
-        let swapped = worker_command(&ports, &command);
-        assert!(
-            swapped
-                .as_ref()
-                .is_err_and(|error| error.contains("is a symlink")),
-            "{swapped:?}"
-        );
-        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
         let unplaced = WorkerTaskRequest {
             placement: None,
             ..task.clone()
@@ -535,6 +527,36 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_briefs_directory_swapped_for_a_link_after_a_write_is_refused() {
+        let scratch = Scratch::new("brief-link");
+        let (ports, task, _) = placed(&scratch);
+        let session = SessionName::parse("cf7a.wu01.wrk.claude.a1f3").unwrap();
+        let session_id = VendorSessionId::parse("3f0c6c1e-6b1a-4a51-9a0e-2a8c5d0c1a10").unwrap();
+        let command = WorkerCommand {
+            task: &task,
+            vendor: Vendor::Claude,
+            session: &session,
+            model: "haiku",
+            effort: Effort::Low,
+            session_id: &session_id,
+        };
+        assert!(worker_command(&ports, &command).is_ok());
+        let victim = scratch.0.join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        let briefs = scratch.0.join("worktrees/briefs");
+        std::fs::remove_dir_all(&briefs).unwrap();
+        std::os::unix::fs::symlink(&victim, &briefs).unwrap();
+        let swapped = worker_command(&ports, &command);
+        assert!(
+            swapped
+                .as_ref()
+                .is_err_and(|error| error.contains("is a symlink")),
+            "{swapped:?}"
+        );
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
     }
 
     #[test]
