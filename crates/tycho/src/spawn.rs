@@ -272,7 +272,11 @@ pub fn start_detached(request: &SpawnRequest<'_>) -> Result<u32, SpawnerError> {
     let words = typed_words(request, &spec_path)?;
     write_spec(&spec_path, &spec)?;
     let name = request.env.session_name.to_string();
-    request.zmx.run_words(&name, &words).map_err(transient)?;
+    if let Err(error) = request.zmx.run_words(&name, &words) {
+        // No launcher will read the spec, and it carries the session secret.
+        drop(fs::remove_file(&spec_path));
+        return Err(transient(error));
+    }
     let pid = wait_for_pid(request, &name);
     remove_spec_after_lease(request, &spec_path);
     pid
@@ -643,6 +647,23 @@ mod tests {
             ensure_agent_dirs(&dirs),
             Err(SpawnerError::Refused(_))
         ));
+        fs::remove_dir_all(&dirs.socket_dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_zmx_run_removes_the_spec() {
+        let dirs = scratch("run-fails");
+        let zmx = Zmx::agent(Path::new("/usr/bin/false"), &dirs.socket_dir);
+        let env = env();
+        let vendor = ["/bin/true".to_string()];
+        let request = shared_request(&dirs, &zmx, &env, &vendor);
+        assert!(matches!(
+            start_detached(&request),
+            Err(SpawnerError::Transient(_))
+        ));
+        let spec = dirs.spec_path(&env.session_name);
+        assert!(dirs.spec_dir().exists(), "the spec was never written");
+        assert!(!spec.exists(), "the spec outlived a failed zmx run");
         fs::remove_dir_all(&dirs.socket_dir).unwrap();
     }
 }
