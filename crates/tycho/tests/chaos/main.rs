@@ -3,6 +3,10 @@
 //! killed at the moments the design names; each case checks that nothing was lost and no second
 //! session was spawned for an attempt. macOS only, run by `mise run chaos-tests`.
 #![allow(
+    clippy::disallowed_methods,
+    reason = "fixtures live in throwaway directories no other user can write"
+)]
+#![allow(
     clippy::print_stdout,
     clippy::print_stderr,
     reason = "the evidence lines are the test's report for the pull request"
