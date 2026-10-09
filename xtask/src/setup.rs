@@ -20,6 +20,9 @@ use std::time::{Duration, Instant};
 use tycho_types::session::{SESSION_NAME_MAX_BYTES, SOCKET_PATH_MAX_BYTES};
 
 pub const AGENT_USER_NAME: &str = "tycho-agent";
+pub const AGENT_GROUP_NAME: &str = "tycho-agent";
+/// `staff`, the default primary group, whose members can traverse a 0750 home.
+const STAFF_GID: u32 = 20;
 pub const SHARED_GROUP_NAME: &str = "tycho-zmx";
 pub const AGENT_SOCKET_DIR: &str = "/Users/Shared/tycho-agent-zmx";
 const CORE_SOCKET_DIR_RELATIVE: &str = ".tycho/zmx";
@@ -108,6 +111,7 @@ enum Check {
     PinCue,
     EntireLogin,
     AgentInSharedGroup,
+    AgentPrimaryGroup,
     CredentialSsh,
     CredentialGh,
     CredentialAws,
@@ -134,7 +138,7 @@ const fn spec(check: Check, name: &'static str, side: Side) -> CheckSpec {
 }
 
 /// Every check, in print order; each one runs on exactly one side.
-const CATALOGUE: [CheckSpec; 34] = [
+const CATALOGUE: [CheckSpec; 35] = [
     spec(Check::AgentUserExists, "agent user exists", Side::Developer),
     spec(
         Check::SharedGroupExists,
@@ -239,6 +243,11 @@ const CATALOGUE: [CheckSpec; 34] = [
     spec(
         Check::AgentInSharedGroup,
         "agent user is a member of the shared group",
+        Side::Agent,
+    ),
+    spec(
+        Check::AgentPrimaryGroup,
+        "agent user's primary group is tycho-agent",
         Side::Agent,
     ),
     spec(
@@ -1112,6 +1121,60 @@ fn membership_status(user: &str, group: &str) -> Status {
     }
 }
 
+const AGENT_GROUP_HINT: &str = "create the group, then make it the agent's primary group: sudo dseditgroup -o create -r \"Tycho Agent\" tycho-agent; sudo dscl . -create /Users/tycho-agent PrimaryGroupID <gid of tycho-agent>";
+
+fn primary_gid(lookup: &DsclLookup, record: &str) -> Result<u32, Status> {
+    match lookup {
+        DsclLookup::Found(stdout) => dscl_value(stdout, "PrimaryGroupID")
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| Status::Unreachable {
+                why: format!("PrimaryGroupID missing from the {record} record"),
+            }),
+        DsclLookup::NotFound => Err(Status::Missing),
+        DsclLookup::Unreachable(why) => Err(Status::Unreachable { why: why.clone() }),
+    }
+}
+
+/// Present only when the user record's gid is the `tycho-agent` group's and is not `staff`.
+fn primary_group_status(user: &DsclLookup, group: &DsclLookup) -> Status {
+    let user_gid = match primary_gid(user, "agent user") {
+        Ok(gid) => gid,
+        Err(status) => return status,
+    };
+    if user_gid == STAFF_GID {
+        return Status::Wrong {
+            found: format!("gid {STAFF_GID} (staff)"),
+            wanted: format!("the gid of group {AGENT_GROUP_NAME}"),
+        };
+    }
+    let group_gid = match primary_gid(group, AGENT_GROUP_NAME) {
+        Ok(gid) => gid,
+        Err(status) => return status,
+    };
+    if user_gid == group_gid {
+        Status::Present
+    } else {
+        Status::Wrong {
+            found: format!("gid {user_gid}"),
+            wanted: format!("gid {group_gid} ({AGENT_GROUP_NAME})"),
+        }
+    }
+}
+
+fn primary_group_finding(username: &str) -> Finding {
+    let user = dscl_read(&format!("/Users/{username}"), Some("PrimaryGroupID"));
+    let group = dscl_read(
+        &format!("/Groups/{AGENT_GROUP_NAME}"),
+        Some("PrimaryGroupID"),
+    );
+    let status = primary_group_status(&user, &group);
+    if status.is_pass() {
+        Finding::new(Check::AgentPrimaryGroup, status)
+    } else {
+        Finding::with_hint(Check::AgentPrimaryGroup, status, AGENT_GROUP_HINT)
+    }
+}
+
 fn credential_absence_finding(
     check: Check,
     home: &Result<String, String>,
@@ -1426,6 +1489,7 @@ fn agent_findings(identity: &Identity) -> Vec<Finding> {
         Check::AgentInSharedGroup,
         membership_status(&identity.username, SHARED_GROUP_NAME),
     )];
+    findings.push(primary_group_finding(&identity.username));
     findings.extend(credential_findings(&home));
     findings.extend(keychain_findings());
     let ls = mise_ls();
@@ -1550,7 +1614,7 @@ pub fn run() -> i32 {
 mod tests {
     use super::*;
 
-    const EXPECTED_SIDES: [(&str, Side); 34] = [
+    const EXPECTED_SIDES: [(&str, Side); 35] = [
         ("agent user exists", Side::Developer),
         ("shared group exists", Side::Developer),
         ("developer is a member of the shared group", Side::Developer),
@@ -1597,6 +1661,7 @@ mod tests {
         ),
         ("entire logged in as the developer", Side::Developer),
         ("agent user is a member of the shared group", Side::Agent),
+        ("agent user's primary group is tycho-agent", Side::Agent),
         ("agent credential: ~/.ssh", Side::Agent),
         ("agent credential: ~/.config/gh", Side::Agent),
         ("agent credential: ~/.aws", Side::Agent),
@@ -1660,7 +1725,7 @@ mod tests {
             CATALOGUE.len()
         );
         assert_eq!(developer_checks.len(), 21);
-        assert_eq!(agent_checks.len(), 13);
+        assert_eq!(agent_checks.len(), 14);
     }
 
     #[test]
@@ -1901,6 +1966,57 @@ mod tests {
         drop(fs::remove_dir(&directory));
         assert_eq!(small_result, Some("[user]\n".to_string()));
         assert!(large_result.is_err());
+    }
+
+    #[test]
+    fn primary_group_passes_when_the_user_gid_is_the_agent_groups() {
+        let user = DsclLookup::Found("PrimaryGroupID: 601\n".to_string());
+        let group = DsclLookup::Found("PrimaryGroupID: 601\n".to_string());
+        assert_eq!(primary_group_status(&user, &group), Status::Present);
+    }
+
+    #[test]
+    fn primary_group_fails_for_staff_a_missing_group_or_a_mismatch() {
+        let agent_group = DsclLookup::Found("PrimaryGroupID: 601\n".to_string());
+        let staff_user = DsclLookup::Found("PrimaryGroupID: 20\n".to_string());
+        assert_eq!(
+            primary_group_status(&staff_user, &agent_group),
+            Status::Wrong {
+                found: "gid 20 (staff)".to_string(),
+                wanted: "the gid of group tycho-agent".to_string()
+            }
+        );
+        let staff_group = DsclLookup::Found("PrimaryGroupID: 20\n".to_string());
+        assert!(matches!(
+            primary_group_status(&staff_user, &staff_group),
+            Status::Wrong { .. }
+        ));
+        let other_user = DsclLookup::Found("PrimaryGroupID: 700\n".to_string());
+        assert_eq!(
+            primary_group_status(&other_user, &agent_group),
+            Status::Wrong {
+                found: "gid 700".to_string(),
+                wanted: "gid 601 (tycho-agent)".to_string()
+            }
+        );
+        assert_eq!(
+            primary_group_status(&other_user, &DsclLookup::NotFound),
+            Status::Missing
+        );
+        assert_eq!(
+            primary_group_status(&DsclLookup::NotFound, &agent_group),
+            Status::Missing
+        );
+        let no_attribute = DsclLookup::Found("RecordName: tycho-agent\n".to_string());
+        assert!(matches!(
+            primary_group_status(&no_attribute, &agent_group),
+            Status::Unreachable { .. }
+        ));
+        let unreachable = DsclLookup::Unreachable("dscl is not on PATH".to_string());
+        assert!(matches!(
+            primary_group_status(&other_user, &unreachable),
+            Status::Unreachable { .. }
+        ));
     }
 
     #[test]
