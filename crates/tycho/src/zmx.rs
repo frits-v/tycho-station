@@ -1,13 +1,18 @@
 //! The core's zmx sessions: the `zmx list` decoder, and run, kill and list in the core
 //! socket directory.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
 use tycho_types::lease::PID_MAX;
 
-use crate::command::{self, CommandError};
-use crate::config::{COMMAND_TIMEOUT, LIST_SESSIONS_MAX};
+use crate::command::{self, Captured, CommandError};
+use crate::config::{COMMAND_OUTPUT_MAX_BYTES, COMMAND_TIMEOUT, LIST_SESSIONS_MAX};
+
+/// Set inside a zmx session: zmx refuses to attach from inside one, and nothing zmx runs for
+/// the core inherits the caller's session.
+pub const SESSION_ENV: &str = "ZMX_SESSION";
 
 /// The core directory is private: zmx does not check who connects to a socket.
 const CORE_DIR_MODE: &str = "0700";
@@ -215,14 +220,59 @@ impl Zmx {
         ]
     }
 
-    pub fn list(&self) -> Result<Vec<ListEntry>, ZmxError> {
-        let captured = command::run_captured(
+    /// zmx with this directory's environment and no inherited session, for a caller that
+    /// drives a subcommand this type does not wrap, such as a viewer's attach.
+    #[must_use]
+    pub fn command(&self, arguments: &[&str]) -> std::process::Command {
+        let mut command = std::process::Command::new(&self.binary);
+        command
+            .args(arguments)
+            .envs(self.environment())
+            .env_remove(SESSION_ENV);
+        command
+    }
+
+    fn status(&self, arguments: &[&str], max_bytes: usize) -> Result<Captured, ZmxError> {
+        command::run_status_capped(
             &self.binary,
-            &["list"],
+            arguments,
             &self.environment(),
+            &[OsString::from(SESSION_ENV)],
+            COMMAND_TIMEOUT,
+            max_bytes,
+        )
+        .map_err(ZmxError::Command)
+    }
+
+    fn succeeded(&self, arguments: &[&str]) -> Result<Captured, ZmxError> {
+        let captured = self.status(arguments, COMMAND_OUTPUT_MAX_BYTES)?;
+        if !captured.status.success() {
+            return Err(ZmxError::Command(CommandError::Failed(
+                self.binary.display().to_string(),
+                captured.status,
+                captured.stderr,
+            )));
+        }
+        Ok(captured)
+    }
+
+    fn detached(&self, arguments: &[&str]) -> Result<(), ZmxError> {
+        let status = command::run_detached(
+            &self.binary,
+            arguments,
+            &self.environment(),
+            &[OsString::from(SESSION_ENV)],
             COMMAND_TIMEOUT,
         )
         .map_err(ZmxError::Command)?;
+        if !status.success() {
+            return Err(ZmxError::RunFailed(status));
+        }
+        Ok(())
+    }
+
+    pub fn list(&self) -> Result<Vec<ListEntry>, ZmxError> {
+        let captured = self.succeeded(&["list"])?;
         decode_list(&captured.stdout).map_err(ZmxError::List)
     }
 
@@ -230,47 +280,19 @@ impl Zmx {
     pub fn run_detached(&self, name: &str, command_line: &str) -> Result<(), ZmxError> {
         let mut arguments = vec!["run", name, "-d"];
         arguments.extend(command_line.split(' ').filter(|word| !word.is_empty()));
-        let status = command::run_detached(
-            &self.binary,
-            &arguments,
-            &self.environment(),
-            COMMAND_TIMEOUT,
-        )
-        .map_err(ZmxError::Command)?;
-        if !status.success() {
-            return Err(ZmxError::RunFailed(status));
-        }
-        Ok(())
+        self.detached(&arguments)
     }
 
     /// Spawns detached with each word as one argument; zmx quotes every word for the shell.
     pub fn run_words(&self, name: &str, words: &[String]) -> Result<(), ZmxError> {
         let mut arguments = vec!["run", name, "-d"];
         arguments.extend(words.iter().map(String::as_str));
-        let status = command::run_detached(
-            &self.binary,
-            &arguments,
-            &self.environment(),
-            COMMAND_TIMEOUT,
-        )
-        .map_err(ZmxError::Command)?;
-        if !status.success() {
-            return Err(ZmxError::RunFailed(status));
-        }
-        Ok(())
+        self.detached(&arguments)
     }
 
     /// The session's scrollback; more than `max_bytes` is an error, never a truncation.
     pub fn history(&self, name: &str, max_bytes: usize) -> Result<String, ZmxError> {
-        let captured = command::run_status_capped(
-            &self.binary,
-            &["history", name],
-            &self.environment(),
-            &[],
-            COMMAND_TIMEOUT,
-            max_bytes,
-        )
-        .map_err(ZmxError::Command)?;
+        let captured = self.status(&["history", name], max_bytes)?;
         if !captured.status.success() {
             return Err(ZmxError::RunFailed(captured.status));
         }
@@ -279,26 +301,13 @@ impl Zmx {
 
     /// Writes text to the session's pty input, as a nudge.
     pub fn send(&self, name: &str, text: &str) -> Result<(), ZmxError> {
-        command::run_captured(
-            &self.binary,
-            &["send", name, text],
-            &self.environment(),
-            COMMAND_TIMEOUT,
-        )
-        .map(|_| ())
-        .map_err(ZmxError::Command)
+        self.succeeded(&["send", name, text]).map(|_| ())
     }
 
     /// Ends a session by name; a missing session is not an error here.
     pub fn kill(&self, name: &str) -> Result<(), ZmxError> {
-        command::run_status(
-            &self.binary,
-            &["kill", name, "--force"],
-            &self.environment(),
-            COMMAND_TIMEOUT,
-        )
-        .map(|_| ())
-        .map_err(ZmxError::Command)
+        self.status(&["kill", name, "--force"], COMMAND_OUTPUT_MAX_BYTES)
+            .map(|_| ())
     }
 }
 

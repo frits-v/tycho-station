@@ -134,6 +134,23 @@ pub fn kill_by_name(zmx: &Zmx, session: &SessionName) -> Result<(), SpawnerError
         .map_err(|error| SpawnerError::Transient(error.to_string()))
 }
 
+/// What reaping a lost session did: the kill by name and the verdict on its recorded vendor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReapReport {
+    pub zmx_kill: Result<(), SpawnerError>,
+    pub vendor: Option<KillVerdict>,
+}
+
+/// `kill_by_name`, then the vendor recorded in the session's spool directory, judged as
+/// `kill_session` judges it; a refusal is reported and changes nothing else.
+#[must_use]
+pub fn reap(zmx: &Zmx, dirs: &AgentDirs, session: &SessionName, agent_uid: u32) -> ReapReport {
+    let zmx_kill = kill_by_name(zmx, session);
+    let path = SessionFiles::new(dirs, session).vendor;
+    let vendor = vendor_verdict(read_vendor(&path, agent_uid), agent_uid);
+    ReapReport { zmx_kill, vendor }
+}
+
 /// The launcher must be the running pid zmx lists under the exact session name.
 pub fn judge_listed(entries: &[ListEntry], session: &str, pid: u32) -> Result<(), KillRefusal> {
     match presence(entries, session) {
@@ -221,25 +238,39 @@ fn checked_lease(request: &KillRequest<'_>) -> Result<Lease, KillRefusal> {
 /// The vendor's group, signalled only as an agent-owned group leader started when recorded.
 fn kill_vendor(request: &KillRequest<'_>) -> Option<KillVerdict> {
     let path = SessionFiles::new(request.dirs, request.session).vendor;
-    let record = match read_vendor(&path, request.agent_uid) {
-        VendorRead::Absent => return None,
-        VendorRead::Unrecognised(reason) => {
-            return Some(KillVerdict::Refused(KillRefusal::Unrecognised(reason)))
-        }
-        VendorRead::Present(record) => record,
+    vendor_verdict(read_vendor(&path, request.agent_uid), request.agent_uid)
+}
+
+fn vendor_verdict(read: VendorRead, agent_uid: u32) -> Option<KillVerdict> {
+    let vendor = match vendor_expectation(read, agent_uid, Uid::current().as_raw()) {
+        Ok(None) => return None,
+        Ok(Some(vendor)) => vendor,
+        Err(refusal) => return Some(KillVerdict::Refused(refusal)),
     };
-    let vendor = Expected {
-        pid: record.pid,
-        started_unix_ms: record.started_unix_ms,
-        agent_uid: request.agent_uid,
-        core_uid: Uid::current().as_raw(),
-        command: None,
-        group_leader: true,
-    };
-    Some(match judge(&process_facts(record.pid), &vendor) {
+    Some(match judge(&process_facts(vendor.pid), &vendor) {
         Ok(()) => signal_if_still(&vendor, true),
         Err(refusal) => KillVerdict::Refused(refusal),
     })
+}
+
+/// What a vendor record allows: nothing to do, a refusal, or the group leader to check.
+pub fn vendor_expectation(
+    read: VendorRead,
+    agent_uid: u32,
+    core_uid: u32,
+) -> Result<Option<Expected<'static>>, KillRefusal> {
+    match read {
+        VendorRead::Absent => Ok(None),
+        VendorRead::Unrecognised(reason) => Err(KillRefusal::Unrecognised(reason)),
+        VendorRead::Present(record) => Ok(Some(Expected {
+            pid: record.pid,
+            started_unix_ms: record.started_unix_ms,
+            agent_uid,
+            core_uid,
+            command: None,
+            group_leader: true,
+        })),
+    }
 }
 
 /// Re-checks the same process and sends SIGKILL; gone by now means zmx ended it.
@@ -524,6 +555,71 @@ mod tests {
             2,
             "{calls}"
         );
+        std::fs::remove_dir_all(&dirs.socket_dir).unwrap();
+    }
+
+    fn vendor_record() -> VendorRead {
+        VendorRead::Present(VendorRecord {
+            pid: PID,
+            started_unix_ms: STARTED_MS,
+        })
+    }
+
+    #[test]
+    fn a_reaped_vendor_with_distinct_uids_passes_only_as_the_agents_group_leader() {
+        let vendor = vendor_expectation(vendor_record(), AGENT, CORE)
+            .unwrap()
+            .unwrap();
+        assert_eq!(judge(&facts(AGENT, PID, STARTED, "sh v"), &vendor), Ok(()));
+        assert_eq!(
+            judge(&facts(CORE, PID, STARTED, "sh v"), &vendor),
+            Err(KillRefusal::CoreUid)
+        );
+        assert_eq!(
+            judge(&facts(AGENT, 1, STARTED, "sh v"), &vendor),
+            Err(KillRefusal::NotGroupLeader { pgid: 1 })
+        );
+        let same_uid = vendor_expectation(vendor_record(), AGENT, AGENT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            judge(&facts(AGENT, PID, STARTED, "sh v"), &same_uid),
+            Err(KillRefusal::CoreUid)
+        );
+        assert!(matches!(
+            vendor_expectation(VendorRead::Absent, AGENT, CORE),
+            Ok(None)
+        ));
+        assert!(matches!(
+            vendor_expectation(VendorRead::Unrecognised("x".to_string()), AGENT, CORE),
+            Err(KillRefusal::Unrecognised(_))
+        ));
+    }
+
+    #[test]
+    fn a_reap_kills_by_name_and_reports_the_vendor_without_signalling_a_core_process() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (dirs, session) = records_for(child.id(), "reap");
+        let (script, log) = recording_zmx(&dirs);
+        let zmx = Zmx::agent(&script, &dirs.socket_dir);
+        let report = reap(&zmx, &dirs, &session, crate::agent_files::current_uid());
+        assert_eq!(report.zmx_kill, Ok(()));
+        assert_eq!(
+            report.vendor,
+            Some(KillVerdict::Refused(KillRefusal::CoreUid))
+        );
+        assert_eq!(child.try_wait().unwrap(), None, "the vendor was signalled");
+        assert!(std::fs::read_to_string(&log)
+            .unwrap()
+            .contains(&format!("kill {session}")));
+        std::fs::remove_file(SessionFiles::new(&dirs, &session).vendor).unwrap();
+        let report = reap(&zmx, &dirs, &session, crate::agent_files::current_uid());
+        assert_eq!(report.vendor, None);
+        child.kill().unwrap();
+        child.wait().unwrap();
         std::fs::remove_dir_all(&dirs.socket_dir).unwrap();
     }
 

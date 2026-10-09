@@ -1,8 +1,9 @@
 //! The evaluation metric table from `docs/design.html` section 17.
 //!
 //! Plus the two baselines slice zero introduces (journal size, index build
-//! time), not yet measured by this issue. The zero-work-units-green rule
-//! lives here too: a run where nothing passed verification fails the gate.
+//! time), measured by the chaos suite's first-merge test. The
+//! zero-work-units-green rule lives here too: a run where nothing passed
+//! verification fails the gate.
 
 /// A metric's recorded value, or the reason it has none yet; never absent without one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +67,9 @@ pub const METRIC_TABLE: [Metric; 12] = [
         definition: "killed sessions that resumed with no lost state and no duplicate spawn",
         measured_at: "chaos tests",
         target: "100 percent, hard gate",
-        measured_value: NOT_MEASURED_SLICE_ZERO,
+        measured_value: MeasuredValue::Recorded(
+            "4 of 4 cases held on state and one session per attempt; the launcher case leaves attempt 1's vendor running (issue 66)",
+        ),
     },
     Metric {
         name: "Gate negative tests",
@@ -103,14 +106,18 @@ pub const METRIC_TABLE: [Metric; 12] = [
         definition: "bytes the journal holds for one merged work unit",
         measured_at: "store",
         target: "baseline, recorded in slice zero",
-        measured_value: NOT_MEASURED_SLICE_ZERO,
+        measured_value: MeasuredValue::Recorded(
+            "16462 bytes over 100 entries for a one-task unit through a fixed gate, summed from sys_journal.raw_length across every invocation but the reconciler's and status reads",
+        ),
     },
     Metric {
         name: "Index build time",
         definition: "wall clock to build the semantic graph index for one worktree",
         measured_at: "worktree clone",
         target: "baseline, recorded in slice zero",
-        measured_value: NOT_MEASURED_SLICE_ZERO,
+        measured_value: MeasuredValue::Recorded(
+            "252 to 507 ms over five cold builds of the synthetic checkout (5 files, 21 symbols) through the graph port",
+        ),
     },
 ];
 
@@ -178,10 +185,11 @@ mod tests {
     #[test]
     fn the_table_carries_exactly_the_design_rows_and_the_two_baselines() {
         assert_eq!(METRIC_TABLE.len(), 12);
-        assert_eq!(METRIC_TABLE[0].name, "Human interrupts per work unit");
-        assert_eq!(METRIC_TABLE[9].name, "Rule citation ledger");
-        assert_eq!(METRIC_TABLE[10].name, "Journal size per unit");
-        assert_eq!(METRIC_TABLE[11].name, "Index build time");
+        let names: Vec<&str> = METRIC_TABLE.iter().map(|metric| metric.name).collect();
+        assert_eq!(names.first(), Some(&"Human interrupts per work unit"));
+        assert_eq!(names.get(9), Some(&"Rule citation ledger"));
+        assert_eq!(names.get(10), Some(&"Journal size per unit"));
+        assert_eq!(names.get(11), Some(&"Index build time"));
     }
 
     #[test]
@@ -203,6 +211,44 @@ mod tests {
         };
         let rendered = render_markdown(std::slice::from_ref(&metric));
         assert!(rendered.contains("weird \\| name"));
+    }
+
+    fn by_name(name: &str) -> &'static Metric {
+        METRIC_TABLE
+            .iter()
+            .find(|metric| metric.name == name)
+            .unwrap()
+    }
+
+    /// The step 4 kill cases the chaos catalogue names as runnable.
+    fn kill_cases() -> usize {
+        let step_four = crate::chaos::SLICE_ZERO_EXIT_TESTS
+            .iter()
+            .find(|test| test.name == "kill tests (step 4)")
+            .unwrap();
+        match step_four.readiness {
+            crate::chaos::Readiness::Runnable { test } => test.split(", ").count(),
+            crate::chaos::Readiness::NotYetRunnable { .. } => 0,
+        }
+    }
+
+    #[test]
+    fn the_baselines_and_restart_recovery_are_recorded() {
+        for name in ["Journal size per unit", "Index build time"] {
+            assert!(matches!(
+                by_name(name).measured_value,
+                MeasuredValue::Recorded(_)
+            ));
+        }
+        let cases = kill_cases();
+        assert_eq!(cases, 4);
+        let MeasuredValue::Recorded(value) = by_name("Restart recovery").measured_value else {
+            panic!("restart recovery is not recorded");
+        };
+        assert!(
+            value.starts_with(&format!("{cases} of {cases} cases")),
+            "{value}"
+        );
     }
 
     #[test]

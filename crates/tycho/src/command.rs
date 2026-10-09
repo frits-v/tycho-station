@@ -135,10 +135,15 @@ pub fn run_detached(
     program: &Path,
     arguments: &[&str],
     environment: &[(&str, &str)],
+    removed: &[OsString],
     timeout: Duration,
 ) -> Result<ExitStatus, CommandError> {
     let name = program.display().to_string();
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    for variable in removed {
+        command.env_remove(variable);
+    }
+    let mut child = command
         .args(arguments)
         .envs(environment.iter().copied())
         .stdin(Stdio::null())

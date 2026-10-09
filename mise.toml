@@ -74,3 +74,7 @@ run = "cargo test -p tycho --test worker -- --ignored --test-threads=1 --nocaptu
 [tasks.control-tests]
 description = "Spawn real interactive claude control sessions under zmx through the launcher, instruct them over the inbox socket from a handler step, then stall, kill and resume them (macOS, uses the developer's claude login)"
 run = "cargo test -p tycho --test control -- --ignored --test-threads=1 --nocapture"
+
+[tasks.chaos-tests]
+description = "Run a work unit through the operator while the terminal app, the restate server, the endpoint and the launcher are killed; record the slice zero baselines (macOS)"
+run = "cargo test -p tycho --test chaos -- --ignored --test-threads=1 --nocapture"
