@@ -66,8 +66,9 @@ so release builds use rustup's cargo.
   commit with a prefix fallback. It saves them, after `mise run cache-trim` collects the
   store down to 3 GiB, only after a passing push to the default branch, so a pull request
   never writes outputs another run reads. A newer push cancels a pull request's running ci,
-  never a push to the default branch, so each merge reaches the save. A run before the
-  first save builds cold.
+  never a push to the default branch, so each merge reaches the save. Each passing push to
+  the default branch saves an entry of up to 3 GiB against the repository's 10 GB cache
+  limit, so the mise tool cache is evicted first. A run before the first save builds cold.
 - The release workflow restores nothing.
 - Locally the store grows under the platform cache directory (`mbx doctor` names it) and
   collects itself; `mise run cache-trim` trims it to the size ci saves, and `mbx stats`
@@ -79,14 +80,14 @@ Every ci run writes SARIF to `target/sarif/<tool>.sarif`: clippy, opengrep, zizm
 jactionlint, and one file per xtask file check (`xtask-check-names`, `xtask-check-comments`,
 `xtask-check-rules`, `xtask-check-credentials`). The `ci` job uploads them as the run's
 `sarif` artifact. A second job, `code-scanning`, runs after it whether it passed or failed:
-it downloads the artifact into `target/sarif`, builds the xtask in a step without a token,
-then runs `xtask sarif-upload`, which posts each file to the code scanning API through
+it builds the xtask, downloads the artifact into `target/sarif`, then runs
+`xtask sarif-upload`, which posts each file to the code scanning API through
 `gh api`, gzipped and base64-encoded, with the commit and ref of the run and the file's name
 as its category, so one tool's upload never replaces another's alerts.
 
-- Only `code-scanning` holds `security-events: write`. The `ci` job, where build scripts and
-  tests run, has `contents: read` and a token only for the online workflow audits, so no
-  build step can write or dismiss code scanning alerts.
+- Only `code-scanning` holds `security-events: write`; the only code that runs there is the
+  xtask and its `--locked` dependency closure, build scripts included. The `ci` job, where
+  the workspace's build scripts and tests run, has `contents: read`.
 - The repository ruleset requires the `ci` check only, so the upload does not gate merge;
   each check already fails `ci` on a finding.
 - A repository without code scanning answers 403 "Code scanning is not enabled". The upload
