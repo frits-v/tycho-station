@@ -1,9 +1,14 @@
 profile: pedantic
 online: true
 rules:
-  # A workflow checks out, restores or saves the build cache, installs the mise pins and runs
-  # one mise task; every check after that lives in the xtask, so no other action has a job.
+  # A workflow checks out, restores or saves the build cache, installs the mise pins, runs
+  # one mise task or the built xtask, and hands the SARIF between jobs as an artifact; every
+  # check lives in the xtask, so no other action has a job.
   forbidden-uses:
     allow:
-      - actions/*
+      - actions/checkout
+      - actions/cache/restore
+      - actions/cache/save
+      - actions/upload-artifact
+      - actions/download-artifact
       - jdx/mise-action

@@ -42,19 +42,19 @@ const RULE_MAX_LINES: usize = 24;
 const COMMANDS: [(&str, &str); 19] = [
     (
         "ci",
-        "every check below that ci runs, then sarif-upload when in GitHub Actions",
+        "format check, clippy, tests, workflow audits, opengrep, repository checks, PR title",
     ),
     (
         "opengrep",
         "the opengrep rules against their fixtures, then over the Rust sources",
     ),
     (
-        "workflows",
-        "zizmor and jactionlint over the workflows at pedantic, online",
+        "workflows [--offline]",
+        "zizmor and jactionlint over the workflows at pedantic; online unless --offline",
     ),
     (
         "sarif-upload",
-        "upload target/sarif/*.sarif to GitHub code scanning",
+        "upload target/sarif/*.sarif to code scanning (the code-scanning ci job)",
     ),
     (
         "check-commit-msg <file>",
@@ -297,9 +297,9 @@ fn step_passed(name: &str, outcome: Result<String, String>) -> bool {
 
 type Check = fn() -> i32;
 
-/// Runs every step even after one fails, so one run reports and uploads all findings. A
-/// cargo build started here finds rustup's cargo on `PATH`, not the mise wrapper that routes
-/// it through the mbx cache, so builds start `mbx` with the cargo subcommand.
+/// Runs every step even after one fails, so one run reports all findings and writes all
+/// SARIF. A cargo build started here finds rustup's cargo on `PATH`, not the mise wrapper
+/// that routes it through the mbx cache, so builds start `mbx` with the cargo subcommand.
 fn ci() -> i32 {
     if let Err(reason) = sarif::clear() {
         eprintln!("xtask ci: {reason}");
@@ -312,7 +312,10 @@ fn ci() -> i32 {
         ),
         ("clippy", step_passed("clippy", clippy::clippy())),
         ("test", run("mbx", &["test", "--workspace"]).success()),
-        ("workflows", workflows::workflows() == 0),
+        (
+            "workflows",
+            workflows::workflows(workflows::Network::Online) == 0,
+        ),
         ("opengrep", opengrep::opengrep() == 0),
     ];
     let checks: [(&str, Check); 6] = [
@@ -327,9 +330,6 @@ fn ci() -> i32 {
         steps.push((name, check() == 0));
     }
     steps.push(("check-pr-title", check_pr_title(pr_title_from_event()) == 0));
-    if env::var("GITHUB_ACTIONS").is_ok_and(|value| value == "true") {
-        steps.push(("sarif-upload", code_scanning::sarif_upload() == 0));
-    }
     let failed: Vec<&str> = steps
         .iter()
         .filter(|(_, passed)| !passed)
@@ -732,7 +732,14 @@ fn main() {
         Some("check-pr-title") => check_pr_title(args.get(1).cloned().or_else(pr_title_from_event)),
         Some("ci") => ci(),
         Some("opengrep") => opengrep::opengrep(),
-        Some("workflows") => workflows::workflows(),
+        Some("workflows") => match args.get(1).map(String::as_str) {
+            None => workflows::workflows(workflows::Network::Online),
+            Some("--offline") => workflows::workflows(workflows::Network::Offline),
+            Some(other) => {
+                eprintln!("usage: xtask workflows [--offline]; got {other}");
+                2
+            }
+        },
         Some("sarif-upload") => code_scanning::sarif_upload(),
         Some("check-names") => check_names(),
         Some("check-comments") => check_comments(),

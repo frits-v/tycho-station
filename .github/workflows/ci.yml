@@ -7,7 +7,8 @@ on:
 permissions: {}
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A push to main runs to the end, so a later merge never cancels the run that saves the store.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 defaults:
   run:
     shell: bash
@@ -18,7 +19,6 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read # checkout, and the online action lookups of zizmor and jactionlint
-      security-events: write # xtask sarif-upload sends the checks' SARIF to code scanning
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -56,3 +56,31 @@ jobs:
             ~/.cargo/git
             ~/.cache/mbx
           key: ${{ runner.os }}-${{ runner.arch }}-mbx-${{ github.sha }}
+  code-scanning:
+    name: code-scanning
+    needs: ci
+    # A pull request from a fork gets a read-only token, which code scanning refuses.
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read # checkout
+      security-events: write # xtask sarif-upload sends the checks' SARIF to code scanning
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          version: 2026.9.13
+          cache: false
+          install_args: rust mr-boxington gh
+      # Built in a step without the token, so no build script or proc-macro runs with it.
+      - run: cargo build --locked -p xtask
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: sarif
+          path: target/sarif
+      - run: target/debug/xtask sarif-upload
+        env:
+          GH_TOKEN: ${{ github.token }}

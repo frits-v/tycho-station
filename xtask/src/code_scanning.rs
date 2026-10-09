@@ -104,6 +104,16 @@ pub fn decode_response(exit: &Exit, response: &str) -> UploadOutcome {
     }
 }
 
+/// A GitHub Actions `warning` workflow command, which the run's summary shows. The
+/// command ends at a newline, and `%`, `\r` and `\n` are escaped in the message.
+fn workflow_warning(title: &str, message: &str) -> String {
+    let escaped = message
+        .replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A");
+    format!("::warning title={title}::{escaped}")
+}
+
 fn required_variable(name: &str) -> Result<String, String> {
     env::var(name)
         .ok()
@@ -259,9 +269,13 @@ fn upload_all() -> Result<String, String> {
         return Err(failures.join("; "));
     }
     if not_enabled > 0 {
-        println!(
-            "sarif-upload: code scanning is not enabled for this repository; {not_enabled} files not uploaded (GitHub: {not_enabled_message})"
+        let skip = format!(
+            "code scanning is not enabled for this repository; {not_enabled} files not uploaded (GitHub: {not_enabled_message})"
         );
+        println!("sarif-upload: {skip}");
+        if env::var("GITHUB_ACTIONS").is_ok_and(|value| value == "true") {
+            println!("{}", workflow_warning("code scanning off", &skip));
+        }
     }
     Ok(format!(
         "examined {} files, {accepted} uploaded, {not_enabled} refused because code scanning is off",
@@ -376,6 +390,14 @@ mod tests {
                 UploadOutcome::ServerError(503),
             ),
         ]);
+    }
+
+    #[test]
+    fn the_skip_warning_is_one_workflow_command_line() {
+        assert_eq!(
+            workflow_warning("code scanning off", "8 files\nnot uploaded, 100%"),
+            "::warning title=code scanning off::8 files%0Anot uploaded, 100%25"
+        );
     }
 
     #[test]

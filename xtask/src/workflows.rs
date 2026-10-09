@@ -1,5 +1,6 @@
 //! `xtask workflows`: zizmor and jactionlint over the workflow files at pedantic, with their
-//! online audits. Both write SARIF under `target/sarif`, and their findings are read from it.
+//! online audits, or without them under `--offline`. Both write SARIF under `target/sarif`,
+//! and their findings are read from it.
 
 use std::env;
 use std::fs;
@@ -17,6 +18,14 @@ const WORKFLOW_FILES_MAX: usize = 64;
 const AUDIT_TIMEOUT: Duration = Duration::from_secs(300);
 const REPORTED_FINDINGS_MAX: usize = 40;
 const TOKEN_VARIABLES: [&str; 2] = ["GH_TOKEN", "GITHUB_TOKEN"];
+
+/// Whether the audits that look actions up on GitHub run. ci runs them; the pre-push hook
+/// runs offline, so it needs no token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Network {
+    Online,
+    Offline,
+}
 
 /// How a SARIF-writing audit ended.
 #[derive(Debug, PartialEq, Eq)]
@@ -139,10 +148,26 @@ fn report(tool: &str, output: &str, outcome: AuditOutcome) -> Result<(), String>
     }
 }
 
-fn zizmor(files: &[PathBuf]) -> Result<(), String> {
+fn zizmor_arguments(network: Network) -> Vec<&'static str> {
+    let mut arguments = vec!["--persona=pedantic", "--format", "sarif", "--no-progress"];
+    if network == Network::Offline {
+        arguments.push("--no-online-audits");
+    }
+    arguments
+}
+
+const fn jactionlint_arguments(network: Network) -> [&'static str; 5] {
+    let online = match network {
+        Network::Online => "--online=strict",
+        Network::Offline => "--no-online",
+    };
+    ["--format", "sarif", "--strict-exit", online, "--verbose"]
+}
+
+fn zizmor(files: &[PathBuf], network: Network) -> Result<(), String> {
     let captured = run_bounded(
         Command::new("zizmor")
-            .args(["--persona=pedantic", "--format", "sarif", "--no-progress"])
+            .args(zizmor_arguments(network))
             .args(files),
         AUDIT_TIMEOUT,
     );
@@ -151,15 +176,9 @@ fn zizmor(files: &[PathBuf]) -> Result<(), String> {
 }
 
 /// The profile and the action allow list live in `.github/jactionlint.yaml`.
-fn jactionlint() -> Result<usize, String> {
+fn jactionlint(network: Network) -> Result<usize, String> {
     let captured: Captured = run_bounded_capturing_stderr(
-        Command::new("jactionlint").args([
-            "--format",
-            "sarif",
-            "--strict-exit",
-            "--online=strict",
-            "--verbose",
-        ]),
+        Command::new("jactionlint").args(jactionlint_arguments(network)),
         AUDIT_TIMEOUT,
     );
     for line in captured
@@ -184,8 +203,8 @@ fn jactionlint() -> Result<usize, String> {
     Ok(files)
 }
 
-fn audits() -> Result<String, String> {
-    if !token_present() {
+fn audits(network: Network) -> Result<String, String> {
+    if network == Network::Online && !token_present() {
         return Err(format!(
             "no GitHub token in {}; the online audits need one",
             TOKEN_VARIABLES.join(" or ")
@@ -195,17 +214,21 @@ fn audits() -> Result<String, String> {
     if files.is_empty() {
         return Err(format!("no workflow files under {WORKFLOW_DIR}"));
     }
-    let zizmor_result = zizmor(&files);
-    let linted = jactionlint()?;
+    let zizmor_result = zizmor(&files, network);
+    let linted = jactionlint(network)?;
     zizmor_result?;
+    let mode = match network {
+        Network::Online => "",
+        Network::Offline => " offline",
+    };
     Ok(format!(
-        "zizmor examined {} files, jactionlint {linted}, no findings",
+        "zizmor examined {} files{mode}, jactionlint {linted}, no findings",
         files.len()
     ))
 }
 
-pub fn workflows() -> i32 {
-    match audits() {
+pub fn workflows(network: Network) -> i32 {
+    match audits(network) {
         Ok(summary) => {
             println!("xtask workflows: {summary}");
             0
@@ -227,6 +250,14 @@ mod tests {
         "ruleId": "missing-timeout", "message": {"text": "no timeout"},
         "locations": [{"physicalLocation": {"artifactLocation": {"uri": ".github/workflows/ci.yml"},
         "region": {"startLine": 12, "startColumn": 3}}}]}]}]}"#;
+
+    #[test]
+    fn offline_audits_turn_off_each_tools_network_and_online_ones_are_strict() {
+        assert!(zizmor_arguments(Network::Offline).contains(&"--no-online-audits"));
+        assert!(!zizmor_arguments(Network::Online).contains(&"--no-online-audits"));
+        assert!(jactionlint_arguments(Network::Offline).contains(&"--no-online"));
+        assert!(jactionlint_arguments(Network::Online).contains(&"--online=strict"));
+    }
 
     #[test]
     fn zizmor_is_judged_by_its_results() {

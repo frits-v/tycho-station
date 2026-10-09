@@ -35,7 +35,7 @@ check is not repeated in any instruction file. "review" means a reader rejects i
 |---|---|
 | A comment exists only for a non-obvious why: a constraint, an invariant, a workaround | review |
 | No history in code or docs: nothing about what the code did before, no ticket or PR numbers, hashes, or names of people | `xtask opengrep` (`rust-history-trace-comment`) for history phrases in Rust comments; `xtask check-comments` for the rest of its marker list, ticket and issue numbers in Rust comments, and documents; review for the rest |
-| A TODO in Rust names its owner: a ticket key (`ABC-123`) or a link; a `#123` passes the rule but is a ticket number, which `check-comments` refuses in a comment | `xtask opengrep` (`rust-todo-without-ticket`), `xtask check-comments` |
+| A TODO in Rust names a ticket key (`ABC-123`) or a link | `xtask opengrep` (`rust-todo-without-ticket`) |
 | No narration: no process commentary addressed to the reader | `xtask check-comments` for the phrases in its marker list |
 | No filler emphasis: bold sprinkles, emdashes as default punctuation, horizontal rules inside a document, emoji | review |
 | Docstrings only where the signature does not state the contract; one line | review |
@@ -49,8 +49,8 @@ check is not repeated in any instruction file. "review" means a reader rejects i
 |---|---|
 | CUE before JSON before YAML; TOML only for mise; YAML only for GitHub Actions | review; `xtask check-config` |
 | Configuration and JSON Schema are exported from CUE and checked in; an export that drifts from its CUE fails | `xtask check-config` in ci and the post-edit hook |
-| Workflow files pass zizmor and jactionlint at pedantic with their online audits; actions pinned by commit; a workflow uses only `actions/*` and `jdx/mise-action` | `xtask workflows` (in `xtask ci` and lefthook pre-push), `forbidden-uses` in `.github/jactionlint.yaml` |
-| A check that reports findings at a file and line writes them as SARIF under `target/sarif`, which ci uploads to code scanning | `finish_findings` in the xtask; review for new checks |
+| Workflow files pass zizmor and jactionlint at pedantic, with their online audits in ci; actions pinned by commit; a workflow uses only the actions `.github/jactionlint.yaml` lists | `xtask workflows` in `xtask ci`, `xtask workflows --offline` in lefthook pre-push when `.github` changes, `forbidden-uses` in `.github/jactionlint.yaml` |
+| A check that reports findings at a file and line writes them as SARIF under `target/sarif`, which the `code-scanning` job uploads | `finish_findings` in the xtask; review for new checks |
 | Figures are stencil documents authored in CUE under `figures/`, rendered to `docs/figures/` and the design page, and checked in ci | `xtask check-figures` (`cue vet`, `stencil check`, byte comparison) in ci and the post-edit hook; `xtask render-figures` writes them |
 | Rule files carry `paths` frontmatter and stay short | `xtask check-rules` |
 

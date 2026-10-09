@@ -13,7 +13,7 @@
     "commands": {
       "clippy": { "run": "cargo clippy --workspace --all-targets -- -D warnings" },
       "test": { "run": "cargo test --workspace" },
-      "workflows": { "run": "cargo run -q -p xtask -- workflows" }
+      "workflows": { "glob": ".github/**", "run": "cargo run -q -p xtask -- workflows --offline" }
     }
   }
 }

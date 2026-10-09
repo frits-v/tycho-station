@@ -65,8 +65,9 @@ so release builds use rustup's cargo.
 - The ci workflow restores `~/.cache/mbx` and the cargo registry on every run, keyed by
   commit with a prefix fallback. It saves them, after `mise run cache-trim` collects the
   store down to 3 GiB, only after a passing push to the default branch, so a pull request
-  never writes outputs another run reads. A pull request run before the first save builds
-  cold.
+  never writes outputs another run reads. A newer push cancels a pull request's running ci,
+  never a push to the default branch, so each merge reaches the save. A run before the
+  first save builds cold.
 - The release workflow restores nothing.
 - Locally the store grows under the platform cache directory (`mbx doctor` names it) and
   collects itself; `mise run cache-trim` trims it to the size ci saves, and `mbx stats`
@@ -76,24 +77,27 @@ so release builds use rustup's cargo.
 
 Every ci run writes SARIF to `target/sarif/<tool>.sarif`: clippy, opengrep, zizmor,
 jactionlint, and one file per xtask file check (`xtask-check-names`, `xtask-check-comments`,
-`xtask-check-rules`, `xtask-check-credentials`). In GitHub Actions, `xtask ci` then runs
-`xtask sarif-upload`, which posts each file to the code scanning API through `gh api` with
-the job's token, gzipped and base64-encoded, with the commit and ref of the run and the
-file's name as its category, so one tool's upload never replaces another's alerts. The
-workflow uploads the same files as the run's `sarif` artifact whether or not code scanning
-takes them.
+`xtask-check-rules`, `xtask-check-credentials`). The `ci` job uploads them as the run's
+`sarif` artifact. A second job, `code-scanning`, runs after it whether it passed or failed:
+it downloads the artifact into `target/sarif`, builds the xtask in a step without a token,
+then runs `xtask sarif-upload`, which posts each file to the code scanning API through
+`gh api`, gzipped and base64-encoded, with the commit and ref of the run and the file's name
+as its category, so one tool's upload never replaces another's alerts.
 
-- A repository without code scanning answers 403 "Code scanning is not enabled". The
-  upload prints `sarif-upload: code scanning is not enabled for this repository; N files
-  not uploaded` with GitHub's message and does not fail ci, since each check already fails ci on a finding. Any
-  other refusal fails ci.
+- Only `code-scanning` holds `security-events: write`. The `ci` job, where build scripts and
+  tests run, has `contents: read` and a token only for the online workflow audits, so no
+  build step can write or dismiss code scanning alerts.
+- The repository ruleset requires the `ci` check only, so the upload does not gate merge;
+  each check already fails `ci` on a finding.
+- A repository without code scanning answers 403 "Code scanning is not enabled". The upload
+  prints `sarif-upload: code scanning is not enabled for this repository; N files not
+  uploaded` with GitHub's message, adds a `code scanning off` warning to the run, and passes.
+  Any other refusal fails the job.
+- A pull request from a fork gets a read-only token, which code scanning refuses, so the job
+  is skipped when the head repository is not this one.
 - For code scanning to accept the files, the operator enables GitHub Code Security for the
   repository (Settings, Advanced Security) where the account's plan offers it, or moves the
   repository to an organisation that has it.
-- The upload needs `security-events: write`. The ci job holds it together with `contents:
-  read`, in `GH_TOKEN` for the whole `mise run ci` step, so build scripts and tests run
-  with a token that can write code scanning results. A separate upload job would keep the
-  token out of the build, at the cost of handing the SARIF files between jobs.
 
 ## Releases
 
