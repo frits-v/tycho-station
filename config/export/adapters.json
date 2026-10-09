@@ -1,0 +1,11 @@
+{
+    "projects": {
+        "default": {
+            "session_vendor": "claude",
+            "pane_host": "zmx",
+            "tracker": "github",
+            "remote_sync": "git",
+            "code_graph": "entire"
+        }
+    }
+}

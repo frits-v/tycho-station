@@ -1,0 +1,36 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "anyOf": [
+        {
+            "const": "completed"
+        },
+        {
+            "const": "escalated"
+        },
+        {
+            "const": "too_large"
+        },
+        {
+            "const": "stalled"
+        },
+        {
+            "const": "cancelled"
+        },
+        {
+            "const": "killed"
+        },
+        {
+            "const": "budget_exceeded"
+        },
+        {
+            "const": "rate_limited"
+        },
+        {
+            "const": "failed"
+        },
+        {
+            "type": "string",
+            "pattern": "^unrecognised:[0-9]+(:[!-~]{0,64})?$"
+        }
+    ]
+}

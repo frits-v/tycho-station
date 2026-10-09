@@ -1,0 +1,865 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+        "AbsolutePath": {
+            "type": "string",
+            "$ref": "#/$defs/Text",
+            "maxLength": 1024,
+            "not": {
+                "pattern": "//|/$|/\\.\\.?(/|$)"
+            },
+            "pattern": "^/"
+        },
+        "Boundaries": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "branch": {
+                    "$ref": "#/$defs/BranchName"
+                },
+                "forbidden_actions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/ShortText"
+                    },
+                    "maxItems": 64
+                },
+                "worktree": {
+                    "$ref": "#/$defs/AbsolutePath"
+                },
+                "writable_paths": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/RelativePath"
+                    },
+                    "maxItems": 64
+                }
+            },
+            "required": [
+                "branch",
+                "forbidden_actions",
+                "worktree",
+                "writable_paths"
+            ]
+        },
+        "BranchName": {
+            "type": "string",
+            "description": "A portable subset of git check-ref-format: no leading dash, no trailing dot, no `..`,\nno empty component, no component starting with a dot or ending in `.lock`.",
+            "maxLength": 128,
+            "not": {
+                "pattern": "^-|\\.$|\\.\\.|^/|//|/$|(^|/)\\.|\\.[lL][oO][cC][kK](/|$)"
+            },
+            "pattern": "^[A-Za-z0-9._/-]+$"
+        },
+        "Budget": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "tokens_max": {
+                    "allOf": [
+                        {
+                            "type": "number"
+                        },
+                        {
+                            "type": "integer",
+                            "maximum": 5E+7,
+                            "minimum": 1
+                        }
+                    ]
+                },
+                "wall_clock_max_ms": {
+                    "allOf": [
+                        {
+                            "type": "number"
+                        },
+                        {
+                            "type": "integer",
+                            "maximum": 8.64E+7,
+                            "minimum": 1
+                        }
+                    ]
+                }
+            },
+            "required": [
+                "tokens_max",
+                "wall_clock_max_ms"
+            ]
+        },
+        "CommitSha": {
+            "type": "string",
+            "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$"
+        },
+        "ContentRef": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "CriterionReport": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "criterion": {
+                    "$ref": "#/$defs/U16"
+                },
+                "evidence": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/ContentRef"
+                    },
+                    "maxItems": 64
+                },
+                "passed": {
+                    "type": "boolean"
+                }
+            },
+            "required": [
+                "criterion",
+                "evidence",
+                "passed"
+            ]
+        },
+        "DoneCriterion": {
+            "anyOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "command": {
+                            "$ref": "#/$defs/ShortText"
+                        },
+                        "expected_exit": {
+                            "$ref": "#/$defs/U8"
+                        },
+                        "kind": {
+                            "const": "command"
+                        }
+                    },
+                    "required": [
+                        "command",
+                        "expected_exit",
+                        "kind"
+                    ]
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "kind": {
+                            "const": "file_present"
+                        },
+                        "path": {
+                            "$ref": "#/$defs/RelativePath"
+                        }
+                    },
+                    "required": [
+                        "kind",
+                        "path"
+                    ]
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "kind": {
+                            "const": "file_absent"
+                        },
+                        "path": {
+                            "$ref": "#/$defs/RelativePath"
+                        }
+                    },
+                    "required": [
+                        "kind",
+                        "path"
+                    ]
+                }
+            ]
+        },
+        "Effort": {
+            "enum": [
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "max"
+            ]
+        },
+        "EpicId": {
+            "$ref": "#/$defs/Slug16"
+        },
+        "EscalationOption": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "blast_radius": {
+                    "$ref": "#/$defs/ShortText"
+                },
+                "label": {
+                    "$ref": "#/$defs/ShortText"
+                },
+                "reversibility": {
+                    "enum": [
+                        "two_way",
+                        "costly",
+                        "one_way"
+                    ]
+                }
+            },
+            "required": [
+                "blast_radius",
+                "label",
+                "reversibility"
+            ]
+        },
+        "EscalationPayload": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "blocking": {
+                    "type": "boolean"
+                },
+                "cases_consulted": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/RecordId"
+                    },
+                    "maxItems": 64
+                },
+                "evidence": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/ContentRef"
+                    },
+                    "maxItems": 64
+                },
+                "give_up_reason": {
+                    "$ref": "#/$defs/ShortText"
+                },
+                "level_reached": {
+                    "$ref": "#/$defs/Level"
+                },
+                "options": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/EscalationOption"
+                    },
+                    "maxItems": 4
+                },
+                "proposed_ruling": {
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/ContentRef"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "question": {
+                    "$ref": "#/$defs/ContentRef"
+                },
+                "question_type": {
+                    "enum": [
+                        "empirical",
+                        "judgment",
+                        "authority"
+                    ]
+                }
+            },
+            "required": [
+                "blocking",
+                "cases_consulted",
+                "evidence",
+                "give_up_reason",
+                "level_reached",
+                "options",
+                "question",
+                "question_type"
+            ]
+        },
+        "Level": {
+            "enum": [
+                "root",
+                "control",
+                "worker"
+            ]
+        },
+        "ProgressMarker": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "head_sha": {
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/CommitSha"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "tests_passing": {
+                    "$ref": "#/$defs/U32"
+                }
+            },
+            "required": [
+                "tests_passing"
+            ]
+        },
+        "RecordId": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "RelativePath": {
+            "type": "string",
+            "$ref": "#/$defs/Text",
+            "maxLength": 1024,
+            "not": {
+                "pattern": "^[/-]|//|/$|(^|/)\\.\\.?(/|$)"
+            }
+        },
+        "ResultPayload": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "branch": {
+                    "$ref": "#/$defs/BranchName"
+                },
+                "criteria": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/CriterionReport"
+                    },
+                    "maxItems": 64
+                },
+                "head_sha": {
+                    "$ref": "#/$defs/CommitSha"
+                },
+                "outcome": {
+                    "enum": [
+                        "done",
+                        "not_done"
+                    ]
+                },
+                "usage": {
+                    "$ref": "#/$defs/Usage"
+                }
+            },
+            "required": [
+                "branch",
+                "criteria",
+                "head_sha",
+                "outcome",
+                "usage"
+            ]
+        },
+        "Routing": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "binding": {
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/Vendor"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "class": {
+                    "$ref": "#/$defs/RoutingName"
+                },
+                "effort": {
+                    "$ref": "#/$defs/Effort"
+                },
+                "fallback_tier": {
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/RoutingName"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "rationale": {
+                    "$ref": "#/$defs/ShortText"
+                },
+                "tier": {
+                    "$ref": "#/$defs/RoutingName"
+                }
+            },
+            "required": [
+                "class",
+                "effort",
+                "rationale",
+                "tier"
+            ]
+        },
+        "RoutingName": {
+            "$ref": "#/$defs/Slug32"
+        },
+        "SessionName": {
+            "type": "string",
+            "description": "`<epic>.<unit>.<ctl|wrk>.<vendor>[.<suffix>]` or `<epic>.root.<vendor>[.<suffix>]`; a unit\nnamed `root` is the root form, so `<epic>.root.ctl.` is refused.",
+            "maxLength": 64,
+            "not": {
+                "pattern": "^[^.]*\\.root\\.(ctl|wrk)\\."
+            },
+            "pattern": "^[a-z0-9][a-z0-9-]*\\.(root|[a-z0-9][a-z0-9-]*\\.(ctl|wrk))\\.(claude|codex|antigravity|amp|opencode)(\\.[a-z0-9][a-z0-9-]*)?$"
+        },
+        "ShortText": {
+            "type": "string",
+            "$ref": "#/$defs/Text",
+            "maxLength": 512
+        },
+        "Slug16": {
+            "type": "string",
+            "maxLength": 16,
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "Slug32": {
+            "type": "string",
+            "maxLength": 32,
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "StateName": {
+            "$ref": "#/$defs/Slug32"
+        },
+        "StatusPayload": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "active_workers": {
+                    "$ref": "#/$defs/U16"
+                },
+                "blockers": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/ContentRef"
+                    },
+                    "maxItems": 64
+                },
+                "last_progress_unix_ms": {
+                    "$ref": "#/$defs/U64"
+                },
+                "progress": {
+                    "$ref": "#/$defs/ProgressMarker"
+                },
+                "state": {
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/StateName"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "summary": {
+                    "$ref": "#/$defs/ShortText"
+                },
+                "usage": {
+                    "$ref": "#/$defs/Usage"
+                }
+            },
+            "required": [
+                "active_workers",
+                "blockers",
+                "last_progress_unix_ms",
+                "progress",
+                "summary",
+                "usage"
+            ]
+        },
+        "TaskPacketPayload": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "boundaries": {
+                    "$ref": "#/$defs/Boundaries"
+                },
+                "budget": {
+                    "$ref": "#/$defs/Budget"
+                },
+                "done_criteria": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/DoneCriterion"
+                    },
+                    "maxItems": 64
+                },
+                "inputs": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/ContentRef"
+                    },
+                    "maxItems": 64
+                },
+                "objective": {
+                    "$ref": "#/$defs/ContentRef"
+                },
+                "result_schema": {
+                    "$ref": "#/$defs/ContentRef"
+                },
+                "routing": {
+                    "$ref": "#/$defs/Routing"
+                }
+            },
+            "required": [
+                "boundaries",
+                "budget",
+                "done_criteria",
+                "inputs",
+                "objective",
+                "result_schema",
+                "routing"
+            ]
+        },
+        "Text": {
+            "type": "string",
+            "description": "No control characters (Unicode category Cc), so text cannot carry terminal escapes.",
+            "pattern": "^[^\\x00-\\x1f\\x7f-\\x9f]+$"
+        },
+        "U16": {
+            "allOf": [
+                {
+                    "type": "number"
+                },
+                {
+                    "type": "integer",
+                    "maximum": 65535,
+                    "minimum": 0
+                }
+            ]
+        },
+        "U32": {
+            "allOf": [
+                {
+                    "type": "number"
+                },
+                {
+                    "type": "integer",
+                    "maximum": 4294967295,
+                    "minimum": 0
+                }
+            ]
+        },
+        "U64": {
+            "allOf": [
+                {
+                    "type": "number"
+                },
+                {
+                    "type": "integer",
+                    "maximum": 1.8446744073709552E+19,
+                    "minimum": 0
+                }
+            ]
+        },
+        "U8": {
+            "allOf": [
+                {
+                    "type": "number"
+                },
+                {
+                    "type": "integer",
+                    "maximum": 255,
+                    "minimum": 0
+                }
+            ]
+        },
+        "Usage": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "cost_micro_dollars": {
+                    "$ref": "#/$defs/U64"
+                },
+                "input_tokens": {
+                    "$ref": "#/$defs/U64"
+                },
+                "output_tokens": {
+                    "$ref": "#/$defs/U64"
+                }
+            },
+            "required": [
+                "input_tokens",
+                "output_tokens"
+            ]
+        },
+        "Vendor": {
+            "enum": [
+                "claude",
+                "codex",
+                "antigravity",
+                "amp",
+                "opencode"
+            ]
+        },
+        "WorkUnitId": {
+            "$ref": "#/$defs/Slug16",
+            "not": {
+                "const": "root"
+            }
+        }
+    },
+    "anyOf": [
+        {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "causation_id": {
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/RecordId"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "correlation_id": {
+                    "$ref": "#/$defs/EpicId"
+                },
+                "created_at_unix_ms": {
+                    "$ref": "#/$defs/U64"
+                },
+                "expires_at_unix_ms": {
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/U64"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "from": {
+                    "$ref": "#/$defs/SessionName"
+                },
+                "id": {
+                    "$ref": "#/$defs/RecordId"
+                },
+                "payload": {
+                    "$ref": "#/$defs/TaskPacketPayload"
+                },
+                "schema_version": {
+                    "const": 1
+                },
+                "to": {
+                    "$ref": "#/$defs/SessionName"
+                },
+                "type": {
+                    "const": "task_packet"
+                },
+                "work_unit_id": {
+                    "$ref": "#/$defs/WorkUnitId"
+                }
+            },
+            "required": [
+                "correlation_id",
+                "created_at_unix_ms",
+                "from",
+                "id",
+                "payload",
+                "schema_version",
+                "to",
+                "type",
+                "work_unit_id"
+            ]
+        },
+        {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "causation_id": {
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/RecordId"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "correlation_id": {
+                    "$ref": "#/$defs/EpicId"
+                },
+                "created_at_unix_ms": {
+                    "$ref": "#/$defs/U64"
+                },
+                "expires_at_unix_ms": {
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/U64"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "from": {
+                    "$ref": "#/$defs/SessionName"
+                },
+                "id": {
+                    "$ref": "#/$defs/RecordId"
+                },
+                "payload": {
+                    "$ref": "#/$defs/ResultPayload"
+                },
+                "schema_version": {
+                    "const": 1
+                },
+                "to": {
+                    "$ref": "#/$defs/SessionName"
+                },
+                "type": {
+                    "const": "result"
+                },
+                "work_unit_id": {
+                    "$ref": "#/$defs/WorkUnitId"
+                }
+            },
+            "required": [
+                "correlation_id",
+                "created_at_unix_ms",
+                "from",
+                "id",
+                "payload",
+                "schema_version",
+                "to",
+                "type",
+                "work_unit_id"
+            ]
+        },
+        {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "causation_id": {
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/RecordId"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "correlation_id": {
+                    "$ref": "#/$defs/EpicId"
+                },
+                "created_at_unix_ms": {
+                    "$ref": "#/$defs/U64"
+                },
+                "expires_at_unix_ms": {
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/U64"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "from": {
+                    "$ref": "#/$defs/SessionName"
+                },
+                "id": {
+                    "$ref": "#/$defs/RecordId"
+                },
+                "payload": {
+                    "$ref": "#/$defs/StatusPayload"
+                },
+                "schema_version": {
+                    "const": 1
+                },
+                "to": {
+                    "$ref": "#/$defs/SessionName"
+                },
+                "type": {
+                    "const": "status"
+                },
+                "work_unit_id": {
+                    "$ref": "#/$defs/WorkUnitId"
+                }
+            },
+            "required": [
+                "correlation_id",
+                "created_at_unix_ms",
+                "from",
+                "id",
+                "payload",
+                "schema_version",
+                "to",
+                "type",
+                "work_unit_id"
+            ]
+        },
+        {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "causation_id": {
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/RecordId"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "correlation_id": {
+                    "$ref": "#/$defs/EpicId"
+                },
+                "created_at_unix_ms": {
+                    "$ref": "#/$defs/U64"
+                },
+                "expires_at_unix_ms": {
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/U64"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "from": {
+                    "$ref": "#/$defs/SessionName"
+                },
+                "id": {
+                    "$ref": "#/$defs/RecordId"
+                },
+                "payload": {
+                    "$ref": "#/$defs/EscalationPayload"
+                },
+                "schema_version": {
+                    "const": 1
+                },
+                "to": {
+                    "$ref": "#/$defs/SessionName"
+                },
+                "type": {
+                    "const": "escalation"
+                },
+                "work_unit_id": {
+                    "$ref": "#/$defs/WorkUnitId"
+                }
+            },
+            "required": [
+                "correlation_id",
+                "created_at_unix_ms",
+                "from",
+                "id",
+                "payload",
+                "schema_version",
+                "to",
+                "type",
+                "work_unit_id"
+            ]
+        }
+    ]
+}

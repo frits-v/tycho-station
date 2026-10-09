@@ -44,7 +44,8 @@ check is not repeated in any instruction file. "review" means a reader rejects i
 
 | Rule | Enforced by |
 |---|---|
-| CUE before JSON before YAML; TOML only for mise; YAML only for GitHub Actions | review; `cue vet` once configuration exists |
+| CUE before JSON before YAML; TOML only for mise; YAML only for GitHub Actions | review; `xtask check-config` |
+| Configuration and JSON Schema are exported from CUE and checked in; an export that drifts from its CUE fails | `xtask check-config` in ci and the post-edit hook |
 | Workflow files pass zizmor pedantic and actionlint; actions pinned by commit | `xtask ci`, lefthook pre-push |
 | Figures are stencil documents authored in CUE under `figures/`, rendered to `docs/figures/` and the design page, and checked in ci | `xtask check-figures` (`cue vet`, `stencil check`, byte comparison) in ci and the post-edit hook; `xtask render-figures` writes them |
 | Rule files carry `paths` frontmatter and stay short | `xtask check-rules` |

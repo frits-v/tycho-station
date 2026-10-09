@@ -21,7 +21,7 @@ is a defect.
 | Layer | Location | Runs |
 |---|---|---|
 | Lints | `Cargo.toml` `[workspace.lints]`, `clippy.toml` | every build, ci, post-edit hook |
-| Repository checks | `xtask` (`check-names`, `check-comments`, `check-rules`, `check-figures`, `check-commit-msg`, `check-pr-title`) | ci, post-edit hook, lefthook |
+| Repository checks | `xtask` (`check-names`, `check-comments`, `check-rules`, `check-figures`, `check-config`, `check-commit-msg`, `check-pr-title`) | ci, post-edit hook, lefthook |
 | Git hooks | `lefthook.json` | commit-msg, pre-commit, pre-push |
 | Host rules | repository ruleset on the default branch | every push and merge |
 | Agent hooks | `.claude/settings.json` | after Edit and Write |

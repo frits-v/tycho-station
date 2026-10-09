@@ -12,6 +12,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output};
 
+mod config;
 mod figures;
 mod process;
 mod release;
@@ -28,7 +29,7 @@ const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
 const DOC_DIRS: [&str; 1] = ["docs"];
 const RULES_DIR: &str = ".claude/rules";
 const RULE_MAX_LINES: usize = 24;
-const COMMANDS: [(&str, &str); 12] = [
+const COMMANDS: [(&str, &str); 14] = [
     (
         "ci",
         "format check, clippy, tests, the repository checks, workflow lints, PR title",
@@ -59,6 +60,14 @@ const COMMANDS: [(&str, &str); 12] = [
         "re-render the figures; fail when docs/figures or the design drift",
     ),
     (
+        "check-config",
+        "cue vet, then a fresh export compared with config/export",
+    ),
+    (
+        "config-export",
+        "cue vet, then export config and JSON Schema to config/export",
+    ),
+    (
         "release-pr [--dry-run]",
         "open the release pull request; --dry-run shows it locally",
     ),
@@ -72,7 +81,7 @@ const COMMANDS: [(&str, &str); 12] = [
     ),
     (
         "hook post-tool-use",
-        "after an edit: format and lint Rust, check documents",
+        "after an edit: format and lint Rust, check documents and CUE",
     ),
 ];
 const ABBREVIATIONS: [&str; 5] = ["tmp", "ctx", "obj", "arr", "cfg"];
@@ -247,6 +256,7 @@ fn ci() -> i32 {
         check_comments,
         check_rules,
         figures::check_figures,
+        config::check_config,
     ] {
         if check() != 0 {
             return 1;
@@ -512,6 +522,7 @@ fn hook_post_tool_use() -> i32 {
         Some("rs") => hook_rust(&path),
         Some("cue") => {
             figures::check_figures();
+            config::check_config();
             0
         }
         Some("md") => {
@@ -581,6 +592,8 @@ fn main() {
         Some("check-rules") => check_rules(),
         Some("render-figures") => figures::render_figures(),
         Some("check-figures") => figures::check_figures(),
+        Some("check-config") => config::check_config(),
+        Some("config-export") => config::config_export(),
         Some("release-pr") => match args.get(1).map(String::as_str) {
             None => release::release_pr(false),
             Some("--dry-run") => release::release_pr(true),
