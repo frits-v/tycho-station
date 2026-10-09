@@ -1860,7 +1860,7 @@ mod tests {
     fn read_bounded_file_rejects_a_fifo_without_blocking() {
         let directory =
             std::env::temp_dir().join(format!("xtask-setup-fifo-{}", std::process::id()));
-        assert!(fs::create_dir_all(&directory).is_ok());
+        assert!(fs::create_dir(&directory).is_ok() || directory.is_dir());
         let fifo = directory.join("pipe");
         let made = Command::new("mkfifo").arg(&fifo).status();
         assert!(made.is_ok_and(|status| status.success()));
@@ -1884,7 +1884,7 @@ mod tests {
     fn read_bounded_file_reads_a_regular_file_and_rejects_an_oversized_one() {
         let directory =
             std::env::temp_dir().join(format!("xtask-setup-file-{}", std::process::id()));
-        assert!(fs::create_dir_all(&directory).is_ok());
+        assert!(fs::create_dir(&directory).is_ok() || directory.is_dir());
         let small = directory.join("small");
         let large = directory.join("large");
         assert!(fs::write(&small, "[user]\n").is_ok());
@@ -1896,7 +1896,9 @@ mod tests {
         assert!(fs::write(&large, oversized).is_ok());
         let small_result = read_bounded_file(&small).ok();
         let large_result = read_bounded_file(&large);
-        drop(fs::remove_dir_all(&directory));
+        drop(fs::remove_file(&small));
+        drop(fs::remove_file(&large));
+        drop(fs::remove_dir(&directory));
         assert_eq!(small_result, Some("[user]\n".to_string()));
         assert!(large_result.is_err());
     }
