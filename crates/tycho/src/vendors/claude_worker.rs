@@ -13,8 +13,9 @@ use crate::vendors::worker::{
 
 pub const CLAUDE_PINNED_VERSION: &str = "2.1.280";
 const CLAUDE_BANNER_SUFFIX: &str = "(Claude Code)";
-const MICRO_DIGITS: usize = 6;
 const HTTP_TOO_MANY_REQUESTS: u64 = 429;
+const HTTP_UNAUTHORIZED: u64 = 401;
+const HTTP_FORBIDDEN: u64 = 403;
 /// System subtypes the pinned CLI emits that a worker does not act on.
 const SYSTEM_OTHER: [&str; 9] = [
     "hook_started",
@@ -79,22 +80,20 @@ fn count(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
 
-/// Micro-dollars from the decimal text of `total_cost_usd`, without floating point.
+/// The largest cost a run may report, a million dollars; anything above is unrecognised.
+const COST_MICRO_DOLLARS_MAX: f64 = 1e12;
+
+/// `total_cost_usd`, exponent form included, rounded to micro-dollars; `None` when it is not
+/// a finite non-negative number within the bound.
 #[must_use]
-pub fn micro_dollars(decimal: &str) -> Option<u64> {
-    let (whole, fraction) = decimal.split_once('.').unwrap_or((decimal, ""));
-    let digits = |part: &str| part.bytes().all(|byte| byte.is_ascii_digit());
-    if whole.is_empty() || !digits(whole) || !digits(fraction) {
-        return None;
-    }
-    let fraction: String = fraction
-        .chars()
-        .chain(std::iter::repeat('0'))
-        .take(MICRO_DIGITS)
-        .collect();
-    let whole: u64 = whole.parse().ok()?;
-    let fraction: u64 = fraction.parse().ok()?;
-    whole.checked_mul(1_000_000)?.checked_add(fraction)
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is finite, non-negative and below 1e12, so it fits a u64 exactly"
+)]
+pub fn micro_dollars(cost: &Value) -> Option<u64> {
+    let micro = (cost.as_f64()? * 1e6).round();
+    (micro.is_finite() && (0.0..=COST_MICRO_DOLLARS_MAX).contains(&micro)).then_some(micro as u64)
 }
 
 /// The prompt of the latest request: uncached, cache-read and cache-written input tokens.
@@ -106,21 +105,18 @@ fn context_tokens(message: &Value) -> Option<u64> {
     (total > 0).then_some(total)
 }
 
-/// Cumulative usage of the run; input counts cache reads and writes as well.
-fn run_usage(event: &Value) -> Usage {
+/// Cumulative usage of the run; input counts cache reads and writes as well. A cost that is
+/// absent or does not parse makes the event unrecognised, never a zero spend.
+fn run_usage(event: &Value) -> Option<Usage> {
     let usage = event.get("usage").cloned().unwrap_or(Value::Null);
-    let cost = event
-        .get("total_cost_usd")
-        .map(ToString::to_string)
-        .and_then(|decimal| micro_dollars(&decimal))
-        .unwrap_or(0);
-    Usage {
+    let cost = event.get("total_cost_usd").and_then(micro_dollars)?;
+    Some(Usage {
         input_tokens: count(&usage, "input_tokens")
             .saturating_add(count(&usage, "cache_read_input_tokens"))
             .saturating_add(count(&usage, "cache_creation_input_tokens")),
         output_tokens: count(&usage, "output_tokens"),
         cost_micro_dollars: cost,
-    }
+    })
 }
 
 fn decode_system(event: &Value) -> ClaudeEvent {
@@ -139,17 +135,18 @@ fn decode_system(event: &Value) -> ClaudeEvent {
 }
 
 fn decode_result_event(event: &Value) -> ClaudeEvent {
-    text(event, "subtype").map_or(ClaudeEvent::Unrecognised, |subtype| {
-        ClaudeEvent::Result(ClaudeResult {
-            subtype,
-            is_error: event
-                .get("is_error")
-                .and_then(Value::as_bool)
-                .unwrap_or(true),
-            api_error_status: event.get("api_error_status").and_then(Value::as_u64),
-            usage: run_usage(event),
-            session_id: text(event, "session_id"),
-        })
+    let (Some(subtype), Some(usage)) = (text(event, "subtype"), run_usage(event)) else {
+        return ClaudeEvent::Unrecognised;
+    };
+    ClaudeEvent::Result(ClaudeResult {
+        subtype,
+        is_error: event
+            .get("is_error")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        api_error_status: event.get("api_error_status").and_then(Value::as_u64),
+        usage,
+        session_id: text(event, "session_id"),
     })
 }
 
@@ -162,7 +159,12 @@ pub fn decode_event(line: &[u8]) -> ClaudeEvent {
     match event.get("type").and_then(Value::as_str) {
         Some("system") => decode_system(&event),
         Some("assistant") => ClaudeEvent::Assistant {
-            context_tokens: event.get("message").and_then(context_tokens),
+            // A subagent's turn has its own context; the worker's is the main thread's.
+            context_tokens: event
+                .get("parent_tool_use_id")
+                .is_none_or(Value::is_null)
+                .then(|| event.get("message").and_then(context_tokens))
+                .flatten(),
             error: text(&event, "error"),
         },
         Some("user") => ClaudeEvent::Other,
@@ -190,7 +192,15 @@ pub fn decode_result(result: &ClaudeResult, stream: &Stream) -> VendorEnd {
         {
             VendorEnd::RateLimited
         }
-        "success" if error == Some("authentication_failed") => VendorEnd::LoginRequired,
+        "success"
+            if error == Some("authentication_failed")
+                || matches!(
+                    result.api_error_status,
+                    Some(HTTP_UNAUTHORIZED | HTTP_FORBIDDEN)
+                ) =>
+        {
+            VendorEnd::LoginRequired
+        }
         "success" | "error_during_execution" | "error_max_structured_output_retries" => {
             VendorEnd::Failed
         }
@@ -338,6 +348,7 @@ mod tests {
             model: ModelName::parse("haiku").unwrap(),
             effort: Effort::Minimal,
             max_turns: max_turns.and_then(NonZeroU16::new),
+            requires_commit: true,
             session_id: VendorSessionId::parse("3f0c6c1e-6b1a-4a51-9a0e-2a8c5d0c1a10").unwrap(),
             settings: r#"{"sandbox":{"enabled":true}}"#.to_string(),
             output_schema: PathBuf::from("/spool/output-schema.json"),
@@ -393,7 +404,7 @@ mod tests {
             Usage {
                 input_tokens: 26 + 33_382 + 65_799,
                 output_tokens: 439,
-                cost_micro_dollars: 75_564,
+                cost_micro_dollars: 75_565,
             }
         );
         assert_eq!(
@@ -448,6 +459,8 @@ mod tests {
             (result("success", false, None), VendorEnd::Completed),
             (result("success", true, Some(429)), VendorEnd::RateLimited),
             (result("success", true, Some(500)), VendorEnd::Failed),
+            (result("success", true, Some(401)), VendorEnd::LoginRequired),
+            (result("success", true, Some(403)), VendorEnd::LoginRequired),
             (result("error_max_turns", true, None), VendorEnd::TurnCap),
             (
                 result("error_max_budget_usd", true, None),
@@ -514,12 +527,47 @@ mod tests {
     }
 
     #[test]
-    fn costs_convert_to_micro_dollars_exactly() {
-        assert_eq!(micro_dollars("0.0755649"), Some(75_564));
-        assert_eq!(micro_dollars("0"), Some(0));
-        assert_eq!(micro_dollars("12.5"), Some(12_500_000));
-        for bad in ["", "-1.0", "1e-5", ".5", "1.2.3"] {
-            assert_eq!(micro_dollars(bad), None, "{bad}");
+    fn costs_round_to_micro_dollars() {
+        let parse = |text: &str| micro_dollars(&serde_json::from_str::<Value>(text).unwrap());
+        assert_eq!(parse("0.0755649"), Some(75_565));
+        assert_eq!(parse("1e-5"), Some(10));
+        assert_eq!(parse("0"), Some(0));
+        assert_eq!(parse("12.5"), Some(12_500_000));
+        for bad in ["-1.0", "\"0.5\"", "null", "1e7"] {
+            assert_eq!(parse(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_result_without_a_readable_cost_is_unrecognised_not_free() {
+        for cost in ["", r#","total_cost_usd":"0.5""#, r#","total_cost_usd":-1"#] {
+            let line = format!(r#"{{"type":"result","subtype":"success","is_error":false{cost}}}"#);
+            assert_eq!(
+                decode_event(line.as_bytes()),
+                ClaudeEvent::Unrecognised,
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_subagents_turn_does_not_set_the_context_size() {
+        let usage = r#""message":{"usage":{"input_tokens":5,"cache_read_input_tokens":90000}}"#;
+        let main = format!(r#"{{"type":"assistant","parent_tool_use_id":null,{usage}}}"#);
+        let sub = format!(r#"{{"type":"assistant","parent_tool_use_id":"toolu_1",{usage}}}"#);
+        assert!(matches!(
+            decode_event(main.as_bytes()),
+            ClaudeEvent::Assistant {
+                context_tokens: Some(90_005),
+                ..
+            }
+        ));
+        assert!(matches!(
+            decode_event(sub.as_bytes()),
+            ClaudeEvent::Assistant {
+                context_tokens: None,
+                ..
+            }
+        ));
     }
 }
