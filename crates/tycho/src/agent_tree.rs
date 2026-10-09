@@ -318,7 +318,7 @@ pub fn move_dir(
     to_name: &OsStr,
 ) -> Result<(), TreeError> {
     let path = to_path.join(to_name);
-    check_name(from_name, &path)?;
+    check_name(from_name, Path::new(from_name))?;
     check_name(to_name, &path)?;
     match renameat(from, from_name, to, to_name) {
         Ok(()) => fsync(to).map_err(|errno| failed(to_path, errno)),

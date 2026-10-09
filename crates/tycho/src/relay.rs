@@ -343,7 +343,7 @@ pub fn relay_once(
 /// Unlinks an ended session's relay directory and its entries; a missing one is removed.
 #[expect(
     clippy::disallowed_methods,
-    reason = "checked above as this user's directory; std removes a symlink at the top as a link and opens descendants without following links"
+    reason = "the relay directory is checked, then removed by path, so its ancestors are resolved again at the call"
 )]
 pub fn remove_relay_dir(dirs: &AgentDirs, session: &SessionName) -> Result<(), String> {
     let dir = relay_dir(dirs, session);
