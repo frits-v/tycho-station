@@ -32,8 +32,8 @@ check is not repeated in any instruction file. "review" means a reader rejects i
 | Rule | Enforced by |
 |---|---|
 | A comment exists only for a non-obvious why: a constraint, an invariant, a workaround | review |
-| No history in code or docs: no "previously", "used to", "replaced", "legacy", no ticket or PR numbers, hashes, names of people | `xtask check-comments` (markers); review |
-| No narration: no "let me", "we tried", "important to note", "in summary" | `xtask check-comments` |
+| No history in code or docs: nothing about what the code did before, no ticket or PR numbers, hashes, or names of people | `xtask check-comments` for the phrases in its marker list; review for the rest |
+| No narration: no process commentary addressed to the reader | `xtask check-comments` for the phrases in its marker list |
 | No filler emphasis: bold sprinkles, emdashes as default punctuation, horizontal rules inside a document, emoji | review |
 | Docstrings only where the signature does not state the contract; one line | review |
 | Documents are atemporal and state what the system does; trade-offs as bullets | review |
