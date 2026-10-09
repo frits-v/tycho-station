@@ -12,7 +12,8 @@ use tycho_types::service::{EpicId, WorkUnitId};
 
 use crate::private_dir;
 use crate::services::epic::{AddUnitAnswer, EpicClient, EpicState, StartRequest};
-use crate::services::{blocking, refuse, secret};
+use crate::services::work_unit::{RuleCall, WorkUnitClient, WorkUnitRequest};
+use crate::services::{blocking, refuse, secret, CODE_NOT_FOUND};
 
 pub const CODE_UNAUTHORIZED: u16 = 401;
 
@@ -52,6 +53,50 @@ impl fmt::Debug for AddUnitCall {
             .field("secret", &"redacted")
             .field("epic", &self.epic)
             .field("unit", &self.unit)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DispatchUnitCall {
+    pub secret: String,
+    pub unit: WorkUnitId,
+    pub request: WorkUnitRequest,
+}
+
+impl fmt::Debug for DispatchUnitCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DispatchUnitCall")
+            .field("secret", &"redacted")
+            .field("unit", &self.unit)
+            .field("request", &self.request)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dispatched {
+    pub unit: WorkUnitId,
+    pub invocation_id: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleUnitCall {
+    pub secret: String,
+    pub unit: WorkUnitId,
+    pub rule: RuleCall,
+}
+
+impl fmt::Debug for RuleUnitCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuleUnitCall")
+            .field("secret", &"redacted")
+            .field("unit", &self.unit)
+            .field("rule", &self.rule)
             .finish()
     }
 }
@@ -134,6 +179,59 @@ impl Operator {
             .start(Json(request))
             .call()
             .await?)
+    }
+
+    /// Starts the unit's run once the epic lists it; answers with the run's invocation id.
+    #[handler]
+    async fn dispatch_unit(
+        &self,
+        service_context: Context<'_>,
+        call: Json<DispatchUnitCall>,
+    ) -> HandlerResult<Json<Dispatched>> {
+        let call = call.into_inner();
+        self.check(&service_context, call.secret).await?;
+        let listed = service_context
+            .object_client::<EpicClient>(call.request.epic.as_str())
+            .status()
+            .call()
+            .await?
+            .into_inner()
+            .is_some_and(|epic| epic.units.contains(&call.unit));
+        if !listed {
+            return Err(refuse(
+                CODE_NOT_FOUND,
+                format!(
+                    "epic {} does not list unit {}",
+                    call.request.epic, call.unit
+                ),
+            ));
+        }
+        let handle = service_context
+            .workflow_client::<WorkUnitClient>(call.unit.as_str())
+            .run(Json(call.request))
+            .send()
+            .await?;
+        Ok(Json(Dispatched {
+            unit: call.unit,
+            invocation_id: handle.invocation_id().to_string(),
+        }))
+    }
+
+    /// Resolves an escalated unit's ruling; the verdict-from-a-file path calls it.
+    #[handler]
+    async fn rule_unit(
+        &self,
+        service_context: Context<'_>,
+        call: Json<RuleUnitCall>,
+    ) -> HandlerResult<()> {
+        let call = call.into_inner();
+        self.check(&service_context, call.secret).await?;
+        service_context
+            .workflow_client::<WorkUnitClient>(call.unit.as_str())
+            .rule(Json(call.rule))
+            .call()
+            .await?;
+        Ok(())
     }
 
     #[handler]

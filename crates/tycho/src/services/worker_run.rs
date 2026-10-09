@@ -8,7 +8,7 @@ use std::time::Duration;
 use restate_sdk::context::DurableFuture;
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
-use tycho_types::envelope::{Outcome, ResultPayload, ShortText};
+use tycho_types::envelope::{Outcome, ResultPayload, ShortText, Usage};
 use tycho_types::exit::{Disposition, ExitState};
 use tycho_types::service::{Attempt, EpicId, TaskId, WorkUnitId, RECONCILER_KEY};
 use tycho_types::session::{SessionKind, SessionName, Suffix, Vendor};
@@ -22,7 +22,9 @@ use crate::services::reconciler::ReconcilerClient;
 use crate::services::session::{
     KillRequest, SessionClient, SessionView, SpawnOutcome, SpawnRequest,
 };
-use crate::services::{refuse, secret, wall_clock_unix_ms, Ports, Timing, CODE_BAD_REQUEST};
+use crate::services::{
+    refuse, secret, wall_clock_unix_ms, Ports, Timing, CODE_BAD_REQUEST, CODE_CANCELLED,
+};
 
 const VIEW_KEY: &str = "view";
 const TIER_FLAG: &str = "--tier";
@@ -197,25 +199,82 @@ pub const fn check_request(request: &WorkerRunRequest) -> Result<(), RequestErro
 }
 
 #[must_use]
-pub fn session_name(request: &WorkerRunRequest, task: &TaskId, attempt: Attempt) -> SessionName {
+pub fn session_name(request: &WorkerRunRequest, key: &str, attempt: Attempt) -> SessionName {
     SessionName::unit(
         request.epic.clone(),
         request.work_unit.clone(),
         SessionKind::Worker,
         request.vendor,
-        Some(Suffix::for_task(task, attempt)),
+        Some(Suffix::for_key(key, attempt)),
     )
+}
+
+/// `.` cannot occur in a task id, so `<task>.u<n>` never collides with another task's key.
+const UNIT_ATTEMPT_SEPARATOR: &str = ".u";
+
+/// The worker run key for a task under a unit attempt; a workflow key runs once.
+#[must_use]
+pub fn worker_key(task: &TaskId, unit_attempt: Attempt) -> String {
+    if unit_attempt == Attempt::FIRST {
+        return task.to_string();
+    }
+    format!("{task}{UNIT_ATTEMPT_SEPARATOR}{}", unit_attempt.get())
+}
+
+/// The task and unit attempt a worker run key names; the inverse of `worker_key`.
+pub fn parse_worker_key(key: &str) -> Result<(TaskId, Attempt), String> {
+    let (task, unit_attempt) = match key.split_once(UNIT_ATTEMPT_SEPARATOR) {
+        None => (key, Attempt::FIRST),
+        Some((task, number)) => {
+            let digits = !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit());
+            let attempt = number
+                .parse::<u16>()
+                .ok()
+                .filter(|_| digits)
+                .and_then(|value| Attempt::new(value).ok())
+                .filter(|attempt| *attempt != Attempt::FIRST)
+                .ok_or_else(|| format!("unit attempt `{number}` in `{key}`"))?;
+            (task, attempt)
+        }
+    };
+    let task = TaskId::parse(task).map_err(|error| format!("task id in `{key}`: {error}"))?;
+    Ok((task, unit_attempt))
+}
+
+/// How a terminal refusal from `Session::spawn` ends the attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnRefusal {
+    /// The run was cancelled: kill what may have started, settle, and propagate.
+    Cancelled,
+    /// The port refused, such as no launcher or an unreadable lease: stop the run.
+    Stop,
+}
+
+#[must_use]
+pub const fn spawn_refusal(code: u16) -> SpawnRefusal {
+    if code == CODE_CANCELLED {
+        SpawnRefusal::Cancelled
+    } else {
+        SpawnRefusal::Stop
+    }
+}
+
+/// Usage in the ledger's own unit: tokens for a seat, micro-dollars when metered.
+#[must_use]
+pub const fn observed_usage(ledger: LedgerKind, usage: &Usage) -> u64 {
+    match ledger {
+        LedgerKind::Seat => usage.input_tokens.saturating_add(usage.output_tokens),
+        LedgerKind::Metered => usage.cost_micro_dollars,
+    }
 }
 
 fn argv_with_tier(
     request: &WorkerRunRequest,
     tier: &RoutingName,
-) -> Result<Vec<ShortText>, HandlerError> {
+) -> Result<Vec<ShortText>, TerminalError> {
     let mut argv = request.argv.clone();
     for item in [TIER_FLAG, tier.as_str()] {
-        argv.push(
-            ShortText::parse(item).map_err(|error| refuse(CODE_BAD_REQUEST, error.to_string()))?,
-        );
+        argv.push(ShortText::parse(item).map_err(|error| TerminalError::new(error.to_string()))?);
     }
     Ok(argv)
 }
@@ -230,6 +289,20 @@ type WakeFuture<'run> = Pin<Box<dyn DurableFuture<Output = Wake> + Send + 'run>>
 struct AttemptEnd {
     exit: ExitState,
     result: Option<ResultPayload>,
+    /// Set when the run stops for a reason no exit state names, such as a refused spawn.
+    stop: Option<String>,
+    spawned: bool,
+}
+
+impl AttemptEnd {
+    const fn exit(exit: ExitState, spawned: bool) -> Self {
+        Self {
+            exit,
+            result: None,
+            stop: None,
+            spawned,
+        }
+    }
 }
 
 pub struct WorkerRun {
@@ -256,28 +329,37 @@ impl fmt::Debug for WorkerRun {
 
 #[restate_sdk::workflow]
 impl WorkerRun {
-    #[handler]
+    #[handler(ingress_private)]
     async fn run(
         &self,
         workflow_context: WorkflowContext<'_>,
         request: Json<WorkerRunRequest>,
     ) -> HandlerResult<Json<WorkerRunOutcome>> {
         let request = request.into_inner();
-        let task = TaskId::parse(workflow_context.key()).map_err(|error| {
-            refuse(
-                CODE_BAD_REQUEST,
-                RequestError::Key(error.to_string()).to_string(),
-            )
-        })?;
+        let key = workflow_context.key().to_string();
+        let (task, _) = parse_worker_key(&key)
+            .map_err(|error| refuse(CODE_BAD_REQUEST, RequestError::Key(error).to_string()))?;
         check_request(&request).map_err(|error| refuse(CODE_BAD_REQUEST, error.to_string()))?;
         let cap = attempt_cap(&request.routing.class);
         let mut tier = request.routing.tier.clone();
         let mut attempt = Attempt::FIRST;
+        let run = Run {
+            key: &key,
+            task: &task,
+            request: &request,
+        };
         for _ in 0..cap.get() {
             let end = self
-                .attempt(&workflow_context, &task, &request, attempt, &tier)
+                .attempt(&workflow_context, &run, attempt, &tier)
                 .await?;
-            match after_attempt(&end.exit, end.result, attempt, cap) {
+            let next = match end.stop {
+                Some(reason) => AfterAttempt::Finish(WorkerRunOutcome::Stopped {
+                    attempt: attempt.get(),
+                    state: reason,
+                }),
+                None => after_attempt(&end.exit, end.result, attempt, cap),
+            };
+            match next {
                 AfterAttempt::Finish(outcome) => {
                     record(
                         &workflow_context,
@@ -319,6 +401,13 @@ impl WorkerRun {
     }
 }
 
+/// What every attempt of one run shares.
+struct Run<'a> {
+    key: &'a str,
+    task: &'a TaskId,
+    request: &'a WorkerRunRequest,
+}
+
 fn record(
     workflow_context: &WorkflowContext<'_>,
     attempt: Attempt,
@@ -336,71 +425,58 @@ fn record(
 }
 
 impl WorkerRun {
-    /// One attempt; budget is settled on every way out, including a cancel.
+    /// One attempt; budget is settled on every way out, an error included.
     async fn attempt(
         &self,
         workflow_context: &WorkflowContext<'_>,
-        task: &TaskId,
-        request: &WorkerRunRequest,
+        run: &Run<'_>,
         attempt: Attempt,
         tier: &RoutingName,
     ) -> Result<AttemptEnd, HandlerError> {
-        if !self
-            .reserve(workflow_context, task, request, attempt)
-            .await?
-        {
-            return Ok(AttemptEnd {
-                exit: ExitState::BudgetExceeded,
-                result: None,
-            });
+        if !self.reserve(workflow_context, run, attempt).await? {
+            return Ok(AttemptEnd::exit(ExitState::BudgetExceeded, false));
         }
-        let session = session_name(request, task, attempt);
+        let session = session_name(run.request, run.key, attempt);
         record(workflow_context, attempt, tier, Some(&session), None);
         let watched = self
-            .spawn_and_watch(workflow_context, request, &session, tier)
+            .spawn_and_watch(workflow_context, run.request, &session, tier)
             .await;
-        let (end, cancelled) = match watched {
-            Ok(end) => (end, None),
-            Err(cancelled) => (
-                AttemptEnd {
-                    exit: ExitState::Cancelled,
-                    result: None,
-                },
-                Some(cancelled),
-            ),
-        };
-        settle(
-            workflow_context,
-            request,
-            task,
-            attempt,
-            end.result.as_ref(),
-        )
-        .await?;
-        if let Some(cancelled) = cancelled {
-            return Err(cancelled.into());
+        match watched {
+            Ok(end) => {
+                settle(
+                    workflow_context,
+                    run,
+                    attempt,
+                    end.result.as_ref(),
+                    end.spawned,
+                )
+                .await?;
+                Ok(end)
+            }
+            Err(error) => {
+                settle(workflow_context, run, attempt, None, true).await?;
+                Err(error.into())
+            }
         }
-        Ok(end)
     }
 
     /// Re-sends the reservation after a full slot; false once the ledger is exhausted.
     async fn reserve(
         &self,
         workflow_context: &WorkflowContext<'_>,
-        task: &TaskId,
-        request: &WorkerRunRequest,
+        run: &Run<'_>,
         attempt: Attempt,
     ) -> Result<bool, HandlerError> {
         let reservation = ReserveRequest {
-            task: task.clone(),
+            task: run.task.clone(),
             attempt: attempt.get(),
             level: SlotLevel::Worker,
-            ledger: request.ledger,
-            amount: request.reservation,
+            ledger: run.request.ledger,
+            amount: run.request.reservation,
         };
         for _ in 0..spine::RESERVE_ROUNDS_MAX {
             let answer = workflow_context
-                .object_client::<EpicClient>(request.epic.as_str())
+                .object_client::<EpicClient>(run.request.epic.as_str())
                 .reserve(Json(reservation.clone()))
                 .call()
                 .await?
@@ -419,7 +495,7 @@ impl WorkerRun {
         ))
     }
 
-    /// The error side is a cancellation, after the session has been killed.
+    /// The error side kills whatever may have started before it returns.
     async fn spawn_and_watch(
         &self,
         workflow_context: &WorkflowContext<'_>,
@@ -427,13 +503,7 @@ impl WorkerRun {
         session: &SessionName,
         tier: &RoutingName,
     ) -> Result<AttemptEnd, TerminalError> {
-        let failed = AttemptEnd {
-            exit: ExitState::Failed,
-            result: None,
-        };
-        let Ok(argv) = argv_with_tier(request, tier) else {
-            return Ok(failed);
-        };
+        let argv = argv_with_tier(request, tier)?;
         let session_secret = workflow_context
             .run(|| async {
                 secret::generate()
@@ -458,17 +528,28 @@ impl WorkerRun {
             .await;
         match spawned.map(Json::into_inner) {
             Ok(SpawnOutcome::Spawned { .. } | SpawnOutcome::Adopted { .. }) => {
-                self.watch(
-                    workflow_context,
-                    session,
-                    Box::pin(awaitable.map(Wake::Result)),
-                )
-                .await
+                let awaitable: WakeFuture<'_> = Box::pin(awaitable.map(Wake::Result));
+                let watched = self.watch(workflow_context, session, awaitable).await;
+                if watched.is_err() {
+                    kill(workflow_context, session, false).await;
+                }
+                watched
             }
-            Ok(SpawnOutcome::Requeue { .. }) | Err(_) => Ok(failed),
+            Ok(SpawnOutcome::Requeue { .. }) => Ok(AttemptEnd::exit(ExitState::Failed, false)),
+            Err(error) => match spawn_refusal(error.code()) {
+                SpawnRefusal::Cancelled => {
+                    kill(workflow_context, session, false).await;
+                    Err(error)
+                }
+                SpawnRefusal::Stop => Ok(AttemptEnd {
+                    stop: Some(format!("spawn refused: {}", error.message())),
+                    ..AttemptEnd::exit(ExitState::Failed, false)
+                }),
+            },
         }
     }
 
+    /// Any error here, a cancel or a failed check, leaves the kill to the caller.
     async fn watch<'run>(
         &self,
         workflow_context: &'run WorkflowContext<'_>,
@@ -480,44 +561,34 @@ impl WorkerRun {
         futures.push(timer(workflow_context, self.timing.stall_silence));
         let mut nudged_unix_ms = None;
         for _ in 0..spine::WATCH_ROUNDS_MAX {
-            let woke = match futures.next().await {
-                Ok(Some((_, woke))) => woke,
-                Ok(None) => break,
-                Err(cancelled) => {
-                    kill(workflow_context, session, false).await;
-                    return Err(cancelled);
-                }
+            let Some((_, woke)) = futures.next().await? else {
+                break;
             };
-            match woke {
-                Wake::Result(Ok(result)) => return Ok(completed(result.into_inner())),
-                Wake::Result(Err(rejected)) => {
-                    return Ok(AttemptEnd {
-                        exit: ExitState::from_wire(rejected.message()),
-                        result: None,
-                    })
-                }
-                Wake::Timer => {}
+            if let Wake::Result(completion) = woke {
+                forget(workflow_context, session);
+                return Ok(match completion {
+                    Ok(result) => completed(result.into_inner()),
+                    Err(rejected) => {
+                        AttemptEnd::exit(ExitState::from_wire(rejected.message()), true)
+                    }
+                });
             }
-            match self
+            let (step, now) = self
                 .check(workflow_context, session, nudged_unix_ms)
-                .await?
-            {
-                (WatchStep::Stall, _) => break,
-                (WatchStep::Nudge(wait), now) => {
+                .await?;
+            let wait = match step {
+                WatchStep::Stall => break,
+                WatchStep::Nudge(wait) => {
                     nudge(workflow_context, session);
                     nudged_unix_ms = Some(now);
-                    futures.push(timer(workflow_context, Duration::from_millis(wait)));
+                    wait
                 }
-                (WatchStep::Wait(wait), _) => {
-                    futures.push(timer(workflow_context, Duration::from_millis(wait)));
-                }
-            }
+                WatchStep::Wait(wait) => wait,
+            };
+            futures.push(timer(workflow_context, Duration::from_millis(wait)));
         }
         kill(workflow_context, session, true).await;
-        Ok(AttemptEnd {
-            exit: ExitState::Stalled,
-            result: None,
-        })
+        Ok(AttemptEnd::exit(ExitState::Stalled, true))
     }
 
     /// Reads Session state through its shared handler, which never queues behind a port step.
@@ -552,6 +623,8 @@ const fn completed(result: ResultPayload) -> AttemptEnd {
     AttemptEnd {
         exit: decode_result(&result),
         result: Some(result),
+        stop: None,
+        spawned: true,
     }
 }
 
@@ -562,6 +635,14 @@ fn nudge(workflow_context: &WorkflowContext<'_>, session: &SessionName) {
             .nudge(Json(text))
             .send();
     }
+}
+
+/// The awaitable completed, resolved or rejected: the reconciler stops expecting the session.
+fn forget(workflow_context: &WorkflowContext<'_>, session: &SessionName) {
+    workflow_context
+        .object_client::<ReconcilerClient>(RECONCILER_KEY)
+        .forget(Json(session.clone()))
+        .send();
 }
 
 /// A kill the port refuses leaves the lease to the reconciler, which expires and reaps it.
@@ -585,32 +666,24 @@ async fn kill(
 
 async fn settle(
     workflow_context: &WorkflowContext<'_>,
-    request: &WorkerRunRequest,
-    task: &TaskId,
+    run: &Run<'_>,
     attempt: Attempt,
     result: Option<&ResultPayload>,
+    spawned: bool,
 ) -> Result<(), HandlerError> {
     let observed = result.map_or(0, |result| {
-        result
-            .usage
-            .input_tokens
-            .saturating_add(result.usage.output_tokens)
+        observed_usage(run.request.ledger, &result.usage)
     });
     workflow_context
-        .object_client::<EpicClient>(request.epic.as_str())
+        .object_client::<EpicClient>(run.request.epic.as_str())
         .settle(Json(SettleRequest {
-            task: task.clone(),
+            task: run.task.clone(),
             attempt: attempt.get(),
             observed,
+            spawned,
         }))
         .call()
         .await?;
-    if result.is_some() {
-        workflow_context
-            .object_client::<ReconcilerClient>(RECONCILER_KEY)
-            .forget(Json(session_name(request, task, attempt)))
-            .send();
-    }
     Ok(())
 }
 
@@ -808,10 +881,53 @@ mod tests {
 
     #[test]
     fn each_attempt_has_its_own_session_name() {
-        let task = TaskId::parse("wu03-t07").unwrap();
-        let first = session_name(&request(1), &task, attempt(1));
-        let second = session_name(&request(1), &task, attempt(2));
+        let first = session_name(&request(1), "wu03-t07", attempt(1));
+        let second = session_name(&request(1), "wu03-t07", attempt(2));
         assert_ne!(first, second);
         assert!(first.to_string().starts_with("cf7a.wu03.wrk.claude."));
+    }
+
+    #[test]
+    fn worker_keys_round_trip_and_never_collide_with_a_task_id() {
+        let task = TaskId::parse("wu03-t07").unwrap();
+        assert_eq!(worker_key(&task, attempt(1)), "wu03-t07");
+        let second = worker_key(&task, attempt(2));
+        assert_eq!(second, "wu03-t07.u2");
+        assert_eq!(parse_worker_key(&second), Ok((task.clone(), attempt(2))));
+        assert_eq!(parse_worker_key("wu03-t07"), Ok((task, attempt(1))));
+        let lookalike = TaskId::parse("wu03-t07-u2").unwrap();
+        assert_ne!(worker_key(&lookalike, attempt(1)), second);
+        assert_ne!(
+            session_name(&request(1), &second, attempt(1)),
+            session_name(&request(1), lookalike.as_str(), attempt(1))
+        );
+        for bad in [
+            "wu03-t07.u1",
+            "wu03-t07.u",
+            "wu03-t07.u+2",
+            "wu03-t07.u0",
+            "Bad.u2",
+        ] {
+            assert!(parse_worker_key(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_cancelled_spawn_propagates_and_any_other_refusal_stops() {
+        assert_eq!(spawn_refusal(CODE_CANCELLED), SpawnRefusal::Cancelled);
+        for code in [400, 404, 500] {
+            assert_eq!(spawn_refusal(code), SpawnRefusal::Stop);
+        }
+    }
+
+    #[test]
+    fn usage_is_charged_in_the_ledger_unit() {
+        let usage = Usage {
+            input_tokens: 1_200,
+            output_tokens: 300,
+            cost_micro_dollars: 42_000,
+        };
+        assert_eq!(observed_usage(LedgerKind::Seat, &usage), 1_500);
+        assert_eq!(observed_usage(LedgerKind::Metered, &usage), 42_000);
     }
 }

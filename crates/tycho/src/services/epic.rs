@@ -116,6 +116,8 @@ pub struct SettleRequest {
     pub attempt: u16,
     /// Usage observed at exit, in the reservation's ledger unit.
     pub observed: u64,
+    /// False when no session ever started for the reservation; nothing is charged then.
+    pub spawned: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,7 +276,7 @@ pub fn reserve(
     Ok(ReserveAnswer::Granted)
 }
 
-/// Charges the larger of the reservation and the observed usage and frees the slot.
+/// Charges the larger of reservation and usage, or nothing if no session started; frees the slot.
 pub fn settle(state: &mut EpicState, request: &SettleRequest) -> Result<SettleAnswer, EpicError> {
     let key = reservation_key(&request.task, request.attempt)?;
     let Some(reservation) = state.reservations.remove(&key) else {
@@ -285,7 +287,11 @@ pub fn settle(state: &mut EpicState, request: &SettleRequest) -> Result<SettleAn
         .used
         .checked_sub(1)
         .ok_or(EpicError::Overflow("slot counter below zero"))?;
-    let amount = reservation.amount.max(request.observed);
+    let amount = if request.spawned {
+        reservation.amount.max(request.observed)
+    } else {
+        0
+    };
     let ledger = state.ledger_mut(reservation.ledger);
     ledger.reserved = ledger
         .reserved
@@ -406,6 +412,7 @@ mod tests {
             task: TaskId::parse(task).unwrap(),
             attempt: 1,
             observed,
+            spawned: true,
         }
     }
 
@@ -562,6 +569,22 @@ mod tests {
         assert_eq!(reserve(&mut state, &waiting), Ok(ReserveAnswer::RetryLater));
         settle(&mut state, &settle_request("t1", 0)).unwrap();
         assert_eq!(reserve(&mut state, &waiting), Ok(ReserveAnswer::Granted));
+    }
+
+    #[test]
+    fn a_reservation_that_never_spawned_settles_at_zero() {
+        let mut state = started(1_000, 0);
+        reserve(&mut state, &request("t1", SlotLevel::Worker, 100)).unwrap();
+        let unspawned = SettleRequest {
+            spawned: false,
+            ..settle_request("t1", 0)
+        };
+        assert_eq!(
+            settle(&mut state, &unspawned),
+            Ok(SettleAnswer::Charged { amount: 0 })
+        );
+        assert_eq!((state.seat.charged, state.seat.reserved), (0, 0));
+        assert_eq!(state.worker_slots.used, 0);
     }
 
     #[test]

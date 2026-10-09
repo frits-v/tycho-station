@@ -7,7 +7,7 @@
 
 use std::env;
 use std::fmt::Display;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::thread;
@@ -33,7 +33,8 @@ const USAGE: &str = "usage: tycho <command>
   graph query <checkout> definitions|callers <symbol>
   graph query <checkout> impact <path>   entities changed under the path since HEAD~1
   epic start <id> <goal>      start an epic through the operator service
-  epic add-unit <id> <unit>   add a work unit to an epic through the operator service";
+  epic add-unit <id> <unit>   add a work unit to an epic through the operator service
+  epic dispatch <id> <unit> <plan.json>   start a listed unit's run with a dispatch plan";
 
 fn main() {
     let arguments: Vec<String> = env::args().skip(1).collect();
@@ -59,6 +60,9 @@ fn main() {
         ["watchdog", "run"] => with_config(run_watchdog),
         ["epic", "start", epic, goal] => with_config(|config, _| {
             operator_call(|http| epic_command::start(config, http, epic, goal))
+        }),
+        ["epic", "dispatch", epic, unit, plan] => with_config(|config, _| {
+            operator_call(|http| epic_command::dispatch(config, http, epic, unit, Path::new(plan)))
         }),
         ["epic", "add-unit", epic, unit] => with_config(|config, _| {
             operator_call(|http| epic_command::add_unit(config, http, epic, unit))

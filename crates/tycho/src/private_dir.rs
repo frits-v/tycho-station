@@ -149,21 +149,42 @@ fn ensure_one(dir: &Path, current_uid: u32, policy: Policy) -> Result<(), DirErr
 
 /// Creates the file 0600 with the given contents unless it exists; never follows a symlink.
 pub fn create_private_file(path: &Path, contents: &[u8]) -> Result<bool, DirError> {
-    let opened = OpenOptions::new()
+    let create = |error| DirError::Create(path.to_path_buf(), error);
+    if fs::symlink_metadata(path).is_ok() {
+        return Ok(false);
+    }
+    let staging = staging_path(path)?;
+    let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(PRIVATE_FILE_MODE)
         .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
-        .open(path);
-    match opened {
-        Ok(mut file) => {
-            file.write_all(contents)
-                .map_err(|error| DirError::Create(path.to_path_buf(), error))?;
-            Ok(true)
-        }
+        .open(&staging)
+        .map_err(create)?;
+    let written = file.write_all(contents).and_then(|()| file.sync_all());
+    drop(file);
+    // A hard link never replaces an existing name, so a concurrent writer keeps its file.
+    let linked = written.and_then(|()| fs::hard_link(&staging, path));
+    let removed = fs::remove_file(&staging);
+    match linked {
+        Ok(()) => removed.map(|()| true).map_err(create),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(DirError::Create(path.to_path_buf(), error)),
+        Err(error) => Err(create(error)),
     }
+}
+
+/// A sibling name only this process uses: `.<name>.<pid>.staging`.
+fn staging_path(path: &Path) -> Result<PathBuf, DirError> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            DirError::Create(
+                path.to_path_buf(),
+                io::Error::new(io::ErrorKind::InvalidInput, "no file name"),
+            )
+        })?;
+    Ok(path.with_file_name(format!(".{name}.{}.staging", std::process::id())))
 }
 
 /// Reads a regular file the current user owns with no group or other bits, up to `max` bytes.
@@ -295,7 +316,9 @@ mod tests {
         let second = create_private_file(&path, b"other");
         let mode = fs::symlink_metadata(&path).unwrap().mode() & 0o777;
         let read = read_private_file(&path, 16);
+        let entries = fs::read_dir(&base).unwrap().count();
         fs::remove_dir_all(&base).unwrap();
+        assert_eq!(entries, 1, "no staging file left beside the secret");
         assert!(matches!(first, Ok(true)));
         assert!(matches!(second, Ok(false)));
         assert_eq!(mode, PRIVATE_FILE_MODE);

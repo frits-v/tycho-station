@@ -20,7 +20,7 @@ use crate::services::reconciler::{fingerprint, ExpectRequest, ReconcilerClient};
 use crate::services::spawner::{LeaseRead, SpawnSpec, Spawner};
 use crate::services::{
     blocking, refuse, secret, spawner_failure, wall_clock_unix_ms, Ports, Timing, CODE_BAD_REQUEST,
-    CODE_CONFLICT, CODE_FORBIDDEN, CODE_INTERNAL, CODE_NOT_FOUND,
+    CODE_CANCELLED, CODE_CONFLICT, CODE_FORBIDDEN, CODE_INTERNAL, CODE_NOT_FOUND,
 };
 
 const STATE_KEY: &str = "session";
@@ -365,12 +365,28 @@ impl Session {
                 return Ok(Json(SpawnOutcome::Requeue { reason }))
             }
         };
-        let spawned_unix_ms = object_context
+        let clock = object_context
             .run(|| async { Ok(wall_clock_unix_ms()) })
             .name("clock after spawn")
-            .await?;
-        record_spawn(&object_context, &name, request, pid, spawned_unix_ms);
-        Ok(Json(outcome))
+            .await;
+        match clock {
+            Ok(spawned_unix_ms) => {
+                record_spawn(&object_context, &name, request, pid, spawned_unix_ms);
+                Ok(Json(outcome))
+            }
+            Err(error) => {
+                // A cancel that lands after the process started still records it, so the
+                // caller's kill and the reconciler can find it.
+                record_spawn(
+                    &object_context,
+                    &name,
+                    request,
+                    pid,
+                    observation.now_unix_ms,
+                );
+                Err(error.into())
+            }
+        }
     }
 
     #[handler]
@@ -409,7 +425,7 @@ impl Session {
         object_context
             .run(|| blocking(move || spawner.send(&name, &text).map_err(spawner_failure)))
             .name("nudge")
-            .retry_policy(self.timing.port_retry())
+            .retry_policy(Timing::nudge_retry())
             .await?;
         Ok(())
     }
@@ -558,12 +574,17 @@ impl Session {
             },
         };
         let spawner = Arc::clone(&self.spawner);
-        object_context
+        let started = object_context
             .run(|| blocking(move || spawner.spawn(&spec).map_err(spawner_failure)))
             .name("spawn")
             .retry_policy(self.timing.port_retry())
-            .await
-            .map_err(HandlerError::from)
+            .await;
+        started.map_err(|error| {
+            if error.code() == CODE_CANCELLED {
+                record_lost(object_context, name, request);
+            }
+            HandlerError::from(error)
+        })
     }
 
     async fn save_scrollback(
@@ -621,6 +642,21 @@ pub fn spawn_record(
         since_unix_ms: spawned_unix_ms,
     };
     (state, expectation)
+}
+
+/// A cancel during the spawn step leaves the process unknown: the session is recorded lost
+/// and reaped by name, since no pid was ever returned.
+fn record_lost(object_context: &ObjectContext<'_>, name: &SessionName, request: &SpawnRequest) {
+    let (state, _) = spawn_record(name, request, 0, 0);
+    let Some(lost) = expire(&state) else {
+        return;
+    };
+    object_context.set(STATE_KEY, Json(lost));
+    object_context.set(SECRET_KEY, request.secret.clone());
+    object_context
+        .object_client::<SessionClient>(name.to_string())
+        .reap()
+        .send();
 }
 
 fn record_spawn(

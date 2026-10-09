@@ -84,6 +84,9 @@ pub mod handler {
     pub const RECONCILER_STATUS: &str = "status";
     pub const OPERATOR_START_EPIC: &str = "start_epic";
     pub const OPERATOR_ADD_UNIT: &str = "add_unit";
+    pub const OPERATOR_DISPATCH_UNIT: &str = "dispatch_unit";
+    pub const OPERATOR_RULE_UNIT: &str = "rule_unit";
+    pub const WORK_UNIT_RULE: &str = "rule";
     pub const WORKER_RUN_RUN: &str = "run";
 }
 

@@ -24,14 +24,15 @@ use std::time::{Duration, Instant};
 
 use restate_sdk::prelude::HttpServer;
 use tycho::config::{
-    admin_url, loopback, CoreConfig, CoreRole, HOME_ENV, MISE_NO_INSTALL, RESTATE_INGRESS_PORT,
-    RESTATE_SERVER_ENV, ZMX_ENV,
+    admin_url, ingress_url, loopback, CoreConfig, CoreRole, HOME_ENV, MISE_NO_INSTALL,
+    RESTATE_INGRESS_PORT, RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::endpoint;
 use tycho::health;
 use tycho::http::Http;
 use tycho::services::doubles::{FixedGate, RecordingSpawner};
 use tycho::services::merge_gate::{GateVerdict, MergeGate, NoGate};
+use tycho::services::operator::read_secret_file;
 use tycho::services::spawner::SpawnSpec;
 use tycho::services::{Ports, Timing};
 use tycho::zmx::{ListEntry, Zmx};
@@ -420,36 +421,86 @@ const DEFAULT_SHA: &str = "2222222222222222222222222222222222222222";
 
 fn result_json(branch: &str) -> String {
     format!(
-        r#"{{"outcome":"done","branch":"{branch}","head_sha":"{HEAD_SHA}","criteria":[],"usage":{{"input_tokens":1200,"output_tokens":300}}}}"#
+        r#"{{"outcome":"done","branch":"{branch}","head_sha":"{HEAD_SHA}","criteria":[],"usage":{{"input_tokens":1200,"output_tokens":300,"cost_micro_dollars":42000}}}}"#
     )
 }
 
-/// Resolves the spawned session's awaitable through ingress after a delay, as a launcher's
-/// exit trap would; only for sessions whose suffix ends with `attempt_suffix`.
-fn resolving_spawner(attempt_suffix: &'static str, delay: Duration) -> RecordingSpawner {
+/// What the launcher double does with a spawned session's awaitable.
+#[derive(Clone, Copy)]
+enum Launcher {
+    /// Resolves with a done result for sessions whose suffix ends with the given attempt.
+    Resolve(&'static str, Duration),
+    /// Rejects with the given exit state.
+    Reject(&'static str, Duration),
+    /// Holds the spawn step for the duration and then never answers.
+    HoldSpawn(Duration),
+    /// Never answers.
+    Silent,
+}
+
+fn launcher_double(launcher: Launcher) -> RecordingSpawner {
     RecordingSpawner::with_hook(Arc::new(move |spec: &SpawnSpec, _pid| {
-        let ends = spec
-            .session
-            .suffix()
-            .is_some_and(|suffix| suffix.as_str().ends_with(attempt_suffix));
-        if !ends {
-            return;
-        }
+        let session = spec.session.to_string();
         let awaitable = spec.environment.awaitable_id.to_string();
-        thread::spawn(move || {
-            thread::sleep(delay);
-            let path = format!("/restate/awakeables/{awaitable}/resolve");
-            let (status, _) = call(&path, &result_json("wu01/t1"), None);
-            println!("evidence: launcher double resolved its awaitable -> {status}");
-        });
+        match launcher {
+            Launcher::Resolve(suffix, delay) if session.ends_with(suffix) => {
+                let branch = format!("wu01/{}", session.rsplit('.').next().unwrap_or("x"));
+                answer(awaitable, delay, "resolve", result_json(&branch));
+            }
+            Launcher::Reject(state, delay) => {
+                answer(awaitable, delay, "reject", state.to_string());
+            }
+            Launcher::HoldSpawn(hold) => thread::sleep(hold),
+            Launcher::Resolve(..) | Launcher::Silent => {}
+        }
     }))
 }
 
-fn worker_request() -> String {
-    r#"{"epic":"cf7a","work_unit":"wu01","vendor":"claude","argv":["tycho-launcher"],"routing":{"class":"implement","tier":"standard","effort":"medium","binding":null,"rationale":"routine change","fallback_tier":"strong"},"ledger":"seat","reservation":1000}"#.to_string()
+/// Resolves or rejects through ingress after a delay, as a launcher's exit trap would.
+fn answer(awaitable: String, delay: Duration, action: &'static str, body: String) {
+    thread::spawn(move || {
+        thread::sleep(delay);
+        let status = client()
+            .post(ingress_url(&format!(
+                "/restate/awakeables/{awaitable}/{action}"
+            )))
+            .header("content-type", "application/json")
+            .body(if action == "reject" {
+                body
+            } else {
+                body.clone()
+            })
+            .send()
+            .map(|response| response.status().as_u16());
+        println!("evidence: launcher double {action} -> {status:?}");
+    });
 }
 
-fn start_epic(core: &Core) {
+fn worker(fallback: &str) -> String {
+    format!(
+        r#"{{"epic":"cf7a","work_unit":"wu01","vendor":"claude","argv":["tycho-launcher"],"routing":{{"class":"implement","tier":"standard","effort":"medium","binding":null,"rationale":"routine change","fallback_tier":"{fallback}"}},"ledger":"seat","reservation":1000}}"#
+    )
+}
+
+fn plan_file(core: &Core, tasks: &[&str]) -> PathBuf {
+    let plan: Vec<String> = tasks
+        .iter()
+        .map(|task| format!(r#"{{"task":"{task}","worker":{}}}"#, worker("strong")))
+        .collect();
+    let path = core.config.home.join("plan.json");
+    fs::write(
+        &path,
+        format!(
+            r#"{{"control_vendor":"codex","plan":[{}]}}"#,
+            plan.join(",")
+        ),
+    )
+    .unwrap();
+    path
+}
+
+/// Starts the epic, lists `wu01`, dispatches it through the CLI, and returns the invocation.
+fn dispatch(core: &Core, tasks: &[&str]) -> String {
     assert!(core
         .tycho(&["epic", "start", "cf7a", "split the orders table"])
         .status
@@ -458,67 +509,137 @@ fn start_epic(core: &Core) {
         .tycho(&["epic", "add-unit", "cf7a", "wu01"])
         .status
         .success());
+    let plan = plan_file(core, tasks);
+    let dispatched = core.tycho(&["epic", "dispatch", "cf7a", "wu01", plan.to_str().unwrap()]);
+    assert!(dispatched.status.success());
+    let body: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    body["invocation_id"].as_str().unwrap().to_string()
+}
+
+fn attach(invocation: &str) -> (u16, String) {
+    let response = client()
+        .get(ingress_url(&format!(
+            "/restate/invocation/{invocation}/attach"
+        )))
+        .send()
+        .unwrap();
+    let status = response.status().as_u16();
+    let text = response.text().unwrap();
+    println!("evidence: attach -> {status} {text}");
+    (status, text)
+}
+
+fn unit_status() -> serde_json::Value {
+    let (_, body) = call("/WorkUnit/wu01/status", "", None);
+    serde_json::from_str(&body).unwrap_or(serde_json::Value::Null)
+}
+
+/// Cancels through the admin API, the way an operator stop would.
+fn cancel(invocation: &str) {
+    let status = client()
+        .patch(admin_url(&format!("/invocations/{invocation}/cancel")))
+        .send()
+        .unwrap()
+        .status()
+        .as_u16();
+    println!("evidence: cancel {invocation} -> {status}");
+    assert!((200..300).contains(&status), "cancel refused: {status}");
+}
+
+fn operator_secret(core: &Core) -> String {
+    read_secret_file(&core.config.operator_secret_file())
+        .unwrap()
+        .expose()
+        .to_string()
 }
 
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
-fn work_unit_runs_through_a_worker_run_to_the_verify_stub() {
-    let spawner = resolving_spawner("a1", Duration::from_millis(500));
+fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
+    let spawner = launcher_double(Launcher::Resolve("a1", Duration::from_millis(500)));
     let gate = FixedGate::new(GateVerdict::Merged {
         default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
     });
     let (core, _doubles, _) =
         start_core_with("unit", &spawner, Arc::new(gate.clone()), test_timing());
-    start_epic(&core);
-    let request = format!(
-        r#"{{"epic":"cf7a","control_vendor":"codex","plan":[{{"task":"wu01-t1","worker":{}}}]}}"#,
-        worker_request()
+    assert_private(
+        Service::WorkUnit,
+        &[handler::WORK_UNIT_RUN, handler::WORK_UNIT_RULE],
+        "wu01",
     );
-    let (status, body) = call("/WorkUnit/wu01/run", &request, None);
+    assert_private(Service::WorkerRun, &[handler::WORKER_RUN_RUN], "wu01-t1");
+    let unlisted = format!(
+        r#"{{"secret":"{}","unit":"wu09","request":{{"epic":"cf7a","control_vendor":"codex","plan":[{{"task":"t","worker":{}}}]}}}}"#,
+        operator_secret(&core),
+        worker("strong")
+    );
+    let invocation = dispatch(&core, &["wu01-t1", "wu01-t2"]);
+    let path = format!("/Operator/{}", handler::OPERATOR_DISPATCH_UNIT);
+    assert_eq!(
+        call(&path, &unlisted, None).0,
+        404,
+        "a unit the epic does not list"
+    );
+    let (status, body) = attach(&invocation);
     assert_eq!(status, 200, "{body}");
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(view["lifecycle"], "done");
     assert_eq!(view["head_sha"], DEFAULT_SHA);
-    assert_eq!(gate.requests().len(), 1, "one verify");
-    assert_eq!(gate.requests()[0].head_sha.as_str(), HEAD_SHA);
+    let requests = gate.requests();
+    assert_eq!(requests.len(), 1, "one verify");
+    let tasks: Vec<&str> = requests[0]
+        .claims
+        .iter()
+        .map(|claim| claim.task.as_str())
+        .collect();
+    assert_eq!(
+        tasks,
+        ["wu01-t1", "wu01-t2"],
+        "every claim reaches the gate"
+    );
     let log = spawner.log();
-    assert_eq!(log.spawned.len(), 1, "one session: {log:?}");
+    assert_eq!(log.spawned.len(), 2, "one session per task: {log:?}");
     let session = &log.spawned[0].0;
-    let (status, session_view) = call(&format!("/Session/{session}/status"), "", None);
-    assert_eq!(status, 200);
+    let (_, session_view) = call(&format!("/Session/{session}/status"), "", None);
     for hidden in ["sign_", "secret", "awaitable"] {
         assert!(!session_view.contains(hidden), "{hidden} in {session_view}");
     }
     let state = epic_status();
     assert_eq!(state["reservations"], serde_json::json!({}));
     assert_eq!(
-        state["seat"]["charged"], 1500,
-        "the larger of 1000 reserved and 1500 used"
+        state["seat"]["charged"], 3000,
+        "each task: the larger of 1000 and 1500 tokens"
     );
+    assert_eq!(state["metered"]["charged"], 0);
     assert_eq!(state["worker_slots"]["used"], 0);
 }
 
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_silent_worker_is_nudged_at_t1_killed_at_t2_and_requeued_as_attempt_two() {
-    let spawner = resolving_spawner("a2", Duration::from_millis(500));
+    let spawner = launcher_double(Launcher::Resolve("a2", Duration::from_millis(500)));
     let timing = Timing {
         stall_silence: Duration::from_secs(2),
         stall_progress: Duration::from_secs(5),
         ..test_timing()
     };
-    let (core, _doubles, _) = start_core_with("stall", &spawner, Arc::new(NoGate), timing);
-    start_epic(&core);
+    let gate = FixedGate::new(GateVerdict::Merged {
+        default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
+    });
+    let (core, _doubles, _) = start_core_with("stall", &spawner, Arc::new(gate), timing);
     let started = Instant::now();
-    let (status, body) = call("/WorkerRun/wu01-t9/run", &worker_request(), None);
+    let invocation = dispatch(&core, &["wu01-t9"]);
+    let (status, body) = attach(&invocation);
     println!(
-        "evidence: worker run returned after {:.1}s",
+        "evidence: unit returned after {:.1}s",
         started.elapsed().as_secs_f64()
     );
     assert_eq!(status, 200, "{body}");
-    let outcome: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(outcome["outcome"], "completed");
-    assert_eq!(outcome["attempt"], 2);
+    let (_, run) = call("/WorkerRun/wu01-t9/status", "", None);
+    let run: serde_json::Value = serde_json::from_str(&run).unwrap();
+    assert_eq!(run["outcome"]["outcome"], "completed");
+    assert_eq!(run["outcome"]["attempt"], 2);
+    assert_eq!(run["tier"], "strong", "attempt 2 moved up a tier");
     let log = spawner.log();
     println!("evidence: spawner log {log:?}");
     let names: Vec<&str> = log.spawned.iter().map(|(name, _)| name.as_str()).collect();
@@ -535,11 +656,6 @@ fn a_silent_worker_is_nudged_at_t1_killed_at_t2_and_requeued_as_attempt_two() {
     );
     assert_eq!(log.killed.len(), 1, "T2 killed attempt 1 by pid");
     assert_eq!(log.killed[0].0, names[0]);
-    let (_, view) = call("/WorkerRun/wu01-t9/status", "", None);
-    assert!(
-        view.contains("\"tier\":\"strong\""),
-        "attempt 2 moved up a tier: {view}"
-    );
     assert_eq!(
         epic_status()["worker_slots"]["used"],
         0,
@@ -550,43 +666,155 @@ fn a_silent_worker_is_nudged_at_t1_killed_at_t2_and_requeued_as_attempt_two() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn an_endpoint_killed_mid_run_replays_to_the_same_state() {
-    let spawner = resolving_spawner("a1", Duration::from_secs(6));
-    let (core, doubles, ports) =
-        start_core_with("replay", &spawner, Arc::new(NoGate), test_timing());
-    start_epic(&core);
-    let response = client()
-        .post(format!(
-            "http://127.0.0.1:{RESTATE_INGRESS_PORT}/WorkerRun/wu01-t5/run/send"
-        ))
-        .header("content-type", "application/json")
-        .body(worker_request())
-        .send()
-        .unwrap();
-    let sent: serde_json::Value = serde_json::from_str(&response.text().unwrap()).unwrap();
-    let invocation = sent["invocationId"].as_str().unwrap().to_string();
+    let spawner = launcher_double(Launcher::Resolve("a1", Duration::from_secs(6)));
+    let gate = FixedGate::new(GateVerdict::Merged {
+        default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
+    });
+    let (core, doubles, ports) = start_core_with("replay", &spawner, Arc::new(gate), test_timing());
+    let invocation = dispatch(&core, &["wu01-t5"]);
     wait_until("the worker session spawned", || {
         spawner.log().spawned.len() == 1
     });
     drop(doubles);
-    println!("evidence: killed the endpoint with invocation {invocation} awaiting its worker");
+    println!("evidence: killed the endpoint with unit {invocation} awaiting its worker");
     thread::sleep(Duration::from_secs(2));
     let _restarted = DoublesEndpoint::start(&ports);
     println!("evidence: endpoint restarted on the same port");
-    let attached = client()
-        .get(format!(
-            "http://127.0.0.1:{RESTATE_INGRESS_PORT}/restate/invocation/{invocation}/attach"
-        ))
-        .send()
-        .unwrap()
-        .text()
-        .unwrap();
-    println!("evidence: attach -> {attached}");
-    let outcome: serde_json::Value = serde_json::from_str(&attached).unwrap();
-    assert_eq!(outcome["outcome"], "completed");
-    assert_eq!(outcome["attempt"], 1);
+    let (status, body) = attach(&invocation);
+    assert_eq!(status, 200, "{body}");
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["lifecycle"], "done");
+    assert_eq!(view["attempt"], 1);
     assert_eq!(
         spawner.log().spawned.len(),
         1,
         "replay spawned no second session"
+    );
+}
+
+#[test]
+#[ignore = "starts real processes; run with mise run spine-tests"]
+fn a_cancel_during_spawn_kills_settles_and_starts_no_second_attempt() {
+    let spawner = launcher_double(Launcher::HoldSpawn(Duration::from_secs(4)));
+    let (core, _doubles, _) =
+        start_core_with("cancel-spawn", &spawner, Arc::new(NoGate), test_timing());
+    let invocation = dispatch(&core, &["wu01-t3"]);
+    wait_until("the spawn step started", || {
+        spawner.log().spawned.len() == 1
+    });
+    cancel(&invocation);
+    let (status, body) = attach(&invocation);
+    assert_eq!(status, 409, "the unit ends cancelled: {body}");
+    wait_until("the started session was reaped by name", || {
+        spawner.log().reaped.len() == 1
+    });
+    wait_until("the worker run settled", || {
+        epic_status()["worker_slots"]["used"] == 0
+    });
+    thread::sleep(Duration::from_secs(3));
+    let log = spawner.log();
+    println!("evidence: spawner log {log:?}");
+    assert_eq!(log.spawned.len(), 1, "no attempt 2");
+    assert_eq!(
+        log.reaped,
+        vec![log.spawned[0].0.clone()],
+        "reaped by name, no pid known"
+    );
+    let status_path = format!("/Session/{}/status", log.spawned[0].0);
+    assert!(call(&status_path, "", None)
+        .1
+        .contains("\"phase\":\"lost\""));
+    assert_eq!(
+        epic_status()["worker_slots"]["used"],
+        0,
+        "the attempt settled"
+    );
+}
+
+#[test]
+#[ignore = "starts real processes; run with mise run spine-tests"]
+fn an_error_while_watching_kills_the_session_before_settling() {
+    let spawner = launcher_double(Launcher::Silent);
+    let (core, _doubles, _) =
+        start_core_with("cancel-watch", &spawner, Arc::new(NoGate), test_timing());
+    let invocation = dispatch(&core, &["wu01-t4"]);
+    wait_until("the worker session spawned", || {
+        spawner.log().spawned.len() == 1
+    });
+    let session = spawner.log().spawned[0].0.clone();
+    let status_path = format!("/Session/{session}/status");
+    wait_until("the session recorded", || {
+        call(&status_path, "", None).1.contains("running")
+    });
+    cancel(&invocation);
+    assert_eq!(attach(&invocation).0, 409);
+    wait_until("the worker run killed the session", || {
+        spawner.log().killed.len() == 1
+    });
+    wait_until("the worker run settled", || {
+        epic_status()["worker_slots"]["used"] == 0
+    });
+    let log = spawner.log();
+    println!("evidence: spawner log {log:?}");
+    assert_eq!(log.killed.len(), 1, "killed on the error path");
+    assert_eq!(log.killed[0].0, session);
+    assert!(call(&status_path, "", None)
+        .1
+        .contains("\"phase\":\"killed\""));
+    assert_eq!(
+        epic_status()["worker_slots"]["used"],
+        0,
+        "settled after the kill"
+    );
+}
+
+#[test]
+#[ignore = "starts real processes; run with mise run spine-tests"]
+fn an_escalated_unit_waits_for_a_ruling_through_the_operator() {
+    let spawner = launcher_double(Launcher::Reject("escalated", Duration::from_millis(500)));
+    let (core, _doubles, _) = start_core_with("rule", &spawner, Arc::new(NoGate), test_timing());
+    let invocation = dispatch(&core, &["wu01-t6"]);
+    wait_until("the unit escalated", || {
+        unit_status()["lifecycle"] == "escalated"
+    });
+    let rule = |secret: &str, attempt: u16| {
+        format!(
+            r#"{{"secret":"{secret}","unit":"wu01","rule":{{"attempt":{attempt},"ruling":{{"verdict":"abandon","reason":"the planted contradiction stands"}}}}}}"#
+        )
+    };
+    let path = format!("/Operator/{}", handler::OPERATOR_RULE_UNIT);
+    assert_eq!(
+        call(&path, &rule(&"x".repeat(64), 1), None).0,
+        401,
+        "a wrong secret"
+    );
+    let secret = operator_secret(&core);
+    assert_eq!(
+        call(&path, &rule(&secret, 2), None).0,
+        409,
+        "not the current attempt"
+    );
+    assert_eq!(unit_status()["lifecycle"], "escalated");
+    assert_eq!(call(&path, &rule(&secret, 1), None).0, 200);
+    let (status, body) = attach(&invocation);
+    assert_eq!(status, 200, "{body}");
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["lifecycle"], "abandoned");
+    assert_eq!(view["reason"], "the planted contradiction stands");
+}
+
+#[test]
+#[ignore = "starts real processes; run with mise run spine-tests"]
+fn a_terminal_error_abandons_the_unit_with_its_reason() {
+    let spawner = launcher_double(Launcher::Resolve("a1", Duration::from_millis(500)));
+    let (core, _doubles, _) = start_core_with("abandon", &spawner, Arc::new(NoGate), test_timing());
+    let invocation = dispatch(&core, &["wu01-t7"]);
+    let (status, body) = attach(&invocation);
+    assert_eq!(status, 200, "{body}");
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["lifecycle"], "abandoned", "never stuck at verifying");
+    assert!(
+        view["reason"].as_str().unwrap().contains("no merge gate"),
+        "{view}"
     );
 }

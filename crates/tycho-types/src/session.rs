@@ -92,7 +92,13 @@ impl Suffix {
     /// `<first 10 hex digits of FNV-1a 64 of the task id>a<attempt>`, such as `3f1c0a9b2ea2`.
     #[must_use]
     pub fn for_task(task: &TaskId, attempt: Attempt) -> Self {
-        let hash = format!("{:016x}", fnv1a_64(task.as_str().as_bytes()));
+        Self::for_key(task.as_str(), attempt)
+    }
+
+    /// The same shape from any run key, such as a worker run key that carries a unit attempt.
+    #[must_use]
+    pub fn for_key(key: &str, attempt: Attempt) -> Self {
+        let hash = format!("{:016x}", fnv1a_64(key.as_bytes()));
         let prefix: String = hash.chars().take(TASK_HASH_HEX_DIGITS).collect();
         Self(format!("{prefix}a{}", attempt.get()))
     }
@@ -433,6 +439,10 @@ mod tests {
         assert_ne!(first, second);
         let other = TaskId::parse("cf7a-wu03-t08").unwrap();
         assert_ne!(first, Suffix::for_task(&other, Attempt::FIRST));
+        assert_ne!(
+            Suffix::for_key("cf7a-wu03-t07.u2", Attempt::FIRST),
+            Suffix::for_key("cf7a-wu03-t07-u2", Attempt::FIRST)
+        );
         let last = Suffix::for_task(&task, Attempt::new(crate::service::ATTEMPT_MAX).unwrap());
         assert!(last.as_str().len() <= SUFFIX_MAX_BYTES);
     }

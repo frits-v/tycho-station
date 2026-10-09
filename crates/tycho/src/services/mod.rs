@@ -24,6 +24,8 @@ pub const CODE_BAD_REQUEST: u16 = 400;
 pub const CODE_FORBIDDEN: u16 = 403;
 pub const CODE_NOT_FOUND: u16 = 404;
 pub const CODE_CONFLICT: u16 = 409;
+/// Restate's code for a cancelled invocation, the same number as a conflict.
+pub const CODE_CANCELLED: u16 = 409;
 pub const CODE_INTERNAL: u16 = 500;
 
 #[must_use]
@@ -68,6 +70,14 @@ impl Timing {
             .exponentiation_factor(2.0)
             .max_delay(self.retry_backoff_max)
             .max_attempts(spine::PORT_STEP_ATTEMPTS_MAX)
+    }
+
+    /// A nudge is best-effort: three tries, two seconds apart.
+    #[must_use]
+    pub fn nudge_retry() -> RunRetryPolicy {
+        RunRetryPolicy::new()
+            .initial_delay(Duration::from_secs(2))
+            .max_attempts(3)
     }
 
     #[must_use]
@@ -136,5 +146,12 @@ mod tests {
         let bound = format!("max_attempts: Some({})", spine::PORT_STEP_ATTEMPTS_MAX);
         assert!(policy.contains(&bound), "{policy}");
         assert!(policy.contains("factor: 2.0"), "{policy}");
+    }
+
+    #[test]
+    fn nudge_retry_is_short() {
+        let policy = format!("{:?}", Timing::nudge_retry());
+        assert!(policy.contains("max_attempts: Some(3)"), "{policy}");
+        assert!(policy.contains("initial_delay: 2s"), "{policy}");
     }
 }

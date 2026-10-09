@@ -4,16 +4,24 @@
 use std::fmt;
 
 use tycho_types::envelope::{BranchName, CommitSha, ShortText};
-use tycho_types::service::{Attempt, WorkUnitId};
+use tycho_types::service::{Attempt, TaskId, WorkUnitId};
 
 pub const FINDINGS_MAX_ITEMS: usize = 32;
 
+/// One task's claim of done: the branch and head SHA in its worktree.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Claim {
+    pub task: TaskId,
+    pub branch: BranchName,
+    pub head_sha: CommitSha,
+}
+
+/// Every claim of the attempt goes to the gate, in plan order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifyRequest {
     pub work_unit: WorkUnitId,
     pub attempt: Attempt,
-    pub branch: BranchName,
-    pub head_sha: CommitSha,
+    pub claims: Vec<Claim>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

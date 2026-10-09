@@ -212,8 +212,11 @@ mod tests {
         let request = VerifyRequest {
             work_unit: WorkUnitId::parse("wu03").unwrap(),
             attempt: Attempt::FIRST,
-            branch: BranchName::parse("wu03/task").unwrap(),
-            head_sha: CommitSha::parse(&"a".repeat(40)).unwrap(),
+            claims: vec![crate::services::merge_gate::Claim {
+                task: tycho_types::service::TaskId::parse("t1").unwrap(),
+                branch: BranchName::parse("wu03/task").unwrap(),
+                head_sha: CommitSha::parse(&"a".repeat(40)).unwrap(),
+            }],
         };
         assert!(gate.verify(&request).is_ok());
         assert_eq!(gate.requests(), vec![request]);
