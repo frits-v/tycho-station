@@ -302,6 +302,10 @@ mod tests {
         assert_eq!(captured.stdout.len(), COMMAND_OUTPUT_MAX_BYTES + 1);
     }
 
+    /// The dump is the test runner's whole environment, which `mbx test` enlarges with about
+    /// 50 KiB of session variables; the production cap is not what this test checks.
+    const ENVIRONMENT_DUMP_MAX_BYTES: usize = 1 << 20;
+
     #[test]
     fn removes_an_inherited_variable_and_keeps_a_set_one() {
         let captured = run_status_capped(
@@ -310,7 +314,7 @@ mod tests {
             &[("TYCHO_COMMAND_SET", "kept")],
             &[OsString::from("HOME")],
             Duration::from_secs(5),
-            COMMAND_OUTPUT_MAX_BYTES,
+            ENVIRONMENT_DUMP_MAX_BYTES,
         )
         .unwrap();
         assert!(captured.stdout.contains("TYCHO_COMMAND_SET=kept"));

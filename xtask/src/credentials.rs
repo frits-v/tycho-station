@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use crate::finish_with_note;
+use crate::finish_findings;
 use crate::process::{run_bounded, Exit};
+use crate::sarif::{Finding, Rule};
 
 const MARKERS: [&str; 10] = [
     "personal access token",
@@ -43,6 +44,16 @@ const INVISIBLE_SEPARATORS: [char; 7] = [
 ];
 /// HTML spellings of a no-break space, lowercased.
 const SPACE_ENTITIES: [&str; 3] = ["&nbsp;", "&#160;", "&#xa0;"];
+const RULES: [Rule<'static>; 2] = [
+    Rule {
+        id: "check-credentials/marker",
+        description: "A file names a user token or a personal credential",
+    },
+    Rule {
+        id: "check-credentials/unreadable",
+        description: "A listed file could not be read for the credential scan",
+    },
+];
 const LISTED_FILES_MAX: usize = 4096;
 const SCANNED_FILE_MAX_BYTES: u64 = 4 << 20;
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -121,7 +132,16 @@ fn passage_lines(text: &str, passage: &[&str]) -> Vec<usize> {
     exempt
 }
 
-fn credential_defects(path: &Path, text: &str) -> Vec<String> {
+/// The one-based column of `marker` on `line` when it appears there unsplit; 1 otherwise,
+/// since a marker split across lines or separators has no single column.
+fn marker_column(text: &str, line: usize, marker: &str) -> usize {
+    text.lines()
+        .nth(line.saturating_sub(1))
+        .and_then(|row| row.to_ascii_lowercase().find(marker))
+        .map_or(1, |index| index.saturating_add(1))
+}
+
+fn credential_defects(path: &Path, text: &str) -> Vec<Finding> {
     let style = path == Path::new(STYLE_PATH);
     let mandate_exempt = if path == Path::new(MANDATE_PATH) {
         passage_lines(text, &MANDATE_CLAUSE)
@@ -142,7 +162,13 @@ fn credential_defects(path: &Path, text: &str) -> Vec<String> {
         for (offset, _) in kept.match_indices(compact_marker(marker).as_str()) {
             let line = lines.get(offset).copied().unwrap_or(0);
             if !exempt_line(line) {
-                defects.push(format!("{}:{line}: `{marker}`", path.display()));
+                defects.push(Finding::at(
+                    path,
+                    line,
+                    marker_column(text, line, marker),
+                    "check-credentials/marker",
+                    format!("`{marker}`"),
+                ));
             }
         }
     }
@@ -190,7 +216,7 @@ fn scanned_text(path: &Path) -> Result<Scanned, String> {
 struct ScanReport {
     examined: usize,
     binary: usize,
-    defects: Vec<String>,
+    defects: Vec<Finding>,
 }
 
 fn scan(base: &Path) -> Result<ScanReport, String> {
@@ -209,7 +235,13 @@ fn scan(base: &Path) -> Result<ScanReport, String> {
             }
             Ok(Scanned::Binary) => report.binary = report.binary.saturating_add(1),
             Ok(Scanned::Absent) => {}
-            Err(reason) => report.defects.push(reason),
+            Err(reason) => report.defects.push(Finding::at(
+                relative,
+                1,
+                1,
+                "check-credentials/unreadable",
+                reason,
+            )),
         }
     }
     Ok(report)
@@ -217,8 +249,9 @@ fn scan(base: &Path) -> Result<ScanReport, String> {
 
 pub fn check_credentials() -> i32 {
     match scan(Path::new(".")) {
-        Ok(report) => finish_with_note(
+        Ok(report) => finish_findings(
             "check-credentials",
+            &RULES,
             report.examined,
             &format!(", skipped {} binary files", report.binary),
             &report.defects,
@@ -238,6 +271,9 @@ mod tests {
 
     fn markers_found(path: &str, text: &str) -> Vec<String> {
         credential_defects(Path::new(path), text)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
     }
 
     #[test]
@@ -247,10 +283,10 @@ mod tests {
         assert_eq!(defects.len(), 10, "{defects:?}");
         assert!(defects
             .iter()
-            .any(|defect| defect.contains("x.yml:2: `ghp_`")));
+            .any(|defect| defect.contains("x.yml:2:10: check-credentials/marker: `ghp_`")));
         assert!(defects
             .iter()
-            .any(|defect| defect.contains("x.yml:9: `gh auth token`")));
+            .any(|defect| defect.contains("x.yml:9:6: check-credentials/marker: `gh auth token`")));
     }
 
     #[test]
@@ -258,7 +294,7 @@ mod tests {
         let wrapped = "store a personal\n  access token as a secret\n";
         assert_eq!(
             markers_found("README.md", wrapped),
-            ["README.md:1: `personal access token`"]
+            ["README.md:1:1: check-credentials/marker: `personal access token`"]
         );
         let entity = "<td>personal&nbsp;access&NBSP;token</td>\n";
         assert_eq!(markers_found("docs/design.html", entity).len(), 1);
@@ -291,8 +327,8 @@ mod tests {
         assert_eq!(
             markers_found("notes/ledger.md", &text),
             [
-                "notes/ledger.md:2: `personal access token`",
-                "notes/ledger.md:1: `ghp_`"
+                "notes/ledger.md:2:1: check-credentials/marker: `personal access token`",
+                "notes/ledger.md:1:9: check-credentials/marker: `ghp_`"
             ]
         );
         assert_eq!(decoded(b"\x89PNG\r\n\x1a\n\0\0"), Scanned::Binary);
@@ -309,7 +345,10 @@ mod tests {
         let text =
             format!("{STYLE_ROW}\n| store a personal access token | `xtask check-credentials` |\n");
         let defects = markers_found(STYLE_PATH, &text);
-        assert_eq!(defects, ["docs/style.md:2: `personal access token`"]);
+        assert_eq!(
+            defects,
+            ["docs/style.md:2:11: check-credentials/marker: `personal access token`"]
+        );
         assert_eq!(markers_found("docs/process.md", &text).len(), 2);
     }
 
@@ -324,7 +363,7 @@ mod tests {
         );
         assert_eq!(
             markers_found(MANDATE_PATH, &elsewhere),
-            ["docs/mandate.md:9: `personal access token`"]
+            ["docs/mandate.md:9:8: check-credentials/marker: `personal access token`"]
         );
         let middle_line_alone = format!("{}\n", MANDATE_CLAUSE[1]);
         assert_eq!(markers_found(MANDATE_PATH, &middle_line_alone).len(), 1);
@@ -360,7 +399,7 @@ mod tests {
         let report = scan(repository_root()).unwrap();
         assert!(report.examined > 0);
         assert!(report.binary > 0, "the committed figure PNGs are binary");
-        assert_eq!(report.defects, Vec::<String>::new());
+        assert_eq!(report.defects, Vec::<Finding>::new());
     }
 
     #[test]

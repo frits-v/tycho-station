@@ -21,7 +21,8 @@ is a defect.
 | Layer | Location | Runs |
 |---|---|---|
 | Lints | `Cargo.toml` `[workspace.lints]`, `clippy.toml` | every build, ci, post-edit hook |
-| Repository checks | `xtask` (`check-names`, `check-comments`, `check-rules`, `check-credentials`, `check-figures`, `check-config`, `check-commit-msg`, `check-pr-title`) | ci, post-edit hook, lefthook |
+| Repository checks | `xtask` (`check-names`, `check-comments`, `check-rules`, `check-credentials`, `check-figures`, `check-config`, `check-commit-msg`, `check-pr-title`, `opengrep`, `workflows`) | ci, post-edit hook, lefthook |
+| Source rules | `opengrep/rust.yml`, each rule with fixture lines in `opengrep/rust.rs` | `xtask opengrep` in ci |
 | Git hooks | `lefthook.json` | commit-msg, pre-commit, pre-push |
 | Host rules | repository ruleset on the default branch | every push and merge |
 | Agent hooks | `.claude/settings.json` | after Edit and Write |
@@ -42,12 +43,62 @@ why, and what is left. It does not narrate the steps taken.
 ## Adding a check
 
 1. Write the check in the xtask as a function returning an exit code, bounded in input
-   and output, that counts what it examined and fails on zero.
+   and output, that counts what it examined and fails on zero. A check whose findings have
+   a file and line reports them through `finish_findings`, which also writes its SARIF. A
+   pattern over Rust source is an opengrep rule in `opengrep/rust.yml` with lines that must
+   fire and lines that must not in `opengrep/rust.rs`.
 2. Add it to the `COMMANDS` table and to `ci`; add it to the post-edit hook when it is
    fast.
 3. Add a unit test for the defect it catches and one for the clean case.
 4. Add the row in `docs/style.md` naming the check, and delete any prose the check now
    replaces.
+
+## Build cache
+
+Cargo runs through mbx, a compiler-output cache that mise wires in (`mr_boxington` on the
+rust pin, `min_version` 2026.9.2). A cargo that the xtask starts finds rustup's cargo on
+`PATH` rather than the mise wrapper, so the xtask starts `mbx clippy` and `mbx test` by
+name, and an opengrep rule refuses `cargo` with a build subcommand in Rust source. dist,
+which `release-binaries` runs, starts cargo through `$CARGO -vV` first, which mbx refuses,
+so release builds use rustup's cargo.
+
+- The ci workflow restores `~/.cache/mbx` and the cargo registry on every run, keyed by
+  commit with a prefix fallback. It saves them, after `mise run cache-trim` collects the
+  store down to 3 GiB, only after a passing push to the default branch, so a pull request
+  never writes outputs another run reads. A newer push cancels a pull request's running ci,
+  never a push to the default branch, so each merge reaches the save. Each passing push to
+  the default branch saves an entry of up to 3 GiB against the repository's 10 GB cache
+  limit, so the mise tool cache is evicted first. A run before the first save builds cold.
+- The release workflow restores nothing.
+- Locally the store grows under the platform cache directory (`mbx doctor` names it) and
+  collects itself; `mise run cache-trim` trims it to the size ci saves, and `mbx stats`
+  shows what it holds.
+
+## Code scanning
+
+Every ci run writes SARIF to `target/sarif/<tool>.sarif`: clippy, opengrep, zizmor,
+jactionlint, and one file per xtask file check (`xtask-check-names`, `xtask-check-comments`,
+`xtask-check-rules`, `xtask-check-credentials`). The `ci` job uploads them as the run's
+`sarif` artifact. A second job, `code-scanning`, runs after it whether it passed or failed:
+it builds the xtask, downloads the artifact into `target/sarif`, then runs
+`xtask sarif-upload`, which posts each file to the code scanning API through
+`gh api`, gzipped and base64-encoded, with the commit and ref of the run and the file's name
+as its category, so one tool's upload never replaces another's alerts.
+
+- Only `code-scanning` holds `security-events: write`; the only code that runs there is the
+  xtask and its `--locked` dependency closure, build scripts included. The `ci` job, where
+  the workspace's build scripts and tests run, has `contents: read`.
+- The repository ruleset requires the `ci` check only, so the upload does not gate merge;
+  each check already fails `ci` on a finding.
+- A repository without code scanning answers 403 "Code scanning is not enabled". The upload
+  prints `sarif-upload: code scanning is not enabled for this repository; N files not
+  uploaded` with GitHub's message, adds a `code scanning off` warning to the run, and passes.
+  Any other refusal fails the job.
+- A pull request from a fork gets a read-only token, which code scanning refuses, so the job
+  is skipped when the head repository is not this one.
+- For code scanning to accept the files, the operator enables GitHub Code Security for the
+  repository (Settings, Advanced Security) where the account's plan offers it, or moves the
+  repository to an organisation that has it.
 
 ## Releases
 

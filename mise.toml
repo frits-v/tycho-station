@@ -1,8 +1,14 @@
+min_version = "2026.9.2"
+
 [tools]
-rust = { version = "1.94", components = "rustfmt,clippy" }
+# mr_boxington runs cargo through mbx, the shared compiler-output cache (mise 2026.9.2+).
+rust = { version = "1.94", components = "rustfmt,clippy", mr_boxington = true }
+mr-boxington = "1.23.0"
 lefthook = "2.2.0"
 zizmor = "1.30.1"
-actionlint = "1.7.12"
+"github:jdx/jactionlint" = "2.0.2"
+opengrep = "1.30.2"
+shellcheck = "0.11.0"
 restate = "1.7.13"
 restate-server = "1.7.13"
 zmx = "0.8.1"
@@ -16,8 +22,20 @@ gh = "2.102.0"
 "cargo:https://github.com/frits-v/stencil" = { version = "rev:bd567cfc6127f526bef4ccd70215ea11ee4518cb", crate = "stencil-cli", bin = "stencil", locked = true }
 
 [tasks.ci]
-description = "Format check, lints, tests, and the pull request title check when run in CI"
+description = "Every check ci runs; in GitHub Actions, then the SARIF upload to code scanning"
 run = "cargo run -q -p xtask -- ci"
+
+[tasks.opengrep]
+description = "Test the opengrep rules against their fixtures, then scan the repository with them"
+run = "cargo run -q -p xtask -- opengrep"
+
+[tasks.workflows]
+description = "Audit the GitHub workflows with zizmor and jactionlint at pedantic"
+run = "cargo run -q -p xtask -- workflows"
+
+[tasks.cache-trim]
+description = "Collect the mbx store down to the size CI saves"
+run = "mbx gc --max-size 3GiB"
 
 [tasks.render-figures]
 description = "Render figures/ with cue and stencil into docs/figures and the design page"
