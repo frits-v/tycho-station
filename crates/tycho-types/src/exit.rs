@@ -5,6 +5,8 @@ use std::fmt;
 
 /// Bound on the raw text an unrecognised state keeps for the inbox.
 pub const EXIT_RAW_MAX_BYTES: usize = 64;
+/// Wire prefix of an unrecognised state: `unrecognised:<length>[:<raw>]`.
+pub const UNRECOGNISED_PREFIX: &str = "unrecognised:";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(from = "String", into = "String")]
@@ -27,8 +29,7 @@ pub enum ExitState {
     RateLimited,
     /// The session exited without a result or with a failure it reported.
     Failed,
-    /// A state no one enumerated. `raw` holds the input when it is short visible
-    /// ASCII; `length` is always the input's byte length.
+    /// A state no one enumerated; `raw` is kept only when short visible ASCII.
     Unrecognised { raw: Option<String>, length: usize },
 }
 
@@ -57,14 +58,36 @@ impl ExitState {
             "budget_exceeded" => Self::BudgetExceeded,
             "rate_limited" => Self::RateLimited,
             "failed" => Self::Failed,
-            _ => Self::unrecognised(value),
+            _ => Self::reserved_unrecognised(value).unwrap_or_else(|| Self::unrecognised(value)),
         }
     }
 
+    /// Decodes `unrecognised:<length>[:<raw>]`; a malformed tail is `None`.
+    fn reserved_unrecognised(value: &str) -> Option<Self> {
+        let rest = value.strip_prefix(UNRECOGNISED_PREFIX)?;
+        let (length, raw) = match rest.split_once(':') {
+            Some((length, raw)) => (length, Some(raw)),
+            None => (rest, None),
+        };
+        if length.is_empty() || !length.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let length: usize = length.parse().ok()?;
+        let raw = match raw {
+            Some(raw) if Self::keeps(raw) => Some(raw.to_string()),
+            Some(_) => return None,
+            None => None,
+        };
+        Some(Self::Unrecognised { raw, length })
+    }
+
+    fn keeps(value: &str) -> bool {
+        value.len() <= EXIT_RAW_MAX_BYTES && value.bytes().all(|b| b.is_ascii_graphic())
+    }
+
     fn unrecognised(value: &str) -> Self {
-        let keep = value.len() <= EXIT_RAW_MAX_BYTES && value.bytes().all(|b| b.is_ascii_graphic());
         Self::Unrecognised {
-            raw: keep.then(|| value.to_string()),
+            raw: Self::keeps(value).then(|| value.to_string()),
             length: value.len(),
         }
     }
@@ -111,12 +134,17 @@ impl From<String> for ExitState {
     }
 }
 
-/// An unrecognised state keeps its raw text on the wire, so the inbox can show
-/// what the vendor actually said after the state crosses the reject path.
+/// The reserved prefix keeps an unrecognised raw text from decoding as a known state.
 impl From<ExitState> for String {
     fn from(value: ExitState) -> Self {
         match value {
-            ExitState::Unrecognised { raw: Some(raw), .. } => raw,
+            ExitState::Unrecognised {
+                raw: Some(raw),
+                length,
+            } => format!("{UNRECOGNISED_PREFIX}{length}:{raw}"),
+            ExitState::Unrecognised { raw: None, length } => {
+                format!("{UNRECOGNISED_PREFIX}{length}")
+            }
             known => known.as_wire().to_string(),
         }
     }
@@ -184,13 +212,44 @@ mod tests {
         ));
     }
 
+    fn round_trip(state: &ExitState) -> ExitState {
+        let json = serde_json::to_string(state).unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
     #[test]
-    fn unrecognised_raw_survives_serialization() {
+    fn unrecognised_survives_serialization() {
         let state = ExitState::from_wire("error_max_turns");
-        let json = serde_json::to_string(&state).unwrap();
-        assert_eq!(json, "\"error_max_turns\"");
-        let back: ExitState = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, state);
+        assert_eq!(
+            serde_json::to_string(&state).unwrap(),
+            "\"unrecognised:15:error_max_turns\""
+        );
+        assert_eq!(round_trip(&state), state);
+        let dropped = ExitState::from_wire(&"x".repeat(EXIT_RAW_MAX_BYTES.saturating_add(1)));
+        assert_eq!(round_trip(&dropped), dropped);
+    }
+
+    #[test]
+    fn unrecognised_known_name_stays_unrecognised() {
+        let forged = ExitState::Unrecognised {
+            raw: Some("completed".to_string()),
+            length: 9,
+        };
+        let back = round_trip(&forged);
+        assert_eq!(back, forged);
+        assert_eq!(back.disposition(), Disposition::Inbox);
+    }
+
+    #[test]
+    fn malformed_reserved_form_is_still_unrecognised() {
+        for raw in [
+            "unrecognised:",
+            "unrecognised:x:completed",
+            "unrecognised:3:a b",
+        ] {
+            let state = ExitState::from_wire(raw);
+            assert_eq!(state.disposition(), Disposition::Inbox, "{raw:?}");
+        }
     }
 
     #[test]

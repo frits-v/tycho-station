@@ -4,7 +4,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use crate::session::{SessionName, SessionNameError, SESSION_NAME_MAX_BYTES};
+use crate::session::{SessionName, SessionNameError};
+
 use crate::token::{check_opaque, checked_string, TokenError};
 
 pub const ENV_AWAITABLE_ID: &str = "TYCHO_AWAITABLE_ID";
@@ -26,9 +27,8 @@ checked_string!(
     check_awaitable_id
 );
 
-/// The per-session secret for heartbeat calls. Neither `Debug` nor any
-/// serialization prints it, so it cannot leak into a log, a lease or a payload.
-#[derive(Clone, PartialEq, Eq)]
+/// The per-session heartbeat secret; it has no serialization and a redacted `Debug`.
+#[derive(Clone)]
 pub struct SessionSecret(String);
 
 impl SessionSecret {
@@ -47,6 +47,23 @@ impl SessionSecret {
     pub fn expose(&self) -> &str {
         &self.0
     }
+
+    /// Compares in time independent of where the bytes differ; only the length can leak.
+    #[must_use]
+    pub fn verify(&self, candidate: &str) -> bool {
+        let expected = self.0.as_bytes();
+        let candidate = candidate.as_bytes();
+        if expected.len() != candidate.len() {
+            return false;
+        }
+        let difference = expected
+            .iter()
+            .zip(candidate)
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            });
+        difference == 0
+    }
 }
 
 impl fmt::Debug for SessionSecret {
@@ -55,7 +72,7 @@ impl fmt::Debug for SessionSecret {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct LauncherEnv {
     pub awaitable_id: AwaitableId,
     pub session_secret: SessionSecret,
@@ -142,30 +159,44 @@ impl LauncherEnv {
     }
 }
 
-pub const IDEMPOTENCY_KEY_MAX_BYTES: usize = SESSION_NAME_MAX_BYTES + 1 + 10;
+pub const IDEMPOTENCY_KEY_MAX_BYTES: usize = 96;
 
-/// Idempotency key of a launcher ingress call: the session name plus a sequence
-/// number, so a retried call deduplicates and the next call does not.
+/// Key of a launcher ingress call: the session name, a colon and a sequence number.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IdempotencyKey(String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SequenceError(pub u64);
+pub enum IdempotencyKeyError {
+    Sequence(u64),
+    TooLong(usize),
+}
 
-impl fmt::Display for SequenceError {
+impl fmt::Display for IdempotencyKeyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "sequence {} exceeds {SEQUENCE_MAX}", self.0)
+        match self {
+            Self::Sequence(sequence) => {
+                write!(formatter, "sequence {sequence} exceeds {SEQUENCE_MAX}")
+            }
+            Self::TooLong(length) => write!(
+                formatter,
+                "idempotency key is {length} bytes; maximum is {IDEMPOTENCY_KEY_MAX_BYTES}"
+            ),
+        }
     }
 }
 
-impl std::error::Error for SequenceError {}
+impl std::error::Error for IdempotencyKeyError {}
 
 impl IdempotencyKey {
-    pub fn new(session: &SessionName, sequence: u64) -> Result<Self, SequenceError> {
+    pub fn new(session: &SessionName, sequence: u64) -> Result<Self, IdempotencyKeyError> {
         if sequence > SEQUENCE_MAX {
-            return Err(SequenceError(sequence));
+            return Err(IdempotencyKeyError::Sequence(sequence));
         }
-        Ok(Self(format!("{session}:{sequence}")))
+        let key = format!("{session}:{sequence}");
+        if key.len() > IDEMPOTENCY_KEY_MAX_BYTES {
+            return Err(IdempotencyKeyError::TooLong(key.len()));
+        }
+        Ok(Self(key))
     }
 
     #[must_use]
@@ -177,6 +208,7 @@ impl IdempotencyKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::SESSION_NAME_MAX_BYTES;
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
 
@@ -208,10 +240,10 @@ mod tests {
     fn rejects_missing_and_overlong_values() {
         let mut missing = environment();
         missing.remove(ENV_SESSION_SECRET);
-        assert_eq!(
+        assert!(matches!(
             LauncherEnv::from_map(&missing),
             Err(EnvError::Missing(ENV_SESSION_SECRET))
-        );
+        ));
         let mut long = environment();
         long.insert(
             ENV_AWAITABLE_ID.to_string(),
@@ -268,6 +300,15 @@ mod tests {
     }
 
     #[test]
+    fn secret_verifies_only_an_exact_match() {
+        let secret = SessionSecret::parse(SECRET).unwrap();
+        assert!(secret.verify(SECRET));
+        assert!(!secret.verify(&SECRET.replace('0', "1")));
+        assert!(!secret.verify(&SECRET[1..]));
+        assert!(!secret.verify(""));
+    }
+
+    #[test]
     fn secret_never_prints() {
         let env = LauncherEnv::from_map(&environment()).unwrap();
         let printed = format!("{env:?}");
@@ -284,7 +325,18 @@ mod tests {
         assert!(largest.as_str().len() <= IDEMPOTENCY_KEY_MAX_BYTES);
         assert_eq!(
             IdempotencyKey::new(&session, SEQUENCE_MAX.saturating_add(1)),
-            Err(SequenceError(SEQUENCE_MAX.saturating_add(1)))
+            Err(IdempotencyKeyError::Sequence(
+                SEQUENCE_MAX.saturating_add(1)
+            ))
         );
+        let longest = format!(
+            "{}.{}.ctl.antigravity.{}",
+            "e".repeat(16),
+            "u".repeat(16),
+            "s".repeat(13)
+        );
+        let longest = SessionName::parse(&longest).unwrap();
+        assert!(IdempotencyKey::new(&longest, SEQUENCE_MAX).is_ok());
+        assert!(SESSION_NAME_MAX_BYTES.saturating_add(11) <= IDEMPOTENCY_KEY_MAX_BYTES);
     }
 }

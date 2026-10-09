@@ -4,15 +4,15 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::service::{EpicId, WorkUnitId, ROOT_SEGMENT};
+use crate::service::{Attempt, EpicId, TaskId, WorkUnitId, ROOT_SEGMENT};
 use crate::token::{check_slug, checked_string, TokenError};
 
-/// zmx names the socket file after the session, inside its socket directory.
-/// `sun_path` is 104 bytes on macOS including the terminating NUL.
+/// `sun_path` is 104 bytes on macOS with its NUL; zmx names the socket after the session.
 pub const SOCKET_PATH_MAX_BYTES: usize = 103;
 /// Leaves 38 bytes of `SOCKET_PATH_MAX_BYTES` for the socket directory and its separator.
 pub const SESSION_NAME_MAX_BYTES: usize = 64;
-pub const SUFFIX_MAX_BYTES: usize = 8;
+pub const SUFFIX_MAX_BYTES: usize = 13;
+const TASK_HASH_HEX_DIGITS: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionKind {
@@ -82,6 +82,22 @@ checked_string!(
     check_suffix
 );
 
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash: u64, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+impl Suffix {
+    /// `<first 10 hex digits of FNV-1a 64 of the task id>a<attempt>`, such as `3f1c0a9b2ea2`.
+    #[must_use]
+    pub fn for_task(task: &TaskId, attempt: Attempt) -> Self {
+        let hash = format!("{:016x}", fnv1a_64(task.as_str().as_bytes()));
+        let prefix: String = hash.chars().take(TASK_HASH_HEX_DIGITS).collect();
+        Self(format!("{prefix}a{}", attempt.get()))
+    }
+}
+
 /// The level a session runs at, derived from its name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -140,8 +156,7 @@ impl fmt::Display for SessionNameError {
 impl std::error::Error for SessionNameError {}
 
 impl SessionName {
-    /// Every component is bounded, and the longest combination fits
-    /// `SESSION_NAME_MAX_BYTES`, so construction cannot fail.
+    /// Infallible: the longest combination of bounded components fits `SESSION_NAME_MAX_BYTES`.
     #[must_use]
     pub const fn unit(
         epic: EpicId,
@@ -207,8 +222,7 @@ impl SessionName {
         })
     }
 
-    /// The socket zmx creates for this session, refused when it would exceed the
-    /// platform limit so the launcher fails before it spawns.
+    /// The socket zmx creates for this session, refused over the platform limit.
     pub fn socket_path(&self, socket_dir: &Path) -> Result<PathBuf, SessionNameError> {
         let path = socket_dir.join(self.to_string());
         let length = path.as_os_str().len();
@@ -349,7 +363,7 @@ mod tests {
             Err(SessionNameError::Unit(TokenError::Empty))
         ));
         assert!(matches!(
-            SessionName::parse("cf7a.wu03.wrk.claude.toolongsuffix"),
+            SessionName::parse("cf7a.wu03.wrk.claude.suffixtoolong1"),
             Err(SessionNameError::Suffix(_))
         ));
         assert!(SessionName::parse("").is_err());
@@ -385,6 +399,21 @@ mod tests {
             session.socket_path(Path::new(&deep)),
             Err(SessionNameError::SocketPathTooLong(_))
         ));
+    }
+
+    #[test]
+    fn task_suffix_is_stable_and_separates_attempts() {
+        let task = TaskId::parse("cf7a-wu03-t07").unwrap();
+        let first = Suffix::for_task(&task, Attempt::FIRST);
+        assert_eq!(first, Suffix::for_task(&task, Attempt::FIRST));
+        assert!(first.as_str().ends_with("a1"));
+        assert_eq!(Suffix::parse(first.as_str()), Ok(first.clone()));
+        let second = Suffix::for_task(&task, Attempt::new(2).unwrap());
+        assert_ne!(first, second);
+        let other = TaskId::parse("cf7a-wu03-t08").unwrap();
+        assert_ne!(first, Suffix::for_task(&other, Attempt::FIRST));
+        let last = Suffix::for_task(&task, Attempt::new(crate::service::ATTEMPT_MAX).unwrap());
+        assert!(last.as_str().len() <= SUFFIX_MAX_BYTES);
     }
 
     #[test]

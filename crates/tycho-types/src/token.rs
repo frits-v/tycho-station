@@ -7,6 +7,7 @@ pub enum TokenError {
     Empty,
     TooShort { length: usize, min: usize },
     TooLong { length: usize, max: usize },
+    WrongLength { length: usize },
     InvalidCharacter { position: usize },
     Reserved,
 }
@@ -19,6 +20,9 @@ impl fmt::Display for TokenError {
                 write!(formatter, "{length} bytes; minimum is {min}")
             }
             Self::TooLong { length, max } => write!(formatter, "{length} bytes; maximum is {max}"),
+            Self::WrongLength { length } => {
+                write!(formatter, "{length} bytes is not an allowed length")
+            }
             Self::InvalidCharacter { position } => {
                 write!(formatter, "invalid character at byte {position}")
             }
@@ -49,8 +53,7 @@ fn first_invalid(value: &str, allowed: impl Fn(u8) -> bool) -> Result<(), TokenE
     Ok(())
 }
 
-/// Lowercase letters, digits and `-`, starting with a letter or digit so that a
-/// session name built from it is never read as a command line flag.
+/// Lowercase letters, digits and `-`, never leading with `-` so no name reads as a flag.
 pub fn check_slug(value: &str, max: usize) -> Result<(), TokenError> {
     check_length(value, max)?;
     if value.starts_with('-') {
@@ -80,9 +83,8 @@ pub fn check_hex(value: &str, lengths: &[usize]) -> Result<(), TokenError> {
     let max = lengths.iter().copied().max().unwrap_or(0);
     check_length(value, max)?;
     if !lengths.contains(&value.len()) {
-        return Err(TokenError::TooShort {
+        return Err(TokenError::WrongLength {
             length: value.len(),
-            min: max,
         });
     }
     first_invalid(value, |byte| {
@@ -90,8 +92,7 @@ pub fn check_hex(value: &str, lengths: &[usize]) -> Result<(), TokenError> {
     })
 }
 
-/// Printable text without control characters, so a summary cannot carry
-/// terminal escape sequences into a pane or the inbox.
+/// Text without control characters, so it cannot carry terminal escapes into a pane.
 pub fn check_text(value: &str, max: usize) -> Result<(), TokenError> {
     check_length(value, max)?;
     if let Some((position, _)) = value.char_indices().find(|(_, c)| c.is_control()) {
@@ -100,8 +101,7 @@ pub fn check_text(value: &str, max: usize) -> Result<(), TokenError> {
     Ok(())
 }
 
-/// Defines a string newtype whose only constructor runs `check`, and which
-/// serializes as a plain JSON string validated on the way in.
+/// A string newtype whose only constructors, including deserialization, run `check`.
 macro_rules! checked_string {
     ($(#[$meta:meta])* $name:ident, $check:expr) => {
         $(#[$meta])*
@@ -193,7 +193,10 @@ mod tests {
     fn hex_requires_an_allowed_length_and_lowercase() {
         let sha = "a".repeat(40);
         assert_eq!(check_hex(&sha, &[40, 64]), Ok(()));
-        assert!(check_hex(&"a".repeat(41), &[40, 64]).is_err());
+        assert_eq!(
+            check_hex(&"a".repeat(41), &[40, 64]),
+            Err(TokenError::WrongLength { length: 41 })
+        );
         assert!(check_hex(&"A".repeat(40), &[40, 64]).is_err());
         assert!(check_hex(&"a".repeat(65), &[40, 64]).is_err());
     }

@@ -1,4 +1,4 @@
-//! The message envelope and the upward payloads: `result`, `status`, `escalation`.
+//! The message envelope and its payloads: `task_packet` down; `result`, `status`, `escalation` up.
 //! Payloads carry references into the content store, never content, so journal
 //! entries stay small.
 
@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::service::{EpicId, WorkUnitId};
 use crate::session::{Level, SessionName};
-use crate::token::{check_hex, check_record_id, check_text, checked_string, TokenError};
+use crate::task_packet::{check_task_packet, TaskPacketPayload};
+use crate::token::{
+    check_hex, check_record_id, check_slug, check_text, checked_string, TokenError,
+};
 
 pub const ENVELOPE_SCHEMA_VERSION: u32 = 1;
 pub const ENVELOPE_MAX_BYTES: usize = 65_536;
@@ -17,8 +20,8 @@ pub const TEXT_MAX_BYTES: usize = 512;
 pub const BRANCH_MAX_BYTES: usize = 128;
 pub const REFS_MAX_ITEMS: usize = 64;
 pub const CRITERIA_MAX_ITEMS: usize = 64;
-pub const OPTIONS_MIN_ITEMS: usize = 2;
 pub const OPTIONS_MAX_ITEMS: usize = 4;
+pub const STATE_NAME_MAX_BYTES: usize = 32;
 const CONTENT_REF_PREFIX: &str = "sha256:";
 
 fn check_message_id(value: &str) -> Result<(), TokenError> {
@@ -40,24 +43,31 @@ fn check_content_ref(value: &str) -> Result<(), TokenError> {
     check_hex(digest, &[64])
 }
 
-/// A git branch name, restricted to a portable subset of what git allows.
+/// A git branch name in a portable subset of what `git check-ref-format` allows.
 fn check_branch(value: &str) -> Result<(), TokenError> {
     check_text(value, BRANCH_MAX_BYTES)?;
     let allowed = |byte: u8| byte.is_ascii_alphanumeric() || b"._/-".contains(&byte);
     if let Some(position) = value.bytes().position(|byte| !allowed(byte)) {
         return Err(TokenError::InvalidCharacter { position });
     }
-    let malformed = value.starts_with(['-', '/', '.'])
-        || value.ends_with(['/', '.'])
-        || value.contains("..")
-        || value.contains("//")
-        || value
-            .rsplit_once('.')
-            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("lock"));
-    if malformed {
+    if value.starts_with('-') || value.ends_with('.') || value.contains("..") {
+        return Err(TokenError::InvalidCharacter { position: 0 });
+    }
+    let malformed_component = value.split('/').any(|component| {
+        component.is_empty()
+            || component.starts_with('.')
+            || component
+                .rsplit_once('.')
+                .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("lock"))
+    });
+    if malformed_component {
         return Err(TokenError::InvalidCharacter { position: 0 });
     }
     Ok(())
+}
+
+fn check_state_name(value: &str) -> Result<(), TokenError> {
+    check_slug(value, STATE_NAME_MAX_BYTES)
 }
 
 checked_string!(
@@ -77,10 +87,16 @@ checked_string!(
     check_content_ref
 );
 checked_string!(BranchName, check_branch);
+checked_string!(
+    /// A reported state; a string so stored statuses survive new state names.
+    StateName,
+    check_state_name
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageType {
+    TaskPacket,
     Result,
     Status,
     Escalation,
@@ -131,6 +147,7 @@ pub struct ProgressMarker {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatusPayload {
+    pub state: Option<StateName>,
     pub summary: ShortText,
     pub last_progress_unix_ms: u64,
     pub progress: ProgressMarker,
@@ -163,8 +180,7 @@ pub struct EscalationOption {
     pub blast_radius: ShortText,
 }
 
-/// A certified question. A missing proposed ruling is decodable because the
-/// arbiter's answer to it is to send the escalation back down.
+/// A certified question; a missing proposed ruling decodes, and the arbiter sends it back down.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EscalationPayload {
@@ -182,6 +198,7 @@ pub struct EscalationPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum Payload {
+    TaskPacket(TaskPacketPayload),
     Result(ResultPayload),
     Status(StatusPayload),
     Escalation(EscalationPayload),
@@ -191,6 +208,7 @@ impl Payload {
     #[must_use]
     pub const fn message_type(&self) -> MessageType {
         match self {
+            Self::TaskPacket(_) => MessageType::TaskPacket,
             Self::Result(_) => MessageType::Result,
             Self::Status(_) => MessageType::Status,
             Self::Escalation(_) => MessageType::Escalation,
@@ -198,8 +216,7 @@ impl Payload {
     }
 }
 
-/// `from` and `to` are session names; level and vendor are derived from them
-/// rather than carried alongside, so they cannot disagree.
+/// Level and vendor derive from `from` and `to`; `parse` and `to_bytes` check the epic and unit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Envelope {
     pub id: RecordId,
@@ -256,11 +273,8 @@ pub enum EnvelopeError {
         count: usize,
         max: usize,
     },
-    TooFew {
-        field: &'static str,
-        count: usize,
-        min: usize,
-    },
+    EpicMismatch,
+    WorkUnitMismatch,
 }
 
 impl fmt::Display for EnvelopeError {
@@ -278,16 +292,27 @@ impl fmt::Display for EnvelopeError {
             Self::TooMany { field, count, max } => {
                 write!(formatter, "{field} has {count} items; maximum is {max}")
             }
-            Self::TooFew { field, count, min } => {
-                write!(formatter, "{field} has {count} items; minimum is {min}")
+            Self::EpicMismatch => {
+                write!(
+                    formatter,
+                    "correlation_id differs from the epic of from or to"
+                )
             }
+            Self::WorkUnitMismatch => write!(
+                formatter,
+                "work_unit_id differs from the unit of from or to, or neither carries one"
+            ),
         }
     }
 }
 
 impl std::error::Error for EnvelopeError {}
 
-const fn check_count(field: &'static str, count: usize, max: usize) -> Result<(), EnvelopeError> {
+pub(crate) const fn check_count(
+    field: &'static str,
+    count: usize,
+    max: usize,
+) -> Result<(), EnvelopeError> {
     if count > max {
         return Err(EnvelopeError::TooMany { field, count, max });
     }
@@ -303,15 +328,7 @@ fn check_result(payload: &ResultPayload) -> Result<(), EnvelopeError> {
 }
 
 fn check_escalation(payload: &EscalationPayload) -> Result<(), EnvelopeError> {
-    let options = payload.options.len();
-    if options < OPTIONS_MIN_ITEMS {
-        return Err(EnvelopeError::TooFew {
-            field: "options",
-            count: options,
-            min: OPTIONS_MIN_ITEMS,
-        });
-    }
-    check_count("options", options, OPTIONS_MAX_ITEMS)?;
+    check_count("options", payload.options.len(), OPTIONS_MAX_ITEMS)?;
     check_count("evidence", payload.evidence.len(), REFS_MAX_ITEMS)?;
     check_count(
         "cases_consulted",
@@ -320,31 +337,26 @@ fn check_escalation(payload: &EscalationPayload) -> Result<(), EnvelopeError> {
     )
 }
 
+fn check_payload(payload: &Payload) -> Result<(), EnvelopeError> {
+    match payload {
+        Payload::TaskPacket(packet) => check_task_packet(packet),
+        Payload::Result(result) => check_result(result),
+        Payload::Status(status) => check_count("blockers", status.blockers.len(), REFS_MAX_ITEMS),
+        Payload::Escalation(escalation) => check_escalation(escalation),
+    }
+}
+
 fn decode_payload(
     message_type: MessageType,
     value: serde_json::Value,
 ) -> Result<Payload, EnvelopeError> {
-    let payload = match message_type {
-        MessageType::Result => {
-            let payload: ResultPayload =
-                serde_json::from_value(value).map_err(EnvelopeError::Json)?;
-            check_result(&payload)?;
-            Payload::Result(payload)
-        }
-        MessageType::Status => {
-            let payload: StatusPayload =
-                serde_json::from_value(value).map_err(EnvelopeError::Json)?;
-            check_count("blockers", payload.blockers.len(), REFS_MAX_ITEMS)?;
-            Payload::Status(payload)
-        }
-        MessageType::Escalation => {
-            let payload: EscalationPayload =
-                serde_json::from_value(value).map_err(EnvelopeError::Json)?;
-            check_escalation(&payload)?;
-            Payload::Escalation(payload)
-        }
+    let decoded = match message_type {
+        MessageType::TaskPacket => serde_json::from_value(value).map(Payload::TaskPacket),
+        MessageType::Result => serde_json::from_value(value).map(Payload::Result),
+        MessageType::Status => serde_json::from_value(value).map(Payload::Status),
+        MessageType::Escalation => serde_json::from_value(value).map(Payload::Escalation),
     };
-    Ok(payload)
+    decoded.map_err(EnvelopeError::Json)
 }
 
 impl Envelope {
@@ -356,7 +368,7 @@ impl Envelope {
         if wire.schema_version != ENVELOPE_SCHEMA_VERSION {
             return Err(EnvelopeError::SchemaVersion(wire.schema_version));
         }
-        Ok(Self {
+        let envelope = Self {
             payload: decode_payload(wire.message_type, wire.payload)?,
             id: wire.id,
             work_unit_id: wire.work_unit_id,
@@ -366,10 +378,14 @@ impl Envelope {
             correlation_id: wire.correlation_id,
             created_at_unix_ms: wire.created_at_unix_ms,
             expires_at_unix_ms: wire.expires_at_unix_ms,
-        })
+        };
+        envelope.validate()?;
+        Ok(envelope)
     }
 
-    pub fn to_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+    /// Refuses to write what `parse` would reject, except for the overall size.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, EnvelopeError> {
+        self.validate()?;
         serde_json::to_vec(&EnvelopeOut {
             schema_version: ENVELOPE_SCHEMA_VERSION,
             id: &self.id,
@@ -383,6 +399,23 @@ impl Envelope {
             expires_at_unix_ms: self.expires_at_unix_ms,
             payload: &self.payload,
         })
+        .map_err(EnvelopeError::Json)
+    }
+
+    fn validate(&self) -> Result<(), EnvelopeError> {
+        if *self.from.epic() != self.correlation_id || *self.to.epic() != self.correlation_id {
+            return Err(EnvelopeError::EpicMismatch);
+        }
+        let units = [self.from.work_unit(), self.to.work_unit()];
+        let carried = units.iter().flatten().count();
+        let agree = units
+            .iter()
+            .flatten()
+            .all(|unit| **unit == self.work_unit_id);
+        if carried == 0 || !agree {
+            return Err(EnvelopeError::WorkUnitMismatch);
+        }
+        check_payload(&self.payload)
     }
 }
 
@@ -432,7 +465,7 @@ mod tests {
 
     #[test]
     fn status_and_escalation_parse() {
-        let status = r#"{"summary":"tests green","last_progress_unix_ms":1800000000000,"progress":{"head_sha":null,"tests_passing":12},"active_workers":2,"usage":{"input_tokens":0,"output_tokens":0},"blockers":[]}"#;
+        let status = r#"{"state":"verifying","summary":"tests green","last_progress_unix_ms":1800000000000,"progress":{"head_sha":null,"tests_passing":12},"active_workers":2,"usage":{"input_tokens":0,"output_tokens":0},"blockers":[]}"#;
         let parsed = Envelope::parse(envelope("status", status).as_bytes()).unwrap();
         assert_eq!(parsed.payload.message_type(), MessageType::Status);
         let parsed =
@@ -489,11 +522,8 @@ mod tests {
 
     #[test]
     fn rejects_counts_outside_bounds() {
-        let few = envelope("escalation", &escalation_payload(1));
-        assert!(matches!(
-            Envelope::parse(few.as_bytes()),
-            Err(EnvelopeError::TooFew { .. })
-        ));
+        let one = envelope("escalation", &escalation_payload(1));
+        assert!(Envelope::parse(one.as_bytes()).is_ok());
         let many = envelope(
             "escalation",
             &escalation_payload(OPTIONS_MAX_ITEMS.saturating_add(1)),
@@ -546,9 +576,154 @@ mod tests {
         assert!(ContentRef::parse("md5:abc").is_err());
         assert!(ContentRef::parse(&format!("sha256:{}", "E".repeat(64))).is_err());
         assert!(BranchName::parse("wu03/task-7").is_ok());
-        for bad in ["-x", "a..b", "a b", "a/", "x.lock", "/a", "a//b", ""] {
+        for bad in [
+            "-x",
+            "a..b",
+            "a b",
+            "a/",
+            "x.lock",
+            "/a",
+            "a//b",
+            "",
+            "a/.hidden",
+            "a.lock/b",
+            "a.",
+        ] {
             assert!(BranchName::parse(bad).is_err(), "{bad:?}");
         }
         assert!(ShortText::parse("line\nbreak").is_err());
+    }
+
+    fn routed(from: &str, to: &str, unit: &str, epic: &str) -> String {
+        envelope("result", &result_payload())
+            .replace("cf7a.wu03.ctl.codex", to)
+            .replace("cf7a.wu03.wrk.claude.a1f3", from)
+            .replace(
+                "\"work_unit_id\":\"wu03\"",
+                &format!("\"work_unit_id\":\"{unit}\""),
+            )
+            .replace(
+                "\"correlation_id\":\"cf7a\"",
+                &format!("\"correlation_id\":\"{epic}\""),
+            )
+    }
+
+    #[test]
+    fn routing_accepts_a_unit_on_either_side() {
+        let up = routed("cf7a.wu03.ctl.codex", "cf7a.root.claude", "wu03", "cf7a");
+        assert!(Envelope::parse(up.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_correlation_id_that_is_not_the_epic() {
+        let other = routed(
+            "cf7a.wu03.wrk.claude.a1f3",
+            "cf7a.wu03.ctl.codex",
+            "wu03",
+            "beef",
+        );
+        assert!(matches!(
+            Envelope::parse(other.as_bytes()),
+            Err(EnvelopeError::EpicMismatch)
+        ));
+        let split = routed(
+            "cf7a.wu03.wrk.claude.a1f3",
+            "beef.wu03.ctl.codex",
+            "wu03",
+            "cf7a",
+        );
+        assert!(matches!(
+            Envelope::parse(split.as_bytes()),
+            Err(EnvelopeError::EpicMismatch)
+        ));
+    }
+
+    #[test]
+    fn rejects_a_work_unit_id_that_is_not_the_unit() {
+        let other = routed(
+            "cf7a.wu03.wrk.claude.a1f3",
+            "cf7a.wu03.ctl.codex",
+            "wu04",
+            "cf7a",
+        );
+        assert!(matches!(
+            Envelope::parse(other.as_bytes()),
+            Err(EnvelopeError::WorkUnitMismatch)
+        ));
+        let none = routed("cf7a.root.claude", "cf7a.root.codex", "wu03", "cf7a");
+        assert!(matches!(
+            Envelope::parse(none.as_bytes()),
+            Err(EnvelopeError::WorkUnitMismatch)
+        ));
+    }
+
+    #[test]
+    fn to_bytes_refuses_what_parse_rejects() {
+        let mut parsed = Envelope::parse(envelope("result", &result_payload()).as_bytes()).unwrap();
+        parsed.correlation_id = EpicId::parse("beef").unwrap();
+        assert!(matches!(
+            parsed.to_bytes(),
+            Err(EnvelopeError::EpicMismatch)
+        ));
+    }
+
+    fn task_packet_payload() -> String {
+        format!(
+            r#"{{"objective":"{d}","done_criteria":[{{"kind":"command","command":"cargo test","expected_exit":0}},{{"kind":"file_absent","path":"TODO.md"}}],"boundaries":{{"worktree":"/Users/agent/wt/cf7a-wu03","branch":"wu03/task-7","writable_paths":["crates"],"forbidden_actions":["push"]}},"inputs":["{d}"],"routing":{{"class":"implement","tier":"t2","effort":"medium","binding":"claude","rationale":"touches the launcher","fallback_tier":"t3"}},"budget":{{"tokens_max":200000,"wall_clock_max_ms":3600000}},"result_schema":"{d}"}}"#,
+            d = digest('f')
+        )
+    }
+
+    #[test]
+    fn task_packet_round_trips() {
+        let down = envelope("task_packet", &task_packet_payload())
+            .replace(
+                "\"from\":\"cf7a.wu03.wrk.claude.a1f3\"",
+                "\"from\":\"cf7a.wu03.ctl.codex\"",
+            )
+            .replace(
+                "\"to\":\"cf7a.wu03.ctl.codex\"",
+                "\"to\":\"cf7a.wu03.wrk.claude.a1f3\"",
+            );
+        let parsed = Envelope::parse(down.as_bytes()).unwrap();
+        assert_eq!(parsed.payload.message_type(), MessageType::TaskPacket);
+        assert_eq!(
+            Envelope::parse(&parsed.to_bytes().unwrap()).unwrap(),
+            parsed
+        );
+    }
+
+    #[test]
+    fn task_packet_rejects_a_missing_rationale_and_too_many_inputs() {
+        let missing = task_packet_payload().replace(r#","rationale":"touches the launcher""#, "");
+        assert!(matches!(
+            Envelope::parse(envelope("task_packet", &missing).as_bytes()),
+            Err(EnvelopeError::Json(_))
+        ));
+        let empty = task_packet_payload().replace("touches the launcher", "");
+        assert!(Envelope::parse(envelope("task_packet", &empty).as_bytes()).is_err());
+        let refs = vec![format!("\"{}\"", digest('d')); REFS_MAX_ITEMS.saturating_add(1)].join(",");
+        let many = task_packet_payload().replace(
+            &format!(r#""inputs":["{}"]"#, digest('f')),
+            &format!(r#""inputs":[{refs}]"#),
+        );
+        assert!(matches!(
+            Envelope::parse(envelope("task_packet", &many).as_bytes()),
+            Err(EnvelopeError::TooMany {
+                field: "inputs",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn status_state_is_optional() {
+        let status = r#"{"summary":"idle","last_progress_unix_ms":0,"progress":{"head_sha":null,"tests_passing":0},"active_workers":0,"usage":{"input_tokens":0,"output_tokens":0},"blockers":[]}"#;
+        let parsed = Envelope::parse(envelope("status", status).as_bytes()).unwrap();
+        let Payload::Status(status) = parsed.payload else {
+            panic!("expected a status payload");
+        };
+        assert_eq!(status.state, None);
+        assert!(StateName::parse("Verifying").is_err());
     }
 }

@@ -4,8 +4,7 @@ use std::fmt;
 
 use crate::token::{check_slug, checked_string, TokenError};
 
-/// Maximum length of an epic or work unit id. Both are segments of a zmx
-/// session name, which is bounded by the socket path limit.
+/// Epic and work unit ids are session name segments, so the socket path limit bounds them.
 pub const ID_MAX_BYTES: usize = 16;
 pub const TASK_ID_MAX_BYTES: usize = 64;
 pub const ATTEMPT_MAX: u16 = 99;
@@ -57,6 +56,26 @@ impl Service {
             Self::WorkUnit | Self::WorkerRun => ServiceKind::Workflow,
         }
     }
+}
+
+/// Handler names, grouped by service, for ingress calls and service-to-service calls.
+pub mod handler {
+    pub const EPIC_START: &str = "start";
+    pub const EPIC_ADD_UNIT: &str = "add_unit";
+    pub const EPIC_RESERVE: &str = "reserve";
+    pub const EPIC_SETTLE: &str = "settle";
+    pub const EPIC_STATUS: &str = "status";
+    pub const WORK_UNIT_RUN: &str = "run";
+    pub const WORK_UNIT_RESULT: &str = "result";
+    pub const WORK_UNIT_ESCALATE: &str = "escalate";
+    pub const WORK_UNIT_STATUS: &str = "status";
+    pub const SESSION_SPAWN: &str = "spawn";
+    pub const SESSION_HEARTBEAT: &str = "heartbeat";
+    pub const SESSION_NUDGE: &str = "nudge";
+    pub const SESSION_HANDOFF: &str = "handoff";
+    pub const SESSION_KILL: &str = "kill";
+    pub const RECONCILER_TICK: &str = "tick";
+    pub const WORKER_RUN_RUN: &str = "run";
 }
 
 fn check_epic_id(value: &str) -> Result<(), TokenError> {
@@ -128,8 +147,7 @@ impl fmt::Display for AttemptError {
 
 impl std::error::Error for AttemptError {}
 
-/// What a `WorkUnit` promise waits for. A workflow key runs once and a unit goes
-/// through several of each, so a promise name always pairs a phase with an attempt.
+/// What a `WorkUnit` promise waits for; a name pairs it with an attempt because a key runs once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
     Plan,

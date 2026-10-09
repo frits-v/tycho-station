@@ -12,4 +12,5 @@ pub mod launcher;
 pub mod lease;
 pub mod service;
 pub mod session;
+pub mod task_packet;
 pub mod token;
