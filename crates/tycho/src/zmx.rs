@@ -11,7 +11,7 @@ use crate::config::{COMMAND_TIMEOUT, LIST_SESSIONS_MAX};
 
 /// The core directory is private: zmx does not check who connects to a socket.
 const CORE_DIR_MODE: &str = "0700";
-/// The agent user and the developer share the group; others get nothing.
+/// Matches `AGENT_DIR_MODE`: the agent user and the developer share the group.
 const AGENT_ZMX_DIR_MODE: &str = "0770";
 
 /// One line of `zmx list`.
@@ -198,6 +198,16 @@ impl Zmx {
         }
     }
 
+    #[must_use]
+    pub fn binary(&self) -> &Path {
+        &self.binary
+    }
+
+    #[must_use]
+    pub fn socket_dir(&self) -> &str {
+        &self.socket_dir
+    }
+
     const fn environment(&self) -> [(&str, &str); 2] {
         [
             ("ZMX_DIR", self.socket_dir.as_str()),
@@ -231,6 +241,52 @@ impl Zmx {
             return Err(ZmxError::RunFailed(status));
         }
         Ok(())
+    }
+
+    /// Spawns detached with each word as one argument; zmx quotes every word for the shell.
+    pub fn run_words(&self, name: &str, words: &[String]) -> Result<(), ZmxError> {
+        let mut arguments = vec!["run", name, "-d"];
+        arguments.extend(words.iter().map(String::as_str));
+        let status = command::run_detached(
+            &self.binary,
+            &arguments,
+            &self.environment(),
+            COMMAND_TIMEOUT,
+        )
+        .map_err(ZmxError::Command)?;
+        if !status.success() {
+            return Err(ZmxError::RunFailed(status));
+        }
+        Ok(())
+    }
+
+    /// The session's scrollback; more than `max_bytes` is an error, never a truncation.
+    pub fn history(&self, name: &str, max_bytes: usize) -> Result<String, ZmxError> {
+        let captured = command::run_status_capped(
+            &self.binary,
+            &["history", name],
+            &self.environment(),
+            &[],
+            COMMAND_TIMEOUT,
+            max_bytes,
+        )
+        .map_err(ZmxError::Command)?;
+        if !captured.status.success() {
+            return Err(ZmxError::RunFailed(captured.status));
+        }
+        Ok(captured.stdout)
+    }
+
+    /// Writes text to the session's pty input, as a nudge.
+    pub fn send(&self, name: &str, text: &str) -> Result<(), ZmxError> {
+        command::run_captured(
+            &self.binary,
+            &["send", name, text],
+            &self.environment(),
+            COMMAND_TIMEOUT,
+        )
+        .map(|_| ())
+        .map_err(ZmxError::Command)
     }
 
     /// Ends a session by name; a missing session is not an error here.

@@ -56,3 +56,7 @@ run = "cargo run -q -p xtask -- release-binaries"
 [tasks.spine-tests]
 description = "Drive the spine services through a real core with a test-double endpoint beside the production one (macOS)"
 run = "cargo test -p tycho --test spine -- --ignored --test-threads=1 --nocapture"
+
+[tasks.launcher-tests]
+description = "Spawn launchers under zmx against a throwaway core, then kill the launcher and the restate server at the named moments (macOS)"
+run = "cargo test -p tycho --test launcher -- --ignored --test-threads=1 --nocapture"
