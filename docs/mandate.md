@@ -148,3 +148,32 @@ change takes effect for work units started after the merge.
 
 13.2 Every mechanism that enforces an article names it. An article without a mechanism
 is enforced by arbiters citing it, and the gap is listed in the design until closed.
+
+## 14. Growth of the law
+
+14.1 The mandate's text changes only by amendment under article 13. Interpretation and
+practice grow beneath it, and the law grows from below through the petition in 14.4,
+never by a session or a council changing the text.
+
+14.2 Interpretation. An arbiter asked what an article means answers with a case scoped to
+that article, marked as an interpretation. It binds below at persuasive weight until a
+human confirms it. A council that finds a case contrary to the mandate records a void
+finding, which is itself a case.
+
+14.3 Convention. A case cited and verified past a set threshold without a failed citation
+becomes a convention: binding within its scope, and a candidate for promotion into a
+mechanism. Promotion into a hook, lint or handler check is a change to the station's
+code and goes through a pull request.
+
+14.4 Petition. The store raises a petition for amendment when a count crosses a
+threshold: the same question has reached the human repeatedly with the same ruling; a
+convention has held without exception for a set period; or a void finding shows an
+article and practice have diverged. A session may ask an arbiter to raise a petition
+early, and the arbiter may refuse. A petition is a decision packet carrying the proposed
+text as a diff, the cases that motivated it with their counts, the strongest dissent and
+the consequences. The human merges it as an amendment or rejects it; a rejection is
+recorded as a case stating that the mandate is silent there by design, and the same
+petition is not raised again without new evidence.
+
+14.5 Thresholds and periods in this article are set in the station's configuration,
+reported with every petition, and changed only by the operator.
