@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal;
+use nix::unistd::{tcsetpgrp, Pid};
 use serde::{Deserialize, Serialize};
 use tycho_types::agent_call::{HeartbeatCall, CONTEXT_TOKENS_MAX};
 use tycho_types::exit::ExitState;
@@ -33,8 +34,9 @@ use crate::exit_decode::{
 };
 pub use crate::launch_spec::{
     check_tier, check_vendor, core_uid_from_environment, take_spec, HeartbeatTarget, LaunchSpec,
-    LauncherSettings, SettingsError, AGENT_TELEMETRY_ENV, HEARTBEAT_TARGET_ENV,
-    SPEC_SCHEMA_VERSION, TIER_FLAG, VENDOR_SANDBOX_SETTINGS_ENV,
+    LauncherSettings, SettingsError, VendorTerminal, AGENT_TELEMETRY_ENV, HEARTBEAT_TARGET_ENV,
+    SPEC_SCHEMA_VERSION, TIER_FLAG, VENDOR_DIR_ENV, VENDOR_SANDBOX_SETTINGS_ENV,
+    VENDOR_TERMINAL_ENV,
 };
 use crate::process::{now_unix_ms, send};
 use crate::spool::{
@@ -375,15 +377,27 @@ impl<I: Ingress> Run<'_, I> {
         let environment = self
             .settings
             .vendor_environment(&self.files.progress, &self.files.result);
-        let mut command =
-            vendor_command(self.settings.session_leader.as_deref(), program, arguments);
-        let child = command
-            .env_clear()
-            .envs(environment)
-            .stdin(Stdio::null())
-            .stdout(create_new(&self.files.stdout)?)
-            .stderr(create_new(&self.files.stderr)?)
-            .spawn()?;
+        // An interactive vendor keeps the pty as its controlling terminal, which a new
+        // session would drop, so it runs in its own process group instead.
+        let leader = match self.settings.terminal {
+            VendorTerminal::Files => self.settings.session_leader.as_deref(),
+            VendorTerminal::Inherit => None,
+        };
+        let mut command = vendor_command(leader, program, arguments);
+        command.env_clear().envs(environment);
+        if let Some(dir) = &self.settings.vendor_dir {
+            command.current_dir(dir);
+        }
+        if self.settings.terminal == VendorTerminal::Files {
+            command
+                .stdin(Stdio::null())
+                .stdout(create_new(&self.files.stdout)?)
+                .stderr(create_new(&self.files.stderr)?);
+        }
+        let child = command.spawn()?;
+        if self.settings.terminal == VendorTerminal::Inherit {
+            self.hand_over_terminal(child.id());
+        }
         let record = VendorRecord {
             pid: child.id(),
             started_unix_ms: now_unix_ms(),
@@ -400,6 +414,22 @@ impl<I: Ingress> Run<'_, I> {
         self.log
             .line(&format!("vendor started as pid {}", record.pid));
         Ok(child)
+    }
+
+    /// Makes the vendor's group the pty's foreground group, so its reads are not stopped
+    /// with SIGTTIN; a read that raced the hand-over is resumed with SIGCONT.
+    fn hand_over_terminal(&mut self, pid: u32) {
+        let Ok(raw) = i32::try_from(pid) else {
+            self.log.line(&format!("vendor pid {pid} is not a pid"));
+            return;
+        };
+        if let Err(error) = tcsetpgrp(io::stdin(), Pid::from_raw(raw)) {
+            self.log
+                .line(&format!("terminal not handed to the vendor: {error}"));
+        }
+        if let Err(error) = send(pid, true, Signal::SIGCONT) {
+            self.log.line(&error);
+        }
     }
 
     fn supervise(&mut self, child: &mut Child, stop_flag: &AtomicBool) -> (ChildEnd, Stop) {

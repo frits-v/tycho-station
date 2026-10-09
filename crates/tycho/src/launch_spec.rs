@@ -42,6 +42,12 @@ pub const AGENT_TELEMETRY_ENV: [(&str, &str); 5] = [
 /// Claude Code reads its sandbox from settings, not the environment; the vendor adapter
 /// passes this JSON with `--settings`, which also overrides looser repository settings.
 pub const VENDOR_SANDBOX_SETTINGS_ENV: &str = "TYCHO_VENDOR_SANDBOX_SETTINGS";
+/// `files` (the default) or `inherit`: whether the vendor writes bounded files or owns the pty.
+pub const VENDOR_TERMINAL_ENV: &str = "TYCHO_VENDOR_TERMINAL";
+/// The vendor's working directory, absolute; unset keeps the launcher's own.
+pub const VENDOR_DIR_ENV: &str = "TYCHO_VENDOR_DIR";
+/// The terminal type an interactive vendor is told; the launcher itself runs under `env -i`.
+pub const VENDOR_TERM: &str = "xterm-256color";
 /// The names of the spec's environment that reach the vendor; everything else stays with
 /// the launcher.
 const VENDOR_SPEC_ENV: [&str; 2] = [ENV_SESSION_NAME, VENDOR_SANDBOX_SETTINGS_ENV];
@@ -49,6 +55,34 @@ const VENDOR_SPEC_ENV: [&str; 2] = [ENV_SESSION_NAME, VENDOR_SANDBOX_SETTINGS_EN
 const VENDOR_PROCESS_ENV: [&str; 2] = ["HOME", "PATH"];
 const GROUP_AND_OTHER_WRITE_BITS: u32 = 0o022;
 const STICKY_BIT: u32 = 0o1000;
+
+/// How the vendor's standard streams are wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VendorTerminal {
+    /// No input, output to bounded files: a headless vendor.
+    #[default]
+    Files,
+    /// The zmx pty for input and output: an interactive control session.
+    Inherit,
+}
+
+impl VendorTerminal {
+    #[must_use]
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Files => "files",
+            Self::Inherit => "inherit",
+        }
+    }
+
+    fn parse(value: Option<&str>) -> Result<Self, SettingsError> {
+        match value {
+            None | Some("files") => Ok(Self::Files),
+            Some("inherit") => Ok(Self::Inherit),
+            Some(_) => Err(SettingsError::Terminal),
+        }
+    }
+}
 
 /// Where heartbeats go; any other name is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +125,7 @@ pub enum SettingsError {
     TooLong(&'static str),
     NotAbsolute(&'static str),
     HeartbeatTarget,
+    Terminal,
     VendorArguments(String),
     Spec(String),
     Tier(String),
@@ -108,6 +143,7 @@ impl fmt::Display for SettingsError {
             }
             Self::NotAbsolute(name) => write!(formatter, "{name} is not an absolute path"),
             Self::HeartbeatTarget => write!(formatter, "{HEARTBEAT_TARGET_ENV} is not known"),
+            Self::Terminal => write!(formatter, "{VENDOR_TERMINAL_ENV} is not files or inherit"),
             Self::VendorArguments(reason) => write!(formatter, "vendor command: {reason}"),
             Self::Spec(reason) => write!(formatter, "launch spec: {reason}"),
             Self::Tier(tier) => write!(
@@ -127,6 +163,8 @@ pub struct LauncherSettings {
     pub dirs: AgentDirs,
     pub zmx: PathBuf,
     pub heartbeat: HeartbeatTarget,
+    pub terminal: VendorTerminal,
+    pub vendor_dir: Option<PathBuf>,
     /// The spec pairs on the vendor allowlist; never the awaitable id or the secret.
     pub vendor_env: Vec<(String, String)>,
     /// The routing tier from `--tier`, handed to the vendor as `TYCHO_TIER`.
@@ -180,6 +218,13 @@ impl LauncherSettings {
         let zmx = absolute(environment, ZMX_ENV)?;
         let heartbeat =
             HeartbeatTarget::parse(environment.get(HEARTBEAT_TARGET_ENV).map(String::as_str))?;
+        let terminal =
+            VendorTerminal::parse(environment.get(VENDOR_TERMINAL_ENV).map(String::as_str))?;
+        let vendor_dir = if environment.contains_key(VENDOR_DIR_ENV) {
+            Some(absolute(environment, VENDOR_DIR_ENV)?)
+        } else {
+            None
+        };
         let allowed = |name: &str| {
             VENDOR_SPEC_ENV.contains(&name)
                 || AGENT_TELEMETRY_ENV
@@ -196,6 +241,8 @@ impl LauncherSettings {
             dirs,
             zmx,
             heartbeat,
+            terminal,
+            vendor_dir,
             vendor_env,
             tier: None,
             wall_clock: WALL_CLOCK_MAX,
@@ -205,7 +252,8 @@ impl LauncherSettings {
     }
 
     /// The vendor's whole environment: the allowlisted spec pairs, `HOME` and `PATH` from the
-    /// launcher, the tier, and the two files the vendor may write.
+    /// launcher, the user name, the terminal type when the vendor owns the pty, the tier, and
+    /// the two files the vendor may write.
     #[must_use]
     pub fn vendor_environment(&self, progress: &Path, result: &Path) -> Vec<(String, String)> {
         let mut pairs = self.vendor_env.clone();
@@ -213,6 +261,14 @@ impl LauncherSettings {
             if let Ok(value) = std::env::var(name) {
                 pairs.push((name.to_string(), value));
             }
+        }
+        // Claude Code finds its keychain login by USER; under `env -i` it reports no login.
+        if let Some(user) = current_user_name() {
+            pairs.push(("USER".to_string(), user.clone()));
+            pairs.push(("LOGNAME".to_string(), user));
+        }
+        if self.terminal == VendorTerminal::Inherit {
+            pairs.push(("TERM".to_string(), VENDOR_TERM.to_string()));
         }
         if let Some(tier) = &self.tier {
             pairs.push((TIER_ENV.to_string(), tier.clone()));
@@ -224,6 +280,15 @@ impl LauncherSettings {
         pairs.push((RESULT_FILE_ENV.to_string(), result.display().to_string()));
         pairs
     }
+}
+
+/// The name of the user the launcher runs as, from the password database, never the environment.
+#[must_use]
+pub fn current_user_name() -> Option<String> {
+    nix::unistd::User::from_uid(nix::unistd::Uid::current())
+        .ok()
+        .flatten()
+        .map(|user| user.name)
 }
 
 /// The spawn step's hand-off, through a file because a typed line is cut at 1024 bytes.
@@ -445,18 +510,58 @@ pub mod tests {
             "ENTIRE_NO_AUTO_UPDATE",
             "ENTIRE_TELEMETRY_OPTOUT",
             "HOME",
+            "LOGNAME",
             "PATH",
             "TYCHO_PROGRESS_FILE",
             "TYCHO_RESULT_FILE",
             "TYCHO_SESSION_NAME",
             "TYCHO_TIER",
             "TYCHO_VENDOR_SANDBOX_SETTINGS",
+            "USER",
         ];
         expected.sort_unstable();
         assert_eq!(names, expected);
         assert!(!pairs
             .iter()
             .any(|(_, value)| value == SECRET || value == "sign_1abc"));
+    }
+
+    #[test]
+    fn an_interactive_vendor_gets_the_terminal_type_and_its_directory() {
+        let mut environment = environment(Path::new("/agent"));
+        let files = LauncherSettings::from_map(&environment).unwrap();
+        assert_eq!(files.terminal, VendorTerminal::Files);
+        assert_eq!(files.vendor_dir, None);
+        let pairs = files.vendor_environment(Path::new("/p"), Path::new("/r"));
+        assert!(!pairs.iter().any(|(name, _)| name == "TERM"));
+        environment.insert(VENDOR_TERMINAL_ENV.to_string(), "inherit".to_string());
+        environment.insert(VENDOR_DIR_ENV.to_string(), "/work/unit".to_string());
+        let inherit = LauncherSettings::from_map(&environment).unwrap();
+        assert_eq!(inherit.terminal, VendorTerminal::Inherit);
+        assert_eq!(inherit.vendor_dir, Some(PathBuf::from("/work/unit")));
+        let pairs = inherit.vendor_environment(Path::new("/p"), Path::new("/r"));
+        assert!(pairs.contains(&("TERM".to_string(), VENDOR_TERM.to_string())));
+        assert!(!pairs.iter().any(|(name, _)| name == VENDOR_DIR_ENV));
+        environment.insert(VENDOR_TERMINAL_ENV.to_string(), "pty".to_string());
+        assert!(matches!(
+            LauncherSettings::from_map(&environment),
+            Err(SettingsError::Terminal)
+        ));
+        environment.insert(VENDOR_TERMINAL_ENV.to_string(), "inherit".to_string());
+        environment.insert(VENDOR_DIR_ENV.to_string(), "work".to_string());
+        assert!(matches!(
+            LauncherSettings::from_map(&environment),
+            Err(SettingsError::NotAbsolute(VENDOR_DIR_ENV))
+        ));
+    }
+
+    #[test]
+    fn the_user_name_comes_from_the_password_database() {
+        let settings = LauncherSettings::from_map(&environment(Path::new("/agent"))).unwrap();
+        let pairs = settings.vendor_environment(Path::new("/p"), Path::new("/r"));
+        let user = current_user_name().unwrap();
+        assert!(pairs.contains(&("USER".to_string(), user.clone())));
+        assert!(pairs.contains(&("LOGNAME".to_string(), user)));
     }
 
     #[test]

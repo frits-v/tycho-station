@@ -11,7 +11,7 @@ use std::io::Write;
 use crate::agent_files::open_append;
 use crate::config::{AgentDirs, LOG_DIR};
 use crate::kill::{kill_by_name, kill_session, KillReport, KillRequest};
-use crate::launch_spec::HeartbeatTarget;
+use crate::launch_spec::{HeartbeatTarget, VendorTerminal};
 use crate::private_dir;
 use crate::process::now_unix_ms;
 use crate::services::spawner::{LeaseRead, SpawnSpec, Spawner, SpawnerError};
@@ -99,6 +99,8 @@ impl Spawner for LauncherSpawner {
             vendor,
             agent_uid: self.agent_uid,
             tier,
+            terminal: VendorTerminal::Files,
+            vendor_dir: None,
         })
         .and_then(spawned_pid)
     }
