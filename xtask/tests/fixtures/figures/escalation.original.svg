@@ -1,0 +1,23 @@
+<svg viewBox="0 0 960 440" role="img" aria-label="Escalation ladder from worker to control session to parent to human, with the give-up rule at each rung">
+  <defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--line-strong)"/></marker></defs>
+  <rect class="box" x="20" y="360" width="300" height="56" rx="6"/><text class="t b" x="36" y="384">Worker</text><text class="t m" x="36" y="402">implements; may not rule</text>
+  <rect class="box accent" x="20" y="250" width="300" height="56" rx="6"/><text class="t b" x="36" y="274">Control session, arbiter L1</text><text class="t m" x="36" y="292">rules alone or convenes a council</text>
+  <rect class="box accent" x="20" y="140" width="300" height="56" rx="6"/><text class="t b" x="36" y="164">Parent control, arbiter L2 .. root</text><text class="t m" x="36" y="182">same steps, wider scope</text>
+  <rect class="box" x="20" y="30" width="300" height="56" rx="6"/><text class="t b" x="36" y="54">Human</text><text class="t m" x="36" y="72">decision packet in; binding case out</text>
+  <path class="ln" marker-end="url(#ah2)" d="M170 360 L170 306"/>
+  <path class="ln" marker-end="url(#ah2)" d="M170 250 L170 196"/>
+  <path class="ln" marker-end="url(#ah2)" d="M170 140 L170 86"/>
+  <text class="t m" x="350" y="54">GIVE-UP RULE TO REACH THIS RUNG</text>
+  <text class="t" x="350" y="76">Council failed, or authority reserved to the human: spend, external</text>
+  <text class="t" x="350" y="94">commitments, data deletion, epic scope, hook-marked human-only, or the</text>
+  <text class="t" x="350" y="112">ruling would overrule a human case.</text>
+  <text class="t" x="350" y="164">Council failed (no quorum, or an unrefuted blocking dissent), or the</text>
+  <text class="t" x="350" y="182">question crosses the work unit boundary: other worktrees, shared</text>
+  <text class="t" x="350" y="200">interfaces, epic acceptance criteria, budget.</text>
+  <text class="t" x="350" y="274">Blocker reproduced; at least two distinct attempts logged with outcomes;</text>
+  <text class="t" x="350" y="292">case law queried; question typed with options. Immediate if outside</text>
+  <text class="t" x="350" y="310">worker authority: scope, interface, irreversible action, security.</text>
+  <text class="t m" x="350" y="384">AT EVERY ARBITER</text>
+  <text class="t" x="350" y="402">1 empirical: probe   2 fresh binding precedent: cite   3 no council trigger: rule alone   4 else council</text>
+  <text class="t m" x="350" y="424">An escalation with no proposed ruling is sent back down. Unpicked escalations move up after a timeout, with a cap.</text>
+</svg>

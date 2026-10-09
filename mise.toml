@@ -11,6 +11,7 @@ entire = "0.11.4"
 release-plz = "0.3.170"
 cargo-dist = "0.33.0"
 gh = "2.102.0"
+"cargo:https://github.com/frits-v/stencil" = { version = "rev:bd567cfc6127f526bef4ccd70215ea11ee4518cb", crate = "stencil-cli", bin = "stencil", locked = true }
 
 [tasks.ci]
 description = "Format check, lints, tests, and the pull request title check when run in CI"
