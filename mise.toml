@@ -1,5 +1,5 @@
 [tools]
-rust = "1.94"
+rust = { version = "1.94", components = "rustfmt,clippy" }
 lefthook = "2.2.0"
 
 [tasks.ci]
