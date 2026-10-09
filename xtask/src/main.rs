@@ -14,6 +14,7 @@ use std::process::{Command, ExitStatus, Output};
 
 mod app_token;
 mod config;
+mod credentials;
 mod figures;
 mod process;
 mod release;
@@ -31,7 +32,7 @@ const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
 const DOC_DIRS: [&str; 1] = ["docs"];
 const RULES_DIR: &str = ".claude/rules";
 const RULE_MAX_LINES: usize = 24;
-const COMMANDS: [(&str, &str); 15] = [
+const COMMANDS: [(&str, &str); 16] = [
     (
         "ci",
         "format check, clippy, tests, the repository checks, workflow lints, PR title",
@@ -52,6 +53,10 @@ const COMMANDS: [(&str, &str); 15] = [
     (
         "check-rules",
         "rule files carry paths frontmatter and stay short",
+    ),
+    (
+        "check-credentials",
+        "no user token named in code, configuration or documents",
     ),
     (
         "render-figures",
@@ -261,6 +266,7 @@ fn ci() -> i32 {
         check_names,
         check_comments,
         check_rules,
+        credentials::check_credentials,
         figures::check_figures,
         config::check_config,
     ] {
@@ -534,6 +540,11 @@ fn hook_post_tool_use() -> i32 {
         Some("md") => {
             check_comments();
             check_rules();
+            credentials::check_credentials();
+            0
+        }
+        Some("yml" | "yaml" | "toml") => {
+            credentials::check_credentials();
             0
         }
         _ => 0,
@@ -561,6 +572,7 @@ fn hook_rust(path: &str) -> i32 {
         println!("xtask hook: {path} formatted, clippy clean");
         check_names();
         check_comments();
+        credentials::check_credentials();
         return 0;
     }
     let report = String::from_utf8_lossy(&output.stderr);
@@ -596,6 +608,7 @@ fn main() {
         Some("check-names") => check_names(),
         Some("check-comments") => check_comments(),
         Some("check-rules") => check_rules(),
+        Some("check-credentials") => credentials::check_credentials(),
         Some("render-figures") => figures::render_figures(),
         Some("check-figures") => figures::check_figures(),
         Some("check-config") => config::check_config(),

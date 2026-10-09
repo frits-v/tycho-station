@@ -50,3 +50,9 @@ check is not repeated in any instruction file. "review" means a reader rejects i
 | Workflow files pass zizmor pedantic and actionlint; actions pinned by commit | `xtask ci`, lefthook pre-push |
 | Figures are stencil documents authored in CUE under `figures/`, rendered to `docs/figures/` and the design page, and checked in ci | `xtask check-figures` (`cue vet`, `stencil check`, byte comparison) in ci and the post-edit hook; `xtask render-figures` writes them |
 | Rule files carry `paths` frontmatter and stay short | `xtask check-rules` |
+
+## Credentials
+
+| Rule | Enforced by |
+|---|---|
+| No personal access tokens; a credential is the shortest-lived and narrowest the task allows, issued to the station's own identity | `xtask check-credentials` (markers `personal access token`, `fine-grained token`, `ghp_`, `github_pat_`, `RELEASE_PLZ_TOKEN` over `.github/`, `docs/`, `mise.toml`, `xtask/src`, `crates/`) in ci and the post-edit hook; review for lifetime and scope |
