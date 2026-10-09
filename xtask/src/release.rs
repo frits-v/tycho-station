@@ -1,11 +1,13 @@
 //! Release commands: release pull requests and tags through release-plz, binaries through dist.
 
 use std::env;
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::app_token::{self, AppCredentials, Repository, APP_ID_VARIABLE, APP_KEY_VARIABLE};
 use crate::process::{run_bounded, Captured, Exit};
 use std::time::Duration;
 
@@ -18,7 +20,6 @@ const REPORT_MAX_LINES: usize = 80;
 const ARTIFACTS_MAX: usize = 32;
 const TAG_MAX_CHARS: usize = 32;
 const RELEASED_PACKAGE: &str = "tycho";
-const RELEASE_TOKEN_VARIABLE: &str = "RELEASE_PLZ_TOKEN";
 const DRY_RUN_DIR: &str = "target/release-dry-run";
 const DISTRIB_DIR: &str = "target/distrib";
 const MACOS_TARGETS: [&str; 2] = ["aarch64-apple-darwin", "x86_64-apple-darwin"];
@@ -232,24 +233,23 @@ fn valid_tag(tag: &str) -> bool {
             .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
-fn release_pr_token(value: Option<String>) -> Result<String, String> {
-    match value {
-        Some(token) if !token.trim().is_empty() => Ok(token),
-        _ => Err(format!(
-            "{RELEASE_TOKEN_VARIABLE} is not set. The release pull request needs a token whose \
-             pull requests trigger ci: create a fine-grained token for this repository with \
-             Contents and Pull requests read and write, and store it as the repository secret \
-             {RELEASE_TOKEN_VARIABLE} (Releases in docs/process.md)"
-        )),
-    }
+fn release_pr_inputs() -> Result<(AppCredentials, Repository), String> {
+    let credentials = app_token::read_credentials(
+        env::var(APP_ID_VARIABLE).ok(),
+        env::var(APP_KEY_VARIABLE).ok(),
+    )?;
+    let repository = app_token::read_repository(env::var("GITHUB_REPOSITORY").ok())?;
+    Ok((credentials, repository))
 }
 
-/// `xtask release-pr`: opens or updates the release pull request.
+/// `xtask release-pr`: opens or updates the release pull request with an App installation token.
 pub fn release_pr(dry_run: bool) -> i32 {
     if dry_run {
         return release_pr_dry_run();
     }
-    let token = match release_pr_token(env::var(RELEASE_TOKEN_VARIABLE).ok()) {
+    let token = match release_pr_inputs()
+        .and_then(|(credentials, repository)| app_token::mint(&credentials, &repository))
+    {
         Ok(token) => token,
         Err(reason) => {
             eprintln!("xtask release-pr: {reason}");
@@ -257,11 +257,34 @@ pub fn release_pr(dry_run: bool) -> i32 {
         }
     };
     let captured = run_bounded(
-        Command::new("release-plz")
-            .args(["release-pr", "--output", "json"])
-            .env("GIT_TOKEN", token),
+        release_plz_command(&["release-pr", "--output", "json"], env::vars_os())
+            .env("GIT_TOKEN", token.expose()),
         RELEASE_PLZ_TIMEOUT,
     );
+    let code = report_release_pr(captured);
+    match app_token::revoke(&token) {
+        Ok(()) => code,
+        Err(reason) => {
+            eprintln!("xtask release-pr: {reason}");
+            1
+        }
+    }
+}
+
+/// release-plz and the cargo and git processes it starts never see the App id or key.
+fn release_plz_command(
+    args: &[&str],
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Command {
+    let mut command = Command::new("release-plz");
+    command
+        .args(args)
+        .env_clear()
+        .envs(app_token::without_app_credentials(parent));
+    command
+}
+
+fn report_release_pr(captured: Captured) -> i32 {
     match decode_release_pr(captured.exit, &captured.stdout) {
         ReleasePrOutcome::Opened { number, url } => {
             println!("xtask release-pr: release pull request #{number} at {url}");
@@ -334,10 +357,9 @@ fn release_pr_dry_run() -> i32 {
 }
 
 fn dry_run_in(scratch: &Path) -> i32 {
-    let mut update = Command::new("release-plz");
-    update.current_dir(scratch).arg("update");
-    let token = env::var(RELEASE_TOKEN_VARIABLE).or_else(|_| env::var("GITHUB_TOKEN"));
-    if let Ok(token) = token {
+    let mut update = release_plz_command(&["update"], env::vars_os());
+    update.current_dir(scratch);
+    if let Ok(token) = env::var("GITHUB_TOKEN") {
         update.env("GIT_TOKEN", token);
     }
     let updated = run_bounded(&mut update, RELEASE_PLZ_TIMEOUT);
@@ -706,6 +728,41 @@ mod tests {
     }
 
     #[test]
+    fn release_plz_never_receives_the_app_credentials() {
+        let parent: Vec<(OsString, OsString)> = [
+            ("PATH", "/usr/bin"),
+            (APP_ID_VARIABLE, "1"),
+            (APP_KEY_VARIABLE, "key-material"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect();
+        let command = release_plz_command(&["release-pr"], parent);
+        let names: Vec<&std::ffi::OsStr> = command.get_envs().map(|(name, _)| name).collect();
+        assert_eq!(names, [std::ffi::OsStr::new("PATH")]);
+    }
+
+    #[test]
+    fn the_step_holding_the_app_key_runs_a_built_binary_not_a_build() {
+        let workflow = include_str!("../../.github/workflows/release.yml");
+        let lines: Vec<&str> = workflow.lines().collect();
+        let key_lines: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains(&format!("secrets.{APP_KEY_VARIABLE}")))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(key_lines.len(), 1, "{key_lines:?}");
+        let step_run = key_lines
+            .first()
+            .and_then(|key| lines.get(..*key))
+            .and_then(|before| before.iter().rev().find(|line| line.contains("run:")))
+            .map(|line| line.trim());
+        assert_eq!(step_run, Some("- run: target/debug/xtask release-pr"));
+        assert!(workflow.contains("- run: cargo build --locked -p xtask"));
+    }
+
+    #[test]
     fn tags_are_versions_only() {
         assert!(valid_tag("v0.1.0"));
         assert!(valid_tag("v12.0.31"));
@@ -720,12 +777,5 @@ mod tests {
         ] {
             assert!(!valid_tag(bad), "{bad}");
         }
-    }
-
-    #[test]
-    fn release_pr_refuses_a_missing_token() {
-        assert!(release_pr_token(None).is_err());
-        assert!(release_pr_token(Some("  ".into())).is_err());
-        assert_eq!(release_pr_token(Some("t".into())), Ok("t".into()));
     }
 }

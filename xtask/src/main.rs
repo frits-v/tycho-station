@@ -12,7 +12,9 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output};
 
+mod app_token;
 mod config;
+mod credentials;
 mod figures;
 mod process;
 mod release;
@@ -30,7 +32,7 @@ const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
 const DOC_DIRS: [&str; 1] = ["docs"];
 const RULES_DIR: &str = ".claude/rules";
 const RULE_MAX_LINES: usize = 24;
-const COMMANDS: [(&str, &str); 15] = [
+const COMMANDS: [(&str, &str); 16] = [
     (
         "ci",
         "format check, clippy, tests, the repository checks, workflow lints, PR title",
@@ -51,6 +53,10 @@ const COMMANDS: [(&str, &str); 15] = [
     (
         "check-rules",
         "rule files carry paths frontmatter and stay short",
+    ),
+    (
+        "check-credentials",
+        "no user token named in any file git tracks",
     ),
     (
         "render-figures",
@@ -260,6 +266,7 @@ fn ci() -> i32 {
         check_names,
         check_comments,
         check_rules,
+        credentials::check_credentials,
         figures::check_figures,
         config::check_config,
     ] {
@@ -437,16 +444,21 @@ fn rule_defects(path: &Path, text: &str) -> Vec<String> {
 }
 
 fn finish(name: &str, examined: usize, defects: &[String]) -> i32 {
+    finish_with_note(name, examined, "", defects)
+}
+
+/// `note` follows the examined count in the summary, for what a check counted but skipped.
+fn finish_with_note(name: &str, examined: usize, note: &str, defects: &[String]) -> i32 {
     if examined == 0 {
-        eprintln!("xtask {name}: examined 0 files; a check over nothing is a failure");
+        eprintln!("xtask {name}: examined 0 files{note}; a check over nothing is a failure");
         return 1;
     }
     if defects.is_empty() {
-        println!("xtask {name}: examined {examined} files, no defects");
+        println!("xtask {name}: examined {examined} files{note}, no defects");
         return 0;
     }
     eprintln!(
-        "xtask {name}: examined {examined} files, {} defects",
+        "xtask {name}: examined {examined} files{note}, {} defects",
         defects.len()
     );
     for defect in defects.iter().take(HOOK_REPORT_MAX_LINES) {
@@ -522,6 +534,7 @@ fn hook_post_tool_use() -> i32 {
     let Some(path) = edited_file() else {
         return 0;
     };
+    credentials::check_credentials();
     let extension = Path::new(&path).extension().and_then(OsStr::to_str);
     match extension {
         Some("rs") => hook_rust(&path),
@@ -595,6 +608,7 @@ fn main() {
         Some("check-names") => check_names(),
         Some("check-comments") => check_comments(),
         Some("check-rules") => check_rules(),
+        Some("check-credentials") => credentials::check_credentials(),
         Some("render-figures") => figures::render_figures(),
         Some("check-figures") => figures::check_figures(),
         Some("check-config") => config::check_config(),

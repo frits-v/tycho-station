@@ -21,7 +21,7 @@ is a defect.
 | Layer | Location | Runs |
 |---|---|---|
 | Lints | `Cargo.toml` `[workspace.lints]`, `clippy.toml` | every build, ci, post-edit hook |
-| Repository checks | `xtask` (`check-names`, `check-comments`, `check-rules`, `check-figures`, `check-config`, `check-commit-msg`, `check-pr-title`) | ci, post-edit hook, lefthook |
+| Repository checks | `xtask` (`check-names`, `check-comments`, `check-rules`, `check-credentials`, `check-figures`, `check-config`, `check-commit-msg`, `check-pr-title`) | ci, post-edit hook, lefthook |
 | Git hooks | `lefthook.json` | commit-msg, pre-commit, pre-push |
 | Host rules | repository ruleset on the default branch | every push and merge |
 | Agent hooks | `.claude/settings.json` | after Edit and Write |
@@ -67,13 +67,60 @@ The `release` workflow runs on every push to the default branch, through the xta
 release-plz writes the release pull request's commit through the GitHub API, so GitHub
 signs it. The pull request still needs `ci`, a required check. A pull request opened with
 the workflow's own `GITHUB_TOKEN` waits for a writer to approve its workflow runs on every
-update, and release-plz updates it on every push, so the job uses a separate token:
+update, and release-plz updates it on every push, so the `release-pr` job opens it with a
+GitHub App installation token that the xtask mints for each run:
 
-- `RELEASE_PLZ_TOKEN`: a fine-grained personal access token for this repository only,
-  with Contents and Pull requests read and write, stored as a repository secret. Without
-  it the `release-pr` job fails and names the secret.
-- Rotation: create the replacement before the expiry date, then
-  `gh secret set RELEASE_PLZ_TOKEN -R frits-v/tycho-station`, then revoke the old token.
-- A GitHub App installation token is the intended replacement: a bot author and
-  short-lived tokens. It needs the token minted in the xtask, since no marketplace action
-  beyond checkout and mise setup is used.
+- The xtask signs an RS256 JWT with the App's private key (`iat` sixty seconds in the
+  past, `exp` ten minutes after `iat`), looks up the App's installation on this
+  repository, and requests an installation token limited to this repository and to
+  Contents and Pull requests write. A token whose grant is wider, or whose grant the
+  response does not state, it refuses and revokes. The token reaches release-plz as
+  `GIT_TOKEN` in its environment and is revoked when release-plz exits. The key, the JWT
+  and the token never appear in arguments, output, errors or child environments: gh runs
+  in a new empty private directory that is also its `GH_CONFIG_DIR`, with `PATH`,
+  `TMPDIR` and the locale from the job, telemetry off and the credential in `GH_TOKEN`;
+  release-plz and the processes it starts get the job's environment without the App id
+  and key.
+- The workflow builds the xtask in a step without the key, then runs the built binary in
+  the step that holds it, so no build script or proc-macro inherits the key. A build
+  script in the build step can still write `$GITHUB_ENV` or replace `target/debug/xtask`,
+  and the next step would run with that environment or binary and the key. Closing that
+  takes a separate build job that passes the binary to the release job as an artifact
+  checked against its digest; the workflow does not do that.
+- A failed revocation fails the job. A run cancelled between minting and revoking, or a
+  token request that ends timed out or over its output cap after GitHub issued the token,
+  leaves the token valid until GitHub expires it, one hour after it was issued.
+- The release pull request's author is the App's bot account (`<app-name>[bot]`), not a
+  person. The merge gate and any ruleset that names authors or bypass actors see that
+  identity.
+- Setup, once: create a GitHub App owned by the operator's account with webhooks off,
+  repository permissions Contents and Pull requests set to read and write and nothing
+  else, installable only on this account. Install it on this repository only. Create the
+  `release` environment limited to the default branch, so a workflow on any other branch
+  cannot read its secret. Generate a private key, then store the App id and the key in
+  the environment and delete the downloaded file:
+
+  ```sh
+  gh api -X PUT repos/frits-v/tycho-station/environments/release \
+    -F 'deployment_branch_policy[protected_branches]=false' \
+    -F 'deployment_branch_policy[custom_branch_policies]=true'
+  gh api -X POST repos/frits-v/tycho-station/environments/release/deployment-branch-policies \
+    -f name=main -f type=branch
+  gh variable set TYCHO_RELEASE_APP_ID -R frits-v/tycho-station --env release --body <app-id>
+  gh secret set TYCHO_RELEASE_APP_PRIVATE_KEY -R frits-v/tycho-station --env release < key.pem
+  rm key.pem
+  ```
+
+  Then delete any repository secret that holds a user token for this workflow, and revoke
+  that token in the account settings of the user who issued it.
+
+- Rotation: generate a new private key in the App settings, store it with the same
+  `gh secret set` command, delete the local file, then delete the old key in the App
+  settings. The next `release-pr` run uses the new key.
+- The first run that names the `release` environment creates it without a branch policy
+  if it does not exist yet; the `PUT` above sets the policy either way. Until the variable
+  and the secret exist in it, the `release-pr` job fails with a message naming both and
+  this section; the `release` and `binaries` jobs use the
+  workflow's own `GITHUB_TOKEN` and are unaffected. A key that does not belong to the App
+  id, or an App not installed on this repository, fails the installation lookup with
+  GitHub's message.

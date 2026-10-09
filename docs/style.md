@@ -8,6 +8,7 @@ check is not repeated in any instruction file. "review" means a reader rejects i
 | Rule | Enforced by |
 |---|---|
 | Stability over performance over convenience; the trade-off is named when it comes up | review |
+| Security over convenience: where options differ in security, the most secure one that does the work is taken and the trade-off named | review |
 | No `unsafe` | `unsafe_code = "forbid"` |
 | Every `Result` handled; no `unwrap`, `expect`, `panic`, `todo`, `unimplemented` outside tests | clippy `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `let_underscore_must_use` |
 | No slice indexing; use `get` | clippy `indexing_slicing` |
@@ -49,3 +50,9 @@ check is not repeated in any instruction file. "review" means a reader rejects i
 | Workflow files pass zizmor pedantic and actionlint; actions pinned by commit | `xtask ci`, lefthook pre-push |
 | Figures are stencil documents authored in CUE under `figures/`, rendered to `docs/figures/` and the design page, and checked in ci | `xtask check-figures` (`cue vet`, `stencil check`, byte comparison) in ci and the post-edit hook; `xtask render-figures` writes them |
 | Rule files carry `paths` frontmatter and stay short | `xtask check-rules` |
+
+## Credentials
+
+| Rule | Enforced by |
+|---|---|
+| No personal access tokens; a credential is the shortest-lived and narrowest the task allows, issued to the station's own identity | `xtask check-credentials` (markers `personal access token`, `fine-grained token`, `classic token`, `gh auth token`, `ghp_`, `gho_`, `ghu_`, `ghr_`, `github_pat_`, `RELEASE_PLZ_TOKEN`, case-insensitive, with whitespace, no-break spaces, zero-width and soft-hyphen characters and their HTML entities removed before matching, over every file `git ls-files` lists or would list that holds no NUL byte, binary files counted, minus the check's own source, this row and the exact lines of mandate clause 7.4) in ci and the post-edit hook; review for lifetime and scope |
