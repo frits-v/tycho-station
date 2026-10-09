@@ -2,11 +2,15 @@
 //! "Operator prerequisites"). `run` never creates anything; a human with sudo or an
 //! account login does that. It only reports what it finds, and a probe that cannot run
 //! is `Unreachable`, never guessed as `Missing` or `Present`.
+//!
+//! Each check belongs to one side. Run as the developer, the command checks the
+//! developer side and defers the agent side; run as `tycho-agent`, the reverse. The
+//! machine is prepared when both runs exit 0.
 
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -29,11 +33,311 @@ const _: () = assert!(AGENT_SOCKET_DIR.len() <= SOCKET_DIR_MAX_BYTES);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_OUTPUT_MAX_BYTES: usize = 1 << 17;
 const CREDENTIAL_FILE_MAX_BYTES: u64 = 1 << 16;
+/// `security find-*-password` exit code when no item matches.
+const SECURITY_ITEM_NOT_FOUND_EXIT: i32 = 44;
+/// `dsmemberutil checkmembership` exit code when the user or group does not exist.
+const DSMEMBERUTIL_NOT_FOUND_EXIT: i32 = 7;
+/// `claude auth status` exit code when no login is stored.
+const CLAUDE_LOGGED_OUT_EXIT: i32 = 1;
 
 fn workspace_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap_or_else(|| Path::new("."))
+}
+
+/// Who a check can be performed as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Developer,
+    Agent,
+}
+
+impl Side {
+    const fn other(self) -> Self {
+        match self {
+            Self::Developer => Self::Agent,
+            Self::Agent => Self::Developer,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Developer => "developer",
+            Self::Agent => "agent",
+        }
+    }
+
+    const fn run_as(self) -> &'static str {
+        match self {
+            Self::Developer => "the developer",
+            Self::Agent => AGENT_USER_NAME,
+        }
+    }
+}
+
+fn mode_for(username: &str) -> Side {
+    if username == AGENT_USER_NAME {
+        Side::Agent
+    } else {
+        Side::Developer
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Check {
+    AgentUserExists,
+    SharedGroupExists,
+    DeveloperInSharedGroup,
+    AgentDirExists,
+    AgentDirIsDirectory,
+    AgentDirOwnerUid,
+    AgentDirOwnerGid,
+    AgentDirMode,
+    CoreDirFitsBudget,
+    CoreDirExists,
+    CoreDirIsDirectory,
+    CoreDirOwnerUid,
+    CoreDirMode,
+    PinZmx,
+    PinRestate,
+    PinRestateServer,
+    PinClaude,
+    PinCodex,
+    PinEntire,
+    PinCue,
+    EntireLogin,
+    AgentInSharedGroup,
+    CredentialSsh,
+    CredentialGh,
+    CredentialAws,
+    CredentialNetrc,
+    CredentialGitconfig,
+    KeychainGithub,
+    KeychainGitlab,
+    KeychainAws,
+    KeychainSsh,
+    KeychainGhCli,
+    ReadOnlyClaudeSettings,
+    ReadOnlyCodexConfig,
+    ReadOnlyZshenv,
+    ReadOnlyZprofile,
+    ReadOnlyZshrc,
+    ClaudeLogin,
+    CodexLogin,
+}
+
+#[derive(Debug)]
+struct CheckSpec {
+    check: Check,
+    name: &'static str,
+    side: Side,
+}
+
+const fn spec(check: Check, name: &'static str, side: Side) -> CheckSpec {
+    CheckSpec { check, name, side }
+}
+
+/// Every check, in print order; each one runs on exactly one side.
+const CATALOGUE: [CheckSpec; 39] = [
+    spec(Check::AgentUserExists, "agent user exists", Side::Developer),
+    spec(
+        Check::SharedGroupExists,
+        "shared group exists",
+        Side::Developer,
+    ),
+    spec(
+        Check::DeveloperInSharedGroup,
+        "developer is a member of the shared group",
+        Side::Developer,
+    ),
+    spec(
+        Check::AgentDirExists,
+        "agent socket directory: exists",
+        Side::Developer,
+    ),
+    spec(
+        Check::AgentDirIsDirectory,
+        "agent socket directory: is a directory",
+        Side::Developer,
+    ),
+    spec(
+        Check::AgentDirOwnerUid,
+        "agent socket directory: owner uid",
+        Side::Developer,
+    ),
+    spec(
+        Check::AgentDirOwnerGid,
+        "agent socket directory: owner gid",
+        Side::Developer,
+    ),
+    spec(
+        Check::AgentDirMode,
+        "agent socket directory: mode",
+        Side::Developer,
+    ),
+    spec(
+        Check::CoreDirFitsBudget,
+        "core socket directory: path fits the socket budget",
+        Side::Developer,
+    ),
+    spec(
+        Check::CoreDirExists,
+        "core socket directory: exists",
+        Side::Developer,
+    ),
+    spec(
+        Check::CoreDirIsDirectory,
+        "core socket directory: is a directory",
+        Side::Developer,
+    ),
+    spec(
+        Check::CoreDirOwnerUid,
+        "core socket directory: owner uid",
+        Side::Developer,
+    ),
+    spec(
+        Check::CoreDirMode,
+        "core socket directory: mode",
+        Side::Developer,
+    ),
+    spec(
+        Check::PinZmx,
+        "zmx resolves through mise at the pinned version",
+        Side::Developer,
+    ),
+    spec(
+        Check::PinRestate,
+        "restate resolves through mise at the pinned version",
+        Side::Developer,
+    ),
+    spec(
+        Check::PinRestateServer,
+        "restate-server resolves through mise at the pinned version",
+        Side::Developer,
+    ),
+    spec(
+        Check::PinClaude,
+        "claude resolves through mise at the pinned version",
+        Side::Developer,
+    ),
+    spec(
+        Check::PinCodex,
+        "codex resolves through mise at the pinned version",
+        Side::Developer,
+    ),
+    spec(
+        Check::PinEntire,
+        "entire resolves through mise at the pinned version",
+        Side::Developer,
+    ),
+    spec(
+        Check::PinCue,
+        "cue resolves through mise at the pinned version",
+        Side::Developer,
+    ),
+    spec(
+        Check::EntireLogin,
+        "entire logged in as the developer",
+        Side::Developer,
+    ),
+    spec(
+        Check::AgentInSharedGroup,
+        "agent user is a member of the shared group",
+        Side::Agent,
+    ),
+    spec(
+        Check::CredentialSsh,
+        "agent credential: ~/.ssh",
+        Side::Agent,
+    ),
+    spec(
+        Check::CredentialGh,
+        "agent credential: ~/.config/gh",
+        Side::Agent,
+    ),
+    spec(
+        Check::CredentialAws,
+        "agent credential: ~/.aws",
+        Side::Agent,
+    ),
+    spec(
+        Check::CredentialNetrc,
+        "agent credential: ~/.netrc",
+        Side::Agent,
+    ),
+    spec(
+        Check::CredentialGitconfig,
+        "agent credential: gitconfig credential helper",
+        Side::Agent,
+    ),
+    spec(
+        Check::KeychainGithub,
+        "agent keychain: no item for github.com",
+        Side::Agent,
+    ),
+    spec(
+        Check::KeychainGitlab,
+        "agent keychain: no item for gitlab.com",
+        Side::Agent,
+    ),
+    spec(
+        Check::KeychainAws,
+        "agent keychain: no item for aws",
+        Side::Agent,
+    ),
+    spec(
+        Check::KeychainSsh,
+        "agent keychain: no item for ssh",
+        Side::Agent,
+    ),
+    spec(
+        Check::KeychainGhCli,
+        "agent keychain: no item for gh:github.com",
+        Side::Agent,
+    ),
+    spec(
+        Check::ReadOnlyClaudeSettings,
+        "agent read-only file: ~/.claude/settings.json",
+        Side::Agent,
+    ),
+    spec(
+        Check::ReadOnlyCodexConfig,
+        "agent read-only file: ~/.codex/config.toml",
+        Side::Agent,
+    ),
+    spec(
+        Check::ReadOnlyZshenv,
+        "agent read-only file: ~/.zshenv",
+        Side::Agent,
+    ),
+    spec(
+        Check::ReadOnlyZprofile,
+        "agent read-only file: ~/.zprofile",
+        Side::Agent,
+    ),
+    spec(
+        Check::ReadOnlyZshrc,
+        "agent read-only file: ~/.zshrc",
+        Side::Agent,
+    ),
+    spec(
+        Check::ClaudeLogin,
+        "claude logged in as the agent",
+        Side::Agent,
+    ),
+    spec(
+        Check::CodexLogin,
+        "codex logged in as the agent",
+        Side::Agent,
+    ),
+];
+
+fn check_name(check: Check) -> &'static str {
+    CATALOGUE
+        .iter()
+        .find(|entry| entry.check == check)
+        .map_or("check missing from the catalogue", |entry| entry.name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,11 +346,16 @@ enum Status {
     Missing,
     Wrong { found: String, wanted: String },
     Unreachable { why: String },
+    Deferred { to: Side },
 }
 
 impl Status {
     const fn is_pass(&self) -> bool {
         matches!(self, Self::Present)
+    }
+
+    const fn is_deferred(&self) -> bool {
+        matches!(self, Self::Deferred { .. })
     }
 }
 
@@ -59,49 +368,37 @@ impl fmt::Display for Status {
                 write!(formatter, "wrong (found {found}, wanted {wanted})")
             }
             Self::Unreachable { why } => write!(formatter, "unreachable ({why})"),
+            Self::Deferred { to } => write!(formatter, "deferred to the {} run", to.label()),
         }
     }
 }
 
 #[derive(Debug, Clone)]
 struct Finding {
-    name: String,
+    check: Check,
     status: Status,
     hint: Option<String>,
-    /// True when this finding could only be checked by running as the agent user, and
-    /// this run did not.
-    deferred: bool,
 }
 
 impl Finding {
-    fn new(name: impl Into<String>, status: Status) -> Self {
+    const fn new(check: Check, status: Status) -> Self {
         Self {
-            name: name.into(),
+            check,
             status,
             hint: None,
-            deferred: false,
         }
     }
 
-    fn with_hint(name: impl Into<String>, status: Status, hint: impl Into<String>) -> Self {
+    fn with_hint(check: Check, status: Status, hint: impl Into<String>) -> Self {
         Self {
-            name: name.into(),
+            check,
             status,
             hint: Some(hint.into()),
-            deferred: false,
         }
     }
 
-    /// A finding this run could not perform because it did not run as the agent user.
-    fn deferred(name: impl Into<String>, hint: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            status: Status::Unreachable {
-                why: "deferred to agent mode".to_string(),
-            },
-            hint: Some(hint.into()),
-            deferred: true,
-        }
+    fn unreachable(check: Check, why: impl Into<String>) -> Self {
+        Self::new(check, Status::Unreachable { why: why.into() })
     }
 }
 
@@ -110,11 +407,17 @@ impl Finding {
 enum Capture {
     Ran {
         success: bool,
+        /// `None` when a signal ended the process.
+        code: Option<i32>,
         stdout: String,
         stderr: String,
     },
     ExecutableNotFound,
     Unreachable(String),
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or_default().trim()
 }
 
 fn plain_command(program: &str, args: &[&str]) -> Command {
@@ -206,6 +509,7 @@ fn run_bounded(mut command: Command) -> Capture {
     match status {
         Ok(status) => Capture::Ran {
             success: status.success(),
+            code: status.code(),
             stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
             stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
         },
@@ -398,23 +702,26 @@ fn mise_pin(ls: &MiseLs, tool: &str) -> Result<MisePin, String> {
 }
 
 fn mise_pinned_finding(
-    name: &str,
+    check: Check,
     tool: &str,
     ls: &MiseLs,
     version_args: &[&str],
     decode: fn(&str) -> Option<String>,
-    not_pinned_hint: &str,
 ) -> Finding {
     match mise_pin(ls, tool) {
-        Err(why) => Finding::new(name, Status::Unreachable { why }),
-        Ok(MisePin::NotPinned) => Finding::with_hint(name, Status::Missing, not_pinned_hint),
+        Err(why) => Finding::unreachable(check, why),
+        Ok(MisePin::NotPinned) => Finding::with_hint(
+            check,
+            Status::Missing,
+            format!("not pinned; pin it in mise.toml as `{tool}`"),
+        ),
         Ok(MisePin::NotInstalled(version)) => Finding::with_hint(
-            name,
+            check,
             Status::Missing,
             format!("pinned at {version} but not installed; run: mise install"),
         ),
         Ok(MisePin::Installed(version)) => Finding::new(
-            name,
+            check,
             mise_pinned_version(tool, version_args, decode, &version),
         ),
     }
@@ -422,291 +729,230 @@ fn mise_pinned_finding(
 
 fn vendor_findings(ls: &MiseLs) -> Vec<Finding> {
     vec![
+        mise_pinned_finding(Check::PinZmx, "zmx", ls, &["--version"], decode_zmx_version),
         mise_pinned_finding(
-            "zmx resolves through mise at the pinned version",
-            "zmx",
-            ls,
-            &["--version"],
-            decode_zmx_version,
-            "not pinned; pin it in mise.toml as `zmx`",
-        ),
-        mise_pinned_finding(
-            "restate resolves through mise at the pinned version",
+            Check::PinRestate,
             "restate",
             ls,
             &["--version"],
             decode_restate_cli_version,
-            "not pinned; pin it in mise.toml as `restate`",
         ),
         mise_pinned_finding(
-            "restate-server resolves through mise at the pinned version",
+            Check::PinRestateServer,
             "restate-server",
             ls,
             &["--version"],
             decode_restate_server_version,
-            "not pinned; pin it in mise.toml as `restate-server`",
         ),
         mise_pinned_finding(
-            "claude resolves through mise at the pinned version",
+            Check::PinClaude,
             "claude",
             ls,
             &["--version"],
             decode_claude_version,
-            "not pinned; pin it in mise.toml as `claude`",
         ),
         mise_pinned_finding(
-            "codex resolves through mise at the pinned version",
+            Check::PinCodex,
             "codex",
             ls,
             &["--version"],
             decode_codex_version,
-            "not pinned yet; pin it in mise.toml as `codex` or `npm:@openai/codex`",
         ),
         mise_pinned_finding(
-            "entire resolves through mise at the pinned version",
+            Check::PinEntire,
             "entire",
             ls,
             &["--version"],
             decode_entire_version,
-            "not pinned; pin it in mise.toml as `entire`",
         ),
-        mise_pinned_finding(
-            "cue resolves through mise at the pinned version",
-            "cue",
-            ls,
-            &["version"],
-            decode_cue_version,
-            "not pinned; pin it in mise.toml as `cue`",
-        ),
+        mise_pinned_finding(Check::PinCue, "cue", ls, &["version"], decode_cue_version),
     ]
+}
+
+/// A login probe runs the tool, so it runs only once `mise ls` reports it installed.
+fn installed_gate(check: Check, tool: &str, ls: &MiseLs) -> Option<Finding> {
+    match mise_pin(ls, tool) {
+        Ok(MisePin::Installed(_)) => None,
+        Err(why) => Some(Finding::unreachable(check, why)),
+        Ok(MisePin::NotPinned) => Some(Finding::unreachable(
+            check,
+            format!("{tool} is not pinned in mise.toml, so its login cannot be checked"),
+        )),
+        Ok(MisePin::NotInstalled(version)) => Some(Finding::unreachable(
+            check,
+            format!("{tool} {version} is pinned but not installed; run: mise install"),
+        )),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 enum AuthStatus {
     LoggedIn,
     LoggedOut,
+    Unrecognised,
 }
 
-fn auth_status_to_status(decoded: Option<&AuthStatus>) -> Status {
-    match decoded {
-        Some(AuthStatus::LoggedIn) => Status::Present,
-        Some(AuthStatus::LoggedOut) => Status::Missing,
-        None => Status::Unreachable {
-            why: "unrecognised auth status output".to_string(),
+fn json_bool(text: &str, field: &str) -> Option<bool> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    value.get(field)?.as_bool()
+}
+
+/// `claude auth status --json` prints `loggedIn` either way and exits 1 when logged out.
+fn decode_claude_auth_status(code: Option<i32>, stdout: &str) -> AuthStatus {
+    match (code, json_bool(stdout, "loggedIn")) {
+        (Some(0), Some(true)) => AuthStatus::LoggedIn,
+        (Some(CLAUDE_LOGGED_OUT_EXIT), Some(false)) => AuthStatus::LoggedOut,
+        _ => AuthStatus::Unrecognised,
+    }
+}
+
+/// `entire auth status --json` exits 0 logged in or out; a non-zero exit is a failure to look.
+fn decode_entire_auth_status(code: Option<i32>, stdout: &str) -> AuthStatus {
+    match (code, json_bool(stdout, "logged_in")) {
+        (Some(0), Some(true)) => AuthStatus::LoggedIn,
+        (Some(0), Some(false)) => AuthStatus::LoggedOut,
+        _ => AuthStatus::Unrecognised,
+    }
+}
+
+/// No codex binary has been available to capture a `login status` sample from.
+const fn decode_codex_login_status(_code: Option<i32>, _stdout: &str) -> AuthStatus {
+    AuthStatus::Unrecognised
+}
+
+struct LoginProbe {
+    check: Check,
+    tool: &'static str,
+    args: &'static [&'static str],
+    decode: fn(Option<i32>, &str) -> AuthStatus,
+}
+
+const ENTIRE_LOGIN: LoginProbe = LoginProbe {
+    check: Check::EntireLogin,
+    tool: "entire",
+    args: &["auth", "status", "--json"],
+    decode: decode_entire_auth_status,
+};
+const CLAUDE_LOGIN: LoginProbe = LoginProbe {
+    check: Check::ClaudeLogin,
+    tool: "claude",
+    args: &["auth", "status", "--json"],
+    decode: decode_claude_auth_status,
+};
+const CODEX_LOGIN: LoginProbe = LoginProbe {
+    check: Check::CodexLogin,
+    tool: "codex",
+    args: &["login", "status"],
+    decode: decode_codex_login_status,
+};
+
+fn login_finding(probe: &LoginProbe, ls: &MiseLs) -> Finding {
+    if let Some(gated) = installed_gate(probe.check, probe.tool, ls) {
+        return gated;
+    }
+    let mut args = vec!["exec", "--", probe.tool];
+    args.extend_from_slice(probe.args);
+    match run_bounded(mise_command(&args)) {
+        Capture::ExecutableNotFound => Finding::unreachable(probe.check, "mise is not on PATH"),
+        Capture::Unreachable(why) => Finding::unreachable(probe.check, why),
+        Capture::Ran {
+            code,
+            stdout,
+            stderr,
+            ..
+        } => match (probe.decode)(code, &stdout) {
+            AuthStatus::LoggedIn => Finding::new(probe.check, Status::Present),
+            AuthStatus::LoggedOut => Finding::with_hint(
+                probe.check,
+                Status::Missing,
+                format!("log in once from a terminal: {} auth login", probe.tool),
+            ),
+            AuthStatus::Unrecognised => Finding::unreachable(
+                probe.check,
+                format!(
+                    "unrecognised {} {} result (exit {code:?}): {:?}",
+                    probe.tool,
+                    probe.args.join(" "),
+                    first_line(&stderr)
+                ),
+            ),
         },
     }
 }
 
-fn decode_claude_auth_status(stdout: &str) -> Option<AuthStatus> {
-    let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
-    let logged_in = value.get("loggedIn")?.as_bool()?;
-    Some(if logged_in {
-        AuthStatus::LoggedIn
-    } else {
-        AuthStatus::LoggedOut
-    })
-}
-
-fn decode_entire_auth_status(stdout: &str) -> Option<AuthStatus> {
-    let value: serde_json::Value = serde_json::from_str(stdout).ok()?;
-    let logged_in = value.get("logged_in")?.as_bool()?;
-    Some(if logged_in {
-        AuthStatus::LoggedIn
-    } else {
-        AuthStatus::LoggedOut
-    })
-}
+/// Services whose keychain items would be a git host, cloud or SSH credential.
+const FORBIDDEN_KEYCHAIN_SERVICES: [(Check, &str); 5] = [
+    (Check::KeychainGithub, "github.com"),
+    (Check::KeychainGitlab, "gitlab.com"),
+    (Check::KeychainAws, "aws"),
+    (Check::KeychainSsh, "ssh"),
+    (Check::KeychainGhCli, "gh:github.com"),
+];
+const KEYCHAIN_LOOKUPS: [&str; 2] = ["find-generic-password", "find-internet-password"];
 
 #[derive(Debug, PartialEq, Eq)]
-enum KeychainListing {
-    NoLoginKeychain,
-    LoginKeychainPresent,
+enum KeychainItem {
+    Absent,
+    /// The keychain file the item was found in.
+    Present(String),
+    Unrecognised,
 }
 
-fn decode_keychain_listing(stdout: &str) -> Option<KeychainListing> {
-    if stdout.trim().is_empty() {
-        return None;
-    }
-    if stdout.contains("login.keychain") {
-        Some(KeychainListing::LoginKeychainPresent)
-    } else {
-        Some(KeychainListing::NoLoginKeychain)
-    }
-}
-
-/// Checked as whoever runs this (expected to be the developer), unlike `claude`/`codex` below.
-fn entire_login_finding() -> Finding {
-    let name = "entire logged in as the developer";
-    match run_bounded(mise_command(&[
-        "exec", "--", "entire", "auth", "status", "--json",
-    ])) {
-        Capture::ExecutableNotFound => Finding::new(
-            name,
-            Status::Unreachable {
-                why: "mise is not on PATH".to_string(),
-            },
-        ),
-        Capture::Unreachable(why) => Finding::new(name, Status::Unreachable { why }),
-        Capture::Ran {
-            success: false,
-            stderr,
-            ..
-        } => Finding::new(
-            name,
-            Status::Unreachable {
-                why: stderr
-                    .lines()
-                    .next()
-                    .unwrap_or("entire auth status failed")
-                    .to_string(),
-            },
-        ),
-        Capture::Ran {
-            success: true,
-            stdout,
-            ..
-        } => Finding::new(
-            name,
-            auth_status_to_status(decode_entire_auth_status(&stdout).as_ref()),
-        ),
+/// Without `-w` or `-g`, `security` prints attributes only and never the secret.
+fn decode_keychain_item(code: Option<i32>, stdout: &str, stderr: &str) -> KeychainItem {
+    match code {
+        Some(SECURITY_ITEM_NOT_FOUND_EXIT) if stderr.contains("could not be found") => {
+            KeychainItem::Absent
+        }
+        Some(0) => first_line(stdout)
+            .strip_prefix("keychain: \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+            .map_or(KeychainItem::Unrecognised, |path| {
+                KeychainItem::Present(path.to_string())
+            }),
+        _ => KeychainItem::Unrecognised,
     }
 }
 
-fn claude_login_finding(identity: &Identity) -> Finding {
-    let name = "claude logged in";
-    if identity.username != AGENT_USER_NAME {
-        return Finding::deferred(
-            name,
-            format!("run as the operator, logged in as {AGENT_USER_NAME}: claude auth status"),
-        );
-    }
-    match run_bounded(mise_command(&[
-        "exec", "--", "claude", "auth", "status", "--json",
-    ])) {
-        Capture::ExecutableNotFound => Finding::new(
-            name,
-            Status::Unreachable {
-                why: "mise is not on PATH".to_string(),
-            },
-        ),
-        Capture::Unreachable(why) => Finding::new(name, Status::Unreachable { why }),
-        Capture::Ran {
-            success: false,
-            stderr,
-            ..
-        } => Finding::new(
-            name,
-            Status::Unreachable {
-                why: stderr
-                    .lines()
-                    .next()
-                    .unwrap_or("claude auth status failed")
-                    .to_string(),
-            },
-        ),
-        Capture::Ran {
-            success: true,
-            stdout,
-            ..
-        } => Finding::new(
-            name,
-            auth_status_to_status(decode_claude_auth_status(&stdout).as_ref()),
-        ),
-    }
-}
-
-/// No codex binary exists to sample a real `login status` from, so this never classifies it.
-fn codex_login_finding(identity: &Identity) -> Finding {
-    let name = "codex logged in";
-    if identity.username != AGENT_USER_NAME {
-        return Finding::deferred(
-            name,
-            format!("run as the operator, logged in as {AGENT_USER_NAME}: codex login status"),
-        );
-    }
-    match run_bounded(mise_command(&["exec", "--", "codex", "login", "status"])) {
-        Capture::ExecutableNotFound => Finding::new(
-            name,
-            Status::Unreachable {
-                why: "mise is not on PATH".to_string(),
-            },
-        ),
-        Capture::Unreachable(why) => Finding::new(name, Status::Unreachable { why }),
-        Capture::Ran {
-            success: false,
-            stderr,
-            ..
-        } => Finding::new(
-            name,
-            Status::Unreachable {
-                why: stderr
-                    .lines()
-                    .next()
-                    .unwrap_or("codex login status failed")
-                    .to_string(),
-            },
-        ),
-        Capture::Ran { success: true, .. } => Finding::new(
-            name,
-            Status::Unreachable {
-                why: "no captured sample exists to decode codex login status output".to_string(),
-            },
-        ),
-    }
-}
-
-fn keychain_listing_to_status(decoded: Option<&KeychainListing>) -> Status {
-    match decoded {
-        Some(KeychainListing::NoLoginKeychain) => Status::Present,
-        Some(KeychainListing::LoginKeychainPresent) => Status::Wrong {
-            found: "login keychain present".to_string(),
-            wanted: "no login keychain".to_string(),
+fn keychain_lookup_status(lookup: &str, service: &str) -> Status {
+    match run_bounded(plain_command("security", &[lookup, "-s", service])) {
+        Capture::ExecutableNotFound => Status::Unreachable {
+            why: "security is not on PATH".to_string(),
         },
-        None => Status::Unreachable {
-            why: "unrecognised security list-keychains output".to_string(),
+        Capture::Unreachable(why) => Status::Unreachable { why },
+        Capture::Ran {
+            code,
+            stdout,
+            stderr,
+            ..
+        } => match decode_keychain_item(code, &stdout, &stderr) {
+            KeychainItem::Absent => Status::Present,
+            KeychainItem::Present(keychain) => Status::Wrong {
+                found: format!("a {lookup} item in {keychain}"),
+                wanted: format!("no item for {service}"),
+            },
+            KeychainItem::Unrecognised => Status::Unreachable {
+                why: format!(
+                    "unrecognised security {lookup} result (exit {code:?}): {:?}",
+                    first_line(&stderr)
+                ),
+            },
         },
     }
 }
 
-fn keychain_finding(identity: &Identity) -> Finding {
-    let name = "agent credential: login keychain";
-    if identity.username != AGENT_USER_NAME {
-        return Finding::deferred(
-            name,
-            format!("run as the operator, logged in as {AGENT_USER_NAME}: security list-keychains"),
-        );
-    }
-    match run_bounded(plain_command("security", &["list-keychains"])) {
-        Capture::ExecutableNotFound => Finding::new(
-            name,
-            Status::Unreachable {
-                why: "security is not on PATH".to_string(),
-            },
-        ),
-        Capture::Unreachable(why) => Finding::new(name, Status::Unreachable { why }),
-        Capture::Ran {
-            success: false,
-            stderr,
-            ..
-        } => Finding::new(
-            name,
-            Status::Unreachable {
-                why: stderr
-                    .lines()
-                    .next()
-                    .unwrap_or("security list-keychains failed")
-                    .to_string(),
-            },
-        ),
-        Capture::Ran {
-            success: true,
-            stdout,
-            ..
-        } => Finding::new(
-            name,
-            keychain_listing_to_status(decode_keychain_listing(&stdout).as_ref()),
-        ),
-    }
+fn keychain_findings() -> Vec<Finding> {
+    FORBIDDEN_KEYCHAIN_SERVICES
+        .iter()
+        .map(|&(check, service)| {
+            let status = KEYCHAIN_LOOKUPS
+                .iter()
+                .map(|lookup| keychain_lookup_status(lookup, service))
+                .find(|status| !status.is_pass())
+                .unwrap_or(Status::Present);
+            Finding::new(check, status)
+        })
+        .collect()
 }
 
 /// From `id -u`/`id -un`, never `$HOME`/`$USER`, so this is whoever is actually running.
@@ -862,15 +1108,16 @@ enum MembershipOutcome {
     NotMember,
     GroupNotFound,
     UserNotFound,
+    Unrecognised,
 }
 
-fn decode_membership(stdout: &str) -> Option<MembershipOutcome> {
-    match stdout.lines().next().unwrap_or_default().trim() {
-        "user is a member of the group" => Some(MembershipOutcome::Member),
-        "user is not a member of the group" => Some(MembershipOutcome::NotMember),
-        "Group not found" => Some(MembershipOutcome::GroupNotFound),
-        "User not found" => Some(MembershipOutcome::UserNotFound),
-        _ => None,
+fn decode_membership(code: Option<i32>, stdout: &str) -> MembershipOutcome {
+    match (code, first_line(stdout)) {
+        (Some(0), "user is a member of the group") => MembershipOutcome::Member,
+        (Some(0), "user is not a member of the group") => MembershipOutcome::NotMember,
+        (Some(DSMEMBERUTIL_NOT_FOUND_EXIT), "Group not found") => MembershipOutcome::GroupNotFound,
+        (Some(DSMEMBERUTIL_NOT_FOUND_EXIT), "User not found") => MembershipOutcome::UserNotFound,
+        _ => MembershipOutcome::Unrecognised,
     }
 }
 
@@ -883,55 +1130,35 @@ fn membership_status(user: &str, group: &str) -> Status {
             why: "dsmemberutil is not on PATH".to_string(),
         },
         Capture::Unreachable(why) => Status::Unreachable { why },
-        Capture::Ran { stdout, .. } => match decode_membership(&stdout) {
-            Some(MembershipOutcome::Member) => Status::Present,
-            Some(
-                MembershipOutcome::NotMember
-                | MembershipOutcome::GroupNotFound
-                | MembershipOutcome::UserNotFound,
-            ) => Status::Missing,
-            None => Status::Unreachable {
-                why: format!("unrecognised dsmemberutil output: {stdout:?}"),
+        Capture::Ran { code, stdout, .. } => match decode_membership(code, &stdout) {
+            MembershipOutcome::Member => Status::Present,
+            MembershipOutcome::NotMember
+            | MembershipOutcome::GroupNotFound
+            | MembershipOutcome::UserNotFound => Status::Missing,
+            MembershipOutcome::Unrecognised => Status::Unreachable {
+                why: format!("unrecognised dsmemberutil result (exit {code:?}): {stdout:?}"),
             },
         },
     }
 }
 
-fn agent_home_unreachable(name: &str) -> Finding {
-    Finding::new(
-        name,
-        Status::Unreachable {
-            why: format!("agent user home directory unknown; run: dscl . -read /Users/{AGENT_USER_NAME} NFSHomeDirectory"),
-        },
-    )
-}
-
-fn credential_absence_finding(name: &str, home: Option<&str>, relative: &str) -> Finding {
-    let Some(home) = home else {
-        return agent_home_unreachable(name);
+fn credential_absence_finding(
+    check: Check,
+    home: &Result<String, String>,
+    relative: &str,
+) -> Finding {
+    let home = match home {
+        Ok(home) => home,
+        Err(why) => return Finding::unreachable(check, format!("agent home unknown: {why}")),
     };
     let path = Path::new(home).join(relative);
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            Finding::new(name, Status::Present)
+            Finding::new(check, Status::Present)
         }
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Finding::new(
-            name,
-            Status::Unreachable {
-                why: format!(
-                    "permission denied; run as the operator: ls -la {}",
-                    path.display()
-                ),
-            },
-        ),
-        Err(error) => Finding::new(
-            name,
-            Status::Unreachable {
-                why: error.to_string(),
-            },
-        ),
+        Err(error) => Finding::unreachable(check, format!("{}: {error}", path.display())),
         Ok(_) => Finding::new(
-            name,
+            check,
             Status::Wrong {
                 found: format!("{} exists", path.display()),
                 wanted: "absent".to_string(),
@@ -940,21 +1167,18 @@ fn credential_absence_finding(name: &str, home: Option<&str>, relative: &str) ->
     }
 }
 
-/// Stats `path` first so a symlink to a FIFO cannot hang the open; reads bounded, erroring over `CREDENTIAL_FILE_MAX_BYTES` rather than truncating.
+/// Opens without blocking and checks the handle, so a FIFO or device fails instead of hanging; reads bounded, erroring over `CREDENTIAL_FILE_MAX_BYTES` rather than truncating.
 fn read_bounded_file(path: &Path) -> io::Result<String> {
-    let metadata = fs::symlink_metadata(path)?;
-    let metadata = if metadata.file_type().is_symlink() {
-        fs::metadata(path)?
-    } else {
-        metadata
-    };
-    if !metadata.is_file() {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
         return Err(io::Error::other(format!(
             "{} is not a regular file",
             path.display()
         )));
     }
-    let mut file = fs::File::open(path)?;
     let mut bytes = Vec::new();
     let cap = CREDENTIAL_FILE_MAX_BYTES.saturating_add(1);
     file.by_ref().take(cap).read_to_end(&mut bytes)?;
@@ -970,32 +1194,35 @@ fn read_bounded_file(path: &Path) -> io::Result<String> {
 fn gitconfig_has_credential_helper(path: &Path) -> Result<bool, Status> {
     match read_bounded_file(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Err(Status::Unreachable {
-            why: format!(
-                "permission denied; run as the operator: cat {}",
-                path.display()
-            ),
-        }),
         Err(error) => Err(Status::Unreachable {
-            why: error.to_string(),
+            why: format!("{}: {error}", path.display()),
         }),
         Ok(text) => Ok(text.contains("[credential")),
     }
 }
 
-/// Checks `~/.gitconfig` and `~/.config/git/config`; the hint also names the system gitconfig, which this cannot inspect as the developer.
-fn credential_gitconfig_finding(home: Option<&str>) -> Finding {
-    let name = "agent credential: gitconfig credential helper";
+/// Checks `~/.gitconfig` and `~/.config/git/config`; the hint names the system gitconfig, which this does not read.
+fn credential_gitconfig_finding(home: &Result<String, String>) -> Finding {
+    let check = Check::CredentialGitconfig;
     let hint = "also check the system gitconfig: git config --system --get-all credential.helper";
-    let Some(home) = home else {
-        return Finding::with_hint(name, agent_home_unreachable(name).status, hint);
+    let home = match home {
+        Ok(home) => home,
+        Err(why) => {
+            return Finding::with_hint(
+                check,
+                Status::Unreachable {
+                    why: format!("agent home unknown: {why}"),
+                },
+                hint,
+            )
+        }
     };
     for relative in [".gitconfig", ".config/git/config"] {
         match gitconfig_has_credential_helper(&Path::new(home).join(relative)) {
-            Err(status) => return Finding::with_hint(name, status, hint),
+            Err(status) => return Finding::with_hint(check, status, hint),
             Ok(true) => {
                 return Finding::with_hint(
-                    name,
+                    check,
                     Status::Wrong {
                         found: format!("credential helper configured in {relative}"),
                         wanted: "no credential helper".to_string(),
@@ -1006,41 +1233,74 @@ fn credential_gitconfig_finding(home: Option<&str>) -> Finding {
             Ok(false) => {}
         }
     }
-    Finding::with_hint(name, Status::Present, hint)
+    Finding::with_hint(check, Status::Present, hint)
 }
 
-fn agent_user_findings() -> Vec<Finding> {
-    let lookup = dscl_read(
-        &format!("/Users/{AGENT_USER_NAME}"),
-        Some("NFSHomeDirectory"),
-    );
-    let home = match &lookup {
-        DsclLookup::Found(stdout) => dscl_value(stdout, "NFSHomeDirectory"),
-        DsclLookup::NotFound | DsclLookup::Unreachable(_) => None,
-    };
-    let mut findings = vec![Finding::new("agent user exists", lookup_status(&lookup))];
-    findings.push(credential_absence_finding(
-        "agent credential: ~/.ssh",
-        home.as_deref(),
-        ".ssh",
-    ));
-    findings.push(credential_absence_finding(
-        "agent credential: ~/.config/gh",
-        home.as_deref(),
-        ".config/gh",
-    ));
-    findings.push(credential_absence_finding(
-        "agent credential: ~/.aws",
-        home.as_deref(),
-        ".aws",
-    ));
-    findings.push(credential_absence_finding(
-        "agent credential: ~/.netrc",
-        home.as_deref(),
-        ".netrc",
-    ));
-    findings.push(credential_gitconfig_finding(home.as_deref()));
-    findings
+fn credential_findings(home: &Result<String, String>) -> Vec<Finding> {
+    vec![
+        credential_absence_finding(Check::CredentialSsh, home, ".ssh"),
+        credential_absence_finding(Check::CredentialGh, home, ".config/gh"),
+        credential_absence_finding(Check::CredentialAws, home, ".aws"),
+        credential_absence_finding(Check::CredentialNetrc, home, ".netrc"),
+        credential_gitconfig_finding(home),
+    ]
+}
+
+/// Settings and shell startup files the design requires to be core-owned and read-only to the agent.
+const AGENT_READ_ONLY_FILES: [(Check, &str); 5] = [
+    (Check::ReadOnlyClaudeSettings, ".claude/settings.json"),
+    (Check::ReadOnlyCodexConfig, ".codex/config.toml"),
+    (Check::ReadOnlyZshenv, ".zshenv"),
+    (Check::ReadOnlyZprofile, ".zprofile"),
+    (Check::ReadOnlyZshrc, ".zshrc"),
+];
+
+/// The owner can always chmod its own file, so an agent-owned file is writable whatever its mode.
+fn read_only_status(owner_uid: u32, mode: u32, agent_uid: u32) -> Status {
+    if owner_uid == agent_uid {
+        return Status::Wrong {
+            found: "owned by the agent".to_string(),
+            wanted: "owned by the core".to_string(),
+        };
+    }
+    if mode & 0o022 != 0 {
+        return Status::Wrong {
+            found: format!("mode {mode:04o}"),
+            wanted: "no group or other write bit".to_string(),
+        };
+    }
+    Status::Present
+}
+
+fn read_only_file_status(path: &Path, agent_uid: u32) -> Status {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Status::Missing,
+        Err(error) => Status::Unreachable {
+            why: format!("{}: {error}", path.display()),
+        },
+        Ok(metadata) if !metadata.file_type().is_file() => Status::Wrong {
+            found: file_kind(&metadata).to_string(),
+            wanted: "regular file".to_string(),
+        },
+        Ok(metadata) => read_only_status(
+            metadata.uid(),
+            metadata.permissions().mode() & 0o7777,
+            agent_uid,
+        ),
+    }
+}
+
+fn read_only_findings(home: &Result<String, String>, agent_uid: u32) -> Vec<Finding> {
+    AGENT_READ_ONLY_FILES
+        .iter()
+        .map(|&(check, relative)| match home {
+            Ok(home) => Finding::new(
+                check,
+                read_only_file_status(&Path::new(home).join(relative), agent_uid),
+            ),
+            Err(why) => Finding::unreachable(check, format!("agent home unknown: {why}")),
+        })
+        .collect()
 }
 
 fn owner_status(found: u32, wanted: Result<u32, String>) -> Status {
@@ -1054,18 +1314,17 @@ fn owner_status(found: u32, wanted: Result<u32, String>) -> Status {
     }
 }
 
-fn owner_uid_status(found: u32, wanted: Result<Vec<u32>, String>) -> Status {
-    match wanted {
-        Ok(candidates) if candidates.contains(&found) => Status::Present,
-        Ok(candidates) => Status::Wrong {
-            found: found.to_string(),
-            wanted: candidates
-                .iter()
-                .map(u32::to_string)
-                .collect::<Vec<_>>()
-                .join(" or "),
-        },
-        Err(why) => Status::Unreachable { why },
+fn owner_uid_status(found: u32, candidates: &[u32]) -> Status {
+    if candidates.contains(&found) {
+        return Status::Present;
+    }
+    Status::Wrong {
+        found: found.to_string(),
+        wanted: candidates
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" or "),
     }
 }
 
@@ -1080,19 +1339,25 @@ fn mode_status(found: u32, wanted: u32) -> Status {
     }
 }
 
+fn file_kind(metadata: &fs::Metadata) -> &'static str {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        "symlink"
+    } else if file_type.is_dir() {
+        "directory"
+    } else if file_type.is_file() {
+        "file"
+    } else {
+        "other"
+    }
+}
+
 fn directory_kind_status(metadata: &fs::Metadata) -> Status {
     if metadata.is_dir() {
         return Status::Present;
     }
-    let kind = if metadata.file_type().is_symlink() {
-        "symlink"
-    } else if metadata.is_file() {
-        "file"
-    } else {
-        "other"
-    };
     Status::Wrong {
-        found: kind.to_string(),
+        found: file_kind(metadata).to_string(),
         wanted: "directory".to_string(),
     }
 }
@@ -1110,7 +1375,20 @@ fn path_length_status(path: &str) -> Status {
     }
 }
 
-fn directory_error_findings(label: &str, error: &io::Error, extra: &[&str]) -> Vec<Finding> {
+/// The checks that follow `exists` for one socket directory, in catalogue order.
+const AGENT_DIR_DEPENDENT: [Check; 4] = [
+    Check::AgentDirIsDirectory,
+    Check::AgentDirOwnerUid,
+    Check::AgentDirOwnerGid,
+    Check::AgentDirMode,
+];
+const CORE_DIR_DEPENDENT: [Check; 3] = [
+    Check::CoreDirIsDirectory,
+    Check::CoreDirOwnerUid,
+    Check::CoreDirMode,
+];
+
+fn directory_error_findings(exists: Check, dependent: &[Check], error: &io::Error) -> Vec<Finding> {
     let (exists_status, why) = if error.kind() == io::ErrorKind::NotFound {
         (Status::Missing, "directory does not exist".to_string())
     } else {
@@ -1121,47 +1399,35 @@ fn directory_error_findings(label: &str, error: &io::Error, extra: &[&str]) -> V
             error.to_string(),
         )
     };
-    let mut findings = vec![Finding::new(format!("{label}: exists"), exists_status)];
-    for name in extra {
-        findings.push(Finding::new(
-            format!("{label}: {name}"),
-            Status::Unreachable { why: why.clone() },
-        ));
-    }
+    let mut findings = vec![Finding::new(exists, exists_status)];
+    findings.extend(
+        dependent
+            .iter()
+            .map(|&check| Finding::unreachable(check, why.clone())),
+    );
     findings
 }
 
-fn agent_socket_dir_findings(
-    group_gid: Result<u32, String>,
-    developer_uids: Result<Vec<u32>, String>,
-) -> Vec<Finding> {
-    let label = "agent socket directory";
+fn agent_socket_dir_findings(group_gid: Result<u32, String>, developer_uid: u32) -> Vec<Finding> {
     let metadata = match fs::symlink_metadata(AGENT_SOCKET_DIR) {
         Ok(metadata) => metadata,
         Err(error) => {
-            return directory_error_findings(
-                label,
-                &error,
-                &["is a directory", "owner uid", "owner gid", "mode"],
-            )
+            return directory_error_findings(Check::AgentDirExists, &AGENT_DIR_DEPENDENT, &error)
         }
     };
     vec![
-        Finding::new(format!("{label}: exists"), Status::Present),
+        Finding::new(Check::AgentDirExists, Status::Present),
+        Finding::new(Check::AgentDirIsDirectory, directory_kind_status(&metadata)),
         Finding::new(
-            format!("{label}: is a directory"),
-            directory_kind_status(&metadata),
+            Check::AgentDirOwnerUid,
+            owner_uid_status(metadata.uid(), &[developer_uid, 0]),
         ),
         Finding::new(
-            format!("{label}: owner uid"),
-            owner_uid_status(metadata.uid(), developer_uids),
-        ),
-        Finding::new(
-            format!("{label}: owner gid"),
+            Check::AgentDirOwnerGid,
             owner_status(metadata.gid(), group_gid),
         ),
         Finding::new(
-            format!("{label}: mode"),
+            Check::AgentDirMode,
             mode_status(
                 metadata.permissions().mode() & 0o7777,
                 AGENT_SOCKET_DIR_MODE,
@@ -1174,150 +1440,141 @@ fn core_socket_dir_path(home: &str) -> String {
     format!("{home}/{CORE_SOCKET_DIR_RELATIVE}")
 }
 
-fn stat_core_socket_dir(path: &str, developer_uid: Result<u32, String>) -> Vec<Finding> {
-    let label = "core socket directory";
+fn stat_core_socket_dir(path: &str, developer_uid: u32) -> Vec<Finding> {
     let mut findings = vec![Finding::new(
-        format!("{label}: path fits the socket budget"),
+        Check::CoreDirFitsBudget,
         path_length_status(path),
     )];
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) => {
             findings.extend(directory_error_findings(
-                label,
+                Check::CoreDirExists,
+                &CORE_DIR_DEPENDENT,
                 &error,
-                &["is a directory", "owner uid", "mode"],
             ));
             return findings;
         }
     };
-    findings.push(Finding::new(format!("{label}: exists"), Status::Present));
+    findings.push(Finding::new(Check::CoreDirExists, Status::Present));
     findings.push(Finding::new(
-        format!("{label}: is a directory"),
+        Check::CoreDirIsDirectory,
         directory_kind_status(&metadata),
     ));
     findings.push(Finding::new(
-        format!("{label}: owner uid"),
-        owner_status(metadata.uid(), developer_uid),
+        Check::CoreDirOwnerUid,
+        owner_status(metadata.uid(), Ok(developer_uid)),
     ));
     findings.push(Finding::new(
-        format!("{label}: mode"),
+        Check::CoreDirMode,
         mode_status(metadata.permissions().mode() & 0o7777, CORE_SOCKET_DIR_MODE),
     ));
     findings
 }
 
-fn core_socket_dir_unreachable_findings(why: &str) -> Vec<Finding> {
-    [
-        "path fits the socket budget",
-        "exists",
-        "is a directory",
-        "owner uid",
-        "mode",
-    ]
-    .iter()
-    .map(|suffix| {
-        Finding::new(
-            format!("core socket directory: {suffix}"),
-            Status::Unreachable {
-                why: why.to_string(),
-            },
-        )
-    })
-    .collect()
-}
-
-fn core_socket_findings(identity: &Result<Identity, String>) -> Vec<Finding> {
-    let identity = match identity {
-        Ok(identity) => identity,
-        Err(why) => return core_socket_dir_unreachable_findings(why),
-    };
+fn core_socket_findings(identity: &Identity) -> Vec<Finding> {
     match resolve_home(&identity.username) {
-        Ok(home) => stat_core_socket_dir(&core_socket_dir_path(&home), Ok(identity.uid)),
-        Err(why) => core_socket_dir_unreachable_findings(&why),
+        Ok(home) => stat_core_socket_dir(&core_socket_dir_path(&home), identity.uid),
+        Err(why) => [Check::CoreDirFitsBudget, Check::CoreDirExists]
+            .iter()
+            .chain(CORE_DIR_DEPENDENT.iter())
+            .map(|&check| Finding::unreachable(check, why.clone()))
+            .collect(),
     }
 }
 
-fn developer_uid_candidates(identity: &Identity) -> Result<Vec<u32>, String> {
-    if identity.username == AGENT_USER_NAME {
-        return Err(
-            "cannot determine the developer's uid while running as the agent user".to_string(),
-        );
-    }
-    Ok(vec![identity.uid, 0])
-}
-
-fn shared_group_findings(identity: &Result<Identity, String>) -> Vec<Finding> {
-    let lookup = dscl_read(&format!("/Groups/{SHARED_GROUP_NAME}"), None);
-    let mut findings = vec![Finding::new("shared group exists", lookup_status(&lookup))];
-    findings.push(match identity {
-        Ok(identity) => Finding::new(
-            "developer is a member of the shared group",
+/// Runs only checks the developer can perform: nothing here reads the agent's home or keychain.
+fn developer_findings(identity: &Identity) -> Vec<Finding> {
+    let agent_lookup = dscl_read(&format!("/Users/{AGENT_USER_NAME}"), Some("RecordName"));
+    let group_lookup = dscl_read(&format!("/Groups/{SHARED_GROUP_NAME}"), None);
+    let mut findings = vec![
+        Finding::new(Check::AgentUserExists, lookup_status(&agent_lookup)),
+        Finding::new(Check::SharedGroupExists, lookup_status(&group_lookup)),
+        Finding::new(
+            Check::DeveloperInSharedGroup,
             membership_status(&identity.username, SHARED_GROUP_NAME),
         ),
-        Err(why) => Finding::new(
-            "developer is a member of the shared group",
-            Status::Unreachable { why: why.clone() },
-        ),
-    });
-    findings.push(Finding::new(
-        "agent user is a member of the shared group",
-        membership_status(AGENT_USER_NAME, SHARED_GROUP_NAME),
-    ));
-    let developer_uids = match identity {
-        Ok(identity) => developer_uid_candidates(identity),
-        Err(why) => Err(why.clone()),
-    };
+    ];
     findings.extend(agent_socket_dir_findings(
-        group_gid(&lookup),
-        developer_uids,
+        group_gid(&group_lookup),
+        identity.uid,
     ));
+    findings.extend(core_socket_findings(identity));
+    let ls = mise_ls();
+    findings.extend(vendor_findings(&ls));
+    findings.push(login_finding(&ENTIRE_LOGIN, &ls));
     findings
 }
 
-fn all_findings() -> Vec<Finding> {
-    let identity = current_identity();
-    let mut findings = agent_user_findings();
-    findings.extend(shared_group_findings(&identity));
-    findings.extend(core_socket_findings(&identity));
+/// Runs only checks the agent can perform on itself: nothing here resolves the developer's home, the core directory or the developer's logins.
+fn agent_findings(identity: &Identity) -> Vec<Finding> {
+    let home = resolve_home(&identity.username);
+    let mut findings = vec![Finding::new(
+        Check::AgentInSharedGroup,
+        membership_status(&identity.username, SHARED_GROUP_NAME),
+    )];
+    findings.extend(credential_findings(&home));
+    findings.extend(keychain_findings());
+    findings.extend(read_only_findings(&home, identity.uid));
     let ls = mise_ls();
-    findings.extend(vendor_findings(&ls));
-    findings.push(entire_login_finding());
-    match &identity {
-        Ok(identity) => {
-            findings.push(claude_login_finding(identity));
-            findings.push(codex_login_finding(identity));
-            findings.push(keychain_finding(identity));
-        }
-        Err(why) => {
-            findings.push(Finding::new(
-                "claude logged in",
-                Status::Unreachable { why: why.clone() },
-            ));
-            findings.push(Finding::new(
-                "codex logged in",
-                Status::Unreachable { why: why.clone() },
-            ));
-            findings.push(Finding::new(
-                "agent credential: login keychain",
-                Status::Unreachable { why: why.clone() },
-            ));
-        }
-    }
+    findings.push(login_finding(&CLAUDE_LOGIN, &ls));
+    findings.push(login_finding(&CODEX_LOGIN, &ls));
     findings
+}
+
+/// One finding per catalogue entry: the produced result, `Deferred` for the other side, `Unreachable` for a gap.
+fn assemble(mode: Side, produced: &[Finding]) -> Vec<Finding> {
+    let mut findings: Vec<Finding> = CATALOGUE
+        .iter()
+        .map(|entry| {
+            if entry.side != mode {
+                return Finding::new(entry.check, Status::Deferred { to: entry.side });
+            }
+            produced
+                .iter()
+                .find(|finding| finding.check == entry.check)
+                .cloned()
+                .unwrap_or_else(|| {
+                    Finding::unreachable(entry.check, "no probe produced this finding")
+                })
+        })
+        .collect();
+    let stray = produced.iter().filter(|finding| {
+        !CATALOGUE
+            .iter()
+            .any(|entry| entry.check == finding.check && entry.side == mode)
+    });
+    findings.extend(stray.map(|finding| {
+        Finding::unreachable(
+            finding.check,
+            "produced by a probe outside this side's catalogue",
+        )
+    }));
+    findings
+}
+
+fn unknown_mode_findings(why: &str) -> Vec<Finding> {
+    CATALOGUE
+        .iter()
+        .map(|entry| {
+            Finding::unreachable(
+                entry.check,
+                format!("cannot tell who is running, so no side can run: {why}"),
+            )
+        })
+        .collect()
 }
 
 fn print_findings(findings: &[Finding]) {
     for finding in findings {
-        println!(
-            "xtask setup: {} {}",
-            if finding.status.is_pass() {
-                "ok"
-            } else {
-                "FAIL"
-            },
-            finding.name
-        );
+        let label = if finding.status.is_pass() {
+            "ok"
+        } else if finding.status.is_deferred() {
+            "DEFERRED"
+        } else {
+            "FAIL"
+        };
+        println!("xtask setup: {label} {}", check_name(finding.check));
         if !finding.status.is_pass() {
             println!("  {}", finding.status);
         }
@@ -1327,32 +1584,519 @@ fn print_findings(findings: &[Finding]) {
     }
 }
 
-/// The finish-style count and exit code; pure over `findings`, so testable without a probe.
-fn summarize(findings: &[Finding]) -> i32 {
-    let examined = findings.len();
-    if examined == 0 {
-        eprintln!("xtask setup: examined 0 preconditions; a check over nothing is a failure");
-        return 1;
-    }
+/// Exit 0 when every check on this run's side passed; deferred checks count on their own line only.
+fn summarize(mode: Option<Side>, findings: &[Finding]) -> i32 {
+    let examined = findings
+        .iter()
+        .filter(|finding| !finding.status.is_deferred())
+        .count();
+    let deferred = findings.len().saturating_sub(examined);
     let failed = findings
         .iter()
-        .filter(|finding| !finding.status.is_pass())
+        .filter(|finding| !finding.status.is_pass() && !finding.status.is_deferred())
         .count();
-    let deferred = findings.iter().filter(|finding| finding.deferred).count();
-    println!("xtask setup: examined {examined} preconditions, {failed} not present");
-    println!("xtask setup: {deferred} findings require the agent-side run (run `mise run setup` as {AGENT_USER_NAME})");
+    let mode_label = mode.map_or("unknown", Side::label);
+    if examined == 0 {
+        eprintln!("xtask setup: {mode_label} mode examined 0 preconditions; a check over nothing is a failure");
+        return 1;
+    }
+    println!(
+        "xtask setup: {mode_label} mode: examined {examined} preconditions, {failed} not present"
+    );
+    match mode {
+        Some(mode) => println!(
+            "xtask setup: {deferred} deferred to the {} run (run `mise run setup` as {})",
+            mode.other().label(),
+            mode.other().run_as()
+        ),
+        None => println!("xtask setup: {deferred} deferred; no side could run"),
+    }
     i32::from(failed > 0)
 }
 
 pub fn run() -> i32 {
-    let findings = all_findings();
-    print_findings(&findings);
-    summarize(&findings)
+    match current_identity() {
+        Ok(identity) => {
+            let mode = mode_for(&identity.username);
+            let produced = match mode {
+                Side::Developer => developer_findings(&identity),
+                Side::Agent => agent_findings(&identity),
+            };
+            let findings = assemble(mode, &produced);
+            print_findings(&findings);
+            summarize(Some(mode), &findings)
+        }
+        Err(why) => {
+            let findings = unknown_mode_findings(&why);
+            print_findings(&findings);
+            summarize(None, &findings)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const EXPECTED_SIDES: [(&str, Side); 39] = [
+        ("agent user exists", Side::Developer),
+        ("shared group exists", Side::Developer),
+        ("developer is a member of the shared group", Side::Developer),
+        ("agent socket directory: exists", Side::Developer),
+        ("agent socket directory: is a directory", Side::Developer),
+        ("agent socket directory: owner uid", Side::Developer),
+        ("agent socket directory: owner gid", Side::Developer),
+        ("agent socket directory: mode", Side::Developer),
+        (
+            "core socket directory: path fits the socket budget",
+            Side::Developer,
+        ),
+        ("core socket directory: exists", Side::Developer),
+        ("core socket directory: is a directory", Side::Developer),
+        ("core socket directory: owner uid", Side::Developer),
+        ("core socket directory: mode", Side::Developer),
+        (
+            "zmx resolves through mise at the pinned version",
+            Side::Developer,
+        ),
+        (
+            "restate resolves through mise at the pinned version",
+            Side::Developer,
+        ),
+        (
+            "restate-server resolves through mise at the pinned version",
+            Side::Developer,
+        ),
+        (
+            "claude resolves through mise at the pinned version",
+            Side::Developer,
+        ),
+        (
+            "codex resolves through mise at the pinned version",
+            Side::Developer,
+        ),
+        (
+            "entire resolves through mise at the pinned version",
+            Side::Developer,
+        ),
+        (
+            "cue resolves through mise at the pinned version",
+            Side::Developer,
+        ),
+        ("entire logged in as the developer", Side::Developer),
+        ("agent user is a member of the shared group", Side::Agent),
+        ("agent credential: ~/.ssh", Side::Agent),
+        ("agent credential: ~/.config/gh", Side::Agent),
+        ("agent credential: ~/.aws", Side::Agent),
+        ("agent credential: ~/.netrc", Side::Agent),
+        ("agent credential: gitconfig credential helper", Side::Agent),
+        ("agent keychain: no item for github.com", Side::Agent),
+        ("agent keychain: no item for gitlab.com", Side::Agent),
+        ("agent keychain: no item for aws", Side::Agent),
+        ("agent keychain: no item for ssh", Side::Agent),
+        ("agent keychain: no item for gh:github.com", Side::Agent),
+        ("agent read-only file: ~/.claude/settings.json", Side::Agent),
+        ("agent read-only file: ~/.codex/config.toml", Side::Agent),
+        ("agent read-only file: ~/.zshenv", Side::Agent),
+        ("agent read-only file: ~/.zprofile", Side::Agent),
+        ("agent read-only file: ~/.zshrc", Side::Agent),
+        ("claude logged in as the agent", Side::Agent),
+        ("codex logged in as the agent", Side::Agent),
+    ];
+
+    fn checks_run(findings: &[Finding]) -> Vec<Check> {
+        findings
+            .iter()
+            .filter(|finding| !finding.status.is_deferred())
+            .map(|finding| finding.check)
+            .collect()
+    }
+
+    #[test]
+    fn mode_runs_partition_the_catalogue() {
+        let table: Vec<(&str, Side)> = CATALOGUE
+            .iter()
+            .map(|entry| (entry.name, entry.side))
+            .collect();
+        assert_eq!(table, EXPECTED_SIDES.to_vec());
+        for (index, entry) in CATALOGUE.iter().enumerate() {
+            let later = CATALOGUE.iter().skip(index.saturating_add(1));
+            assert!(later.clone().all(|other| other.check != entry.check));
+            assert!(later.clone().all(|other| other.name != entry.name));
+        }
+
+        let developer_run = assemble(Side::Developer, &[]);
+        let agent_run = assemble(Side::Agent, &[]);
+        for (mode, run) in [(Side::Developer, &developer_run), (Side::Agent, &agent_run)] {
+            let checks: Vec<Check> = run.iter().map(|finding| finding.check).collect();
+            let catalogue: Vec<Check> = CATALOGUE.iter().map(|entry| entry.check).collect();
+            assert_eq!(
+                checks, catalogue,
+                "every check exactly once in {mode:?} mode"
+            );
+            for (finding, entry) in run.iter().zip(CATALOGUE.iter()) {
+                if entry.side == mode {
+                    assert!(!finding.status.is_deferred());
+                } else {
+                    assert_eq!(finding.status, Status::Deferred { to: mode.other() });
+                }
+            }
+        }
+
+        let developer_checks = checks_run(&developer_run);
+        let agent_checks = checks_run(&agent_run);
+        assert!(developer_checks
+            .iter()
+            .all(|check| !agent_checks.contains(check)));
+        assert_eq!(
+            developer_checks.len().saturating_add(agent_checks.len()),
+            CATALOGUE.len()
+        );
+        assert_eq!(developer_checks.len(), 21);
+        assert_eq!(agent_checks.len(), 18);
+    }
+
+    #[test]
+    fn mode_is_agent_only_for_the_agent_user() {
+        assert_eq!(mode_for("tycho-agent"), Side::Agent);
+        assert_eq!(mode_for("frits"), Side::Developer);
+        assert_eq!(mode_for("tycho-agent2"), Side::Developer);
+        assert_eq!(mode_for(""), Side::Developer);
+    }
+
+    #[test]
+    fn assemble_keeps_produced_results_and_fails_closed_on_gaps() {
+        let produced = [Finding::new(Check::AgentUserExists, Status::Present)];
+        let findings = assemble(Side::Developer, &produced);
+        assert_eq!(
+            findings.first().map(|finding| &finding.status),
+            Some(&Status::Present)
+        );
+        let shared_group = findings
+            .iter()
+            .find(|finding| finding.check == Check::SharedGroupExists)
+            .map(|finding| finding.status.clone());
+        assert_eq!(
+            shared_group,
+            Some(Status::Unreachable {
+                why: "no probe produced this finding".to_string()
+            })
+        );
+
+        let stray = [Finding::new(Check::ClaudeLogin, Status::Present)];
+        let findings = assemble(Side::Developer, &stray);
+        assert_eq!(findings.len(), CATALOGUE.len().saturating_add(1));
+        assert!(findings
+            .last()
+            .is_some_and(|finding| matches!(finding.status, Status::Unreachable { .. })));
+    }
+
+    #[test]
+    fn unknown_identity_makes_every_check_unreachable() {
+        let findings = unknown_mode_findings("id is not on PATH");
+        assert_eq!(findings.len(), CATALOGUE.len());
+        assert!(findings
+            .iter()
+            .all(|finding| matches!(finding.status, Status::Unreachable { .. })));
+        assert_eq!(summarize(None, &findings), 1);
+    }
+
+    #[test]
+    fn summarize_exits_on_its_own_side_and_ignores_deferred() {
+        assert_eq!(summarize(Some(Side::Developer), &[]), 1);
+        let own_side_green = [
+            Finding::new(Check::AgentUserExists, Status::Present),
+            Finding::new(Check::ClaudeLogin, Status::Deferred { to: Side::Agent }),
+        ];
+        assert_eq!(summarize(Some(Side::Developer), &own_side_green), 0);
+        let own_side_red = [
+            Finding::new(Check::AgentUserExists, Status::Missing),
+            Finding::new(Check::ClaudeLogin, Status::Deferred { to: Side::Agent }),
+        ];
+        assert_eq!(summarize(Some(Side::Developer), &own_side_red), 1);
+        let only_deferred = [Finding::new(
+            Check::ClaudeLogin,
+            Status::Deferred { to: Side::Agent },
+        )];
+        assert_eq!(summarize(Some(Side::Developer), &only_deferred), 1);
+    }
+
+    #[test]
+    fn deferred_is_never_a_pass() {
+        let status = Status::Deferred { to: Side::Agent };
+        assert!(!status.is_pass());
+        assert!(status.is_deferred());
+        assert_eq!(status.to_string(), "deferred to the agent run");
+        assert_eq!(
+            Status::Deferred {
+                to: Side::Developer
+            }
+            .to_string(),
+            "deferred to the developer run"
+        );
+    }
+
+    #[test]
+    fn decodes_keychain_item_lookup_states() {
+        let not_found = "security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.\n";
+        assert_eq!(
+            decode_keychain_item(Some(44), "", not_found),
+            KeychainItem::Absent
+        );
+        let found = "keychain: \"/Users/frits/Library/Keychains/login.keychain-db\"\nversion: 512\nclass: \"genp\"\nattributes:\n    \"svce\"<blob>=\"tycho-probe-test\"\n";
+        assert_eq!(
+            decode_keychain_item(Some(0), found, ""),
+            KeychainItem::Present("/Users/frits/Library/Keychains/login.keychain-db".to_string())
+        );
+        let found_internet = "keychain: \"/Users/frits/Library/Keychains/login.keychain-db\"\nversion: 512\nclass: \"inet\"\n";
+        assert!(matches!(
+            decode_keychain_item(Some(0), found_internet, ""),
+            KeychainItem::Present(_)
+        ));
+        assert_eq!(
+            decode_keychain_item(Some(44), "", "some other error\n"),
+            KeychainItem::Unrecognised
+        );
+        assert_eq!(
+            decode_keychain_item(Some(0), "unexpected\n", ""),
+            KeychainItem::Unrecognised
+        );
+        assert_eq!(
+            decode_keychain_item(Some(51), "", "User interaction is not allowed.\n"),
+            KeychainItem::Unrecognised
+        );
+        assert_eq!(
+            decode_keychain_item(None, "", ""),
+            KeychainItem::Unrecognised
+        );
+    }
+
+    #[test]
+    fn decodes_auth_status_with_exit_code_per_tool() {
+        let claude_logged_in = r#"{"loggedIn": true, "authMethod": "claude.ai"}"#;
+        let claude_logged_out = "{\n  \"loggedIn\": false,\n  \"authMethod\": \"none\",\n  \"apiProvider\": \"firstParty\"\n}\n";
+        assert_eq!(
+            decode_claude_auth_status(Some(0), claude_logged_in),
+            AuthStatus::LoggedIn
+        );
+        assert_eq!(
+            decode_claude_auth_status(Some(1), claude_logged_out),
+            AuthStatus::LoggedOut
+        );
+        assert_eq!(
+            decode_claude_auth_status(Some(0), claude_logged_out),
+            AuthStatus::Unrecognised
+        );
+        assert_eq!(
+            decode_claude_auth_status(Some(1), claude_logged_in),
+            AuthStatus::Unrecognised
+        );
+        assert_eq!(
+            decode_claude_auth_status(Some(1), "not json"),
+            AuthStatus::Unrecognised
+        );
+
+        let entire_logged_in = r#"{"logged_in": true, "token_source": "macOS Keychain"}"#;
+        let entire_logged_out = "{\n  \"logged_in\": false,\n  \"available_contexts\": 0\n}\n";
+        assert_eq!(
+            decode_entire_auth_status(Some(0), entire_logged_in),
+            AuthStatus::LoggedIn
+        );
+        assert_eq!(
+            decode_entire_auth_status(Some(0), entire_logged_out),
+            AuthStatus::LoggedOut
+        );
+        assert_eq!(
+            decode_entire_auth_status(Some(1), ""),
+            AuthStatus::Unrecognised
+        );
+        assert_eq!(
+            decode_entire_auth_status(Some(0), "not json"),
+            AuthStatus::Unrecognised
+        );
+
+        assert_eq!(
+            decode_codex_login_status(Some(0), "Logged in"),
+            AuthStatus::Unrecognised
+        );
+    }
+
+    #[test]
+    fn login_probes_stop_before_exec_unless_the_tool_is_installed() {
+        let ls = MiseLs::Json(
+            r#"{
+                "claude": [{"version": "2.1.280", "installed": false, "active": true}],
+                "entire": [{"version": "0.11.4", "installed": true, "active": true}]
+            }"#
+            .to_string(),
+        );
+        assert!(matches!(
+            installed_gate(Check::ClaudeLogin, "claude", &ls),
+            Some(Finding {
+                status: Status::Unreachable { .. },
+                ..
+            })
+        ));
+        assert!(matches!(
+            installed_gate(Check::CodexLogin, "codex", &ls),
+            Some(Finding {
+                status: Status::Unreachable { .. },
+                ..
+            })
+        ));
+        assert!(installed_gate(Check::EntireLogin, "entire", &ls).is_none());
+        let unreachable = MiseLs::Unreachable("mise is not on PATH".to_string());
+        assert!(installed_gate(Check::EntireLogin, "entire", &unreachable).is_some());
+    }
+
+    #[test]
+    fn read_bounded_file_rejects_a_fifo_without_blocking() {
+        let directory =
+            std::env::temp_dir().join(format!("xtask-setup-fifo-{}", std::process::id()));
+        assert!(fs::create_dir_all(&directory).is_ok());
+        let fifo = directory.join("pipe");
+        let made = Command::new("mkfifo").arg(&fifo).status();
+        assert!(made.is_ok_and(|status| status.success()));
+
+        let (sender, receiver) = mpsc::channel();
+        let path = fifo.clone();
+        thread::spawn(move || {
+            drop(sender.send(read_bounded_file(&path).map_err(|error| error.to_string())));
+        });
+        let outcome = receiver.recv_timeout(Duration::from_secs(2));
+        drop(fs::remove_file(&fifo));
+        drop(fs::remove_dir(&directory));
+
+        let Ok(result) = outcome else {
+            panic!("read_bounded_file blocked on a FIFO");
+        };
+        assert!(result.is_err_and(|error| error.contains("is not a regular file")));
+    }
+
+    #[test]
+    fn read_bounded_file_reads_a_regular_file_and_rejects_an_oversized_one() {
+        let directory =
+            std::env::temp_dir().join(format!("xtask-setup-file-{}", std::process::id()));
+        assert!(fs::create_dir_all(&directory).is_ok());
+        let small = directory.join("small");
+        let large = directory.join("large");
+        assert!(fs::write(&small, "[user]\n").is_ok());
+        let oversized = "x".repeat(
+            usize::try_from(CREDENTIAL_FILE_MAX_BYTES)
+                .unwrap_or(0)
+                .saturating_add(1),
+        );
+        assert!(fs::write(&large, oversized).is_ok());
+        let small_result = read_bounded_file(&small).ok();
+        let large_result = read_bounded_file(&large);
+        drop(fs::remove_dir_all(&directory));
+        assert_eq!(small_result, Some("[user]\n".to_string()));
+        assert!(large_result.is_err());
+    }
+
+    #[test]
+    fn read_only_status_requires_another_owner_and_no_shared_write() {
+        assert_eq!(read_only_status(0, 0o644, 502), Status::Present);
+        assert!(matches!(
+            read_only_status(502, 0o444, 502),
+            Status::Wrong { .. }
+        ));
+        assert!(matches!(
+            read_only_status(0, 0o664, 502),
+            Status::Wrong { .. }
+        ));
+        assert!(matches!(
+            read_only_status(0, 0o646, 502),
+            Status::Wrong { .. }
+        ));
+    }
+
+    #[test]
+    fn read_only_file_status_reports_missing_and_non_regular_files() {
+        let directory =
+            std::env::temp_dir().join(format!("xtask-setup-read-only-{}", std::process::id()));
+        assert!(fs::create_dir_all(&directory).is_ok());
+        let missing = read_only_file_status(&directory.join("absent"), 502);
+        let not_a_file = read_only_file_status(&directory, 502);
+        drop(fs::remove_dir_all(&directory));
+        assert_eq!(missing, Status::Missing);
+        assert_eq!(
+            not_a_file,
+            Status::Wrong {
+                found: "directory".to_string(),
+                wanted: "regular file".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_membership_states_with_exit_code_and_rejects_the_unrecognised() {
+        assert_eq!(
+            decode_membership(Some(0), "user is a member of the group\n"),
+            MembershipOutcome::Member
+        );
+        assert_eq!(
+            decode_membership(Some(0), "user is not a member of the group\n"),
+            MembershipOutcome::NotMember
+        );
+        assert_eq!(
+            decode_membership(Some(7), "Group not found\n"),
+            MembershipOutcome::GroupNotFound
+        );
+        assert_eq!(
+            decode_membership(Some(7), "User not found\n"),
+            MembershipOutcome::UserNotFound
+        );
+        assert_eq!(
+            decode_membership(Some(1), "user is a member of the group\n"),
+            MembershipOutcome::Unrecognised
+        );
+        assert_eq!(
+            decode_membership(Some(0), "Group not found\n"),
+            MembershipOutcome::Unrecognised
+        );
+        assert_eq!(
+            decode_membership(Some(0), "garbage\n"),
+            MembershipOutcome::Unrecognised
+        );
+        assert_eq!(
+            decode_membership(None, "user is a member of the group\n"),
+            MembershipOutcome::Unrecognised
+        );
+    }
+
+    #[test]
+    fn missing_agent_home_makes_every_home_probe_unreachable() {
+        let home = Err("user tycho-agent does not exist".to_string());
+        for finding in credential_findings(&home) {
+            assert!(matches!(finding.status, Status::Unreachable { .. }));
+        }
+        for finding in read_only_findings(&home, 502) {
+            assert!(matches!(finding.status, Status::Unreachable { .. }));
+        }
+    }
+
+    #[test]
+    fn directory_error_names_every_dependent_check() {
+        let error = io::Error::from(io::ErrorKind::NotFound);
+        let findings =
+            directory_error_findings(Check::AgentDirExists, &AGENT_DIR_DEPENDENT, &error);
+        let checks: Vec<Check> = findings.iter().map(|finding| finding.check).collect();
+        assert_eq!(
+            checks,
+            vec![
+                Check::AgentDirExists,
+                Check::AgentDirIsDirectory,
+                Check::AgentDirOwnerUid,
+                Check::AgentDirOwnerGid,
+                Check::AgentDirMode
+            ]
+        );
+        assert_eq!(
+            findings.first().map(|finding| &finding.status),
+            Some(&Status::Missing)
+        );
+    }
 
     #[test]
     fn decodes_each_version_output_and_rejects_the_unrecognised() {
@@ -1404,7 +2148,6 @@ mod tests {
         );
         assert_eq!(decode_codex_version("codex 0.5.0\n"), None);
     }
-
     #[test]
     fn classifies_a_version_against_its_pin() {
         // A real zmx --version sample at a version older than a pin.
@@ -1425,7 +2168,6 @@ mod tests {
             }
         );
     }
-
     #[test]
     fn decodes_mise_exec_failure_states() {
         let not_installed = "mise ERROR \"codex\" couldn't exec process: No such file or directory\nmise ERROR Version: 2026.9.0 macos-arm64 (2026-09-01)\nmise ERROR Run with --verbose or MISE_VERBOSE=1 for more information\n";
@@ -1438,7 +2180,6 @@ mod tests {
             MiseFailure::Other("mise ERROR some other failure".to_string())
         );
     }
-
     #[test]
     fn decodes_dscl_failure_states() {
         let not_found = "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)\n";
@@ -1448,7 +2189,6 @@ mod tests {
             DsclFailure::Other("<dscl_cmd> DS Error: -14009 (eDSPermissionError)".to_string())
         );
     }
-
     #[test]
     fn decodes_mise_pin_states_and_rejects_the_unrecognised() {
         let json = r#"{
@@ -1467,77 +2207,12 @@ mod tests {
         assert_eq!(decode_mise_pin("not json", "zmx"), None);
         assert_eq!(decode_mise_pin(r#"{"zmx": "not an array"}"#, "zmx"), None);
     }
-
-    #[test]
-    fn decodes_membership_states_and_rejects_the_unrecognised() {
-        assert_eq!(
-            decode_membership("user is a member of the group\n"),
-            Some(MembershipOutcome::Member)
-        );
-        assert_eq!(
-            decode_membership("user is not a member of the group\n"),
-            Some(MembershipOutcome::NotMember)
-        );
-        assert_eq!(
-            decode_membership("Group not found\n"),
-            Some(MembershipOutcome::GroupNotFound)
-        );
-        assert_eq!(
-            decode_membership("User not found\n"),
-            Some(MembershipOutcome::UserNotFound)
-        );
-        assert_eq!(decode_membership("garbage\n"), None);
-    }
-
     #[test]
     fn decodes_id_output_and_rejects_the_empty_line() {
         assert_eq!(decode_id_output("501\n"), Some("501".to_string()));
         assert_eq!(decode_id_output("frits\n"), Some("frits".to_string()));
         assert_eq!(decode_id_output("\n"), None);
     }
-
-    #[test]
-    fn decodes_auth_status_json_per_tool() {
-        let logged_in = r#"{"loggedIn": true, "email": "user@example.com"}"#;
-        let logged_out = r#"{"loggedIn": false}"#;
-        assert_eq!(
-            decode_claude_auth_status(logged_in),
-            Some(AuthStatus::LoggedIn)
-        );
-        assert_eq!(
-            decode_claude_auth_status(logged_out),
-            Some(AuthStatus::LoggedOut)
-        );
-        assert_eq!(decode_claude_auth_status("not json"), None);
-
-        let entire_logged_in = r#"{"logged_in": true, "user": "github:example"}"#;
-        let entire_logged_out = r#"{"logged_in": false}"#;
-        assert_eq!(
-            decode_entire_auth_status(entire_logged_in),
-            Some(AuthStatus::LoggedIn)
-        );
-        assert_eq!(
-            decode_entire_auth_status(entire_logged_out),
-            Some(AuthStatus::LoggedOut)
-        );
-        assert_eq!(decode_entire_auth_status("not json"), None);
-    }
-
-    #[test]
-    fn decodes_keychain_listing_and_rejects_empty_output() {
-        let sample = "    \"/Users/frits/Library/Keychains/login.keychain-db\"\n    \"/Library/Keychains/System.keychain\"\n";
-        assert_eq!(
-            decode_keychain_listing(sample),
-            Some(KeychainListing::LoginKeychainPresent)
-        );
-        let no_login = "    \"/Library/Keychains/System.keychain\"\n";
-        assert_eq!(
-            decode_keychain_listing(no_login),
-            Some(KeychainListing::NoLoginKeychain)
-        );
-        assert_eq!(decode_keychain_listing(""), None);
-    }
-
     #[test]
     fn parses_dscl_attribute_lines_and_rejects_the_absent_key() {
         assert_eq!(
@@ -1556,7 +2231,6 @@ mod tests {
             None
         );
     }
-
     #[test]
     fn dscl_value_handles_the_continuation_line_form() {
         let sample = "dsAttrTypeNative:accountPolicyData:\n <?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n\t<key>failedLoginCount</key>\n\t<integer>0</integer>\n</dict>\n</plist>\n\ndsAttrTypeNative:AvatarRepresentation: \n";
@@ -1565,7 +2239,6 @@ mod tests {
         assert!(value.contains("<key>failedLoginCount</key>"));
         assert!(!value.contains("AvatarRepresentation"));
     }
-
     #[test]
     fn owner_and_mode_status_pass_only_on_an_exact_match() {
         assert_eq!(owner_status(501, Ok(501)), Status::Present);
@@ -1591,20 +2264,6 @@ mod tests {
             }
         );
     }
-
-    #[test]
-    fn owner_uid_status_accepts_any_candidate() {
-        assert_eq!(owner_uid_status(501, Ok(vec![501, 0])), Status::Present);
-        assert_eq!(owner_uid_status(0, Ok(vec![501, 0])), Status::Present);
-        assert_eq!(
-            owner_uid_status(777, Ok(vec![501, 0])),
-            Status::Wrong {
-                found: "777".to_string(),
-                wanted: "501 or 0".to_string()
-            }
-        );
-    }
-
     #[test]
     fn socket_dir_budget_is_computed_from_tycho_types_constants() {
         assert_eq!(SOCKET_DIR_MAX_BYTES, 38);
@@ -1612,21 +2271,11 @@ mod tests {
         let long = "/".to_string() + &"d".repeat(SOCKET_DIR_MAX_BYTES.saturating_add(1));
         assert!(matches!(path_length_status(&long), Status::Wrong { .. }));
     }
-
     #[test]
     fn agent_and_core_socket_dirs_cannot_collide_for_a_real_home() {
         let core = core_socket_dir_path("/Users/example-developer");
         assert_ne!(core, AGENT_SOCKET_DIR);
     }
-
-    #[test]
-    fn missing_agent_home_makes_every_credential_probe_unreachable() {
-        let finding = credential_absence_finding("x", None, ".ssh");
-        assert!(matches!(finding.status, Status::Unreachable { .. }));
-        let finding = credential_gitconfig_finding(None);
-        assert!(matches!(finding.status, Status::Unreachable { .. }));
-    }
-
     #[test]
     fn mise_command_disables_auto_install_and_the_network() {
         let command = mise_command(&["exec", "--", "zmx", "--version"]);
@@ -1646,24 +2295,15 @@ mod tests {
     }
 
     #[test]
-    fn summarize_fails_on_zero_examined_and_on_any_non_present() {
-        assert_eq!(summarize(&[]), 1);
-        let all_present = [
-            Finding::new("a", Status::Present),
-            Finding::new("b", Status::Present),
-        ];
-        assert_eq!(summarize(&all_present), 0);
-        let one_missing = [
-            Finding::new("a", Status::Present),
-            Finding::new("b", Status::Missing),
-        ];
-        assert_eq!(summarize(&one_missing), 1);
-    }
-
-    #[test]
-    fn deferred_finding_is_a_failure_and_counted_as_deferred() {
-        let finding = Finding::deferred("x", "run as the operator: codex login status");
-        assert!(!finding.status.is_pass());
-        assert!(finding.deferred);
+    fn owner_uid_status_accepts_any_candidate() {
+        assert_eq!(owner_uid_status(501, &[501, 0]), Status::Present);
+        assert_eq!(owner_uid_status(0, &[501, 0]), Status::Present);
+        assert_eq!(
+            owner_uid_status(777, &[501, 0]),
+            Status::Wrong {
+                found: "777".to_string(),
+                wanted: "501 or 0".to_string()
+            }
+        );
     }
 }
