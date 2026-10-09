@@ -1548,6 +1548,7 @@ dependencies = [
  "nix",
  "reqwest",
  "restate-sdk",
+ "serde",
  "serde_json",
  "tokio",
  "tycho-types",

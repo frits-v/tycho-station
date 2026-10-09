@@ -8,11 +8,14 @@
 use std::env;
 use std::fmt::Display;
 use std::process;
+use std::sync::Arc;
 use std::thread;
 
 use tycho::config::{self, CoreConfig, ENDPOINT_PORT, PROBE_TIMEOUT, WATCHDOG_INTERVAL};
 use tycho::http::Http;
 use tycho::launchd::Agent;
+use tycho::services::spawner::NoLauncher;
+use tycho::services::{Ports, Timing};
 use tycho::watchdog::{self, LoopEnd, Supervisor};
 use tycho::{core, endpoint};
 
@@ -74,7 +77,11 @@ fn main() {
 }
 
 fn serve_endpoint() -> i32 {
-    match endpoint::serve(config::loopback(ENDPOINT_PORT)) {
+    let ports = Ports {
+        spawner: Arc::new(NoLauncher),
+        timing: Timing::default(),
+    };
+    match endpoint::serve(config::loopback(ENDPOINT_PORT), &ports) {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("tycho: endpoint: {error}");

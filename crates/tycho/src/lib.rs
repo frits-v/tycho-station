@@ -15,5 +15,6 @@ pub mod http;
 pub mod launchd;
 pub mod private_dir;
 pub mod probe;
+pub mod services;
 pub mod watchdog;
 pub mod zmx;
