@@ -1,0 +1,19 @@
+[workspace]
+git_only = true
+release_always = false
+release = false
+changelog_update = true
+git_release_enable = false
+git_tag_enable = false
+semver_check = false
+dependencies_update = false
+pr_branch_prefix = "release-plz-"
+pr_labels = ["release"]
+release_commits = "^(feat|fix|perf|refactor|revert)(\\(.*\\))?!?:"
+
+[[package]]
+name = "tycho"
+release = true
+git_tag_enable = true
+git_tag_name = "v{{ version }}"
+git_release_enable = true

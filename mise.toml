@@ -1,5 +1,5 @@
 [tools]
-rust = { version = "1.94", components = "rustfmt,clippy" }
+rust = { version = "1.94", components = "rustfmt,clippy", targets = "aarch64-apple-darwin,x86_64-apple-darwin" }
 lefthook = "2.2.0"
 zizmor = "1.30.1"
 actionlint = "1.7.12"
@@ -10,6 +10,7 @@ cue = "0.17.1"
 entire = "0.11.4"
 release-plz = "0.3.170"
 cargo-dist = "0.33.0"
+gh = "2.102.0"
 
 [tasks.ci]
 description = "Format check, lints, tests, and the pull request title check when run in CI"
@@ -34,3 +35,15 @@ run = "entire plugin install graph --pin v0.4.0 --yes"
 [tasks.graph-tests]
 description = "Build, rebuild and query the semantic graph index of a copy of this repository and record the index build time; needs `mise run graph-plugin` first"
 run = "cargo test -p tycho --test graph -- --ignored --test-threads=1 --nocapture"
+
+[tasks.release-pr]
+description = "Open or update the release pull request; --dry-run shows it locally"
+run = "cargo run -q -p xtask -- release-pr"
+
+[tasks.release]
+description = "Tag a merged release pull request and create its GitHub release"
+run = "cargo run -q -p xtask -- release"
+
+[tasks.release-binaries]
+description = "Build this host's tycho archives with dist and upload them to the release"
+run = "cargo run -q -p xtask -- release-binaries"

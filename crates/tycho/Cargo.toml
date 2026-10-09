@@ -16,3 +16,6 @@ tycho-types = { path = "../tycho-types" }
 
 [lints]
 workspace = true
+
+[package.metadata.dist]
+dist = true

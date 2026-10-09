@@ -1,0 +1,73 @@
+name: release
+on:
+  push:
+    branches: [main]
+permissions: {}
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    # A group per commit: a queued release is never cancelled by a later push.
+    concurrency:
+      group: release-${{ github.sha }}
+      cancel-in-progress: false
+    permissions:
+      contents: write # create the tag and the GitHub release
+      pull-requests: read # find the release pull request a commit came from
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          cache: false
+      - id: release
+        run: mise run release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+  binaries:
+    name: binaries (${{ matrix.os }})
+    needs: release
+    if: needs.release.outputs.tag != ''
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    concurrency:
+      group: binaries-${{ github.sha }}-${{ matrix.os }}
+      cancel-in-progress: false
+    permissions:
+      contents: write # upload archives to the GitHub release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          cache: false
+      - run: mise run release-binaries
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.release.outputs.tag }}
+  release-pr:
+    name: release-pr
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: release-pr-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
+        with:
+          cache: false
+      - run: mise run release-pr
+        env:
+          RELEASE_PLZ_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
