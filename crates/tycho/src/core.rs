@@ -5,7 +5,9 @@ use std::thread;
 
 use tycho_types::service::{handler, Service, RECONCILER_KEY};
 
-use crate::config::{CoreConfig, CorePorts, CoreRole, HEALTH_WAIT_POLLS_MAX, POLL_INTERVAL};
+use crate::config::{
+    CoreConfig, CorePorts, CoreRole, COMMAND_TIMEOUT, HEALTH_WAIT_POLLS_MAX, POLL_INTERVAL,
+};
 use crate::health::{self, Health};
 use crate::http::{Http, Outcome};
 use crate::services::operator;
@@ -60,7 +62,7 @@ pub fn start(supervisor: &Supervisor, config: &CoreConfig) -> StartReport {
             &mut || thread::sleep(POLL_INTERVAL),
         )
         .map_err(|last| format!("ingress did not become healthy: {last}"))
-        .and_then(|_| start_reconciler(http, ports))
+        .and_then(|_| start_reconciler(ports))
     } else {
         Err("not attempted: the core did not come up".to_string())
     };
@@ -89,7 +91,10 @@ pub fn wait_for_ingress(
     Err(last)
 }
 
-fn start_reconciler(http: &Http, ports: CorePorts) -> Result<String, String> {
+/// The first call through ingress reaches the endpoint, which can take longer than a probe;
+/// it is not retried, since a second start would begin another tick chain generation.
+fn start_reconciler(ports: CorePorts) -> Result<String, String> {
+    let http = Http::new(COMMAND_TIMEOUT).map_err(|error| error.to_string())?;
     let path = format!(
         "/{}/{RECONCILER_KEY}/{}",
         Service::Reconciler.name(),

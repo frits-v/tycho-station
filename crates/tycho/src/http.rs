@@ -85,10 +85,22 @@ impl Http {
     }
 }
 
+/// reqwest's message is the same for a refused connect and a timeout; the reason names which.
+fn unreachable_reason(error: &reqwest::Error) -> String {
+    let kind = if error.is_timeout() {
+        "timed out"
+    } else if error.is_connect() {
+        "connect failed"
+    } else {
+        "request failed"
+    };
+    format!("{kind}: {error}")
+}
+
 fn read(sent: reqwest::Result<reqwest::blocking::Response>) -> Outcome {
     let response = match sent {
         Ok(response) => response,
-        Err(error) => return Outcome::Unreachable(error.to_string()),
+        Err(error) => return Outcome::Unreachable(unreachable_reason(&error)),
     };
     let status = response.status().as_u16();
     let limit = u64::try_from(HTTP_BODY_MAX_BYTES).unwrap_or(u64::MAX);
@@ -114,6 +126,23 @@ mod tests {
     use std::io::Write;
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn a_refused_connect_and_a_timeout_are_told_apart() {
+        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+        let refused = format!("http://{}/", closed.local_addr().unwrap());
+        drop(closed);
+        let silent = TcpListener::bind("127.0.0.1:0").unwrap();
+        let unanswered = format!("http://{}/", silent.local_addr().unwrap());
+        let http = Http::new(Duration::from_millis(200)).unwrap();
+        assert!(
+            matches!(http.get(&refused), Outcome::Unreachable(reason) if reason.starts_with("connect failed: ")),
+        );
+        assert!(
+            matches!(http.get(&unanswered), Outcome::Unreachable(reason) if reason.starts_with("timed out: ")),
+        );
+        drop(silent);
+    }
 
     #[test]
     fn a_body_over_the_cap_is_too_large() {
