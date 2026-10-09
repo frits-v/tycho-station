@@ -20,8 +20,8 @@ use tycho_types::envelope::CommitSha;
 use tycho_types::service::WorkUnitId;
 
 use crate::support::{
-    admin_query, attach, client, dispatch, lifecycle_and_attempt, session_status, start_core,
-    unit_status, wait_until, worker_run_status, DoublesEndpoint,
+    admin_query, attach, await_unit_end, client, dispatch, lifecycle_and_attempt, session_status,
+    start_core, unit_status, wait_until, worker_run_status, DoublesEndpoint,
 };
 
 const DEFAULT_SHA: &str = "2222222222222222222222222222222222222222";
@@ -120,6 +120,7 @@ fn endpoint_killed_between_tasks_replays_without_dispatching_twice() {
     );
     let _restarted = DoublesEndpoint::start(&ports);
     println!("evidence: endpoint restarted on the same port");
+    await_unit_end("endpoint killed between tasks", &before);
     let (status, body) = attach(&invocation);
     assert_eq!(status, 200, "{body}");
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -274,6 +275,7 @@ fn a_unit_merges_end_to_end_and_records_the_baselines() {
     let (core, _endpoint, _) =
         start_core("merge", Arc::new(spawner.clone()), Arc::new(gate.clone()));
     let invocation = dispatch(&core, &["wu01-t1"]);
+    await_unit_end("first merge", &("queued".to_string(), 1));
     let (status, body) = attach(&invocation);
     assert_eq!(status, 200, "{body}");
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();

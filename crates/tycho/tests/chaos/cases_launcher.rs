@@ -23,13 +23,11 @@ use tycho_types::envelope::CommitSha;
 
 use crate::launcher_spawner::{running_vendor, AgentGuard, LauncherSpawner, VendorPlan, VendorRun};
 use crate::support::{
-    attach, dispatch, http, lifecycle_and_attempt, retrying_invocations, session_status,
-    start_endpoint, start_with_retries, unit_status, wait_until, worker_run_status, Core,
-    DoublesEndpoint, TYCHO, WAIT_TIMEOUT,
+    attach, await_unit_end, dispatch, http, lifecycle_and_attempt, session_status, start_endpoint,
+    start_with_retries, unit_status, wait_until, worker_run_status, Core, DoublesEndpoint, TYCHO,
 };
 
 const DEFAULT_SHA: &str = "2222222222222222222222222222222222222222";
-const UNIT_TERMINAL: [&str; 3] = ["done", "abandoned", "escalated"];
 
 fn merged_gate() -> FixedGate {
     FixedGate::new(GateVerdict::Merged {
@@ -109,51 +107,6 @@ fn wait_for_heartbeat(name: &str) {
     wait_until(&format!("a heartbeat from {name} recorded"), || {
         !session_status(name)["heartbeat_unix_ms"].is_null()
     });
-}
-
-/// Polls until the unit reaches a terminal lifecycle; on the deadline, reports what is retrying.
-fn await_unit_end(why: &str, before: &(String, u64)) -> serde_json::Value {
-    let started = Instant::now();
-    while started.elapsed() < WAIT_TIMEOUT {
-        let view = unit_status();
-        if UNIT_TERMINAL.contains(&view["lifecycle"].as_str().unwrap_or("")) {
-            println!(
-                "evidence: unit ended {} after {:.1}s",
-                view["lifecycle"],
-                started.elapsed().as_secs_f64()
-            );
-            return view;
-        }
-        if let Some(looping) = looping_invocation() {
-            print_failed_pair(before, &view);
-            panic!("{why}: an invocation of the unit is looping; view {view}; {looping}");
-        }
-        thread::sleep(Duration::from_millis(500));
-    }
-    let retrying = retrying_invocations();
-    for (_, line) in &retrying {
-        println!("evidence: still retrying: {line}");
-    }
-    let view = unit_status();
-    print_failed_pair(before, &view);
-    panic!(
-        "{why}: the unit did not end within {WAIT_TIMEOUT:?}; view {view}; retrying {retrying:?}"
-    );
-}
-
-fn print_failed_pair(before: &(String, u64), view: &serde_json::Value) {
-    let after = lifecycle_and_attempt(view);
-    println!("evidence: lifecycle before the kill {before:?}, at failure {after:?}");
-}
-
-/// An invocation Restate has retried this often will not end on its own; the case fails now.
-const RETRIES_LOOPING: u64 = 5;
-
-fn looping_invocation() -> Option<String> {
-    retrying_invocations()
-        .into_iter()
-        .find(|(retries, _)| *retries >= RETRIES_LOOPING)
-        .map(|(_, line)| line)
 }
 
 /// No duplicate session so far, then the unit ended done in the attempt it ran before the kill.

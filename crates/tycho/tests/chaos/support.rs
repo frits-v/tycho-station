@@ -415,6 +415,53 @@ pub fn attach(invocation: &str) -> (u16, String) {
     }
 }
 
+const UNIT_TERMINAL: [&str; 3] = ["done", "abandoned", "escalated"];
+
+/// Polls until the unit reaches a terminal lifecycle; on the deadline, reports what is retrying.
+pub fn await_unit_end(why: &str, before: &(String, u64)) -> serde_json::Value {
+    let started = Instant::now();
+    while started.elapsed() < WAIT_TIMEOUT {
+        let view = unit_status();
+        if UNIT_TERMINAL.contains(&view["lifecycle"].as_str().unwrap_or("")) {
+            println!(
+                "evidence: unit ended {} after {:.1}s",
+                view["lifecycle"],
+                started.elapsed().as_secs_f64()
+            );
+            return view;
+        }
+        if let Some(looping) = looping_invocation() {
+            print_failed_pair(before, &view);
+            panic!("{why}: an invocation of the unit is looping; view {view}; {looping}");
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    let retrying = retrying_invocations();
+    for (_, line) in &retrying {
+        println!("evidence: still retrying: {line}");
+    }
+    let view = unit_status();
+    print_failed_pair(before, &view);
+    panic!(
+        "{why}: the unit did not end within {WAIT_TIMEOUT:?}; view {view}; retrying {retrying:?}"
+    );
+}
+
+fn print_failed_pair(before: &(String, u64), view: &serde_json::Value) {
+    let after = lifecycle_and_attempt(view);
+    println!("evidence: lifecycle before the kill {before:?}, at failure {after:?}");
+}
+
+/// An invocation Restate has retried this often will not end on its own; the case fails now.
+const RETRIES_LOOPING: u64 = 5;
+
+fn looping_invocation() -> Option<String> {
+    retrying_invocations()
+        .into_iter()
+        .find(|(retries, _)| *retries >= RETRIES_LOOPING)
+        .map(|(_, line)| line)
+}
+
 /// Runs one SQL query against Restate's admin introspection and returns its rows.
 pub fn admin_query(sql: &str) -> Vec<serde_json::Value> {
     let body = serde_json::json!({ "query": sql }).to_string();
