@@ -14,6 +14,7 @@ use crate::sarif::{self, Finding};
 
 const RULES_FILE: &str = "opengrep/rust.yml";
 const FIXTURE_DIR: &str = "opengrep";
+const FIXTURE_FILE: &str = "opengrep/rust.rs";
 const SCANNED_DIRS: [&str; 2] = ["crates", "xtask"];
 const EXCLUDED: [&str; 2] = ["target", ".worktrees"];
 const OPENGREP_TIMEOUT: Duration = Duration::from_secs(300);
@@ -150,9 +151,26 @@ pub fn decode_test(report: &Value) -> TestReport {
     TestReport::Rules(rules)
 }
 
-/// Every rule in the rule file passed its fixtures; a rule opengrep did not test counts as
-/// having no fixture lines. Returns the number of rules.
-pub fn fixtures_pass(rule_ids: &[String], report: TestReport) -> Result<usize, String> {
+/// The rule ids that `// ok:` annotations in the fixture text name, one entry per line;
+/// `opengrep test` reports only the `ruleid:` lines, so the lines that must not fire are
+/// counted here.
+pub fn ok_annotations(fixtures: &str) -> Vec<String> {
+    fixtures
+        .lines()
+        .filter_map(|line| line.trim_start().strip_prefix("// ok:"))
+        .flat_map(|ids| ids.split(','))
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
+/// Every rule in the rule file passed its fixtures and has at least one `ok:` line; a rule
+/// opengrep did not test counts as having no fixture lines. Returns the number of rules.
+pub fn fixtures_pass(
+    rule_ids: &[String],
+    ok_lines: &[String],
+    report: TestReport,
+) -> Result<usize, String> {
     let rules = match report {
         TestReport::Rules(rules) => rules,
         TestReport::BrokenConfig(reason) => return Err(format!("broken rule file: {reason}")),
@@ -166,6 +184,11 @@ pub fn fixtures_pass(rule_ids: &[String], report: TestReport) -> Result<usize, S
             Some((_, FixtureVerdict::Passed { .. })) => {}
             Some((_, verdict)) => failures.push(format!("{id}: {verdict:?}")),
             None => failures.push(format!("{id}: {:?}", FixtureVerdict::NoFixtureLines)),
+        }
+    }
+    for id in rule_ids {
+        if !ok_lines.contains(id) {
+            failures.push(format!("{id}: no `ok:` fixture line in {FIXTURE_FILE}"));
         }
     }
     for (tested, _) in &rules {
@@ -251,7 +274,9 @@ fn test_fixtures(rule_ids: &[String]) -> Result<usize, String> {
         Command::new("opengrep").args(["test", "--json", FIXTURE_DIR]),
         &[0, 1],
     )?;
-    fixtures_pass(rule_ids, decode_test(&report))
+    let fixtures = fs::read_to_string(FIXTURE_FILE)
+        .map_err(|error| format!("cannot read {FIXTURE_FILE}: {error}"))?;
+    fixtures_pass(rule_ids, &ok_annotations(&fixtures), decode_test(&report))
 }
 
 fn scan() -> Result<ScanReport, String> {
@@ -384,7 +409,11 @@ mod tests {
             "opengrep.rust-b": check(true, &[7], &[7]),
         }));
         assert_eq!(
-            fixtures_pass(&ids(&["rust-a", "rust-b"]), decode_test(&report)),
+            fixtures_pass(
+                &ids(&["rust-a", "rust-b"]),
+                &ids(&["rust-a", "rust-b"]),
+                decode_test(&report)
+            ),
             Ok(2)
         );
     }
@@ -392,10 +421,25 @@ mod tests {
     #[test]
     fn an_untested_rule_a_fixture_miss_or_no_rules_fails() {
         let report = test_report(&json!({"rust-a": check(true, &[3], &[3])}));
-        assert!(fixtures_pass(&ids(&["rust-a", "rust-b"]), decode_test(&report)).is_err());
+        let both = ids(&["rust-a", "rust-b"]);
+        assert!(fixtures_pass(&both, &both, decode_test(&report)).is_err());
         let missed = test_report(&json!({"rust-a": check(false, &[3], &[])}));
-        assert!(fixtures_pass(&ids(&["rust-a"]), decode_test(&missed)).is_err());
-        assert!(fixtures_pass(&[], decode_test(&test_report(&json!({})))).is_err());
+        assert!(fixtures_pass(&ids(&["rust-a"]), &ids(&["rust-a"]), decode_test(&missed)).is_err());
+        assert!(fixtures_pass(&[], &[], decode_test(&test_report(&json!({})))).is_err());
+    }
+
+    #[test]
+    fn a_rule_without_an_ok_line_fails() {
+        let report = test_report(&json!({"rust-a": check(true, &[3], &[3])}));
+        let fixtures = "// ruleid: rust-a\nfire();\n// ok: rust-b, rust-c\nquiet();\n";
+        let ok_lines = ok_annotations(fixtures);
+        assert_eq!(ok_lines, ids(&["rust-b", "rust-c"]));
+        assert!(fixtures_pass(&ids(&["rust-a"]), &ok_lines, decode_test(&report)).is_err());
+        let with_ok = ok_annotations("    // ok: rust-a\n");
+        assert_eq!(
+            fixtures_pass(&ids(&["rust-a"]), &with_ok, decode_test(&report)),
+            Ok(1)
+        );
     }
 
     #[test]

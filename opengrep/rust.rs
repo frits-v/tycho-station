@@ -3,12 +3,18 @@ fn todo_comments() {
     // TODO: split the slab pass
     // ruleid: rust-todo-without-ticket
     /// TODO measure the tag before placing it
-    // ok: rust-todo-without-ticket
+    // ruleid: rust-todo-without-ticket
     // TODO(#41): split the slab pass
+    // ruleid: rust-todo-without-ticket
+    //! TODO measure the slab first
+    // ruleid: rust-todo-without-ticket
+    /* TODO split the slab pass */
     // ok: rust-todo-without-ticket
     // TODO: https://github.com/example/tycho/issues/41
     // ok: rust-todo-without-ticket
     // TODO ABC-12 split the slab pass
+    // ok: rust-todo-without-ticket
+    /* TODO(ABC-12): split the slab pass */
 }
 
 fn history_comments() {
@@ -22,6 +28,10 @@ fn history_comments() {
     // The clearance is used to keep tubes off the slab edge.
     // ok: rust-history-trace-comment
     // A tag lies nearest its own connector.
+    // ok: rust-history-trace-comment
+    /// Nothing was written before the write failed.
+    // ruleid: rust-history-trace-comment
+    // The tag was centred before.
 }
 
 fn cargo_commands() {
@@ -31,10 +41,24 @@ fn cargo_commands() {
     run(Command::new("cargo").arg("test"));
     // ruleid: rust-cargo-build-bypasses-mbx
     run("cargo", &["test", "--workspace"]);
+    // ruleid: rust-cargo-build-bypasses-mbx
+    run(Command::new("cargo").args(&["test"]));
+    // ruleid: rust-cargo-build-bypasses-mbx
+    run(Command::new("cargo").current_dir(root).args(["build", "--release"]));
     // ok: rust-cargo-build-bypasses-mbx
     run(Command::new("cargo").args(["fmt", "--all", "--check"]));
     // ok: rust-cargo-build-bypasses-mbx
     run("cargo", &["fmt", "--all", "--", "--check"]);
     // ok: rust-cargo-build-bypasses-mbx
     run(Command::new("mbx").args(["build", "--release"]));
+}
+
+fn let_bound_cargo_commands() {
+    let mut command = Command::new("cargo");
+    command.current_dir(root);
+    // ruleid: rust-cargo-build-bypasses-mbx
+    command.arg("build");
+    let mut listing = Command::new("cargo");
+    // ok: rust-cargo-build-bypasses-mbx
+    listing.args(["metadata", "--no-deps"]);
 }

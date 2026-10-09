@@ -1,12 +1,12 @@
 rules:
   - id: rust-todo-without-ticket
     message: >-
-      TODO without a ticket reference. Name an issue (#123, ABC-123) or link one, so the
+      TODO without a ticket reference. Name a ticket key (ABC-123) or link the ticket, so the
       comment has an owner.
     languages: [rust]
     severity: ERROR
     patterns:
-      - pattern-regex: '//\s*TODO(?!\s*[:(]?\s*(?:#[0-9]+|[A-Z]+-[0-9]+|https?://))'
+      - pattern-regex: '(?://[/!]?|/\*[*!]?)\s*TODO(?!\s*[:(]?\s*(?:[A-Z]+-[0-9]+|https?://))'
 
   - id: rust-history-trace-comment
     message: >-
@@ -17,7 +17,7 @@ rules:
     patterns:
       # The lookbehinds exempt the instrumental "is/are/was used to", which says what a
       # thing is for rather than what it once did.
-      - pattern-regex: '(?i)//[^\n]*\b(?:previously|(?<!\bis\s)(?<!\bare\s)(?<!\bwas\s)(?<!\bwere\s)(?<!\bbe\s)(?<!\bbeen\s)(?<!\bbeing\s)used\s+to|now\s+does|was\s+\w+\s+before|this\s+replaces|we\s+changed|removed\s+the|an\s+earlier\s+version|first\s+two\s+versions)\b'
+      - pattern-regex: '(?i)//[^\n]*\b(?:previously|(?<!\bis\s)(?<!\bare\s)(?<!\bwas\s)(?<!\bwere\s)(?<!\bbe\s)(?<!\bbeen\s)(?<!\bbeing\s)used\s+to|now\s+does|was\s+\w+\s+before(?!\s+\w)|this\s+replaces|we\s+changed|removed\s+the|an\s+earlier\s+version|first\s+two\s+versions)\b'
 
   - id: rust-cargo-build-bypasses-mbx
     message: >-
@@ -28,7 +28,19 @@ rules:
     patterns:
       - pattern-either:
           - pattern: Command::new("cargo").args([$SUBCOMMAND, ...])
+          - pattern: Command::new("cargo").args(&[$SUBCOMMAND, ...])
           - pattern: Command::new("cargo").arg($SUBCOMMAND)
+          - pattern: Command::new("cargo").$SETUP(...).args([$SUBCOMMAND, ...])
+          - pattern: Command::new("cargo").$SETUP(...).args(&[$SUBCOMMAND, ...])
+          - pattern: Command::new("cargo").$SETUP(...).arg($SUBCOMMAND)
+          - patterns:
+              - pattern-inside: |
+                  let mut $COMMAND = Command::new("cargo");
+                  ...
+              - pattern-either:
+                  - pattern: $COMMAND.arg($SUBCOMMAND)
+                  - pattern: $COMMAND.args([$SUBCOMMAND, ...])
+                  - pattern: $COMMAND.args(&[$SUBCOMMAND, ...])
           - pattern: $RUNNER("cargo", &[$SUBCOMMAND, ...])
       - metavariable-regex:
           metavariable: $SUBCOMMAND
