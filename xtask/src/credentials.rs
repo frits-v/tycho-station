@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use crate::finish;
+use crate::finish_with_note;
 use crate::process::{run_bounded, Exit};
 
 const MARKERS: [&str; 10] = [
@@ -35,6 +35,14 @@ const MANDATE_CLAUSE: [&str; 3] = [
     "work and names the trade-off. No personal access token is used; a credential is the",
     "shortest-lived and narrowest the task allows, issued to the station's own identity.",
 ];
+/// Characters that render as nothing or as a gap and can split a marker: zero-width space,
+/// non-joiner and joiner, word joiner, byte order mark, soft hyphen, and the replacement
+/// character a non-UTF-8 byte such as a Latin-1 no-break space decodes to.
+const INVISIBLE_SEPARATORS: [char; 7] = [
+    '\u{200b}', '\u{200c}', '\u{200d}', '\u{2060}', '\u{feff}', '\u{ad}', '\u{fffd}',
+];
+/// HTML spellings of a no-break space, lowercased.
+const SPACE_ENTITIES: [&str; 3] = ["&nbsp;", "&#160;", "&#xa0;"];
 const LISTED_FILES_MAX: usize = 4096;
 const SCANNED_FILE_MAX_BYTES: u64 = 4 << 20;
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -70,35 +78,35 @@ fn listed_files(base: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-/// Lowercased text with each run of whitespace, no-break spaces and `&nbsp;` as one space, and
-/// for each byte kept the line it came from, so a marker wrapped across lines still matches.
-fn normalized(text: &str) -> (String, Vec<usize>) {
-    let lower = text.to_ascii_lowercase().replace("&nbsp;", "\u{a0}");
+/// Lowercased text with every whitespace character, invisible separator and HTML no-break
+/// space removed, and for each byte kept the line it came from. Markers are compared in the same
+/// compact form, so a marker wrapped across lines or split by any separator still matches.
+fn compacted(text: &str) -> (String, Vec<usize>) {
+    let mut lower = text.to_ascii_lowercase();
+    for entity in SPACE_ENTITIES {
+        lower = lower.replace(entity, " ");
+    }
     let mut kept = String::with_capacity(lower.len());
     let mut lines = Vec::with_capacity(lower.len());
     let mut line = 1_usize;
-    let mut in_space = false;
     for character in lower.chars() {
         let source_line = line;
         if character == '\n' {
             line = line.saturating_add(1);
         }
-        if character.is_whitespace() {
-            if in_space {
-                continue;
-            }
-            in_space = true;
-            kept.push(' ');
-            lines.push(source_line);
+        if character.is_whitespace() || INVISIBLE_SEPARATORS.contains(&character) {
             continue;
         }
-        in_space = false;
         kept.push(character);
         for _ in 0..character.len_utf8() {
             lines.push(source_line);
         }
     }
     (kept, lines)
+}
+
+fn compact_marker(marker: &str) -> String {
+    marker.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// The one-based line numbers of every place `passage` appears as consecutive whole lines.
@@ -128,10 +136,10 @@ fn credential_defects(path: &Path, text: &str) -> Vec<String> {
                 .is_some_and(|row| row.starts_with(STYLE_ROW_PREFIX));
         style_row || mandate_exempt.contains(&line)
     };
-    let (kept, lines) = normalized(text);
+    let (kept, lines) = compacted(text);
     let mut defects = Vec::new();
     for marker in MARKERS {
-        for (offset, _) in kept.match_indices(marker) {
+        for (offset, _) in kept.match_indices(compact_marker(marker).as_str()) {
             let line = lines.get(offset).copied().unwrap_or(0);
             if !exempt_line(line) {
                 defects.push(format!("{}:{line}: `{marker}`", path.display()));
@@ -141,13 +149,31 @@ fn credential_defects(path: &Path, text: &str) -> Vec<String> {
     defects
 }
 
-/// Reads a scanned file as text; `None` for a binary file, which carries no prose to check, or a
-/// tracked file deleted from the working tree.
-fn scanned_text(path: &Path) -> Result<Option<String>, String> {
+/// What a listed file holds for the scan.
+#[derive(Debug, PartialEq, Eq)]
+enum Scanned {
+    Text(String),
+    /// Bytes with a NUL: an image or other binary, counted in the summary.
+    Binary,
+    /// A tracked file deleted from the working tree, or not a regular file.
+    Absent,
+}
+
+/// Text for any bytes without a NUL; a byte that is not UTF-8 becomes U+FFFD, which the
+/// compaction removes, so one stray byte cannot hide a file.
+fn decoded(bytes: &[u8]) -> Scanned {
+    if bytes.contains(&0) {
+        Scanned::Binary
+    } else {
+        Scanned::Text(String::from_utf8_lossy(bytes).into_owned())
+    }
+}
+
+fn scanned_text(path: &Path) -> Result<Scanned, String> {
     let size = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_file() => metadata.len(),
-        Ok(_) => return Ok(None),
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Ok(_) => return Ok(Scanned::Absent),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Scanned::Absent),
         Err(error) => return Err(format!("{}: {error}", path.display())),
     };
     if size > SCANNED_FILE_MAX_BYTES {
@@ -157,14 +183,19 @@ fn scanned_text(path: &Path) -> Result<Option<String>, String> {
         ));
     }
     let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    Ok(String::from_utf8(bytes).ok())
+    Ok(decoded(&bytes))
 }
 
-/// The number of text files examined and the defects found under `base`.
-fn scan(base: &Path) -> Result<(usize, Vec<String>), String> {
+#[derive(Debug, Default)]
+struct ScanReport {
+    examined: usize,
+    binary: usize,
+    defects: Vec<String>,
+}
+
+fn scan(base: &Path) -> Result<ScanReport, String> {
     let files = listed_files(base)?;
-    let mut examined = 0_usize;
-    let mut defects = Vec::new();
+    let mut report = ScanReport::default();
     let scanned = files.iter().filter(|path| {
         !EXCLUDED_PATHS
             .iter()
@@ -172,20 +203,26 @@ fn scan(base: &Path) -> Result<(usize, Vec<String>), String> {
     });
     for relative in scanned {
         match scanned_text(&base.join(relative)) {
-            Ok(Some(text)) => {
-                examined = examined.saturating_add(1);
-                defects.extend(credential_defects(relative, &text));
+            Ok(Scanned::Text(text)) => {
+                report.examined = report.examined.saturating_add(1);
+                report.defects.extend(credential_defects(relative, &text));
             }
-            Ok(None) => {}
-            Err(reason) => defects.push(reason),
+            Ok(Scanned::Binary) => report.binary = report.binary.saturating_add(1),
+            Ok(Scanned::Absent) => {}
+            Err(reason) => report.defects.push(reason),
         }
     }
-    Ok((examined, defects))
+    Ok(report)
 }
 
 pub fn check_credentials() -> i32 {
     match scan(Path::new(".")) {
-        Ok((examined, defects)) => finish("check-credentials", examined, &defects),
+        Ok(report) => finish_with_note(
+            "check-credentials",
+            report.examined,
+            &format!(", skipped {} binary files", report.binary),
+            &report.defects,
+        ),
         Err(reason) => {
             eprintln!("xtask check-credentials: {reason}");
             1
@@ -227,6 +264,38 @@ mod tests {
         assert_eq!(markers_found("docs/design.html", entity).len(), 1);
         let no_break = "a fine-grained\u{a0}token\n";
         assert_eq!(markers_found("notes/ledger.md", no_break).len(), 1);
+    }
+
+    #[test]
+    fn flags_a_marker_split_by_each_invisible_separator_or_entity() {
+        for separator in INVISIBLE_SEPARATORS {
+            let text = format!("gh{separator}p_abc and personal{separator}access token\n");
+            assert_eq!(markers_found("README.md", &text).len(), 2, "{separator:?}");
+        }
+        for entity in ["&nbsp;", "&#160;", "&#xa0;", "&#XA0;"] {
+            let text = format!("<td>fine-grained{entity}token</td>\n");
+            assert_eq!(
+                markers_found("docs/design.html", &text).len(),
+                1,
+                "{entity}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_latin_1_byte_does_not_hide_a_file() {
+        let latin_1 = b"use a\xa0ghp_abc token\nand a personal\xa0access token\n";
+        let Scanned::Text(text) = decoded(latin_1) else {
+            panic!("a Latin-1 file is text");
+        };
+        assert_eq!(
+            markers_found("notes/ledger.md", &text),
+            [
+                "notes/ledger.md:2: `personal access token`",
+                "notes/ledger.md:1: `ghp_`"
+            ]
+        );
+        assert_eq!(decoded(b"\x89PNG\r\n\x1a\n\0\0"), Scanned::Binary);
     }
 
     #[test]
@@ -288,9 +357,10 @@ mod tests {
             );
         }
         assert!(!files.iter().any(|path| path.starts_with("target")));
-        let (examined, defects) = scan(repository_root()).unwrap();
-        assert!(examined > 0);
-        assert_eq!(defects, Vec::<String>::new());
+        let report = scan(repository_root()).unwrap();
+        assert!(report.examined > 0);
+        assert!(report.binary > 0, "the committed figure PNGs are binary");
+        assert_eq!(report.defects, Vec::<String>::new());
     }
 
     #[test]

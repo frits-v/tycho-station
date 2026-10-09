@@ -444,16 +444,21 @@ fn rule_defects(path: &Path, text: &str) -> Vec<String> {
 }
 
 fn finish(name: &str, examined: usize, defects: &[String]) -> i32 {
+    finish_with_note(name, examined, "", defects)
+}
+
+/// `note` follows the examined count in the summary, for what a check counted but skipped.
+fn finish_with_note(name: &str, examined: usize, note: &str, defects: &[String]) -> i32 {
     if examined == 0 {
-        eprintln!("xtask {name}: examined 0 files; a check over nothing is a failure");
+        eprintln!("xtask {name}: examined 0 files{note}; a check over nothing is a failure");
         return 1;
     }
     if defects.is_empty() {
-        println!("xtask {name}: examined {examined} files, no defects");
+        println!("xtask {name}: examined {examined} files{note}, no defects");
         return 0;
     }
     eprintln!(
-        "xtask {name}: examined {examined} files, {} defects",
+        "xtask {name}: examined {examined} files{note}, {} defects",
         defects.len()
     );
     for defect in defects.iter().take(HOOK_REPORT_MAX_LINES) {
@@ -529,6 +534,7 @@ fn hook_post_tool_use() -> i32 {
     let Some(path) = edited_file() else {
         return 0;
     };
+    credentials::check_credentials();
     let extension = Path::new(&path).extension().and_then(OsStr::to_str);
     match extension {
         Some("rs") => hook_rust(&path),
@@ -540,11 +546,6 @@ fn hook_post_tool_use() -> i32 {
         Some("md") => {
             check_comments();
             check_rules();
-            credentials::check_credentials();
-            0
-        }
-        Some("yml" | "yaml" | "toml" | "html" | "json") => {
-            credentials::check_credentials();
             0
         }
         _ => 0,
@@ -572,7 +573,6 @@ fn hook_rust(path: &str) -> i32 {
         println!("xtask hook: {path} formatted, clippy clean");
         check_names();
         check_comments();
-        credentials::check_credentials();
         return 0;
     }
     let report = String::from_utf8_lossy(&output.stderr);
