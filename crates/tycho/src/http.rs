@@ -85,10 +85,14 @@ impl Http {
     }
 }
 
+/// The prefix of an unreachable reason for a request that timed out, which the server may
+/// still have acted on.
+pub const TIMED_OUT: &str = "timed out";
+
 /// reqwest's message is the same for a refused connect and a timeout; the reason names which.
 fn unreachable_reason(error: &reqwest::Error) -> String {
     let kind = if error.is_timeout() {
-        "timed out"
+        TIMED_OUT
     } else if error.is_connect() {
         "connect failed"
     } else {
