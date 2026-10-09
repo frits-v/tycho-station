@@ -1121,10 +1121,11 @@ fn decode_membership(code: Option<i32>, stdout: &str) -> MembershipOutcome {
     }
 }
 
-fn membership_status(user: &str, group: &str) -> Status {
+/// `user_flag` is `-U` for a user name or `-u` for a numeric uid.
+fn membership_status_for(user_flag: &str, user: &str, group: &str) -> Status {
     match run_bounded(plain_command(
         "dsmemberutil",
-        &["checkmembership", "-U", user, "-G", group],
+        &["checkmembership", user_flag, user, "-G", group],
     )) {
         Capture::ExecutableNotFound => Status::Unreachable {
             why: "dsmemberutil is not on PATH".to_string(),
@@ -1140,6 +1141,10 @@ fn membership_status(user: &str, group: &str) -> Status {
             },
         },
     }
+}
+
+fn membership_status(user: &str, group: &str) -> Status {
+    membership_status_for("-U", user, group)
 }
 
 fn credential_absence_finding(
@@ -1255,39 +1260,79 @@ const AGENT_READ_ONLY_FILES: [(Check, &str); 5] = [
     (Check::ReadOnlyZshrc, ".zshrc"),
 ];
 
-/// The owner can always chmod its own file, so an agent-owned file is writable whatever its mode.
-fn read_only_status(owner_uid: u32, mode: u32, agent_uid: u32) -> Status {
-    if owner_uid == agent_uid {
-        return Status::Wrong {
-            found: "owned by the agent".to_string(),
-            wanted: "owned by the core".to_string(),
-        };
-    }
-    if mode & 0o022 != 0 {
-        return Status::Wrong {
-            found: format!("mode {mode:04o}"),
-            wanted: "no group or other write bit".to_string(),
-        };
-    }
-    Status::Present
+/// Who owns a file the agent must not be able to write.
+#[derive(Debug, PartialEq, Eq)]
+enum FileOwner {
+    /// The agent itself, which can always chmod its own file.
+    Agent,
+    /// Root, or a member of the shared group other than the agent: the core runs as the developer.
+    Core,
+    Other(u32),
+    Unknown(String),
 }
 
-fn read_only_file_status(path: &Path, agent_uid: u32) -> Status {
-    match fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Status::Missing,
-        Err(error) => Status::Unreachable {
-            why: format!("{}: {error}", path.display()),
+fn classify_file_owner(owner_uid: u32, agent_uid: u32) -> FileOwner {
+    if owner_uid == agent_uid {
+        return FileOwner::Agent;
+    }
+    if owner_uid == 0 {
+        return FileOwner::Core;
+    }
+    match membership_status_for("-u", &owner_uid.to_string(), SHARED_GROUP_NAME) {
+        Status::Present => FileOwner::Core,
+        Status::Missing => FileOwner::Other(owner_uid),
+        Status::Unreachable { why } => FileOwner::Unknown(why),
+        other => FileOwner::Unknown(format!("unexpected membership status: {other}")),
+    }
+}
+
+/// Present only for a core-owned file with no group or other write bit; every other arm fails.
+fn read_only_status(owner: FileOwner, mode: u32) -> Status {
+    match owner {
+        FileOwner::Agent => Status::Wrong {
+            found: "owned by the agent".to_string(),
+            wanted: format!(
+                "owned by root or a member of {SHARED_GROUP_NAME} other than the agent"
+            ),
         },
-        Ok(metadata) if !metadata.file_type().is_file() => Status::Wrong {
+        FileOwner::Other(uid) => Status::Wrong {
+            found: format!("owned by uid {uid}"),
+            wanted: format!(
+                "owned by root or a member of {SHARED_GROUP_NAME} other than the agent"
+            ),
+        },
+        FileOwner::Unknown(why) => Status::Unreachable {
+            why: format!("cannot tell whether the owner is the core: {why}"),
+        },
+        FileOwner::Core if mode & 0o022 != 0 => Status::Wrong {
+            found: format!("mode {mode:04o}"),
+            wanted: "no group or other write bit".to_string(),
+        },
+        FileOwner::Core => Status::Present,
+    }
+}
+
+/// A symlink fails: the agent may own the link even when the target is core-owned.
+fn read_only_file_status(path: &Path, agent_uid: u32) -> Status {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Status::Missing,
+        Err(error) => {
+            return Status::Unreachable {
+                why: format!("{}: {error}", path.display()),
+            }
+        }
+    };
+    if !metadata.file_type().is_file() {
+        return Status::Wrong {
             found: file_kind(&metadata).to_string(),
             wanted: "regular file".to_string(),
-        },
-        Ok(metadata) => read_only_status(
-            metadata.uid(),
-            metadata.permissions().mode() & 0o7777,
-            agent_uid,
-        ),
+        };
     }
+    read_only_status(
+        classify_file_owner(metadata.uid(), agent_uid),
+        metadata.permissions().mode() & 0o7777,
+    )
 }
 
 fn read_only_findings(home: &Result<String, String>, agent_uid: u32) -> Vec<Finding> {
@@ -1995,31 +2040,62 @@ mod tests {
     }
 
     #[test]
-    fn read_only_status_requires_another_owner_and_no_shared_write() {
-        assert_eq!(read_only_status(0, 0o644, 502), Status::Present);
+    fn read_only_status_passes_only_for_a_core_owner_without_shared_write() {
+        assert_eq!(read_only_status(FileOwner::Core, 0o644), Status::Present);
+        assert_eq!(read_only_status(FileOwner::Core, 0o444), Status::Present);
         assert!(matches!(
-            read_only_status(502, 0o444, 502),
+            read_only_status(FileOwner::Agent, 0o444),
             Status::Wrong { .. }
         ));
         assert!(matches!(
-            read_only_status(0, 0o664, 502),
+            read_only_status(FileOwner::Other(777), 0o444),
             Status::Wrong { .. }
         ));
         assert!(matches!(
-            read_only_status(0, 0o646, 502),
+            read_only_status(
+                FileOwner::Unknown("dsmemberutil is not on PATH".to_string()),
+                0o444
+            ),
+            Status::Unreachable { .. }
+        ));
+        assert!(matches!(
+            read_only_status(FileOwner::Core, 0o664),
+            Status::Wrong { .. }
+        ));
+        assert!(matches!(
+            read_only_status(FileOwner::Core, 0o646),
             Status::Wrong { .. }
         ));
     }
 
     #[test]
-    fn read_only_file_status_reports_missing_and_non_regular_files() {
+    fn file_owner_is_the_agent_or_root_without_a_lookup() {
+        assert_eq!(classify_file_owner(502, 502), FileOwner::Agent);
+        assert_eq!(classify_file_owner(0, 502), FileOwner::Core);
+    }
+
+    #[test]
+    fn read_only_file_status_fails_every_arm_that_is_not_a_core_owned_file() {
         let directory =
             std::env::temp_dir().join(format!("xtask-setup-read-only-{}", std::process::id()));
         assert!(fs::create_dir_all(&directory).is_ok());
-        let missing = read_only_file_status(&directory.join("absent"), 502);
-        let not_a_file = read_only_file_status(&directory, 502);
+        let regular = directory.join("settings.json");
+        let link = directory.join("link.json");
+        assert!(fs::write(&regular, "{}").is_ok());
+        assert!(std::os::unix::fs::symlink(&regular, &link).is_ok());
+        let own_uid = fs::metadata(&regular)
+            .map(|metadata| metadata.uid())
+            .unwrap_or(0);
+
+        let missing = read_only_file_status(&directory.join("absent"), own_uid);
+        let unreadable = read_only_file_status(&regular.join("child"), own_uid);
+        let not_a_file = read_only_file_status(&directory, own_uid);
+        let symlink = read_only_file_status(&link, own_uid);
+        let agent_owned = read_only_file_status(&regular, own_uid);
         drop(fs::remove_dir_all(&directory));
+
         assert_eq!(missing, Status::Missing);
+        assert!(matches!(unreadable, Status::Unreachable { .. }));
         assert_eq!(
             not_a_file,
             Status::Wrong {
@@ -2027,6 +2103,33 @@ mod tests {
                 wanted: "regular file".to_string()
             }
         );
+        assert_eq!(
+            symlink,
+            Status::Wrong {
+                found: "symlink".to_string(),
+                wanted: "regular file".to_string()
+            }
+        );
+        assert!(matches!(
+            agent_owned,
+            Status::Wrong { found, .. } if found == "owned by the agent"
+        ));
+    }
+
+    #[test]
+    fn read_only_findings_examine_every_listed_path() {
+        let expected: Vec<Check> = AGENT_READ_ONLY_FILES
+            .iter()
+            .map(|&(check, _)| check)
+            .collect();
+        let absent_home = Ok("/nonexistent/xtask-setup-home".to_string());
+        let unknown_home = Err("user tycho-agent does not exist".to_string());
+        for home in [absent_home, unknown_home] {
+            let findings = read_only_findings(&home, 502);
+            let checks: Vec<Check> = findings.iter().map(|finding| finding.check).collect();
+            assert_eq!(checks, expected);
+            assert!(findings.iter().all(|finding| !finding.status.is_pass()));
+        }
     }
 
     #[test]
