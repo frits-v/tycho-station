@@ -10,7 +10,7 @@
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -35,7 +35,6 @@ const SOCKET_DIR_MAX_BYTES: usize = SOCKET_PATH_MAX_BYTES
 const _: () = assert!(AGENT_SOCKET_DIR.len() <= SOCKET_DIR_MAX_BYTES);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_OUTPUT_MAX_BYTES: usize = 1 << 17;
-const CREDENTIAL_FILE_MAX_BYTES: u64 = 1 << 16;
 /// `security find-*-password` exit code when no item matches.
 const SECURITY_ITEM_NOT_FOUND_EXIT: i32 = 44;
 /// `dsmemberutil checkmembership` exit code when the user or group does not exist.
@@ -1213,65 +1212,57 @@ fn credential_absence_finding(
     }
 }
 
-/// Opens without blocking and checks the handle, so a FIFO or device fails instead of hanging; reads bounded, erroring over `CREDENTIAL_FILE_MAX_BYTES` rather than truncating.
-fn read_bounded_file(path: &Path) -> io::Result<String> {
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)?;
-    if !file.metadata()?.is_file() {
-        return Err(io::Error::other(format!(
-            "{} is not a regular file",
-            path.display()
-        )));
-    }
-    let mut bytes = Vec::new();
-    let cap = CREDENTIAL_FILE_MAX_BYTES.saturating_add(1);
-    file.by_ref().take(cap).read_to_end(&mut bytes)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > CREDENTIAL_FILE_MAX_BYTES {
-        return Err(io::Error::other(format!(
-            "{} exceeds {CREDENTIAL_FILE_MAX_BYTES} bytes",
-            path.display()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-fn gitconfig_has_credential_helper(path: &Path) -> Result<bool, Status> {
-    match read_bounded_file(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(Status::Unreachable {
-            why: format!("{}: {error}", path.display()),
-        }),
-        Ok(text) => Ok(text.contains("[credential")),
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
-enum SystemHelper {
+enum CredentialHelpers {
     Unset,
-    /// The configured helpers, comma-separated.
+    /// Each helper with the scope it came from, comma-separated.
     Configured(String),
     Unrecognised,
 }
 
-fn decode_system_credential_helper(code: Option<i32>, stdout: &str) -> SystemHelper {
-    let helpers: Vec<&str> = stdout
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    match (code, helpers.is_empty()) {
-        (Some(GIT_CONFIG_KEY_UNSET_EXIT), true) => SystemHelper::Unset,
-        (Some(0), false) => SystemHelper::Configured(helpers.join(", ")),
-        _ => SystemHelper::Unrecognised,
+/// `git config --show-scope --get-all` exits 1 with no output when no file sets the key, and prints `<scope>\t<value>` per value otherwise.
+fn decode_credential_helpers(code: Option<i32>, stdout: &str, stderr: &str) -> CredentialHelpers {
+    let lines: Vec<&str> = stdout.lines().filter(|line| !line.is_empty()).collect();
+    match code {
+        Some(GIT_CONFIG_KEY_UNSET_EXIT) if lines.is_empty() && stderr.trim().is_empty() => {
+            CredentialHelpers::Unset
+        }
+        Some(0) if !lines.is_empty() => {
+            let mut helpers = Vec::new();
+            for line in lines {
+                match line.split_once('\t') {
+                    Some((scope, helper)) if !scope.is_empty() && !helper.trim().is_empty() => {
+                        helpers.push(format!("{} (scope {scope})", helper.trim()));
+                    }
+                    _ => return CredentialHelpers::Unrecognised,
+                }
+            }
+            CredentialHelpers::Configured(helpers.join(", "))
+        }
+        _ => CredentialHelpers::Unrecognised,
     }
 }
 
-/// Apple's git ships `credential.helper=osxkeychain` in the system gitconfig.
-fn system_credential_helper_status() -> Status {
-    let args = ["config", "--system", "--get-all", "credential.helper"];
-    match run_bounded(plain_command("git", &args)) {
+/// Every file git reads for the agent: the home files, the system file, includes, and the gitconfig that ships with Apple's git, which `--system` does not read.
+fn credential_helper_command(home: &str) -> Command {
+    let mut command = plain_command(
+        "git",
+        &["config", "--show-scope", "--get-all", "credential.helper"],
+    );
+    command.current_dir("/").env_clear().env("HOME", home);
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+    command
+}
+
+fn credential_gitconfig_finding(home: &Result<String, String>) -> Finding {
+    let check = Check::CredentialGitconfig;
+    let home = match home {
+        Ok(home) => home,
+        Err(why) => return Finding::unreachable(check, format!("agent home unknown: {why}")),
+    };
+    let status = match run_bounded(credential_helper_command(home)) {
         Capture::ExecutableNotFound => Status::Unreachable {
             why: "git is not on PATH".to_string(),
         },
@@ -1281,45 +1272,22 @@ fn system_credential_helper_status() -> Status {
             stdout,
             stderr,
             ..
-        } => match decode_system_credential_helper(code, &stdout) {
-            SystemHelper::Unset => Status::Present,
-            SystemHelper::Configured(helpers) => Status::Wrong {
-                found: format!("system credential helper {helpers}"),
+        } => match decode_credential_helpers(code, &stdout, &stderr) {
+            CredentialHelpers::Unset => Status::Present,
+            CredentialHelpers::Configured(helpers) => Status::Wrong {
+                found: format!("credential helper {helpers}"),
                 wanted: "no credential helper".to_string(),
             },
-            SystemHelper::Unrecognised => Status::Unreachable {
+            CredentialHelpers::Unrecognised => Status::Unreachable {
                 why: format!(
-                    "unrecognised git config --system result (exit {code:?}): {:?}",
+                    "unrecognised git config result (exit {code:?}): {:?} {:?}",
+                    first_line(&stdout),
                     first_line(&stderr)
                 ),
             },
         },
-    }
-}
-
-/// Checks `~/.gitconfig`, `~/.config/git/config` and the system gitconfig.
-fn credential_gitconfig_finding(home: &Result<String, String>) -> Finding {
-    let check = Check::CredentialGitconfig;
-    let home = match home {
-        Ok(home) => home,
-        Err(why) => return Finding::unreachable(check, format!("agent home unknown: {why}")),
     };
-    for relative in [".gitconfig", ".config/git/config"] {
-        match gitconfig_has_credential_helper(&Path::new(home).join(relative)) {
-            Err(status) => return Finding::new(check, status),
-            Ok(true) => {
-                return Finding::new(
-                    check,
-                    Status::Wrong {
-                        found: format!("credential helper configured in {relative}"),
-                        wanted: "no credential helper".to_string(),
-                    },
-                )
-            }
-            Ok(false) => {}
-        }
-    }
-    Finding::new(check, system_credential_helper_status())
+    Finding::new(check, status)
 }
 
 fn credential_findings(home: &Result<String, String>) -> Vec<Finding> {
@@ -1970,35 +1938,60 @@ mod tests {
     }
 
     #[test]
-    fn decodes_system_credential_helper_states_and_rejects_the_unrecognised() {
+    fn decodes_credential_helper_states_and_rejects_the_unrecognised() {
         assert_eq!(
-            decode_system_credential_helper(Some(1), ""),
-            SystemHelper::Unset
+            decode_credential_helpers(Some(1), "", ""),
+            CredentialHelpers::Unset
         );
         assert_eq!(
-            decode_system_credential_helper(Some(0), "osxkeychain\n"),
-            SystemHelper::Configured("osxkeychain".to_string())
+            decode_credential_helpers(Some(0), "unknown\tosxkeychain\n", ""),
+            CredentialHelpers::Configured("osxkeychain (scope unknown)".to_string())
         );
         assert_eq!(
-            decode_system_credential_helper(Some(0), "osxkeychain\nstore\n"),
-            SystemHelper::Configured("osxkeychain, store".to_string())
+            decode_credential_helpers(Some(0), "unknown\tosxkeychain\nglobal\tstore\n", ""),
+            CredentialHelpers::Configured(
+                "osxkeychain (scope unknown), store (scope global)".to_string()
+            )
         );
         assert_eq!(
-            decode_system_credential_helper(Some(0), ""),
-            SystemHelper::Unrecognised
+            decode_credential_helpers(Some(1), "", "xcrun: error: invalid active developer path\n"),
+            CredentialHelpers::Unrecognised
         );
         assert_eq!(
-            decode_system_credential_helper(Some(1), "osxkeychain\n"),
-            SystemHelper::Unrecognised
+            decode_credential_helpers(Some(0), "osxkeychain\n", ""),
+            CredentialHelpers::Unrecognised
         );
         assert_eq!(
-            decode_system_credential_helper(Some(3), ""),
-            SystemHelper::Unrecognised
+            decode_credential_helpers(Some(0), "", ""),
+            CredentialHelpers::Unrecognised
         );
         assert_eq!(
-            decode_system_credential_helper(None, ""),
-            SystemHelper::Unrecognised
+            decode_credential_helpers(Some(1), "unknown\tosxkeychain\n", ""),
+            CredentialHelpers::Unrecognised
         );
+        assert_eq!(
+            decode_credential_helpers(Some(3), "", ""),
+            CredentialHelpers::Unrecognised
+        );
+        assert_eq!(
+            decode_credential_helpers(None, "", ""),
+            CredentialHelpers::Unrecognised
+        );
+    }
+
+    #[test]
+    fn credential_helper_command_runs_from_root_with_only_home_and_path() {
+        let command = credential_helper_command("/Users/tycho-agent");
+        assert_eq!(command.get_current_dir(), Some(Path::new("/")));
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(envs.contains(&(
+            std::ffi::OsStr::new("HOME"),
+            Some(std::ffi::OsStr::new("/Users/tycho-agent"))
+        )));
+        assert!(envs
+            .iter()
+            .all(|(name, _)| *name == "HOME" || *name == "PATH"));
+        assert!(command.get_args().all(|arg| arg != "--system"));
     }
 
     #[test]
@@ -2027,53 +2020,6 @@ mod tests {
         assert!(installed_gate(Check::EntireLogin, "entire", &ls).is_none());
         let unreachable = MiseLs::Unreachable("mise is not on PATH".to_string());
         assert!(installed_gate(Check::EntireLogin, "entire", &unreachable).is_some());
-    }
-
-    #[test]
-    fn read_bounded_file_rejects_a_fifo_without_blocking() {
-        let directory =
-            std::env::temp_dir().join(format!("xtask-setup-fifo-{}", std::process::id()));
-        assert!(fs::create_dir(&directory).is_ok() || directory.is_dir());
-        let fifo = directory.join("pipe");
-        let made = Command::new("mkfifo").arg(&fifo).status();
-        assert!(made.is_ok_and(|status| status.success()));
-
-        let (sender, receiver) = mpsc::channel();
-        let path = fifo.clone();
-        thread::spawn(move || {
-            drop(sender.send(read_bounded_file(&path).map_err(|error| error.to_string())));
-        });
-        let outcome = receiver.recv_timeout(Duration::from_secs(2));
-        drop(fs::remove_file(&fifo));
-        drop(fs::remove_dir(&directory));
-
-        let Ok(result) = outcome else {
-            panic!("read_bounded_file blocked on a FIFO");
-        };
-        assert!(result.is_err_and(|error| error.contains("is not a regular file")));
-    }
-
-    #[test]
-    fn read_bounded_file_reads_a_regular_file_and_rejects_an_oversized_one() {
-        let directory =
-            std::env::temp_dir().join(format!("xtask-setup-file-{}", std::process::id()));
-        assert!(fs::create_dir(&directory).is_ok() || directory.is_dir());
-        let small = directory.join("small");
-        let large = directory.join("large");
-        assert!(fs::write(&small, "[user]\n").is_ok());
-        let oversized = "x".repeat(
-            usize::try_from(CREDENTIAL_FILE_MAX_BYTES)
-                .unwrap_or(0)
-                .saturating_add(1),
-        );
-        assert!(fs::write(&large, oversized).is_ok());
-        let small_result = read_bounded_file(&small).ok();
-        let large_result = read_bounded_file(&large);
-        drop(fs::remove_file(&small));
-        drop(fs::remove_file(&large));
-        drop(fs::remove_dir(&directory));
-        assert_eq!(small_result, Some("[user]\n".to_string()));
-        assert!(large_result.is_err());
     }
 
     #[test]
