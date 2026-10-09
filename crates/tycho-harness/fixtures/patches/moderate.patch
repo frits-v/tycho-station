@@ -1,0 +1,11 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -5,7 +5,7 @@
+ }
+ 
+ pub fn greeting() -> String {
+-    String::new()
++    String::from("Hello there")
+ }
+ 
+ pub fn find_tag(id: u32) -> Vec<&'static str> {

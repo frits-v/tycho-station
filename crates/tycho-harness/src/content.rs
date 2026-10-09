@@ -85,11 +85,11 @@ mod tests {
             ),
             (
                 OBJECTIVE_FORCED_ESCALATION,
-                "sha256:8ed7164700b499d5f24bd105154685b5d2988abbc0c64f885e90cddb42688b3b",
+                "sha256:04034684accc4cf760f9728274b4f48554b0f9caa90784591fdde4aa8e362fa4",
             ),
             (
                 OBJECTIVE_FORCED_COUNCIL,
-                "sha256:d9aa50c62b11b8c6c53f9c9b3576eb9876b57246c6d9018703c24236da34b767",
+                "sha256:9a0f8c15dddd215e17cc3ca437c4ec92fd2b53074539d16ec1942a46d457784c",
             ),
             (
                 OBJECTIVE_DOWNSTREAM,

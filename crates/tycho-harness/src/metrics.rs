@@ -114,27 +114,34 @@ pub const METRIC_TABLE: [Metric; 12] = [
     },
 ];
 
+/// `|` cannot survive into a markdown table cell unescaped.
+fn escape_cell(text: &str) -> String {
+    text.replace('|', "\\|")
+}
+
 /// Renders the table as GitHub-flavoured markdown.
 #[must_use]
 pub fn render_markdown(metrics: &[Metric]) -> String {
     use std::fmt::Write as _;
 
     let mut table = String::from(
-        "| Metric | Definition | Measured at | Target | Measured value |\n|---|---|---|---|---|\n",
+        "| Metric | Definition | Measured at | v1 target | Measured value |\n|---|---|---|---|---|\n",
     );
     for metric in metrics {
         let value = match metric.measured_value {
             MeasuredValue::Recorded(value) => value.to_string(),
             MeasuredValue::NotYetMeasured { reason } => format!("absent: {reason}"),
         };
-        let row = writeln!(
+        writeln!(
             table,
             "| {} | {} | {} | {} | {} |",
-            metric.name, metric.definition, metric.measured_at, metric.target, value
-        );
-        if row.is_err() {
-            table.push_str("| (row could not be rendered) |\n");
-        }
+            escape_cell(metric.name),
+            escape_cell(metric.definition),
+            escape_cell(metric.measured_at),
+            escape_cell(metric.target),
+            escape_cell(&value)
+        )
+        .ok();
     }
     table
 }
@@ -182,6 +189,20 @@ mod tests {
         let rendered = render_markdown(&METRIC_TABLE[..1]);
         assert!(rendered.contains("Human interrupts per work unit"));
         assert!(rendered.contains("absent: no work unit has run through the merge gate yet"));
+        assert!(rendered.contains("v1 target"));
+    }
+
+    #[test]
+    fn a_pipe_in_a_cell_is_escaped_not_left_to_break_the_table() {
+        let metric = Metric {
+            name: "weird | name",
+            definition: "d",
+            measured_at: "m",
+            target: "t",
+            measured_value: MeasuredValue::Recorded("v"),
+        };
+        let rendered = render_markdown(std::slice::from_ref(&metric));
+        assert!(rendered.contains("weird \\| name"));
     }
 
     #[test]

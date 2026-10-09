@@ -64,12 +64,13 @@ struct CommitSpec {
     offset_minutes: i64,
 }
 
-const WIDGET_CARGO_TOML: &[u8] =
-    b"[package]\nname = \"widget\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n";
-const WIDGET_GITIGNORE: &[u8] = b"/target\n";
-const WIDGET_LIB_RS: &[u8] = include_bytes!("../fixtures/widget/src/lib.rs");
+const WIDGET_CARGO_TOML: &[u8] = b"[package]\nname = \"widget\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n\n[workspace]\n";
+const WIDGET_GITIGNORE: &[u8] = b"/target\nCargo.lock\n";
+const WIDGET_LIB_RS_INITIAL: &[u8] = include_bytes!("../fixtures/widget/src/lib_initial.rs");
+const WIDGET_LIB_RS_FINAL: &[u8] = include_bytes!("../fixtures/widget/src/lib.rs");
+const WIDGET_ROUTING_JSON: &[u8] = include_bytes!("../fixtures/widget/config/routing.json");
 
-const COMMITS: [CommitSpec; 3] = [
+const COMMITS: [CommitSpec; 4] = [
     CommitSpec {
         message: "chore: scaffold the widget project",
         files: &[
@@ -80,13 +81,21 @@ const COMMITS: [CommitSpec; 3] = [
     },
     CommitSpec {
         message: "test: add the widget source and its tests",
-        files: &[("src/lib.rs", WIDGET_LIB_RS)],
+        files: &[("src/lib.rs", WIDGET_LIB_RS_INITIAL)],
         offset_minutes: 1,
     },
     CommitSpec {
         message: "docs: add the budget ceiling policy",
         files: &[("POLICY.md", content::POLICY_BUDGET_CEILING)],
         offset_minutes: 2,
+    },
+    CommitSpec {
+        message: "feat: add the routing ceiling and two lookup shapes",
+        files: &[
+            ("config/routing.json", WIDGET_ROUTING_JSON),
+            ("src/lib.rs", WIDGET_LIB_RS_FINAL),
+        ],
+        offset_minutes: 3,
     },
 ];
 
@@ -103,10 +112,21 @@ fn ensure_empty_directory(path: &Path) -> Result<(), RepositoryError> {
     Ok(())
 }
 
+/// A bare `git` invocation with every inherited environment variable dropped
+/// except `PATH`, so a caller's `GIT_DIR` or similar never reaches the child.
+fn base_command(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new("git");
+    command.env_clear();
+    if let Ok(path) = std::env::var("PATH") {
+        command.env("PATH", path);
+    }
+    command.current_dir(dir).args(args);
+    command
+}
+
 /// Isolates every git invocation from the host's global and system config.
 fn run_git(dir: &Path, author_date: &str, args: &[&str]) -> Result<Output, RepositoryError> {
-    Command::new("git")
-        .current_dir(dir)
+    base_command(dir, args)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_NAME", AUTHOR_NAME)
@@ -115,7 +135,6 @@ fn run_git(dir: &Path, author_date: &str, args: &[&str]) -> Result<Output, Repos
         .env("GIT_COMMITTER_EMAIL", AUTHOR_EMAIL)
         .env("GIT_AUTHOR_DATE", author_date)
         .env("GIT_COMMITTER_DATE", author_date)
-        .args(args)
         .output()
         .map_err(RepositoryError::Io)
 }
@@ -170,11 +189,9 @@ pub fn apply_patch(checkout: &Path, patch: &[u8]) -> Result<(), RepositoryError>
     if patch.len() > PATCH_MAX_BYTES {
         return Err(RepositoryError::PatchTooLarge { bytes: patch.len() });
     }
-    let mut child = Command::new("git")
-        .current_dir(checkout)
+    let mut child = base_command(checkout, &["apply", "-"])
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .args(["apply", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -196,14 +213,46 @@ pub fn apply_patch(checkout: &Path, patch: &[u8]) -> Result<(), RepositoryError>
     })
 }
 
+/// Used by the verification tests to confirm a checkout stays clean after a run.
+#[cfg(test)]
+pub(crate) fn status_porcelain(dir: &Path) -> Result<String, RepositoryError> {
+    let output = checked_git(dir, &commit_date(0), &["status", "--porcelain"])?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const EXPECTED_HEAD_SHA: &str = "1373499003445ddcf74cee767c714099e164b7de";
+    const EXPECTED_HEAD_SHA: &str = "3711d61ebf71d9117a6d46772eb40fc05d86f03a";
+
+    struct EnvVarGuard {
+        key: &'static str,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            std::env::set_var(key, value);
+            Self { key }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            std::env::remove_var(self.key);
+        }
+    }
 
     #[test]
     fn build_produces_a_stable_head_sha() {
+        let checkout = tempfile::tempdir().unwrap();
+        let built = build(checkout.path()).unwrap();
+        assert_eq!(built.head_sha.as_str(), EXPECTED_HEAD_SHA);
+    }
+
+    #[test]
+    fn build_ignores_an_inherited_git_dir() {
+        let _guard = EnvVarGuard::set("GIT_DIR", "/nonexistent-should-be-ignored");
         let checkout = tempfile::tempdir().unwrap();
         let built = build(checkout.path()).unwrap();
         assert_eq!(built.head_sha.as_str(), EXPECTED_HEAD_SHA);

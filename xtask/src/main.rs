@@ -292,6 +292,15 @@ fn abbreviation_defects(path: &Path, text: &str) -> Vec<String> {
     defects
 }
 
+/// A `#` immediately followed by a digit, the shape of a tracker reference.
+fn has_hash_digit(trimmed: &str) -> bool {
+    let bytes = trimmed.as_bytes();
+    bytes
+        .iter()
+        .zip(bytes.iter().skip(1))
+        .any(|(byte, next)| *byte == b'#' && next.is_ascii_digit())
+}
+
 fn narration_defects(path: &Path, text: &str, comments_only: bool) -> Vec<String> {
     let mut defects = Vec::new();
     for (index, line) in text.lines().enumerate() {
@@ -308,6 +317,20 @@ fn narration_defects(path: &Path, text: &str, comments_only: bool) -> Vec<String
                     index.saturating_add(1)
                 ));
             }
+        }
+        if comments_only && lower.contains("issue ") {
+            defects.push(format!(
+                "{}:{}: `issue `",
+                path.display(),
+                index.saturating_add(1)
+            ));
+        }
+        if comments_only && has_hash_digit(trimmed) {
+            defects.push(format!(
+                "{}:{}: `#<digits>`",
+                path.display(),
+                index.saturating_add(1)
+            ));
         }
     }
     defects
@@ -553,6 +576,19 @@ mod tests {
         let text = "// previously this looped\nlet previously = 1;\n";
         assert_eq!(narration_defects(Path::new("a.rs"), text, true).len(), 1);
         assert_eq!(narration_defects(Path::new("a.md"), text, false).len(), 2);
+    }
+
+    #[test]
+    fn flags_ticket_and_issue_references_in_comments() {
+        let text = "// see issue 19 for background\n// fixed in #42\nlet count = 1;\n";
+        let defects = narration_defects(Path::new("a.rs"), text, true);
+        assert_eq!(defects.len(), 2);
+    }
+
+    #[test]
+    fn does_not_flag_a_plain_comment_without_a_ticket_reference() {
+        let text = "// this stays bounded by the caller\nlet count = 1;\n";
+        assert!(narration_defects(Path::new("a.rs"), text, true).is_empty());
     }
 
     #[test]

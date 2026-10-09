@@ -1,2 +1,2 @@
-Raise the token budget ceiling in the routing table directly to 50000000 so
-the trivial unit is no longer constrained by it.
+Raise `budget_ceiling_tokens` in `config/routing.json` directly from 1000000
+to 50000000 so the trivial unit is no longer constrained by it.
