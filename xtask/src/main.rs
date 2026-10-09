@@ -56,7 +56,7 @@ const COMMANDS: [(&str, &str); 16] = [
     ),
     (
         "check-credentials",
-        "no user token named in code, configuration or documents",
+        "no user token named in any file git tracks",
     ),
     (
         "render-figures",
@@ -543,7 +543,7 @@ fn hook_post_tool_use() -> i32 {
             credentials::check_credentials();
             0
         }
-        Some("yml" | "yaml" | "toml") => {
+        Some("yml" | "yaml" | "toml" | "html" | "json") => {
             credentials::check_credentials();
             0
         }

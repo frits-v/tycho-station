@@ -55,4 +55,4 @@ check is not repeated in any instruction file. "review" means a reader rejects i
 
 | Rule | Enforced by |
 |---|---|
-| No personal access tokens; a credential is the shortest-lived and narrowest the task allows, issued to the station's own identity | `xtask check-credentials` (markers `personal access token`, `fine-grained token`, `ghp_`, `github_pat_`, `RELEASE_PLZ_TOKEN` over `.github/`, `docs/`, `mise.toml`, `xtask/src`, `crates/`) in ci and the post-edit hook; review for lifetime and scope |
+| No personal access tokens; a credential is the shortest-lived and narrowest the task allows, issued to the station's own identity | `xtask check-credentials` (markers `personal access token`, `fine-grained token`, `classic token`, `gh auth token`, `ghp_`, `gho_`, `ghu_`, `ghr_`, `github_pat_`, `RELEASE_PLZ_TOKEN`, case-insensitive and across line breaks and no-break spaces, over every file `git ls-files` lists or would list, minus the check's own source) in ci and the post-edit hook; review for lifetime and scope |
