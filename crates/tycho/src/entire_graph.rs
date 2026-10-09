@@ -146,6 +146,9 @@ pub fn decode_doctor(stdout: &str) -> EgressState {
     let Some(local) = value.get("phase_1_local_only").and_then(Value::as_object) else {
         return EgressState::Unrecognised("no phase_1_local_only object".to_string());
     };
+    if local.is_empty() {
+        return EgressState::Unrecognised("phase_1_local_only is empty".to_string());
+    }
     let mut remote = Vec::new();
     for (name, setting) in local {
         match setting.as_bool() {
@@ -155,7 +158,7 @@ pub fn decode_doctor(stdout: &str) -> EgressState {
         }
     }
     match (flag_field(&value, "no_egress"), remote.is_empty()) {
-        (Some(true), true) if !local.is_empty() => EgressState::NoEgress,
+        (Some(true), true) => EgressState::NoEgress,
         (Some(_), _) => EgressState::Egress(remote.join(", ")),
         (None, _) => EgressState::Unrecognised("no no_egress flag".to_string()),
     }

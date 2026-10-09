@@ -121,7 +121,8 @@ fn doctor_with_a_remote_capability_is_egress() {
 
 #[test]
 fn doctor_garbage_is_unrecognised() {
-    for garbage in GARBAGE {
+    let empty = "{\"no_egress\":true,\"phase_1_local_only\":{}}";
+    for garbage in GARBAGE.iter().chain(&[empty]) {
         assert!(matches!(
             decode_doctor(garbage),
             EgressState::Unrecognised(_)
