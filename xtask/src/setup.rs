@@ -1223,6 +1223,10 @@ fn credential_absence_finding(
     }
 }
 
+/// An empty value clears every helper set before it, Apple's `osxkeychain` included.
+const CLEAR_CREDENTIAL_HELPERS_HINT: &str =
+    "as the agent, clear every credential helper: git config --global credential.helper \"\"";
+
 #[derive(Debug, PartialEq, Eq)]
 enum CredentialHelpers {
     Unset,
@@ -1231,7 +1235,7 @@ enum CredentialHelpers {
     Unrecognised,
 }
 
-/// `git config --show-scope --get-all` exits 1 with no output when no file sets the key, and prints `<scope>\t<value>` per value otherwise.
+/// `git config --show-scope --get-all` exits 1 with no output when no file sets the key, and otherwise prints `<scope>\t<value>` per value in the order git applies them; an empty value clears the helpers before it.
 fn decode_credential_helpers(code: Option<i32>, stdout: &str, stderr: &str) -> CredentialHelpers {
     let lines: Vec<&str> = stdout.lines().filter(|line| !line.is_empty()).collect();
     match code {
@@ -1242,13 +1246,21 @@ fn decode_credential_helpers(code: Option<i32>, stdout: &str, stderr: &str) -> C
             let mut helpers = Vec::new();
             for line in lines {
                 match line.split_once('\t') {
-                    Some((scope, helper)) if !scope.is_empty() && !helper.trim().is_empty() => {
-                        helpers.push(format!("{} (scope {scope})", helper.trim()));
+                    Some((scope, helper)) if !scope.is_empty() => {
+                        if helper.trim().is_empty() {
+                            helpers.clear();
+                        } else {
+                            helpers.push(format!("{} (scope {scope})", helper.trim()));
+                        }
                     }
                     _ => return CredentialHelpers::Unrecognised,
                 }
             }
-            CredentialHelpers::Configured(helpers.join(", "))
+            if helpers.is_empty() {
+                CredentialHelpers::Unset
+            } else {
+                CredentialHelpers::Configured(helpers.join(", "))
+            }
         }
         _ => CredentialHelpers::Unrecognised,
     }
@@ -1285,10 +1297,16 @@ fn credential_gitconfig_finding(home: &Result<String, String>) -> Finding {
             ..
         } => match decode_credential_helpers(code, &stdout, &stderr) {
             CredentialHelpers::Unset => Status::Present,
-            CredentialHelpers::Configured(helpers) => Status::Wrong {
-                found: format!("credential helper {helpers}"),
-                wanted: "no credential helper".to_string(),
-            },
+            CredentialHelpers::Configured(helpers) => {
+                return Finding::with_hint(
+                    check,
+                    Status::Wrong {
+                        found: format!("credential helper {helpers}"),
+                        wanted: "no credential helper".to_string(),
+                    },
+                    CLEAR_CREDENTIAL_HELPERS_HINT,
+                )
+            }
             CredentialHelpers::Unrecognised => Status::Unreachable {
                 why: format!(
                     "unrecognised git config result (exit {code:?}): {:?} {:?}",
@@ -1963,10 +1981,40 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_credential_helper_clears_the_helpers_before_it() {
+        assert_eq!(
+            decode_credential_helpers(Some(0), "unknown\tosxkeychain\nglobal\t\n", ""),
+            CredentialHelpers::Unset
+        );
+        assert_eq!(
+            decode_credential_helpers(
+                Some(0),
+                "unknown\tosxkeychain\nglobal\t\nlocal\tstore\n",
+                ""
+            ),
+            CredentialHelpers::Configured("store (scope local)".to_string())
+        );
+        assert_eq!(
+            decode_credential_helpers(
+                Some(0),
+                "unknown\t\nglobal\tstore\nglobal\tosxkeychain\n",
+                ""
+            ),
+            CredentialHelpers::Configured(
+                "store (scope global), osxkeychain (scope global)".to_string()
+            )
+        );
+    }
+
+    #[test]
     fn decodes_credential_helper_states_and_rejects_the_unrecognised() {
         assert_eq!(
             decode_credential_helpers(Some(1), "", ""),
             CredentialHelpers::Unset
+        );
+        assert_eq!(
+            decode_credential_helpers(Some(0), "\tosxkeychain\n", ""),
+            CredentialHelpers::Unrecognised
         );
         assert_eq!(
             decode_credential_helpers(Some(0), "unknown\tosxkeychain\n", ""),
