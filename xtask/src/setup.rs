@@ -44,6 +44,8 @@ const DSMEMBERUTIL_NOT_FOUND_EXIT: i32 = 7;
 const CLAUDE_LOGGED_OUT_EXIT: i32 = 1;
 /// `codex login status` exit code when no login is stored.
 const CODEX_LOGGED_OUT_EXIT: i32 = 1;
+/// `git config --get-all` exit code when the key is not set.
+const GIT_CONFIG_KEY_UNSET_EXIT: i32 = 1;
 
 fn workspace_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1245,39 +1247,79 @@ fn gitconfig_has_credential_helper(path: &Path) -> Result<bool, Status> {
     }
 }
 
-/// Checks `~/.gitconfig` and `~/.config/git/config`; the hint names the system gitconfig, which this does not read.
+#[derive(Debug, PartialEq, Eq)]
+enum SystemHelper {
+    Unset,
+    /// The configured helpers, comma-separated.
+    Configured(String),
+    Unrecognised,
+}
+
+fn decode_system_credential_helper(code: Option<i32>, stdout: &str) -> SystemHelper {
+    let helpers: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    match (code, helpers.is_empty()) {
+        (Some(GIT_CONFIG_KEY_UNSET_EXIT), true) => SystemHelper::Unset,
+        (Some(0), false) => SystemHelper::Configured(helpers.join(", ")),
+        _ => SystemHelper::Unrecognised,
+    }
+}
+
+/// Apple's git ships `credential.helper=osxkeychain` in the system gitconfig.
+fn system_credential_helper_status() -> Status {
+    let args = ["config", "--system", "--get-all", "credential.helper"];
+    match run_bounded(plain_command("git", &args)) {
+        Capture::ExecutableNotFound => Status::Unreachable {
+            why: "git is not on PATH".to_string(),
+        },
+        Capture::Unreachable(why) => Status::Unreachable { why },
+        Capture::Ran {
+            code,
+            stdout,
+            stderr,
+            ..
+        } => match decode_system_credential_helper(code, &stdout) {
+            SystemHelper::Unset => Status::Present,
+            SystemHelper::Configured(helpers) => Status::Wrong {
+                found: format!("system credential helper {helpers}"),
+                wanted: "no credential helper".to_string(),
+            },
+            SystemHelper::Unrecognised => Status::Unreachable {
+                why: format!(
+                    "unrecognised git config --system result (exit {code:?}): {:?}",
+                    first_line(&stderr)
+                ),
+            },
+        },
+    }
+}
+
+/// Checks `~/.gitconfig`, `~/.config/git/config` and the system gitconfig.
 fn credential_gitconfig_finding(home: &Result<String, String>) -> Finding {
     let check = Check::CredentialGitconfig;
-    let hint = "also check the system gitconfig: git config --system --get-all credential.helper";
     let home = match home {
         Ok(home) => home,
-        Err(why) => {
-            return Finding::with_hint(
-                check,
-                Status::Unreachable {
-                    why: format!("agent home unknown: {why}"),
-                },
-                hint,
-            )
-        }
+        Err(why) => return Finding::unreachable(check, format!("agent home unknown: {why}")),
     };
     for relative in [".gitconfig", ".config/git/config"] {
         match gitconfig_has_credential_helper(&Path::new(home).join(relative)) {
-            Err(status) => return Finding::with_hint(check, status, hint),
+            Err(status) => return Finding::new(check, status),
             Ok(true) => {
-                return Finding::with_hint(
+                return Finding::new(
                     check,
                     Status::Wrong {
                         found: format!("credential helper configured in {relative}"),
                         wanted: "no credential helper".to_string(),
                     },
-                    hint,
                 )
             }
             Ok(false) => {}
         }
     }
-    Finding::with_hint(check, Status::Present, hint)
+    Finding::new(check, system_credential_helper_status())
 }
 
 fn credential_findings(home: &Result<String, String>) -> Vec<Finding> {
@@ -1925,6 +1967,38 @@ mod tests {
         assert!(CODEX_LOGIN.login_hint.ends_with("codex login"));
         assert!(CLAUDE_LOGIN.login_hint.ends_with("claude auth login"));
         assert!(ENTIRE_LOGIN.login_hint.ends_with("entire auth login"));
+    }
+
+    #[test]
+    fn decodes_system_credential_helper_states_and_rejects_the_unrecognised() {
+        assert_eq!(
+            decode_system_credential_helper(Some(1), ""),
+            SystemHelper::Unset
+        );
+        assert_eq!(
+            decode_system_credential_helper(Some(0), "osxkeychain\n"),
+            SystemHelper::Configured("osxkeychain".to_string())
+        );
+        assert_eq!(
+            decode_system_credential_helper(Some(0), "osxkeychain\nstore\n"),
+            SystemHelper::Configured("osxkeychain, store".to_string())
+        );
+        assert_eq!(
+            decode_system_credential_helper(Some(0), ""),
+            SystemHelper::Unrecognised
+        );
+        assert_eq!(
+            decode_system_credential_helper(Some(1), "osxkeychain\n"),
+            SystemHelper::Unrecognised
+        );
+        assert_eq!(
+            decode_system_credential_helper(Some(3), ""),
+            SystemHelper::Unrecognised
+        );
+        assert_eq!(
+            decode_system_credential_helper(None, ""),
+            SystemHelper::Unrecognised
+        );
     }
 
     #[test]
