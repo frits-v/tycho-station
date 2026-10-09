@@ -2,6 +2,8 @@
 paths:
   - "**/*.rs"
 ---
+Stability over performance over convenience; name the trade-off when it comes up.
+
 Beyond what clippy and `xtask check-*` enforce (`docs/style.md` names each):
 
 - Every loop has a fixed bound or walks a finite collection; no recursion, use an explicit bounded stack.
