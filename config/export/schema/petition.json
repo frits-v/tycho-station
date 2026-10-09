@@ -5,10 +5,44 @@
             "type": "string",
             "pattern": "^sha256:[0-9a-f]{64}$"
         },
+        "ConventionHoldBaseline": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "counter": {
+                    "const": "convention_hold"
+                },
+                "decided": {
+                    "type": "string",
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+                },
+                "verified_citations": {
+                    "$ref": "#/$defs/U32"
+                }
+            },
+            "required": [
+                "counter",
+                "decided",
+                "verified_citations"
+            ]
+        },
         "PetitionArticle": {
             "type": "string",
             "description": "The article number of the clause the petition would amend, or \"new\" for a new article.",
             "pattern": "^([1-9][0-9]?|new)$"
+        },
+        "PetitionBaseline": {
+            "anyOf": [
+                {
+                    "$ref": "#/$defs/RepeatedRulingBaseline"
+                },
+                {
+                    "$ref": "#/$defs/ConventionHoldBaseline"
+                },
+                {
+                    "$ref": "#/$defs/VoidFindingBaseline"
+                }
+            ]
         },
         "PetitionCounter": {
             "enum": [
@@ -20,7 +54,7 @@
             ]
         },
         "PetitionState": {
-            "description": "open and amend count toward the open maximum and block a second petition with the same\nfingerprint; merged, closed and reject are terminal.",
+            "description": "open and amend count toward the open maximum and block a second petition with the same\nfingerprint; merged, closed and reject are terminal. A dormancy petition whose pull request\ncloses without a merge goes from amend back to open.",
             "enum": [
                 "open",
                 "amend",
@@ -33,6 +67,23 @@
             "type": "string",
             "maxLength": 64,
             "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "RepeatedRulingBaseline": {
+            "type": "object",
+            "description": "What a suppressing case records, per counter; dormancy and early petitions record none.",
+            "additionalProperties": false,
+            "properties": {
+                "count": {
+                    "$ref": "#/$defs/U32"
+                },
+                "counter": {
+                    "const": "repeated_ruling"
+                }
+            },
+            "required": [
+                "count",
+                "counter"
+            ]
         },
         "ShortText": {
             "type": "string",
@@ -55,6 +106,22 @@
                     "minimum": 0
                 }
             ]
+        },
+        "VoidFindingBaseline": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "count": {
+                    "$ref": "#/$defs/U32"
+                },
+                "counter": {
+                    "const": "void_finding"
+                }
+            },
+            "required": [
+                "count",
+                "counter"
+            ]
         }
     },
     "type": "object",
@@ -64,8 +131,15 @@
             "$ref": "#/$defs/PetitionArticle"
         },
         "baseline": {
-            "description": "The superseded rejection's baseline, when raised on new evidence.",
-            "$ref": "#/$defs/U32"
+            "type": "object",
+            "description": "The superseded case's baseline, when raised on new evidence. CUE holds its counter to\nthe petition's; the JSON Schema export carries the per-counter shapes only.",
+            "properties": {
+                "counter": true
+            },
+            "$ref": "#/$defs/PetitionBaseline",
+            "required": [
+                "counter"
+            ]
         },
         "cases": {
             "type": "array",
@@ -119,7 +193,7 @@
             "$ref": "#/$defs/PetitionState"
         },
         "supersedes": {
-            "description": "The latest rejection case holding this fingerprint, when raised on new evidence.",
+            "description": "The latest suppressing case holding this fingerprint, when raised on new evidence.",
             "$ref": "#/$defs/RecordId"
         },
         "thresholds": {
