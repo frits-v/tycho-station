@@ -25,6 +25,7 @@ pub mod packets;
 pub mod private_dir;
 pub mod probe;
 pub mod process;
+pub mod repositories;
 pub mod services;
 pub mod spawn;
 pub mod spool;

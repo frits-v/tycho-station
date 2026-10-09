@@ -2,6 +2,7 @@
 
 pub mod doubles;
 pub mod epic;
+pub mod launcher_spawner;
 pub mod merge_gate;
 pub mod operator;
 pub mod reconciler;
@@ -10,6 +11,7 @@ pub mod session;
 pub mod spawner;
 pub mod work_unit;
 pub mod worker_run;
+pub mod workers;
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -109,6 +111,8 @@ pub struct Ports {
     pub operator_secret: Option<std::path::PathBuf>,
     /// Where decision packets go; `None` abandons a unit that escalates, since no one would see it.
     pub packet_dir: Option<std::path::PathBuf>,
+    /// Headless workers in cloned worktrees; `None` runs each worker's argv as given.
+    pub workers: Option<Arc<workers::WorkerPorts>>,
 }
 
 impl std::fmt::Debug for Ports {
@@ -121,6 +125,7 @@ impl std::fmt::Debug for Ports {
             .field("config", &self.config.hashes())
             .field("operator_secret", &self.operator_secret)
             .field("packet_dir", &self.packet_dir)
+            .field("workers", &self.workers)
             .finish()
     }
 }

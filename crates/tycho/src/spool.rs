@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use tycho_types::envelope::{Envelope, Payload, ENVELOPE_MAX_BYTES};
 use tycho_types::exit::ExitState;
 use tycho_types::launcher::{AwaitableId, IdempotencyKey};
+use tycho_types::rejection::encode_escalation;
 use tycho_types::service::handler::SESSION_HEARTBEAT;
 use tycho_types::session::SessionName;
 
@@ -94,6 +95,25 @@ pub fn check_result_envelope(
     String::from_utf8(bytes).map_err(|error| error.to_string())
 }
 
+/// The rejection message an escalation envelope from this session carries: `escalated`, a
+/// newline and the certified question.
+pub fn escalation_rejection(
+    value: &serde_json::Value,
+    session: &SessionName,
+) -> Result<String, String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    let envelope = Envelope::parse(&bytes).map_err(|error| error.to_string())?;
+    if envelope.from != *session {
+        return Err(format!("envelope from {} not {session}", envelope.from));
+    }
+    match envelope.payload {
+        Payload::Escalation(payload) => {
+            encode_escalation(&payload).map_err(|error| error.to_string())
+        }
+        _ => Err("envelope payload is not an escalation".to_string()),
+    }
+}
+
 impl SpoolRecord {
     pub fn resolution(&self) -> Result<Resolution, SpoolError> {
         if self.schema_version != SPOOL_SCHEMA_VERSION {
@@ -108,6 +128,9 @@ impl SpoolRecord {
             (ExitState::Completed, None) => Err(SpoolError::Inconsistent(
                 "completed without an envelope".to_string(),
             )),
+            (ExitState::Escalated, Some(envelope)) => escalation_rejection(envelope, &self.session)
+                .map(Resolution::Reject)
+                .map_err(SpoolError::Inconsistent),
             (_, Some(_)) => Err(SpoolError::Inconsistent(
                 "an envelope on a failure state".to_string(),
             )),

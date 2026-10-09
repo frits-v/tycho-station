@@ -334,6 +334,7 @@ fn start_core_with_spawner(
         config: Arc::new(test_config()),
         operator_secret: Some(core.config.operator_secret_file()),
         packet_dir: Some(core.config.packet_dir()),
+        workers: None,
     };
     adjust(&mut ports, &core);
     let doubles = DoublesEndpoint::start(&ports);

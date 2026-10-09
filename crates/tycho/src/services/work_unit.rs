@@ -2,7 +2,7 @@
 //! with the run handler as the only writer of lifecycle state.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,13 +15,19 @@ use tycho_types::rejection::Question;
 use tycho_types::service::{Attempt, EpicId, Phase, PromiseName, TaskId, WorkUnitId};
 use tycho_types::session::{SessionKind, SessionName, Vendor};
 
+use crate::code_graph::StepKey;
 use crate::config::spine;
 use crate::config_store::{FactoryConfig, UnitConfig};
 use crate::packets::{self, Blocker, PacketContext, PacketError};
+use crate::repositories::{pin_ref, unit_branch, Worktree};
 use crate::services::epic::EpicClient;
 use crate::services::merge_gate::{Claim, GateError, GateVerdict, MergeGate, VerifyRequest};
 use crate::services::worker_run::{
     worker_key, WorkerRunClient, WorkerRunOutcome, WorkerRunRequest,
+};
+use crate::services::workers::{
+    graph_key, index, Checkpoint, IndexKind, IndexRecord, WorkerEvidence, WorkerPlacement,
+    WorkerPorts,
 };
 use crate::services::{
     blocking, refuse, secret, Ports, Timing, CODE_BAD_REQUEST, CODE_CANCELLED, CODE_CONFLICT,
@@ -179,6 +185,14 @@ pub struct WorkUnitView {
     /// The rationale of the last `continue` verdict, which names the chosen option.
     #[serde(default)]
     pub chosen_option: Option<ShortText>,
+    /// The current attempt's clone of the canonical repository.
+    #[serde(default)]
+    pub worktree: Option<Worktree>,
+    /// Every graph index build and rebuild of the unit's worktrees.
+    #[serde(default)]
+    pub index: Vec<IndexRecord>,
+    #[serde(default)]
+    pub checkpoints: Vec<Checkpoint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -422,6 +436,7 @@ pub struct WorkUnit {
     timing: Timing,
     config: Arc<FactoryConfig>,
     packet_dir: Option<PathBuf>,
+    workers: Option<Arc<WorkerPorts>>,
 }
 
 impl WorkUnit {
@@ -432,6 +447,7 @@ impl WorkUnit {
             timing: ports.timing,
             config: Arc::clone(&ports.config),
             packet_dir: ports.packet_dir.clone(),
+            workers: ports.workers.clone(),
         }
     }
 }
@@ -444,6 +460,7 @@ impl fmt::Debug for WorkUnit {
             .field("timing", &self.timing)
             .field("config", &self.config.hashes())
             .field("packet_dir", &self.packet_dir)
+            .field("workers", &self.workers)
             .finish()
     }
 }
@@ -644,6 +661,9 @@ impl WorkUnit {
                 packet_error: None,
                 epic: Some(request.epic.clone()),
                 chosen_option: None,
+                worktree: None,
+                index: Vec::new(),
+                checkpoints: Vec::new(),
             },
             timing: start.timing,
         };
@@ -872,10 +892,14 @@ impl WorkUnit {
         attempt: Attempt,
     ) -> Result<AttemptEnd, TerminalError> {
         let mut claims = Vec::new();
+        let placement = self.place(unit, unit_id, request, attempt).await?;
         for planned in &request.plan {
             let mut worker = planned.worker.clone();
             worker.epic = request.epic.clone();
             worker.work_unit = unit_id.clone();
+            if let Some(task) = worker.task.as_mut() {
+                task.placement.clone_from(&placement);
+            }
             let outcome = unit
                 .workflow_context
                 .workflow_client::<WorkerRunClient>(worker_key(&planned.task, attempt))
@@ -884,11 +908,24 @@ impl WorkUnit {
                 .await?
                 .into_inner();
             match outcome {
-                WorkerRunOutcome::Completed { result, .. } => claims.push(Claim {
-                    task: planned.task.clone(),
-                    branch: result.branch,
-                    head_sha: result.head_sha,
-                }),
+                WorkerRunOutcome::Completed {
+                    result, evidence, ..
+                } => {
+                    if let Some(placement) = &placement {
+                        let checkpointed = Checkpointed {
+                            placement,
+                            result: &result,
+                            evidence: evidence.as_ref(),
+                        };
+                        self.checkpoint(unit, unit_id, attempt, &checkpointed)
+                            .await?;
+                    }
+                    claims.push(Claim {
+                        task: planned.task.clone(),
+                        branch: result.branch,
+                        head_sha: result.head_sha,
+                    });
+                }
                 WorkerRunOutcome::Escalated { .. }
                 | WorkerRunOutcome::Replan { .. }
                 | WorkerRunOutcome::Inbox { .. } => {
@@ -909,6 +946,143 @@ impl WorkUnit {
         }
         unit.step(Event::ResultDone)?;
         self.verify(unit, unit_id, attempt, claims).await
+    }
+
+    /// Clones the unit attempt's worktree from the canonical repository and builds its graph
+    /// index, when the plan holds a headless task and the endpoint serves headless workers.
+    async fn place(
+        &self,
+        unit: &mut Unit<'_>,
+        unit_id: &WorkUnitId,
+        request: &WorkUnitRequest,
+        attempt: Attempt,
+    ) -> Result<Option<WorkerPlacement>, TerminalError> {
+        let Some(workers) = &self.workers else {
+            return Ok(None);
+        };
+        if !request
+            .plan
+            .iter()
+            .any(|planned| planned.worker.task.is_some())
+        {
+            return Ok(None);
+        }
+        let path = workers
+            .repositories
+            .worktree_path(&request.epic, unit_id, attempt);
+        let branch = unit_branch(unit_id, attempt)
+            .map_err(|error| failure(CODE_INTERNAL, error.to_string()))?;
+        let cloner = Arc::clone(workers);
+        let worktree = unit
+            .workflow_context
+            .run(|| {
+                blocking(move || {
+                    cloner
+                        .repositories
+                        .clone_worktree(&cloner.project, &path, &branch)
+                        .map(Json)
+                        .map_err(|error| refuse(CODE_INTERNAL, error.to_string()))
+                })
+            })
+            .name("worktree")
+            .await?
+            .into_inner();
+        unit.view.worktree = Some(worktree.clone());
+        unit.save();
+        let key =
+            graph_key(unit_id, attempt, "build").map_err(|error| failure(CODE_INTERNAL, error))?;
+        self.index(unit, unit_id, IndexKind::Build, key, &worktree.path)
+            .await?;
+        let control = SessionName::unit(
+            request.epic.clone(),
+            unit_id.clone(),
+            SessionKind::Control,
+            request.control_vendor,
+            None,
+        );
+        Ok(Some(WorkerPlacement { worktree, control }))
+    }
+
+    /// One graph build or rebuild on the checkout path, by the core; a failure is recorded.
+    async fn index(
+        &self,
+        unit: &mut Unit<'_>,
+        unit_id: &WorkUnitId,
+        kind: IndexKind,
+        key: StepKey,
+        worktree: &Path,
+    ) -> Result<(), TerminalError> {
+        let Some(workers) = &self.workers else {
+            return Ok(());
+        };
+        let graph = Arc::clone(&workers.graph);
+        let (unit_key, worktree) = (unit_id.clone(), worktree.to_path_buf());
+        let record = unit
+            .workflow_context
+            .run(|| {
+                blocking(move || {
+                    Ok(Json(index(
+                        graph.as_ref(),
+                        kind,
+                        &key,
+                        &unit_key,
+                        &worktree,
+                    )))
+                })
+            })
+            .name("graph index")
+            .await?
+            .into_inner();
+        unit.view.index.push(record);
+        unit.save();
+        Ok(())
+    }
+
+    /// At a worker's result: pins its commit in the canonical repository, records the
+    /// checkpoint, and rebuilds the index when the worker committed.
+    async fn checkpoint(
+        &self,
+        unit: &mut Unit<'_>,
+        unit_id: &WorkUnitId,
+        attempt: Attempt,
+        checkpointed: &Checkpointed<'_>,
+    ) -> Result<(), TerminalError> {
+        let Some(workers) = &self.workers else {
+            return Ok(());
+        };
+        let sequence = u32::try_from(unit.view.checkpoints.len())
+            .unwrap_or(u32::MAX)
+            .saturating_add(1);
+        let pin = pin_ref(unit_id, sequence);
+        let pinner = Arc::clone(workers);
+        let (worktree, head, pin_name) = (
+            checkpointed.placement.worktree.clone(),
+            checkpointed.result.head_sha.clone(),
+            pin.clone(),
+        );
+        unit.workflow_context
+            .run(|| {
+                blocking(move || {
+                    pinner
+                        .repositories
+                        .pin(&pinner.project, &worktree, &head, &pin_name)
+                        .map_err(|error| refuse(CODE_INTERNAL, error.to_string()))
+                })
+            })
+            .name("pin")
+            .await?;
+        unit.view
+            .checkpoints
+            .push(checkpointed.record(sequence, pin));
+        unit.save();
+        if checkpointed.result.head_sha == checkpointed.placement.worktree.base {
+            return Ok(());
+        }
+        let key = graph_key(unit_id, attempt, &format!("rebuild.{sequence}"))
+            .map_err(|error| failure(CODE_INTERNAL, error))?;
+        let path = checkpointed.placement.worktree.path.clone();
+        self.index(unit, unit_id, IndexKind::Rebuild, key, &path)
+            .await
     }
 
     async fn verify(
@@ -948,6 +1122,30 @@ impl WorkUnit {
                     findings.iter().map(ToString::to_string).collect(),
                 ))
             }
+        }
+    }
+}
+
+/// A worker's result and where it ran, as the checkpoint records it.
+struct Checkpointed<'a> {
+    placement: &'a WorkerPlacement,
+    result: &'a ResultPayload,
+    evidence: Option<&'a WorkerEvidence>,
+}
+
+impl Checkpointed<'_> {
+    fn record(&self, sequence: u32, pin_ref: String) -> Checkpoint {
+        Checkpoint {
+            sequence,
+            commit: self.result.head_sha.clone(),
+            pin_ref,
+            worktree: self.placement.worktree.path.clone(),
+            resume_handle: self
+                .evidence
+                .and_then(|evidence| evidence.resume_handle.clone()),
+            session: self.evidence.map(|evidence| evidence.session.to_string()),
+            context_tokens: self.evidence.map(|evidence| evidence.context_tokens),
+            reason: "result".to_string(),
         }
     }
 }
@@ -1170,6 +1368,9 @@ mod tests {
             packet_error: None,
             epic: Some(EpicId::parse("cf7a").unwrap()),
             chosen_option: None,
+            worktree: None,
+            index: Vec::new(),
+            checkpoints: Vec::new(),
         }
     }
 

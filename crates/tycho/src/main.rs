@@ -44,7 +44,8 @@ const USAGE: &str = "usage: tycho <command>
   epic dispatch <id> <unit> <plan.json>   start a listed unit's run with a dispatch plan
   launch --spec <spec file> [--tier <tier>]   run a vendor session: lease, heartbeat, spool, resolve
   launch --replay <spool file>    deliver a spooled result that was never acknowledged
-  worker --vendor <vendor> ...    run one headless worker inside a launcher session";
+  worker --vendor <vendor> ...    run one headless worker inside a launcher session
+  worker-session -- <program> ... run a program as the leader of a new session";
 
 fn main() {
     let arguments: Vec<String> = env::args().skip(1).collect();
@@ -90,7 +91,7 @@ fn main() {
         ["launch", "--replay", spool] => replay(spool),
         ["launch", "--spec", spec] => launch(spec, None),
         ["launch", "--spec", spec, "--tier", tier] => launch(spec, Some(tier)),
-        ["worker", ..] => worker(arguments.get(1..).unwrap_or_default()),
+        ["worker" | "worker-session", ..] => worker(&arguments),
         ["graph", "build", checkout, unit] => report_result(graph::build(checkout, unit)),
         ["graph", "query", checkout, kind, argument] => {
             report_result(graph::query(checkout, kind, argument))
@@ -142,8 +143,16 @@ fn launch(spec: &str, tier: Option<&str>) -> i32 {
     }
 }
 
-/// The launcher's vendor command for a headless worker; the event stream goes to stdout.
-fn worker(words: &[String]) -> i32 {
+/// The launcher's vendor command for a headless worker, whose event stream goes to stdout,
+/// and the session trampoline it runs the vendor through.
+fn worker(arguments: &[String]) -> i32 {
+    let words = arguments.get(1..).unwrap_or_default();
+    if arguments
+        .first()
+        .is_some_and(|command| command == "worker-session")
+    {
+        return worker_session(words);
+    }
     let environment = env::vars().collect();
     let mut stdout = std::io::stdout();
     match tycho::vendors::worker_process::run(words, &environment, &mut stdout) {
@@ -153,6 +162,13 @@ fn worker(words: &[String]) -> i32 {
             tycho::vendors::worker_process::EXIT_REFUSED
         }
     }
+}
+
+/// Never returns on success: the process becomes the vendor in a session of its own.
+fn worker_session(words: &[String]) -> i32 {
+    let error = tycho::vendors::worker_process::session_leader(words);
+    eprintln!("tycho: worker-session: {error}");
+    tycho::vendors::worker_process::EXIT_REFUSED
 }
 
 fn replay(spool: &str) -> i32 {
@@ -210,6 +226,7 @@ fn serve_endpoint() -> i32 {
             .as_ref()
             .map(|home| home.join(config::OPERATOR_SECRET_FILE)),
         packet_dir: home.map(|home| home.join(config::PACKET_DIR)),
+        workers: None,
     };
     match endpoint::serve(config::loopback(ENDPOINT_PORT), &ports) {
         Ok(()) => 0,

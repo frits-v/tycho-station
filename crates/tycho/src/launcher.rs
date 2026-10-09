@@ -773,6 +773,25 @@ mod tests {
     }
 
     #[test]
+    fn an_escalated_result_rejects_with_the_certified_question() {
+        let dir = scratch("escalated");
+        let settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
+        let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
+        let mut envelope = crate::exit_decode::tests::envelope(NAME);
+        envelope["type"] = serde_json::json!("escalation");
+        envelope["payload"] = crate::vendors::worker_process::tests::question();
+        let result = serde_json::json!({"state": "escalated", "envelope": envelope});
+        let script = format!("printf '%s' '{result}' > \"$TYCHO_RESULT_FILE\"; exit 1");
+        let recorder = recorder(&files);
+        let end = launch(&settings, &sh(&script), &recorder).unwrap();
+        assert_eq!(end.state, "escalated");
+        let events = recorder.events.borrow();
+        let last = events.last().unwrap();
+        assert!(last.starts_with("deliver sign_1abc escalated\n{"), "{last}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn the_wall_clock_deadline_stops_the_vendor() {
         let dir = scratch("wall-clock");
         let mut settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
