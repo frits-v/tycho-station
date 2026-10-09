@@ -28,6 +28,7 @@ pub mod process;
 pub mod services;
 pub mod spawn;
 pub mod spool;
+pub mod vendors;
 pub mod verdicts;
 pub mod watchdog;
 pub mod zmx;
