@@ -1,0 +1,205 @@
+<svg class="fig-dark" role="img" aria-label="Topology: Human surfaces attach to zmx sessions; root, control and worker sessions run under zmx; the durable core lives outside every repo." xmlns="http://www.w3.org/2000/svg" width="1080" height="676.5" viewBox="0 0 1080 676.5">
+  <rect x="0" y="0" width="1080" height="676.5" fill="#161C1B"/>
+  <defs>
+    <marker id="topology-dark-arrow-clear-dark-gray" viewBox="0 0 10 8" refX="10" refY="4" markerWidth="10" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#9AA3AF"/></marker>
+    <marker id="topology-dark-arrow-clear-dark-solid-3" viewBox="0 0 10 8" refX="10" refY="4" markerWidth="10" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#6CECDB"/></marker>
+    <marker id="topology-dark-arrow-clear-dark-dash-5" viewBox="0 0 10 8" refX="10" refY="4" markerWidth="10" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#D6B7FF"/></marker>
+  </defs>
+  <g data-id="" data-tag="Page">
+    <g data-id="/body" data-tag="Body">
+      <g data-id="/body/0" data-tag="Col">
+        <g data-id="/body/0/children/0" data-tag="Zone" data-kind="zone">
+          <rect x="20.75" y="20.75" width="1038.5" height="93.9" rx="7.25" fill="none" stroke="#8E98A6" stroke-width="1.5" stroke-dasharray="6 5"/>
+          <text x="33.5" y="45.07" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#A8B1BD">HUMAN SURFACES, DISPOSABLE READERS</text>
+          <g data-id="/body/0/children/0/children/0" data-tag="Row">
+            <g data-id="/body/0/children/0/children/0/children/0" data-tag="Pcard">
+              <rect x="34" y="56.4" width="246.25" height="45" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+              <text x="45" y="75.93" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">TUI</text>
+              <text x="45" y="91.57" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#A8B1BD">inbox, feed, focus</text>
+            </g>
+            <g data-id="/body/0/children/0/children/0/children/1" data-tag="Pcard">
+              <rect x="289.25" y="56.4" width="246.25" height="45" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+              <text x="300.25" y="75.93" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">Web view</text>
+              <text x="300.25" y="91.57" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#A8B1BD">localhost, SSE</text>
+            </g>
+            <g data-id="/body/0/children/0/children/0/children/2" data-tag="Pcard">
+              <rect x="544.5" y="56.4" width="246.25" height="45" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+              <text x="555.5" y="75.93" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">Ghostty</text>
+              <text x="555.5" y="91.57" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#A8B1BD">tabs via AppleScript</text>
+            </g>
+            <g data-id="/body/0/children/0/children/0/children/3" data-tag="Pcard">
+              <rect x="799.75" y="56.4" width="246.25" height="45" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+              <text x="810.75" y="75.93" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">Notifications</text>
+              <text x="810.75" y="91.57" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#A8B1BD">link to web</text>
+            </g>
+          </g>
+        </g>
+        <g data-id="/body/0/children/1" data-tag="Row">
+          <g data-id="/body/0/children/1/children/0" data-tag="Zone" data-kind="host">
+            <rect x="20.75" y="164.15" width="759" height="352.8" rx="7.25" fill="none" stroke="#8E98A6" stroke-width="1.5" stroke-dasharray="6 5"/>
+            <text x="33.5" y="188.47" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#A8B1BD">ZMX: ONE DAEMON PER SESSION, OWNS THE PTY</text>
+            <g data-id="/body/0/children/1/children/0/children/0" data-tag="Col">
+              <g data-id="/body/0/children/1/children/0/children/0/children/0" data-tag="Row">
+                <g data-id="/body/0/children/1/children/0/children/0/children/0/children/0" data-tag="Pcard">
+                  <rect x="34" y="199.8" width="353.75" height="73.2" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+                  <text x="45" y="226.23" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">Reader binary</text>
+                  <text x="45" y="241.87" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#A8B1BD">serves TUI and web view from the store; restartable at</text>
+                  <text x="45" y="256.27" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#A8B1BD">any time</text>
+                </g>
+                <g data-id="/body/0/children/1/children/0/children/0/children/0/children/1" data-tag="Pcard">
+                  <rect x="412.75" y="199.8" width="353.75" height="73.2" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+                  <text x="423.75" y="219.33" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">Root control session</text>
+                  <text x="423.75" y="234.97" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#A8B1BD">orchestrator of orchestrators; never edits</text>
+                  <text x="431.75" y="258.27" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="600" fill="#C4CCD6">• cf7a.root.claude</text>
+                </g>
+              </g>
+              <g data-id="/body/0/children/1/children/0/children/0/children/1" data-tag="Row">
+                <g data-id="/body/0/children/1/children/0/children/0/children/1/children/0" data-tag="Col">
+                  <g data-id="/body/0/children/1/children/0/children/0/children/1/children/0/children/0" data-tag="Pcard">
+                    <rect x="34" y="302" width="353.75" height="57.8" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+                    <text x="45" y="321.53" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">Control session, work unit 03</text>
+                    <text x="53" y="345.07" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="600" fill="#C4CCD6">• cf7a.wu03.ctl.codex</text>
+                  </g>
+                  <g data-id="/body/0/children/1/children/0/children/0/children/1/children/0/children/1" data-tag="Row">
+                    <g data-id="/body/0/children/1/children/0/children/0/children/1/children/0/children/1/children/0" data-tag="Pcard">
+                      <rect x="34" y="388.8" width="172.38" height="43" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+                      <text x="45" y="415.03" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">wu03.wrk.claude.a1f3</text>
+                    </g>
+                    <g data-id="/body/0/children/1/children/0/children/0/children/1/children/0/children/1/children/1" data-tag="Pcard">
+                      <rect x="215.38" y="388.8" width="172.38" height="43" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+                      <text x="226.38" y="415.03" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">wu03.wrk.codex.b77e</text>
+                    </g>
+                  </g>
+                </g>
+                <g data-id="/body/0/children/1/children/0/children/0/children/1/children/1" data-tag="Col">
+                  <g data-id="/body/0/children/1/children/0/children/0/children/1/children/1/children/0" data-tag="Pcard">
+                    <rect x="412.75" y="302" width="353.75" height="57.8" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+                    <text x="423.75" y="321.53" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">Control session, work unit 04</text>
+                    <text x="431.75" y="345.07" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="600" fill="#C4CCD6">• cf7a.wu04.ctl.claude</text>
+                  </g>
+                  <g data-id="/body/0/children/1/children/0/children/0/children/1/children/1/children/1" data-tag="Row">
+                    <g data-id="/body/0/children/1/children/0/children/0/children/1/children/1/children/1/children/0" data-tag="Pcard">
+                      <rect x="412.75" y="388.8" width="172.38" height="43" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+                      <text x="423.75" y="415.03" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">wu04.wrk.claude.c201</text>
+                    </g>
+                    <g data-id="/body/0/children/1/children/0/children/0/children/1/children/1/children/1/children/1" data-tag="Pcard">
+                      <rect x="594.13" y="388.8" width="172.38" height="43" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+                      <text x="605.13" y="415.03" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">wu04.wrk.agy.d9c4</text>
+                    </g>
+                  </g>
+                </g>
+              </g>
+              <g data-id="/body/0/children/1/children/0/children/0/children/2" data-tag="Text">
+                <rect x="34.13" y="460.92" width="732.25" height="42.65" rx="7.38" fill="#1D2524" stroke="#3A4644" stroke-width="1.25"/>
+                <text x="46.75" y="486.62" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#E9EDF2">workers: headless, stream-json, one task each, exit when done</text>
+              </g>
+            </g>
+          </g>
+          <g data-id="/body/0/children/1/children/1" data-tag="Zone" data-kind="host">
+            <rect x="789.25" y="164.15" width="270" height="352.8" rx="7.25" fill="none" stroke="#8E98A6" stroke-width="1.5" stroke-dasharray="6 5"/>
+            <text x="802" y="188.47" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#A8B1BD">DURABLE CORE, OUTSIDE EVERY REPO</text>
+            <g data-id="/body/0/children/1/children/1/children/0" data-tag="Pcard">
+              <rect x="802.5" y="199.8" width="243.5" height="59.4" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+              <text x="813.5" y="219.33" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">Restate server</text>
+              <text x="813.5" y="234.97" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#A8B1BD">one binary under zmx: journal, state,</text>
+              <text x="813.5" y="249.37" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#A8B1BD">timers</text>
+            </g>
+            <g data-id="/body/0/children/1/children/1/children/1" data-tag="Pcard">
+              <rect x="802.5" y="268.2" width="243.5" height="59.4" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+              <text x="813.5" y="287.73" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">Factory services</text>
+              <text x="813.5" y="303.37" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#A8B1BD">Rust endpoint: epic, work unit,</text>
+              <text x="813.5" y="317.77" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#A8B1BD">escalation, packet</text>
+            </g>
+            <g data-id="/body/0/children/1/children/1/children/2" data-tag="Pcard">
+              <rect x="802.5" y="336.6" width="243.5" height="45" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+              <text x="813.5" y="356.13" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">Read model</text>
+              <text x="813.5" y="371.77" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#A8B1BD">SQLite graph, rebuilt from handlers</text>
+            </g>
+            <g data-id="/body/0/children/1/children/1/children/3" data-tag="Pcard">
+              <rect x="802.5" y="390.6" width="243.5" height="59.4" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+              <text x="813.5" y="410.13" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">Case law and blobs</text>
+              <text x="813.5" y="425.77" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#A8B1BD">JSON per case, content-addressed</text>
+              <text x="813.5" y="440.17" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#A8B1BD">artifacts</text>
+            </g>
+          </g>
+        </g>
+        <g data-id="/body/0/children/2" data-tag="Pcard">
+          <rect x="20.5" y="566.2" width="1039" height="45" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+          <text x="31.5" y="585.73" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">Canonical repo</text>
+          <text x="31.5" y="601.37" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#A8B1BD">core-owned bare repo; children write only to worktrees; the core verifies, fast-forwards default, then syncs to any remote</text>
+        </g>
+      </g>
+    </g>
+    <g data-id="/legend" data-tag="Legend">
+      <g data-id="/legend/0" data-tag="LegendEntry" data-kind="solid-3">
+        <line x1="20" y1="628.9" x2="46" y2="628.9" stroke="#6CECDB" stroke-width="2"/>
+        <text x="52" y="633.27" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">Solid teal</text>
+        <text x="111.89" y="633.27" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#C4CCD6">awaitable: a resolved promise, a fired timer or a completed step</text>
+      </g>
+      <g data-id="/legend/1" data-tag="LegendEntry" data-kind="dash-5">
+        <line x1="488.25" y1="628.9" x2="514.25" y2="628.9" stroke="#D6B7FF" stroke-width="2" stroke-dasharray="6 5"/>
+        <text x="520.25" y="633.27" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">Dashed indigo</text>
+        <text x="610.11" y="633.27" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#C4CCD6">signal from a session or an arbiter</text>
+      </g>
+      <g data-id="/legend/2" data-tag="LegendEntry" data-kind="gray">
+        <line x1="20" y1="649.3" x2="46" y2="649.3" stroke="#9AA3AF" stroke-width="2"/>
+        <text x="52" y="653.67" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">Solid gray</text>
+        <text x="116.42" y="653.67" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#C4CCD6">attach or read; owns no process</text>
+      </g>
+    </g>
+  </g>
+  <g data-id="/links/0" data-tag="Link" data-kind="gray">
+    <path d="M 667.63 101.9 L 667.63 191.3 L 589.63 191.3 L 589.63 191.3" fill="none" stroke="#9AA3AF" stroke-width="2" stroke-linejoin="round"/>
+    <line x1="589.63" y1="189.3" x2="589.63" y2="199.3" stroke="none" marker-end="url(#topology-dark-arrow-clear-dark-gray)"/>
+    <rect x="626.47" y="132.05" width="82.31" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+    <text x="635.22" y="150.97" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">zmx attach</text>
+  </g>
+  <g data-id="/links/1" data-tag="Link" data-kind="gray">
+    <path d="M 157.13 101.9 L 157.13 139 L 10 139 L 10 236.4 L 23.5 236.4" fill="none" stroke="#9AA3AF" stroke-width="2" stroke-linejoin="round"/>
+    <line x1="23.5" y1="236.4" x2="33.5" y2="236.4" stroke="none" marker-end="url(#topology-dark-arrow-clear-dark-gray)"/>
+  </g>
+  <g data-id="/links/2" data-tag="Link" data-kind="gray">
+    <path d="M 412.38 101.9 L 412.38 139 L 10 139 L 10 236.4 L 23.5 236.4" fill="none" stroke="#9AA3AF" stroke-width="2" stroke-linejoin="round"/>
+    <line x1="23.5" y1="236.4" x2="33.5" y2="236.4" stroke="none" marker-end="url(#topology-dark-arrow-clear-dark-gray)"/>
+    <rect x="138.65" y="124.45" width="145.08" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+    <text x="147.4" y="143.37" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">reads store via reader</text>
+  </g>
+  <g data-id="/links/3" data-tag="Link" data-kind="gray">
+    <path d="M 922.88 101.9 L 922.88 155.4 L 924.25 155.4 L 924.25 155.4" fill="none" stroke="#9AA3AF" stroke-width="2" stroke-linejoin="round"/>
+    <line x1="924.25" y1="153.4" x2="924.25" y2="163.4" stroke="none" marker-end="url(#topology-dark-arrow-clear-dark-gray)"/>
+    <rect x="886.79" y="114.1" width="72.16" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+    <text x="895.54" y="133.02" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">read only</text>
+  </g>
+  <g data-id="/links/4" data-tag="Link" data-kind="solid-3">
+    <path d="M 589.63 273.5 L 589.63 293.5 L 210.88 293.5 L 210.88 293.5" fill="none" stroke="#6CECDB" stroke-width="2" stroke-linejoin="round"/>
+    <line x1="210.88" y1="291.5" x2="210.88" y2="301.5" stroke="none" marker-end="url(#topology-dark-arrow-clear-dark-solid-3)"/>
+  </g>
+  <g data-id="/links/5" data-tag="Link" data-kind="solid-3">
+    <path d="M 589.63 273.5 L 589.63 291.5" fill="none" stroke="#6CECDB" stroke-width="2" stroke-linejoin="round"/>
+    <line x1="589.63" y1="291.5" x2="589.63" y2="301.5" stroke="none" marker-end="url(#topology-dark-arrow-clear-dark-solid-3)"/>
+  </g>
+  <g data-id="/links/6" data-tag="Link" data-kind="solid-3">
+    <path d="M 210.88 360.3 L 210.88 382.1 L 120.19 382.1 L 120.19 382.1" fill="none" stroke="#6CECDB" stroke-width="2" stroke-linejoin="round"/>
+    <line x1="120.19" y1="378.3" x2="120.19" y2="388.3" stroke="none" marker-end="url(#topology-dark-arrow-clear-dark-solid-3)"/>
+  </g>
+  <g data-id="/links/7" data-tag="Link" data-kind="solid-3">
+    <path d="M 210.88 360.3 L 210.88 382.1 L 301.56 382.1 L 301.56 382.1" fill="none" stroke="#6CECDB" stroke-width="2" stroke-linejoin="round"/>
+    <line x1="301.56" y1="378.3" x2="301.56" y2="388.3" stroke="none" marker-end="url(#topology-dark-arrow-clear-dark-solid-3)"/>
+  </g>
+  <g data-id="/links/8" data-tag="Link" data-kind="solid-3">
+    <path d="M 589.63 360.3 L 589.63 382.1 L 498.94 382.1 L 498.94 382.1" fill="none" stroke="#6CECDB" stroke-width="2" stroke-linejoin="round"/>
+    <line x1="498.94" y1="378.3" x2="498.94" y2="388.3" stroke="none" marker-end="url(#topology-dark-arrow-clear-dark-solid-3)"/>
+  </g>
+  <g data-id="/links/9" data-tag="Link" data-kind="solid-3">
+    <path d="M 589.63 360.3 L 589.63 382.1 L 680.31 382.1 L 680.31 382.1" fill="none" stroke="#6CECDB" stroke-width="2" stroke-linejoin="round"/>
+    <line x1="680.31" y1="378.3" x2="680.31" y2="388.3" stroke="none" marker-end="url(#topology-dark-arrow-clear-dark-solid-3)"/>
+  </g>
+  <g data-id="/links/10" data-tag="Link" data-kind="dash-5">
+    <path d="M 767 236.4 L 799.25 236.4 L 799.25 229.5 L 799.25 229.5" fill="none" stroke="#D6B7FF" stroke-width="2" stroke-dasharray="6 5" stroke-linejoin="round"/>
+    <line x1="792" y1="229.5" x2="802" y2="229.5" stroke="none" marker-end="url(#topology-dark-arrow-clear-dark-dash-5)"/>
+  </g>
+  <g data-id="/links/11" data-tag="Link" data-kind="dash-5">
+    <path d="M 767 330.9 L 799.25 330.9 L 799.25 297.9 L 799.25 297.9" fill="none" stroke="#D6B7FF" stroke-width="2" stroke-dasharray="6 5" stroke-linejoin="round"/>
+    <line x1="792" y1="297.9" x2="802" y2="297.9" stroke="none" marker-end="url(#topology-dark-arrow-clear-dark-dash-5)"/>
+  </g>
+</svg>

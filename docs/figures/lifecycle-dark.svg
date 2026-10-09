@@ -1,0 +1,219 @@
+<svg class="fig-dark" role="img" aria-label="Work unit lifecycle: The states of the WorkUnit workflow's run handler and the awaits that move a unit between them." xmlns="http://www.w3.org/2000/svg" width="860" height="1206.8" viewBox="0 0 860 1206.8">
+  <rect x="0" y="0" width="860" height="1206.8" fill="#161C1B"/>
+  <defs>
+    <marker id="lifecycle-dark-arrow-clear-dark-solid-3" viewBox="0 0 10 8" refX="10" refY="4" markerWidth="10" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#6CECDB"/></marker>
+    <marker id="lifecycle-dark-arrow-clear-dark-solid-7" viewBox="0 0 10 8" refX="10" refY="4" markerWidth="10" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#E86D0F"/></marker>
+    <marker id="lifecycle-dark-arrow-clear-dark-dash-5" viewBox="0 0 10 8" refX="10" refY="4" markerWidth="10" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#D6B7FF"/></marker>
+  </defs>
+  <g data-id="" data-tag="Page">
+    <g data-id="/body" data-tag="Body">
+      <g data-id="/body/0" data-tag="Zone" data-kind="workflow">
+        <rect x="20.75" y="20.75" width="818.5" height="1120.5" rx="7.25" fill="#141E1B" stroke="#434C5A" stroke-width="1.5"/>
+        <text x="33.5" y="45.07" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#A8B1BD">WorkUnit run handler</text>
+        <g data-id="/body/0/children/0" data-tag="Pcard">
+          <rect x="34" y="56.4" width="792" height="43" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+          <text x="45" y="82.63" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">queued</text>
+        </g>
+        <g data-id="/body/0/children/1" data-tag="Pipe" data-kind="solid-3">
+          <circle cx="430" cy="111.9" r="4" fill="#6CECDB"/>
+          <line x1="430" y1="115.9" x2="430" y2="127.9" stroke="#6CECDB" stroke-width="2"/>
+          <rect x="369.33" y="128.65" width="121.34" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+          <line x1="430" y1="158.5" x2="430" y2="168.5" stroke="#6CECDB" stroke-width="2"/>
+          <line x1="430" y1="168.5" x2="430" y2="178.5" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-solid-3)"/>
+          <text x="378.08" y="147.57" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">child claims lease</text>
+        </g>
+        <g data-id="/body/0/children/2" data-tag="Pcard">
+          <rect x="34" y="187" width="792" height="43" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+          <text x="45" y="213.23" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">claimed</text>
+        </g>
+        <g data-id="/body/0/children/3" data-tag="Pipe" data-kind="solid-3">
+          <circle cx="163.65" cy="242.5" r="4" fill="#6CECDB"/>
+          <line x1="163.65" y1="246.5" x2="163.65" y2="258.5" stroke="#6CECDB" stroke-width="2"/>
+          <rect x="123.06" y="259.25" width="81.2" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+          <line x1="163.65" y1="289.1" x2="163.65" y2="299.1" stroke="#6CECDB" stroke-width="2"/>
+          <line x1="163.65" y1="299.1" x2="163.65" y2="309.1" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-solid-3)"/>
+          <text x="131.81" y="278.17" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">first status</text>
+        </g>
+        <g data-id="/body/0/children/4" data-tag="Row">
+          <g data-id="/body/0/children/4/children/0" data-tag="Pcard">
+            <rect x="34" y="317.6" width="259.31" height="288" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+            <text x="45" y="466.33" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">running</text>
+          </g>
+          <g data-id="/body/0/children/4/children/1" data-tag="Col">
+            <g data-id="/body/0/children/4/children/1/children/0" data-tag="Col">
+              <g data-id="/body/0/children/4/children/1/children/0/children/0" data-tag="Pipe" data-kind="solid-3">
+                <circle cx="305.81" cy="332.4" r="4" fill="#6CECDB"/>
+                <line x1="309.81" y1="332.4" x2="338.14" y2="332.4" stroke="#6CECDB" stroke-width="2"/>
+                <rect x="338.89" y="317.85" width="86.56" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+                <line x1="426.21" y1="332.4" x2="452.54" y2="332.4" stroke="#6CECDB" stroke-width="2"/>
+                <line x1="452.54" y1="332.4" x2="462.54" y2="332.4" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-solid-3)"/>
+                <text x="347.64" y="336.77" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">silence &gt; T1</text>
+              </g>
+              <g data-id="/body/0/children/4/children/1/children/0/children/1" data-tag="Pipe" data-kind="dash-5">
+                <line x1="311.81" y1="367" x2="301.81" y2="367" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-dash-5)"/>
+                <line x1="311.81" y1="367" x2="323.81" y2="367" stroke="#D6B7FF" stroke-width="2" stroke-dasharray="6 5"/>
+                <rect x="324.56" y="352.45" width="115.23" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+                <line x1="440.54" y1="367" x2="454.54" y2="367" stroke="#D6B7FF" stroke-width="2" stroke-dasharray="6 5"/>
+                <circle cx="458.54" cy="367" r="4" fill="#D6B7FF"/>
+                <text x="333.31" y="371.37" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">nudge answered</text>
+              </g>
+            </g>
+            <g data-id="/body/0/children/4/children/1/children/1" data-tag="Col">
+              <g data-id="/body/0/children/4/children/1/children/1/children/0" data-tag="Pipe" data-kind="solid-7">
+                <circle cx="305.81" cy="461.6" r="4" fill="#E86D0F"/>
+                <line x1="309.81" y1="461.6" x2="327.48" y2="461.6" stroke="#E86D0F" stroke-width="2"/>
+                <rect x="328.23" y="447.05" width="107.89" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+                <line x1="436.87" y1="461.6" x2="452.54" y2="461.6" stroke="#E86D0F" stroke-width="2"/>
+                <line x1="452.54" y1="461.6" x2="462.54" y2="461.6" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-solid-7)"/>
+                <text x="336.98" y="465.97" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">worker gave up</text>
+              </g>
+            </g>
+            <g data-id="/body/0/children/4/children/1/children/2" data-tag="Col">
+              <g data-id="/body/0/children/4/children/1/children/2/children/0" data-tag="Pipe" data-kind="solid-3">
+                <circle cx="305.81" cy="556.2" r="4" fill="#6CECDB"/>
+                <line x1="309.81" y1="556.2" x2="328.09" y2="556.2" stroke="#6CECDB" stroke-width="2"/>
+                <rect x="328.84" y="541.65" width="106.67" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+                <line x1="436.26" y1="556.2" x2="452.54" y2="556.2" stroke="#6CECDB" stroke-width="2"/>
+                <line x1="452.54" y1="556.2" x2="462.54" y2="556.2" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-solid-3)"/>
+                <text x="337.59" y="560.57" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">give-up rule hit</text>
+              </g>
+              <g data-id="/body/0/children/4/children/1/children/2/children/1" data-tag="Pipe" data-kind="dash-5">
+                <line x1="311.81" y1="590.8" x2="301.81" y2="590.8" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-dash-5)"/>
+                <line x1="311.81" y1="590.8" x2="352.18" y2="590.8" stroke="#D6B7FF" stroke-width="2" stroke-dasharray="6 5"/>
+                <rect x="352.93" y="576.25" width="58.49" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+                <line x1="412.17" y1="590.8" x2="454.54" y2="590.8" stroke="#D6B7FF" stroke-width="2" stroke-dasharray="6 5"/>
+                <circle cx="458.54" cy="590.8" r="4" fill="#D6B7FF"/>
+                <text x="361.68" y="595.17" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">verdict</text>
+              </g>
+            </g>
+          </g>
+          <g data-id="/body/0/children/4/children/2" data-tag="Col">
+            <g data-id="/body/0/children/4/children/2/children/0" data-tag="Pcard">
+              <rect x="471.04" y="325.5" width="354.96" height="43" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+              <text x="482.04" y="351.73" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">stalled</text>
+            </g>
+            <g data-id="/body/0/children/4/children/2/children/1" data-tag="Pipe" data-kind="solid-7">
+              <circle cx="648.52" cy="373" r="4" fill="#E86D0F"/>
+              <line x1="648.52" y1="377" x2="648.52" y2="389" stroke="#E86D0F" stroke-width="2"/>
+              <rect x="545.54" y="389.75" width="205.96" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+              <line x1="648.52" y1="419.6" x2="648.52" y2="429.6" stroke="#E86D0F" stroke-width="2"/>
+              <line x1="648.52" y1="429.6" x2="648.52" y2="439.6" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-solid-7)"/>
+              <text x="554.29" y="408.67" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">no progress &gt; T2: kill, attempt+1</text>
+            </g>
+            <g data-id="/body/0/children/4/children/2/children/2" data-tag="Pcard">
+              <rect x="471.04" y="440.1" width="354.96" height="43" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+              <text x="482.04" y="466.33" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">retry queued</text>
+            </g>
+            <g data-id="/body/0/children/4/children/2/children/3" data-tag="Pipe" data-kind="solid-3">
+              <circle cx="522.17" cy="487.6" r="4" fill="#6CECDB"/>
+              <line x1="522.17" y1="491.6" x2="522.17" y2="503.6" stroke="#6CECDB" stroke-width="2"/>
+              <rect x="471.29" y="504.35" width="101.78" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+              <line x1="522.17" y1="534.2" x2="522.17" y2="544.2" stroke="#6CECDB" stroke-width="2"/>
+              <line x1="522.17" y1="544.2" x2="522.17" y2="554.2" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-solid-3)"/>
+              <text x="480.04" y="523.27" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">attempt &gt; max</text>
+            </g>
+            <g data-id="/body/0/children/4/children/2/children/4" data-tag="Row">
+              <g data-id="/body/0/children/4/children/2/children/4/children/0" data-tag="Pcard">
+                <rect x="471.04" y="554.7" width="89.93" height="43" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+                <text x="482.04" y="580.93" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">escalated</text>
+              </g>
+              <g data-id="/body/0/children/4/children/2/children/4/children/1" data-tag="Pipe" data-kind="solid-3">
+                <circle cx="569.47" cy="576.2" r="4" fill="#6CECDB"/>
+                <line x1="573.47" y1="576.2" x2="587.47" y2="576.2" stroke="#6CECDB" stroke-width="2"/>
+                <rect x="588.22" y="561.65" width="116.82" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+                <line x1="705.79" y1="576.2" x2="717.79" y2="576.2" stroke="#6CECDB" stroke-width="2"/>
+                <line x1="717.79" y1="576.2" x2="727.79" y2="576.2" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-solid-3)"/>
+                <text x="596.97" y="580.57" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">verdict: abandon</text>
+              </g>
+              <g data-id="/body/0/children/4/children/2/children/4/children/2" data-tag="Pcard">
+                <rect x="732.29" y="554.7" width="93.71" height="43" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+                <text x="743.29" y="580.93" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">abandoned</text>
+              </g>
+            </g>
+          </g>
+        </g>
+        <g data-id="/body/0/children/5" data-tag="Row">
+          <g data-id="/body/0/children/5/children/0" data-tag="Pipe" data-kind="solid-3">
+            <circle cx="78.07" cy="618.1" r="4" fill="#6CECDB"/>
+            <line x1="78.07" y1="622.1" x2="78.07" y2="634.1" stroke="#6CECDB" stroke-width="2"/>
+            <rect x="34.25" y="634.85" width="87.65" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+            <line x1="78.07" y1="664.7" x2="78.07" y2="674.7" stroke="#6CECDB" stroke-width="2"/>
+            <line x1="78.07" y1="674.7" x2="78.07" y2="684.7" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-solid-3)"/>
+            <text x="43" y="653.77" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">result: done</text>
+          </g>
+          <g data-id="/body/0/children/5/children/1" data-tag="Pipe" data-kind="solid-7">
+            <line x1="231.78" y1="624.1" x2="231.78" y2="614.1" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-solid-7)"/>
+            <line x1="231.78" y1="624.1" x2="231.78" y2="634.1" stroke="#E86D0F" stroke-width="2"/>
+            <rect x="131.4" y="634.85" width="200.76" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+            <line x1="231.78" y1="664.7" x2="231.78" y2="676.7" stroke="#E86D0F" stroke-width="2"/>
+            <circle cx="231.78" cy="680.7" r="4" fill="#E86D0F"/>
+            <text x="140.15" y="653.77" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">criteria fail: findings, attempt+1</text>
+          </g>
+        </g>
+        <g data-id="/body/0/children/6" data-tag="Pcard">
+          <rect x="34" y="693.2" width="792" height="43" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+          <text x="45" y="719.43" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">verifying</text>
+        </g>
+        <g data-id="/body/0/children/7" data-tag="Pipe" data-kind="solid-3">
+          <circle cx="430" cy="748.7" r="4" fill="#6CECDB"/>
+          <line x1="430" y1="752.7" x2="430" y2="764.7" stroke="#6CECDB" stroke-width="2"/>
+          <rect x="337.34" y="765.45" width="185.32" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+          <line x1="430" y1="795.3" x2="430" y2="805.3" stroke="#6CECDB" stroke-width="2"/>
+          <line x1="430" y1="805.3" x2="430" y2="815.3" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-solid-3)"/>
+          <text x="346.09" y="784.37" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">fresh checkout, criteria pass</text>
+        </g>
+        <g data-id="/body/0/children/8" data-tag="Pcard">
+          <rect x="34" y="823.8" width="792" height="43" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+          <text x="45" y="850.03" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">fast-forward</text>
+        </g>
+        <g data-id="/body/0/children/9" data-tag="Pipe" data-kind="solid-3">
+          <circle cx="430" cy="879.3" r="4" fill="#6CECDB"/>
+          <line x1="430" y1="883.3" x2="430" y2="895.3" stroke="#6CECDB" stroke-width="2"/>
+          <rect x="370.1" y="896.05" width="119.8" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+          <line x1="430" y1="925.9" x2="430" y2="935.9" stroke="#6CECDB" stroke-width="2"/>
+          <line x1="430" y1="935.9" x2="430" y2="945.9" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-solid-3)"/>
+          <text x="378.85" y="914.97" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">default advanced</text>
+        </g>
+        <g data-id="/body/0/children/10" data-tag="Pcard">
+          <rect x="34" y="954.4" width="792" height="43" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+          <text x="45" y="980.63" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">merged</text>
+        </g>
+        <g data-id="/body/0/children/11" data-tag="Pipe" data-kind="solid-3">
+          <circle cx="430" cy="1009.9" r="4" fill="#6CECDB"/>
+          <line x1="430" y1="1013.9" x2="430" y2="1025.9" stroke="#6CECDB" stroke-width="2"/>
+          <rect x="367.68" y="1026.65" width="124.63" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+          <line x1="430" y1="1056.5" x2="430" y2="1066.5" stroke="#6CECDB" stroke-width="2"/>
+          <line x1="430" y1="1066.5" x2="430" y2="1076.5" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-solid-3)"/>
+          <text x="376.43" y="1045.57" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">prune, checkpoint</text>
+        </g>
+        <g data-id="/body/0/children/12" data-tag="Pcard">
+          <rect x="34" y="1085" width="792" height="43" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+          <text x="45" y="1111.23" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="13" font-weight="700" fill="#E9EDF2">done</text>
+        </g>
+      </g>
+    </g>
+    <g data-id="/legend" data-tag="Legend">
+      <g data-id="/legend/0" data-tag="LegendEntry" data-kind="solid-3">
+        <line x1="20" y1="1159.2" x2="46" y2="1159.2" stroke="#6CECDB" stroke-width="2"/>
+        <text x="52" y="1163.57" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">Solid teal</text>
+        <text x="111.89" y="1163.57" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#C4CCD6">awaitable: a resolved promise, a fired timer or a completed step</text>
+      </g>
+      <g data-id="/legend/1" data-tag="LegendEntry" data-kind="solid-7">
+        <line x1="488.25" y1="1159.2" x2="514.25" y2="1159.2" stroke="#E86D0F" stroke-width="2"/>
+        <text x="520.25" y="1163.57" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">Solid orange</text>
+        <text x="599.62" y="1163.57" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#C4CCD6">awaitable that fails the attempt</text>
+      </g>
+      <g data-id="/legend/2" data-tag="LegendEntry" data-kind="dash-5">
+        <line x1="20" y1="1179.6" x2="46" y2="1179.6" stroke="#D6B7FF" stroke-width="2" stroke-dasharray="6 5"/>
+        <text x="52" y="1183.97" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">Dashed indigo</text>
+        <text x="141.86" y="1183.97" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="400" fill="#C4CCD6">signal from a session or an arbiter</text>
+      </g>
+    </g>
+  </g>
+  <g data-id="/links/0" data-tag="Link" data-kind="solid-3">
+    <path d="M 826.5 461.6 L 834.5 461.6 L 834.5 274 L 430 274 L 430 240.5" fill="none" stroke="#6CECDB" stroke-width="2" stroke-linejoin="round"/>
+    <line x1="430" y1="240.5" x2="430" y2="230.5" stroke="none" marker-end="url(#lifecycle-dark-arrow-clear-dark-solid-3)"/>
+    <rect x="584.9" y="259.45" width="94.7" height="29.1" rx="5.25" fill="#1C222B" stroke="#4C5664" stroke-width="1.5"/>
+    <text x="593.65" y="278.37" xml:space="preserve" font-family="Inter, 'Public Sans', system-ui, sans-serif" font-size="12" font-weight="700" fill="#E9EDF2">backoff done</text>
+  </g>
+</svg>

@@ -1,0 +1,11 @@
+<svg viewBox="0 0 960 190" role="img" aria-label="Deep link flow from a notification through the web view to the terminal app pane">
+  <defs><marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--line-strong)"/></marker></defs>
+  <rect class="box" x="20" y="60" width="170" height="60" rx="6"/><text class="t b" x="36" y="86">Notification</text><text class="t m" x="36" y="104">Slack, mail, macOS</text>
+  <rect class="box" x="250" y="60" width="170" height="60" rx="6"/><text class="t b" x="266" y="86">Web view</text><text class="t m" x="266" y="104">localhost/inbox/pkt-0142</text>
+  <rect class="box" x="480" y="60" width="170" height="60" rx="6"/><text class="t b" x="496" y="86">Reader binary</text><text class="t m" x="496" y="104">resolves pane ref</text>
+  <rect class="box accent" x="710" y="60" width="230" height="60" rx="6"/><text class="t b" x="726" y="86">Ghostty tab</text><text class="t mono" x="726" y="104">focus by terminal id, or new tab: zmx attach S</text>
+  <path class="ln" marker-end="url(#ah3)" d="M190 90 L250 90"/><text class="lbl" x="196" y="54">http link survives</text>
+  <path class="ln" marker-end="url(#ah3)" d="M420 90 L480 90"/><text class="lbl" x="426" y="54">GET /open/S</text>
+  <path class="ln" marker-end="url(#ah3)" d="M650 90 L710 90"/><text class="lbl" x="656" y="54">AppleScript</text>
+  <text class="t m" x="20" y="160">Chat tools strip custom URL schemes, so the notification carries a localhost link. The reader keeps the Ghostty terminal id it last opened for each session; it focuses that, or opens a tab running the attach.</text>
+</svg>

@@ -1,0 +1,45 @@
+<svg viewBox="0 0 960 520" role="img" aria-label="Topology: human surfaces attach to zmx sessions; root, control and worker sessions under zmx; a factory store outside every repo; GitHub as the merge gate">
+  <!-- human surfaces -->
+  <rect class="box ghost" x="20" y="20" width="920" height="86" rx="8"/>
+  <text class="t m" x="34" y="40">HUMAN SURFACES, DISPOSABLE READERS</text>
+  <rect class="box" x="40" y="50" width="200" height="42" rx="6"/><text class="t b" x="60" y="76">Ghostty</text><text class="t m" x="130" y="76">tabs via AppleScript</text>
+  <rect class="box" x="260" y="50" width="200" height="42" rx="6"/><text class="t b" x="280" y="76">TUI</text><text class="t m" x="320" y="76">inbox, feed, focus</text>
+  <rect class="box" x="480" y="50" width="200" height="42" rx="6"/><text class="t b" x="500" y="76">Web view</text><text class="t m" x="580" y="76">localhost, SSE</text>
+  <rect class="box" x="700" y="50" width="220" height="42" rx="6"/><text class="t b" x="720" y="76">Notifications</text><text class="t m" x="830" y="76">link to web</text>
+  <!-- zmx layer -->
+  <rect class="box ghost" x="20" y="130" width="640" height="330" rx="8"/>
+  <text class="t m" x="34" y="150">ZMX: ONE DAEMON PER SESSION, OWNS THE PTY</text>
+  <rect class="box accent" x="40" y="166" width="600" height="46" rx="6"/>
+  <text class="t b" x="60" y="186">Root control session</text><text class="t mono" x="60" y="203">cf7a.root.claude</text>
+  <text class="t m" x="330" y="194">orchestrator of orchestrators; never edits</text>
+  <rect class="box accent" x="40" y="246" width="280" height="46" rx="6"/>
+  <text class="t b" x="58" y="266">Control session, work unit 03</text><text class="t mono" x="58" y="283">cf7a.wu03.ctl.codex</text>
+  <rect class="box accent" x="360" y="246" width="280" height="46" rx="6"/>
+  <text class="t b" x="378" y="266">Control session, work unit 04</text><text class="t mono" x="378" y="283">cf7a.wu04.ctl.claude</text>
+  <rect class="box" x="40" y="326" width="130" height="40" rx="6"/><text class="t mono" x="52" y="350">wu03.wrk.claude.a1f3</text>
+  <rect class="box" x="190" y="326" width="130" height="40" rx="6"/><text class="t mono" x="202" y="350">wu03.wrk.codex.b77e</text>
+  <rect class="box" x="360" y="326" width="130" height="40" rx="6"/><text class="t mono" x="372" y="350">wu04.wrk.claude.c201</text>
+  <rect class="box" x="510" y="326" width="130" height="40" rx="6"/><text class="t mono" x="522" y="350">wu04.wrk.agy.d9c4</text>
+  <text class="t m" x="40" y="392">workers: headless, stream-json, one task each, exit when done</text>
+  <rect class="box" x="40" y="408" width="600" height="36" rx="6"/><text class="t b" x="60" y="431">Reader binary</text><text class="t m" x="170" y="431">serves TUI and web view from the store; restartable at any time</text>
+  <!-- store -->
+  <rect class="box ghost" x="680" y="130" width="260" height="330" rx="8"/>
+  <text class="t m" x="694" y="150">DURABLE CORE, OUTSIDE EVERY REPO</text>
+  <rect class="box store" x="700" y="166" width="220" height="54" rx="6"/><text class="t b" x="716" y="186">Restate server</text><text class="t m" x="716" y="204">one binary under zmx: journal, state, timers</text>
+  <rect class="box store" x="700" y="232" width="220" height="54" rx="6"/><text class="t b" x="716" y="252">Factory services</text><text class="t m" x="716" y="270">Rust endpoint: epic, work unit, escalation, packet</text>
+  <rect class="box store" x="700" y="298" width="220" height="54" rx="6"/><text class="t b" x="716" y="318">Read model</text><text class="t m" x="716" y="336">SQLite graph, rebuilt from handlers</text>
+  <rect class="box store" x="700" y="364" width="220" height="54" rx="6"/><text class="t b" x="716" y="384">Case law and blobs</text><text class="t m" x="716" y="402">JSON per case, content-addressed artifacts</text>
+  <!-- canonical repo -->
+  <rect class="box" x="20" y="480" width="920" height="30" rx="6"/>
+  <text class="t b" x="40" y="500">Canonical repo</text><text class="t m" x="160" y="500">core-owned bare repo; children write only to worktrees; the core verifies, fast-forwards default, then syncs to any remote</text>
+  <!-- lines -->
+  <path class="ln" d="M340 189 L340 246"/>
+  <path class="ln" d="M500 189 L500 246"/>
+  <path class="ln" d="M105 292 L105 326"/><path class="ln" d="M255 292 L255 326"/>
+  <path class="ln" d="M425 292 L425 326"/><path class="ln" d="M575 292 L575 326"/>
+  <path class="ln acc" d="M640 189 L700 189"/><path class="ln acc" d="M640 269 L700 259"/>
+  <path class="ln" d="M140 92 L140 130"/><text class="lbl" x="146" y="120">zmx attach</text>
+  <path class="ln" d="M360 92 L360 130"/><path class="ln" d="M580 92 L580 130"/>
+  <text class="lbl" x="366" y="120">reads store via reader</text>
+  <path class="ln" d="M810 92 L810 130"/><text class="lbl" x="816" y="120">read only</text>
+</svg>

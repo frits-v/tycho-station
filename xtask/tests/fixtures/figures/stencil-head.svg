@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="1206.8" viewBox="0 0 860 1206.8">
+  <defs>
+    <style>
+      @font-face { font-family: "Inter"; font-style: normal; font-weight: 400; src: url("data:font/ttf;base64,AAAA") format("truetype"); }
+      @font-face { font-family: "Inter"; font-style: normal; font-weight: 700; src: url("data:font/ttf;base64,AAAA") format("truetype"); }
+    </style>
+  </defs>
+  <rect x="0" y="0" width="860" height="1206.8" fill="#FFFFFF"/>
+  <defs>
+    <marker id="arrow-clear-solid-3" viewBox="0 0 10 8" refX="10" refY="4" markerWidth="10" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#066A5E"/></marker>
+    <marker id="arrow-clear-solid-7" viewBox="0 0 10 8" refX="10" refY="4" markerWidth="10" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#A13F0E"/></marker>
+    <marker id="arrow-clear-dash-5" viewBox="0 0 10 8" refX="10" refY="4" markerWidth="10" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#202EA5"/></marker>
+  </defs>
+  <g data-id="" data-tag="Page">
