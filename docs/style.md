@@ -22,6 +22,7 @@ check is not repeated in any instruction file. "review" means a reader rejects i
 | A check reports how many things it examined; zero is a failure | `xtask` `finish`; review for new checks |
 | A probe that could not run is a failure, never not applicable | review |
 | Specific names; no `tmp`, `ctx`, `obj`, `arr`, `cfg` unless a framework imposes it | `xtask check-names` |
+| A cargo build started from Rust goes through `mbx` by name (`mbx clippy`, `mbx test`); `cargo fmt` is not a build and stays | `xtask opengrep` (`rust-cargo-build-bypasses-mbx`) |
 | Every `allow` states a reason | clippy `allow_attributes_without_reason` |
 | No `dbg!`, no printing or exiting outside the command line crate | clippy `dbg_macro`, `print_stdout`, `print_stderr`, `exit` |
 | Formatting and clippy pedantic and nursery clean | `cargo fmt --check`, `cargo clippy -D warnings` in ci and the post-edit hook |
@@ -33,7 +34,8 @@ check is not repeated in any instruction file. "review" means a reader rejects i
 | Rule | Enforced by |
 |---|---|
 | A comment exists only for a non-obvious why: a constraint, an invariant, a workaround | review |
-| No history in code or docs: nothing about what the code did before, no ticket or PR numbers, hashes, or names of people | `xtask check-comments` for the phrases in its marker list; review for the rest |
+| No history in code or docs: nothing about what the code did before, no ticket or PR numbers, hashes, or names of people | `xtask opengrep` (`rust-history-trace-comment`) for history phrases in Rust comments; `xtask check-comments` for the rest of its marker list, ticket and issue numbers in Rust comments, and documents; review for the rest |
+| A TODO in Rust names its owner: a ticket key (`ABC-123`) or a link; a `#123` passes the rule but is a ticket number, which `check-comments` refuses in a comment | `xtask opengrep` (`rust-todo-without-ticket`), `xtask check-comments` |
 | No narration: no process commentary addressed to the reader | `xtask check-comments` for the phrases in its marker list |
 | No filler emphasis: bold sprinkles, emdashes as default punctuation, horizontal rules inside a document, emoji | review |
 | Docstrings only where the signature does not state the contract; one line | review |
@@ -47,7 +49,8 @@ check is not repeated in any instruction file. "review" means a reader rejects i
 |---|---|
 | CUE before JSON before YAML; TOML only for mise; YAML only for GitHub Actions | review; `xtask check-config` |
 | Configuration and JSON Schema are exported from CUE and checked in; an export that drifts from its CUE fails | `xtask check-config` in ci and the post-edit hook |
-| Workflow files pass zizmor pedantic and actionlint; actions pinned by commit | `xtask ci`, lefthook pre-push |
+| Workflow files pass zizmor and jactionlint at pedantic with their online audits; actions pinned by commit; a workflow uses only `actions/*` and `jdx/mise-action` | `xtask workflows` (in `xtask ci` and lefthook pre-push), `forbidden-uses` in `.github/jactionlint.yaml` |
+| A check that reports findings at a file and line writes them as SARIF under `target/sarif`, which ci uploads to code scanning | `finish_findings` in the xtask; review for new checks |
 | Figures are stencil documents authored in CUE under `figures/`, rendered to `docs/figures/` and the design page, and checked in ci | `xtask check-figures` (`cue vet`, `stencil check`, byte comparison) in ci and the post-edit hook; `xtask render-figures` writes them |
 | Rule files carry `paths` frontmatter and stay short | `xtask check-rules` |
 

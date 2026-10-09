@@ -11,13 +11,13 @@ mandate: #Mandate & {
 			pending: false
 		}
 		ci: {
-			what:    "xtask ci in the ci workflow: formatting, clippy with the workspace lints, tests, zizmor, actionlint, and the xtask checks. check-names, check-comments, check-rules and check-config count the files they examined and fail at zero; a file that cannot be read still counts as examined. check-config also fails when an export under config/export differs from a fresh export of its CUE. check-pr-title passes when no title is available."
+			what:    "xtask ci in the ci workflow: formatting, clippy with the workspace lints, tests, zizmor and jactionlint at pedantic, the opengrep rules after their fixtures, and the xtask checks; every step runs even after one fails. Each check counts what it examined and fails at zero; an unreadable file counts as examined. check-config also fails when an export differs from a fresh export of its CUE. check-pr-title passes when no title is available. In the workflow, sarif-upload sends the checks' SARIF to code scanning."
 			runs:    "every pull request and push to the default branch"
 			record:  "forge"
 			pending: false
 		}
 		lefthook: {
-			what:    "commit-msg runs check-commit-msg; pre-commit checks formatting; pre-push runs clippy, tests and the workflow lints."
+			what:    "commit-msg runs check-commit-msg; pre-commit checks formatting; pre-push runs clippy, tests and xtask workflows."
 			runs:    "local git operations"
 			record:  "not_recorded"
 			pending: false
