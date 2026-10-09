@@ -53,6 +53,7 @@ use tycho::zmx::{ListEntry, Zmx};
 use tycho_types::envelope::CommitSha;
 use tycho_types::service::handler;
 use tycho_types::session::SessionName;
+use tycho_types::task_packet::RoutingName;
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
 const TEST_ENDPOINT_PORT: u16 = 19_081;
@@ -501,6 +502,43 @@ fn only_worker_session(core: &Core) -> String {
     names[0].clone()
 }
 
+/// Every spooled worker session in attempt order with its acknowledged record, printed.
+fn spooled_records(core: &Core) -> Vec<(String, Value)> {
+    let dirs = AgentDirs::new(core.agent.clone()).unwrap();
+    let mut names: Vec<String> = fs::read_dir(core.agent.join("spool"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    // The suffix ends in `a<attempt>`, so the name order is the attempt order below ten.
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            let files = SessionFiles::new(&dirs, &SessionName::parse(&name).unwrap());
+            let acknowledged = files.spool.with_extension(ACKNOWLEDGED_SUFFIX);
+            let record: Value = fs::read(&acknowledged)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or(Value::Null);
+            println!("evidence: spooled session {name} record {record}");
+            (name, record)
+        })
+        .collect()
+}
+
+/// The worker run's attempt cap for the route the tests dispatch under.
+fn probe_attempt_cap() -> usize {
+    let config = FactoryConfig::embedded().unwrap();
+    let route = config
+        .route(
+            &RoutingName::parse("probe").unwrap(),
+            &RoutingName::parse("light").unwrap(),
+        )
+        .unwrap();
+    usize::from(route.attempt_cap)
+}
+
 fn worker_status() -> Value {
     let status = get(&format!("/WorkerRun/{TASK}/status"));
     println!("evidence: worker run status {status}");
@@ -669,8 +707,24 @@ fn a_headless_worker_rejects_on_the_planted_contradiction() {
     let text = fs::read_to_string(&packet).unwrap();
     println!("evidence: packet {}\n{text}", packet.display());
     assert!(text.contains("POLICY.md"), "{text}");
-    let record = spool_record(&core, &only_worker_session(&core));
-    assert_eq!(record["state"], "escalated");
+    worker_status();
+    // A real model does not always write its escalation on the first attempt; the run may
+    // retry, but nothing may start after an attempt that escalated.
+    let records = spooled_records(&core);
+    assert!(
+        !records.is_empty() && records.len() <= probe_attempt_cap(),
+        "{records:?}"
+    );
+    let states: Vec<&Value> = records.iter().map(|(_, record)| &record["state"]).collect();
+    assert_eq!(states.last(), Some(&&json!("escalated")), "{states:?}");
+    assert!(
+        !states
+            .iter()
+            .rev()
+            .skip(1)
+            .any(|state| **state == json!("escalated")),
+        "an attempt started after one escalated: {states:?}"
+    );
     let worktree = PathBuf::from(
         get(&format!("/WorkUnit/{UNIT}/status"))["worktree"]["path"]
             .as_str()
