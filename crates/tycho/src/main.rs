@@ -89,7 +89,13 @@ fn with_config(action: impl FnOnce(&CoreConfig, &Supervisor) -> i32) -> i32 {
             return 2;
         }
     };
-    action(&config, &Supervisor::new(config.clone(), http))
+    match Supervisor::new(config.clone(), http) {
+        Ok(supervisor) => action(&config, &supervisor),
+        Err(error) => {
+            eprintln!("tycho: refusing to start: {error}");
+            2
+        }
+    }
 }
 
 fn finish(report: &impl Display, succeeded: bool, config: &CoreConfig) -> i32 {

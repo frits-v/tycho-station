@@ -11,6 +11,7 @@ pub mod endpoint;
 pub mod health;
 pub mod http;
 pub mod launchd;
+pub mod private_dir;
 pub mod probe;
 pub mod watchdog;
 pub mod zmx;

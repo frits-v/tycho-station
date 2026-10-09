@@ -2,19 +2,18 @@
 //! endpoint once both answer.
 
 use std::fmt;
-use std::fs::{self, DirBuilder};
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::command;
 use crate::config::{
-    CoreConfig, CoreRole, COMMAND_TIMEOUT, CORE_SOCKET_DIR_MODE, HEALTH_WAIT_POLLS_MAX,
-    POLL_INTERVAL, SESSION_WAIT_POLLS_MAX, STARTUP_GRACE_SECONDS,
+    CoreConfig, CoreRole, COMMAND_TIMEOUT, HEALTH_WAIT_POLLS_MAX, POLL_INTERVAL,
+    SESSION_WAIT_POLLS_MAX, STARTUP_GRACE_SECONDS,
 };
 use crate::health::{self, Health, Registration};
 use crate::http::Http;
+use crate::private_dir::{self, DirError};
 use crate::zmx::{presence, Presence, Zmx};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,10 +114,12 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    #[must_use]
-    pub fn new(config: CoreConfig, http: Http) -> Self {
-        let zmx = Zmx::new(&config.zmx, &config.socket_dir);
-        Self { config, zmx, http }
+    /// Refuses to supervise until every core directory is private to the current user,
+    /// because zmx creates a missing socket directory and its parents with looser modes.
+    pub fn new(config: CoreConfig, http: Http) -> Result<Self, DirError> {
+        private_dir::ensure(&config.dirs())?;
+        let zmx = Zmx::new(&config.zmx, &config.socket_dir());
+        Ok(Self { config, zmx, http })
     }
 
     #[must_use]
@@ -139,8 +140,8 @@ impl Supervisor {
             registration: None,
             failure: None,
         };
-        if let Err(error) = self.prepare_dirs() {
-            report.failure = Some(format!("cannot create the core directories: {error}"));
+        if let Err(error) = private_dir::ensure(&self.config.dirs()) {
+            report.failure = Some(error.to_string());
             return report;
         }
         for role in CoreRole::ALL {
@@ -170,30 +171,6 @@ impl Supervisor {
             report.registration = Some(health::register(&self.http));
         }
         report
-    }
-
-    fn prepare_dirs(&self) -> Result<(), String> {
-        let socket_dir = &self.config.socket_dir;
-        DirBuilder::new()
-            .recursive(true)
-            .mode(CORE_SOCKET_DIR_MODE)
-            .create(socket_dir)
-            .map_err(|error| format!("{}: {error}", socket_dir.display()))?;
-        let mode = fs::metadata(socket_dir)
-            .map_err(|error| format!("{}: {error}", socket_dir.display()))?
-            .permissions()
-            .mode()
-            & 0o777;
-        if mode != CORE_SOCKET_DIR_MODE {
-            return Err(format!(
-                "{} has mode {mode:o}; the core socket directory must be {CORE_SOCKET_DIR_MODE:o}",
-                socket_dir.display()
-            ));
-        }
-        for dir in [self.config.restate_data_dir(), self.config.log_dir()] {
-            fs::create_dir_all(&dir).map_err(|error| format!("{}: {error}", dir.display()))?;
-        }
-        Ok(())
     }
 
     fn apply(&self, role: CoreRole, action: Action) -> Result<String, String> {

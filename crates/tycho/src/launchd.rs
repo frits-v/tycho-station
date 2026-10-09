@@ -5,13 +5,15 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use nix::unistd::{Uid, User};
+
 use crate::command::{self, CommandError};
 use crate::config::{
     CoreConfig, COMMAND_TIMEOUT, HOME_ENV, LAUNCHD_LABEL, LAUNCHD_PATH, RESTATE_SERVER_ENV, ZMX_ENV,
 };
+use crate::private_dir::{self, DirError};
 
 const LAUNCHCTL: &str = "/bin/launchctl";
-const ID: &str = "/usr/bin/id";
 /// launchd waits this long before restarting an agent that exited.
 pub const THROTTLE_SECONDS: u32 = 10;
 
@@ -101,7 +103,8 @@ pub enum LaunchdError {
     AlreadyLoaded(String),
     Io(PathBuf, std::io::Error),
     NoHome,
-    BadUid(String),
+    UserLookup(String),
+    Dir(DirError),
 }
 
 impl fmt::Display for LaunchdError {
@@ -110,8 +113,11 @@ impl fmt::Display for LaunchdError {
             Self::Command(error) => write!(formatter, "{error}"),
             Self::AlreadyLoaded(target) => write!(formatter, "{target} is already loaded"),
             Self::Io(path, error) => write!(formatter, "{}: {error}", path.display()),
-            Self::NoHome => formatter.write_str("HOME is not set"),
-            Self::BadUid(text) => write!(formatter, "id -u printed {text:?}"),
+            Self::NoHome => formatter.write_str("the current uid has no home directory"),
+            Self::UserLookup(error) => {
+                write!(formatter, "cannot look up the current user: {error}")
+            }
+            Self::Dir(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -126,17 +132,14 @@ pub struct Agent {
 impl Agent {
     /// The agent under `~/Library/LaunchAgents` in the `gui/<uid>` domain.
     pub fn for_user(label: &str) -> Result<Self, LaunchdError> {
-        let home = std::env::var_os("HOME").ok_or(LaunchdError::NoHome)?;
-        let uid_text = command::run_captured(Path::new(ID), &["-u"], &[], COMMAND_TIMEOUT)
-            .map_err(LaunchdError::Command)?
-            .stdout;
-        let uid: u32 = uid_text
-            .trim()
-            .parse()
-            .map_err(|_| LaunchdError::BadUid(uid_text.clone()))?;
+        let uid = Uid::current();
+        let home = User::from_uid(uid)
+            .map_err(|error| LaunchdError::UserLookup(error.to_string()))?
+            .ok_or(LaunchdError::NoHome)?
+            .dir;
         Ok(Self {
             label: label.to_string(),
-            plist_path: PathBuf::from(home)
+            plist_path: home
                 .join("Library/LaunchAgents")
                 .join(format!("{label}.plist")),
             domain: format!("gui/{uid}"),
@@ -169,8 +172,7 @@ impl Agent {
         if self.state()? != AgentState::NotLoaded {
             return Err(LaunchdError::AlreadyLoaded(self.target()));
         }
-        let log_dir = config.log_dir();
-        fs::create_dir_all(&log_dir).map_err(|error| LaunchdError::Io(log_dir, error))?;
+        private_dir::ensure(&config.dirs()).map_err(LaunchdError::Dir)?;
         if let Some(parent) = self.plist_path.parent() {
             fs::create_dir_all(parent).map_err(|error| LaunchdError::Io(parent.into(), error))?;
         }
@@ -256,7 +258,6 @@ mod tests {
     fn renders_the_plist() {
         let config = CoreConfig::new(
             PathBuf::from("/Users/someone/.tycho"),
-            PathBuf::from(crate::config::CORE_SOCKET_DIR),
             PathBuf::from("/opt/zmx/0.8.1/zmx"),
             PathBuf::from("/opt/restate-server/1.7.13/restate-server"),
             PathBuf::from("/opt/bin/tycho"),

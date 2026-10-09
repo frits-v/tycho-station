@@ -20,7 +20,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tycho::config::{
-    CoreConfig, CoreRole, CORE_SOCKET_DIR, HOME_ENV, RESTATE_INGRESS_PORT, RESTATE_SERVER_ENV,
+    CoreConfig, CoreRole, HOME_ENV, MISE_NO_INSTALL, RESTATE_INGRESS_PORT, RESTATE_SERVER_ENV,
     ZMX_ENV,
 };
 use tycho::health::{self, Health};
@@ -40,7 +40,8 @@ struct Core {
 
 impl Core {
     fn new(test: &str) -> Self {
-        let home = env::temp_dir().join(format!("tycho-{test}-{}", std::process::id()));
+        let user_home = PathBuf::from(env::var_os("HOME").unwrap());
+        let home = user_home.join(format!(".tycho-test-{test}-{}", std::process::id()));
         if home.exists() {
             fs::remove_dir_all(&home).unwrap();
         }
@@ -48,7 +49,6 @@ impl Core {
         let restate_server = mise_which("restate-server");
         let config = CoreConfig::new(
             home.clone(),
-            PathBuf::from(CORE_SOCKET_DIR),
             zmx.clone(),
             restate_server.clone(),
             PathBuf::from(TYCHO),
@@ -94,7 +94,7 @@ impl Core {
     }
 
     fn zmx(&self) -> Zmx {
-        Zmx::new(&self.config.zmx, &self.config.socket_dir)
+        Zmx::new(&self.config.zmx, &self.config.socket_dir())
     }
 
     fn pid(&self, role: CoreRole) -> u32 {
@@ -127,7 +127,11 @@ impl Drop for Core {
 }
 
 fn mise_which(tool: &str) -> PathBuf {
-    let output = Command::new("mise").args(["which", tool]).output().unwrap();
+    let output = Command::new("mise")
+        .args(["which", tool])
+        .envs(MISE_NO_INSTALL)
+        .output()
+        .unwrap();
     assert!(output.status.success(), "mise which {tool} failed");
     PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
 }

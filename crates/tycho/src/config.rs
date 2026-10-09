@@ -4,9 +4,10 @@
 use std::env;
 use std::fmt;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use nix::unistd::{Uid, User};
 use tycho_types::session::SOCKET_PATH_MAX_BYTES;
 
 use crate::command::{self, CommandError};
@@ -23,10 +24,9 @@ pub const HOME_ENV: &str = "TYCHO_HOME";
 pub const ZMX_ENV: &str = "TYCHO_ZMX";
 pub const RESTATE_SERVER_ENV: &str = "TYCHO_RESTATE_SERVER";
 pub const HOME_DEFAULT_DIR: &str = ".tycho";
-/// Developer-owned, mode 0700, apart from the agents' group-shared directory, because zmx
-/// does not check who connects to a socket.
-pub const CORE_SOCKET_DIR: &str = "/Users/Shared/tycho-core-zmx";
-pub const CORE_SOCKET_DIR_MODE: u32 = 0o700;
+/// Under the private home, never a shared directory: zmx does not check who connects to a
+/// socket, and the agents' directory is group-shared.
+pub const CORE_SOCKET_DIR: &str = "zmx";
 pub const RESTATE_DATA_DIR: &str = "restate";
 pub const LOG_DIR: &str = "logs";
 pub const STOP_FILE: &str = "watchdog.stop";
@@ -91,6 +91,8 @@ pub fn endpoint_url(path: &str) -> String {
 #[derive(Debug)]
 pub enum ConfigError {
     NoHome,
+    UserLookup(String),
+    HomeOutsideUserHome(PathBuf),
     Resolve(&'static str, CommandError),
     NotFound(PathBuf),
     UnsafePath(PathBuf),
@@ -101,7 +103,15 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoHome => write!(formatter, "neither {HOME_ENV} nor HOME is set"),
+            Self::NoHome => formatter.write_str("the current uid has no home directory"),
+            Self::UserLookup(error) => {
+                write!(formatter, "cannot look up the current user: {error}")
+            }
+            Self::HomeOutsideUserHome(path) => write!(
+                formatter,
+                "{HOME_ENV}={} is not a directory under the user's home",
+                path.display()
+            ),
             Self::Resolve(tool, error) => write!(formatter, "cannot resolve {tool}: {error}"),
             Self::NotFound(path) => write!(formatter, "{} does not exist", path.display()),
             Self::UnsafePath(path) => write!(
@@ -122,48 +132,40 @@ impl fmt::Display for ConfigError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreConfig {
     pub home: PathBuf,
-    pub socket_dir: PathBuf,
     pub zmx: PathBuf,
     pub restate_server: PathBuf,
     pub tycho: PathBuf,
 }
 
 impl CoreConfig {
-    /// Reads the environment, falling back to `$HOME/.tycho` and `mise which` for tools.
+    /// The home is `.tycho` under the current uid's home from the user database, or
+    /// `TYCHO_HOME` when that names a directory under it; tools come from `mise which`.
     pub fn from_environment() -> Result<Self, ConfigError> {
+        let user_home = user_home()?;
         let home = match env::var_os(HOME_ENV) {
-            Some(home) => PathBuf::from(home),
-            None => PathBuf::from(env::var_os("HOME").ok_or(ConfigError::NoHome)?)
-                .join(HOME_DEFAULT_DIR),
+            Some(home) => checked_home_override(&user_home, PathBuf::from(home))?,
+            None => user_home.join(HOME_DEFAULT_DIR),
         };
         let zmx = tool_path(ZMX_ENV, "zmx")?;
         let restate_server = tool_path(RESTATE_SERVER_ENV, "restate-server")?;
         let tycho = env::current_exe().map_err(ConfigError::CurrentExe)?;
-        Self::new(
-            home,
-            PathBuf::from(CORE_SOCKET_DIR),
-            zmx,
-            restate_server,
-            tycho,
-        )
+        Self::new(home, zmx, restate_server, tycho)
     }
 
     /// Every path is typed into a shell by zmx, so each must be shell-safe text.
     pub fn new(
         home: PathBuf,
-        socket_dir: PathBuf,
         zmx: PathBuf,
         restate_server: PathBuf,
         tycho: PathBuf,
     ) -> Result<Self, ConfigError> {
-        for path in [&home, &socket_dir, &zmx, &restate_server, &tycho] {
+        for path in [&home, &zmx, &restate_server, &tycho] {
             if !is_shell_safe(path) {
                 return Err(ConfigError::UnsafePath(path.clone()));
             }
         }
         let config = Self {
             home,
-            socket_dir,
             zmx,
             restate_server,
             tycho,
@@ -172,7 +174,7 @@ impl CoreConfig {
             .iter()
             .map(|role| {
                 config
-                    .socket_dir
+                    .socket_dir()
                     .join(role.session_name())
                     .as_os_str()
                     .len()
@@ -183,6 +185,22 @@ impl CoreConfig {
             return Err(ConfigError::SocketPathTooLong(longest));
         }
         Ok(config)
+    }
+
+    #[must_use]
+    pub fn socket_dir(&self) -> PathBuf {
+        self.home.join(CORE_SOCKET_DIR)
+    }
+
+    /// Every directory the core writes, parents first.
+    #[must_use]
+    pub fn dirs(&self) -> [PathBuf; 4] {
+        [
+            self.home.clone(),
+            self.socket_dir(),
+            self.restate_data_dir(),
+            self.log_dir(),
+        ]
     }
 
     #[must_use]
@@ -221,13 +239,44 @@ impl CoreConfig {
     }
 }
 
+fn user_home() -> Result<PathBuf, ConfigError> {
+    User::from_uid(Uid::current())
+        .map_err(|error| ConfigError::UserLookup(error.to_string()))?
+        .map(|user| user.dir)
+        .ok_or(ConfigError::NoHome)
+}
+
+fn checked_home_override(user_home: &Path, home: PathBuf) -> Result<PathBuf, ConfigError> {
+    let inside = home.is_absolute()
+        && home != user_home
+        && home.starts_with(user_home)
+        && home
+            .components()
+            .all(|component| matches!(component, Component::RootDir | Component::Normal(_)));
+    if inside {
+        Ok(home)
+    } else {
+        Err(ConfigError::HomeOutsideUserHome(home))
+    }
+}
+
+/// The environment for any mise call: resolving a tool never installs one.
+pub const MISE_NO_INSTALL: [(&str, &str); 2] = [
+    ("MISE_EXEC_AUTO_INSTALL", "false"),
+    ("MISE_NOT_FOUND_AUTO_INSTALL", "false"),
+];
+
 fn tool_path(variable: &str, tool: &'static str) -> Result<PathBuf, ConfigError> {
     let path = if let Some(path) = env::var_os(variable) {
         PathBuf::from(path)
     } else {
-        let output =
-            command::run_captured(Path::new("mise"), &["which", tool], &[], COMMAND_TIMEOUT)
-                .map_err(|error| ConfigError::Resolve(tool, error))?;
+        let output = command::run_captured(
+            Path::new("mise"),
+            &["which", tool],
+            &MISE_NO_INSTALL,
+            COMMAND_TIMEOUT,
+        )
+        .map_err(|error| ConfigError::Resolve(tool, error))?;
         PathBuf::from(output.stdout.trim())
     };
     if !path.is_absolute() || !path.exists() {
@@ -251,13 +300,8 @@ mod tests {
     use super::*;
 
     fn config(home: &str) -> Result<CoreConfig, ConfigError> {
-        with_socket_dir(home, CORE_SOCKET_DIR)
-    }
-
-    fn with_socket_dir(home: &str, socket_dir: &str) -> Result<CoreConfig, ConfigError> {
         CoreConfig::new(
             PathBuf::from(home),
-            PathBuf::from(socket_dir),
             PathBuf::from("/opt/zmx"),
             PathBuf::from("/opt/restate-server"),
             PathBuf::from("/opt/tycho"),
@@ -265,12 +309,39 @@ mod tests {
     }
 
     #[test]
-    fn accepts_the_shared_core_socket_dir() {
+    fn puts_the_socket_dir_under_the_home() {
         let config = config("/Users/someone/.tycho").unwrap();
         assert_eq!(
-            config.socket_dir,
-            PathBuf::from("/Users/Shared/tycho-core-zmx")
+            config.socket_dir(),
+            PathBuf::from("/Users/someone/.tycho/zmx")
         );
+    }
+
+    #[test]
+    fn accepts_a_home_override_under_the_user_home() {
+        let user_home = Path::new("/Users/someone");
+        let home = PathBuf::from("/Users/someone/.tycho-test");
+        assert_eq!(
+            checked_home_override(user_home, home.clone()).unwrap(),
+            home
+        );
+    }
+
+    #[test]
+    fn rejects_a_home_override_outside_the_user_home() {
+        let user_home = Path::new("/Users/someone");
+        for home in [
+            "/tmp/tycho",
+            "/Users/Shared/tycho",
+            "/Users/someone",
+            "/Users/someone/../other",
+            ".tycho",
+        ] {
+            assert!(matches!(
+                checked_home_override(user_home, PathBuf::from(home)),
+                Err(ConfigError::HomeOutsideUserHome(_))
+            ));
+        }
     }
 
     #[test]
@@ -282,10 +353,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_socket_dir_past_the_socket_bound() {
-        let socket_dir = format!("/{}", "a".repeat(90));
+    fn rejects_a_home_past_the_socket_bound() {
+        let home = format!("/{}", "a".repeat(90));
         assert!(matches!(
-            with_socket_dir("/h", &socket_dir),
+            config(&home),
             Err(ConfigError::SocketPathTooLong(_))
         ));
     }
