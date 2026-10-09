@@ -9,7 +9,7 @@ use std::env;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus, Output};
 
 const TYPES: [&str; 11] = [
@@ -18,6 +18,52 @@ const TYPES: [&str; 11] = [
 const SUBJECT_MAX: usize = 72;
 const HOOK_INPUT_MAX_BYTES: u64 = 1 << 20;
 const HOOK_REPORT_MAX_LINES: usize = 40;
+const WALK_MAX_FILES: usize = 4096;
+const WALK_MAX_DEPTH: usize = 16;
+const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
+const DOC_DIRS: [&str; 1] = ["docs"];
+const RULES_DIR: &str = ".claude/rules";
+const RULE_MAX_LINES: usize = 24;
+const COMMANDS: [(&str, &str); 7] = [
+    (
+        "ci",
+        "format check, clippy, tests, the repository checks, workflow lints, PR title",
+    ),
+    (
+        "check-commit-msg <file>",
+        "one commit message against the conventional grammar",
+    ),
+    (
+        "check-pr-title [title]",
+        "a pull request title, from the argument or the CI event",
+    ),
+    ("check-names", "no abbreviated identifiers in Rust sources"),
+    (
+        "check-comments",
+        "no narration or history in Rust comments and documents",
+    ),
+    (
+        "check-rules",
+        "rule files carry paths frontmatter and stay short",
+    ),
+    (
+        "hook post-tool-use",
+        "after an edit: format and lint Rust, check documents",
+    ),
+];
+const ABBREVIATIONS: [&str; 5] = ["tmp", "ctx", "obj", "arr", "cfg"];
+const NARRATION_MARKERS: [&str; 10] = [
+    "previously",
+    "used to ",
+    "no longer",
+    "replaced ",
+    "let me",
+    "we tried",
+    "important to note",
+    "in summary",
+    "now does",
+    "legacy",
+];
 
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
@@ -172,29 +218,217 @@ fn ci() -> i32 {
             return 1;
         }
     }
+    for check in [check_names, check_comments, check_rules] {
+        if check() != 0 {
+            return 1;
+        }
+    }
     check_pr_title(pr_title_from_event())
+}
+
+fn walk(dirs: &[&str], extension: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = dirs.iter().map(|d| (PathBuf::from(d), 0)).collect();
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > WALK_MAX_DEPTH || found.len() >= WALK_MAX_FILES {
+            break;
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten().take(WALK_MAX_FILES) {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push((path, depth.saturating_add(1)));
+            } else if path.extension() == Some(OsStr::new(extension)) {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+fn outside_strings(line: &str) -> String {
+    let mut kept = String::with_capacity(line.len());
+    let mut inside = false;
+    let mut escaped = false;
+    for c in line.chars() {
+        let toggles = c == '"' && !escaped;
+        escaped = inside && c == '\\' && !escaped;
+        if toggles {
+            inside = !inside;
+        }
+        kept.push(if inside || toggles { ' ' } else { c });
+    }
+    kept
+}
+
+fn identifiers(line: &str) -> Vec<String> {
+    outside_strings(line)
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn abbreviation_defects(path: &Path, text: &str) -> Vec<String> {
+    let mut defects = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("#[") {
+            continue;
+        }
+        for token in identifiers(line) {
+            let framework = token == "cfg" && (line.contains("cfg(") || line.contains("cfg!"));
+            if ABBREVIATIONS.contains(&token.as_str()) && !framework {
+                defects.push(format!(
+                    "{}:{}: identifier `{token}`",
+                    path.display(),
+                    index.saturating_add(1)
+                ));
+            }
+        }
+    }
+    defects
+}
+
+fn narration_defects(path: &Path, text: &str, comments_only: bool) -> Vec<String> {
+    let mut defects = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if comments_only && !trimmed.starts_with("//") {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        for marker in NARRATION_MARKERS {
+            if lower.contains(marker) {
+                defects.push(format!(
+                    "{}:{}: `{marker}`",
+                    path.display(),
+                    index.saturating_add(1)
+                ));
+            }
+        }
+    }
+    defects
+}
+
+fn rule_defects(path: &Path, text: &str) -> Vec<String> {
+    let mut defects = Vec::new();
+    let has_paths = text.starts_with("---\n") && text.contains("\npaths:");
+    if !has_paths {
+        defects.push(format!("{}: missing `paths` frontmatter", path.display()));
+    }
+    let lines = text.lines().count();
+    if lines > RULE_MAX_LINES {
+        defects.push(format!(
+            "{}: {lines} lines; limit is {RULE_MAX_LINES}",
+            path.display()
+        ));
+    }
+    defects
+}
+
+fn finish(name: &str, examined: usize, defects: &[String]) -> i32 {
+    if examined == 0 {
+        eprintln!("xtask {name}: examined 0 files; a check over nothing is a failure");
+        return 1;
+    }
+    if defects.is_empty() {
+        println!("xtask {name}: examined {examined} files, no defects");
+        return 0;
+    }
+    eprintln!(
+        "xtask {name}: examined {examined} files, {} defects",
+        defects.len()
+    );
+    for defect in defects.iter().take(HOOK_REPORT_MAX_LINES) {
+        eprintln!("  {defect}");
+    }
+    1
+}
+
+fn check_names() -> i32 {
+    let files = walk(&SOURCE_DIRS, "rs");
+    let defects: Vec<String> = files
+        .iter()
+        .filter_map(|p| {
+            fs::read_to_string(p)
+                .ok()
+                .map(|t| abbreviation_defects(p, &t))
+        })
+        .flatten()
+        .collect();
+    finish("check-names", files.len(), &defects)
+}
+
+fn check_comments() -> i32 {
+    let sources = walk(&SOURCE_DIRS, "rs");
+    let docs = walk(&DOC_DIRS, "md");
+    let mut defects = Vec::new();
+    for path in &sources {
+        if let Ok(text) = fs::read_to_string(path) {
+            defects.extend(narration_defects(path, &text, true));
+        }
+    }
+    for path in &docs {
+        if let Ok(text) = fs::read_to_string(path) {
+            defects.extend(narration_defects(path, &text, false));
+        }
+    }
+    finish(
+        "check-comments",
+        sources.len().saturating_add(docs.len()),
+        &defects,
+    )
+}
+
+fn check_rules() -> i32 {
+    let files = walk(&[RULES_DIR], "md");
+    let defects: Vec<String> = files
+        .iter()
+        .filter_map(|p| fs::read_to_string(p).ok().map(|t| rule_defects(p, &t)))
+        .flatten()
+        .collect();
+    finish("check-rules", files.len(), &defects)
 }
 
 fn capture(program: &str, args: &[&str]) -> Option<Output> {
     Command::new(program).args(args).output().ok()
 }
 
-fn edited_rust_file() -> Option<String> {
+fn edited_file() -> Option<String> {
     let mut text = String::new();
     io::stdin()
         .take(HOOK_INPUT_MAX_BYTES)
         .read_to_string(&mut text)
         .ok()?;
     let event: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let path = event.get("tool_input")?.get("file_path")?.as_str()?;
-    (Path::new(path).extension() == Some(OsStr::new("rs"))).then(|| path.to_string())
+    event
+        .get("tool_input")?
+        .get("file_path")?
+        .as_str()
+        .map(str::to_string)
 }
 
 fn hook_post_tool_use() -> i32 {
-    let Some(path) = edited_rust_file() else {
+    let Some(path) = edited_file() else {
         return 0;
     };
-    capture("cargo", &["fmt", "--", &path]);
+    let extension = Path::new(&path).extension().and_then(OsStr::to_str);
+    match extension {
+        Some("rs") => hook_rust(&path),
+        Some("md") => {
+            check_comments();
+            check_rules();
+            0
+        }
+        _ => 0,
+    }
+}
+
+fn hook_rust(path: &str) -> i32 {
+    capture("cargo", &["fmt", "--", path]);
     let Some(output) = capture(
         "cargo",
         &[
@@ -212,12 +446,24 @@ fn hook_post_tool_use() -> i32 {
     };
     if output.status.success() {
         println!("xtask hook: {path} formatted, clippy clean");
+        check_names();
+        check_comments();
         return 0;
     }
     let report = String::from_utf8_lossy(&output.stderr);
     println!("xtask hook: clippy findings after editing {path}");
     for line in report.lines().take(HOOK_REPORT_MAX_LINES) {
         println!("{line}");
+    }
+    check_names();
+    check_comments();
+    0
+}
+
+fn help() -> i32 {
+    println!("xtask <command>\n");
+    for (name, what) in COMMANDS {
+        println!("  {name:<26} {what}");
     }
     0
 }
@@ -234,6 +480,9 @@ fn main() {
         ),
         Some("check-pr-title") => check_pr_title(args.get(1).cloned().or_else(pr_title_from_event)),
         Some("ci") => ci(),
+        Some("check-names") => check_names(),
+        Some("check-comments") => check_comments(),
+        Some("check-rules") => check_rules(),
         Some("hook") if args.get(1).map(String::as_str) == Some("post-tool-use") => {
             hook_post_tool_use()
         }
@@ -241,8 +490,9 @@ fn main() {
             eprintln!("usage: xtask hook post-tool-use");
             2
         }
+        Some("help") | None => help(),
         _ => {
-            eprintln!("usage: xtask <check-commit-msg <file> | check-pr-title [title] | ci | hook post-tool-use>");
+            help();
             2
         }
     };
@@ -288,6 +538,31 @@ mod tests {
         );
         let long = format!("fix: {}", "x".repeat(80));
         assert!(matches!(check_subject(&long), Verdict::TooLong(_)));
+    }
+
+    #[test]
+    fn flags_abbreviations_but_not_framework_cfg() {
+        let text = "let tmp = 1;\n#[cfg(test)]\nif cfg!(unix) {}\nlet s = \"tmp ctx\";\n";
+        let defects = abbreviation_defects(Path::new("a.rs"), text);
+        assert_eq!(defects.len(), 1);
+        assert!(defects.first().is_some_and(|d| d.contains("`tmp`")));
+    }
+
+    #[test]
+    fn flags_narration_in_comments_only_for_sources() {
+        let text = "// previously this looped\nlet previously = 1;\n";
+        assert_eq!(narration_defects(Path::new("a.rs"), text, true).len(), 1);
+        assert_eq!(narration_defects(Path::new("a.md"), text, false).len(), 2);
+    }
+
+    #[test]
+    fn rule_files_need_paths_frontmatter_and_stay_short() {
+        let good = "---\npaths:\n  - \"**/*.rs\"\n---\nshort\n";
+        assert!(rule_defects(Path::new("r.md"), good).is_empty());
+        let unscoped = "no frontmatter\n";
+        assert_eq!(rule_defects(Path::new("r.md"), unscoped).len(), 1);
+        let long = format!("{good}{}", "x\n".repeat(RULE_MAX_LINES));
+        assert_eq!(rule_defects(Path::new("r.md"), &long).len(), 1);
     }
 
     #[test]
