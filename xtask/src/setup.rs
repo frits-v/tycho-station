@@ -42,6 +42,8 @@ const SECURITY_ITEM_NOT_FOUND_EXIT: i32 = 44;
 const DSMEMBERUTIL_NOT_FOUND_EXIT: i32 = 7;
 /// `claude auth status` exit code when no login is stored.
 const CLAUDE_LOGGED_OUT_EXIT: i32 = 1;
+/// `codex login status` exit code when no login is stored.
+const CODEX_LOGGED_OUT_EXIT: i32 = 1;
 
 fn workspace_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -776,7 +778,7 @@ fn json_bool(text: &str, field: &str) -> Option<bool> {
 }
 
 /// `claude auth status --json` prints `loggedIn` either way and exits 1 when logged out.
-fn decode_claude_auth_status(code: Option<i32>, stdout: &str) -> AuthStatus {
+fn decode_claude_auth_status(code: Option<i32>, stdout: &str, _stderr: &str) -> AuthStatus {
     match (code, json_bool(stdout, "loggedIn")) {
         (Some(0), Some(true)) => AuthStatus::LoggedIn,
         (Some(CLAUDE_LOGGED_OUT_EXIT), Some(false)) => AuthStatus::LoggedOut,
@@ -785,7 +787,7 @@ fn decode_claude_auth_status(code: Option<i32>, stdout: &str) -> AuthStatus {
 }
 
 /// `entire auth status --json` exits 0 logged in or out; a non-zero exit is a failure to look.
-fn decode_entire_auth_status(code: Option<i32>, stdout: &str) -> AuthStatus {
+fn decode_entire_auth_status(code: Option<i32>, stdout: &str, _stderr: &str) -> AuthStatus {
     match (code, json_bool(stdout, "logged_in")) {
         (Some(0), Some(true)) => AuthStatus::LoggedIn,
         (Some(0), Some(false)) => AuthStatus::LoggedOut,
@@ -793,16 +795,20 @@ fn decode_entire_auth_status(code: Option<i32>, stdout: &str) -> AuthStatus {
     }
 }
 
-/// Only a logged-out sample (`Not logged in`, exit 1) has been captured; without a logged-in one, every result stays unrecognised.
-const fn decode_codex_login_status(_code: Option<i32>, _stdout: &str) -> AuthStatus {
-    AuthStatus::Unrecognised
+/// `codex login status` exits 1 with `Not logged in` on stderr when logged out; the logged-in output is unsampled until the agent's first `codex login`, so it decodes as unrecognised.
+fn decode_codex_login_status(code: Option<i32>, _stdout: &str, stderr: &str) -> AuthStatus {
+    match (code, first_line(stderr)) {
+        (Some(CODEX_LOGGED_OUT_EXIT), "Not logged in") => AuthStatus::LoggedOut,
+        _ => AuthStatus::Unrecognised,
+    }
 }
 
 struct LoginProbe {
     check: Check,
     tool: &'static str,
     args: &'static [&'static str],
-    decode: fn(Option<i32>, &str) -> AuthStatus,
+    decode: fn(Option<i32>, &str, &str) -> AuthStatus,
+    login_hint: &'static str,
 }
 
 const ENTIRE_LOGIN: LoginProbe = LoginProbe {
@@ -810,18 +816,21 @@ const ENTIRE_LOGIN: LoginProbe = LoginProbe {
     tool: "entire",
     args: &["auth", "status", "--json"],
     decode: decode_entire_auth_status,
+    login_hint: "log in once from a terminal: entire auth login",
 };
 const CLAUDE_LOGIN: LoginProbe = LoginProbe {
     check: Check::ClaudeLogin,
     tool: "claude",
     args: &["auth", "status", "--json"],
     decode: decode_claude_auth_status,
+    login_hint: "log in once from a terminal: claude auth login",
 };
 const CODEX_LOGIN: LoginProbe = LoginProbe {
     check: Check::CodexLogin,
     tool: "codex",
     args: &["login", "status"],
     decode: decode_codex_login_status,
+    login_hint: "log in once from a terminal: codex login",
 };
 
 fn login_finding(probe: &LoginProbe, ls: &MiseLs) -> Finding {
@@ -838,13 +847,11 @@ fn login_finding(probe: &LoginProbe, ls: &MiseLs) -> Finding {
             stdout,
             stderr,
             ..
-        } => match (probe.decode)(code, &stdout) {
+        } => match (probe.decode)(code, &stdout, &stderr) {
             AuthStatus::LoggedIn => Finding::new(probe.check, Status::Present),
-            AuthStatus::LoggedOut => Finding::with_hint(
-                probe.check,
-                Status::Missing,
-                format!("log in once from a terminal: {} auth login", probe.tool),
-            ),
+            AuthStatus::LoggedOut => {
+                Finding::with_hint(probe.check, Status::Missing, probe.login_hint)
+            }
             AuthStatus::Unrecognised => Finding::unreachable(
                 probe.check,
                 format!(
@@ -1852,53 +1859,72 @@ mod tests {
         let claude_logged_in = r#"{"loggedIn": true, "authMethod": "claude.ai"}"#;
         let claude_logged_out = "{\n  \"loggedIn\": false,\n  \"authMethod\": \"none\",\n  \"apiProvider\": \"firstParty\"\n}\n";
         assert_eq!(
-            decode_claude_auth_status(Some(0), claude_logged_in),
+            decode_claude_auth_status(Some(0), claude_logged_in, ""),
             AuthStatus::LoggedIn
         );
         assert_eq!(
-            decode_claude_auth_status(Some(1), claude_logged_out),
+            decode_claude_auth_status(Some(1), claude_logged_out, ""),
             AuthStatus::LoggedOut
         );
         assert_eq!(
-            decode_claude_auth_status(Some(0), claude_logged_out),
+            decode_claude_auth_status(Some(0), claude_logged_out, ""),
             AuthStatus::Unrecognised
         );
         assert_eq!(
-            decode_claude_auth_status(Some(1), claude_logged_in),
+            decode_claude_auth_status(Some(1), claude_logged_in, ""),
             AuthStatus::Unrecognised
         );
         assert_eq!(
-            decode_claude_auth_status(Some(1), "not json"),
+            decode_claude_auth_status(Some(1), "not json", ""),
             AuthStatus::Unrecognised
         );
 
         let entire_logged_in = r#"{"logged_in": true, "token_source": "macOS Keychain"}"#;
         let entire_logged_out = "{\n  \"logged_in\": false,\n  \"available_contexts\": 0\n}\n";
         assert_eq!(
-            decode_entire_auth_status(Some(0), entire_logged_in),
+            decode_entire_auth_status(Some(0), entire_logged_in, ""),
             AuthStatus::LoggedIn
         );
         assert_eq!(
-            decode_entire_auth_status(Some(0), entire_logged_out),
+            decode_entire_auth_status(Some(0), entire_logged_out, ""),
             AuthStatus::LoggedOut
         );
         assert_eq!(
-            decode_entire_auth_status(Some(1), ""),
+            decode_entire_auth_status(Some(1), "", ""),
             AuthStatus::Unrecognised
         );
         assert_eq!(
-            decode_entire_auth_status(Some(0), "not json"),
+            decode_entire_auth_status(Some(0), "not json", ""),
             AuthStatus::Unrecognised
         );
 
         assert_eq!(
-            decode_codex_login_status(Some(0), "Logged in"),
+            decode_codex_login_status(Some(1), "", "Not logged in\n"),
+            AuthStatus::LoggedOut
+        );
+        assert_eq!(
+            decode_codex_login_status(Some(1), "Not logged in\n", ""),
             AuthStatus::Unrecognised
         );
         assert_eq!(
-            decode_codex_login_status(Some(1), "Not logged in\n"),
+            decode_codex_login_status(Some(0), "", "Not logged in\n"),
             AuthStatus::Unrecognised
         );
+        assert_eq!(
+            decode_codex_login_status(Some(0), "Logged in", ""),
+            AuthStatus::Unrecognised
+        );
+        assert_eq!(
+            decode_codex_login_status(Some(1), "", "error: something else\n"),
+            AuthStatus::Unrecognised
+        );
+    }
+
+    #[test]
+    fn login_hints_name_each_tools_own_login_command() {
+        assert!(CODEX_LOGIN.login_hint.ends_with("codex login"));
+        assert!(CLAUDE_LOGIN.login_hint.ends_with("claude auth login"));
+        assert!(ENTIRE_LOGIN.login_hint.ends_with("entire auth login"));
     }
 
     #[test]
