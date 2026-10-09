@@ -14,6 +14,7 @@ use tycho_types::service::Service;
 
 use crate::agent_files::{read_checked, shred};
 use crate::config::{AgentDirs, AGENT_DIR_ENV, ZMX_ENV};
+use crate::launch_probe::LAUNCH_PROBE_SERVICE;
 
 pub const HEARTBEAT_TARGET_ENV: &str = "TYCHO_HEARTBEAT_TARGET";
 pub const CORE_UID_ENV: &str = "TYCHO_CORE_UID";
@@ -53,6 +54,8 @@ const STICKY_BIT: u32 = 0o1000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeartbeatTarget {
     Session,
+    /// The launcher tests' stand-in, served only by an endpoint inside the test.
+    LaunchProbe,
 }
 
 impl HeartbeatTarget {
@@ -60,6 +63,7 @@ impl HeartbeatTarget {
     pub const fn as_wire(self) -> &'static str {
         match self {
             Self::Session => "session",
+            Self::LaunchProbe => "launch_probe",
         }
     }
 
@@ -67,12 +71,14 @@ impl HeartbeatTarget {
     pub const fn service(self) -> &'static str {
         match self {
             Self::Session => Service::Session.name(),
+            Self::LaunchProbe => LAUNCH_PROBE_SERVICE,
         }
     }
 
     fn parse(value: Option<&str>) -> Result<Self, SettingsError> {
         match value {
             None | Some("session") => Ok(Self::Session),
+            Some("launch_probe") => Ok(Self::LaunchProbe),
             Some(_) => Err(SettingsError::HeartbeatTarget),
         }
     }

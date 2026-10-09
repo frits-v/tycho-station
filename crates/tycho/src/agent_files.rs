@@ -29,10 +29,15 @@ fn refused(path: &Path, reason: &str) -> io::Error {
 
 /// Opens a file that must not exist yet, mode 0600, never through a symlink.
 pub fn create_new(path: &Path) -> io::Result<File> {
+    create_new_mode(path, PRIVATE_FILE_MODE)
+}
+
+/// `create_new` with a caller's mode, for a file another user of the group must read.
+pub fn create_new_mode(path: &Path, mode: u32) -> io::Result<File> {
     OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(PRIVATE_FILE_MODE)
+        .mode(mode)
         .custom_flags(OFlag::O_NOFOLLOW.bits())
         .open(path)
 }
@@ -56,7 +61,12 @@ fn sync_parent(path: &Path) -> io::Result<()> {
 
 /// Writes a file that must not exist yet and syncs it and its directory.
 pub fn write_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = create_new(path)?;
+    write_new_mode(path, bytes, PRIVATE_FILE_MODE)
+}
+
+/// `write_new` with a caller's mode.
+pub fn write_new_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    let mut file = create_new_mode(path, mode)?;
     file.write_all(bytes)?;
     file.sync_all()?;
     drop(file);

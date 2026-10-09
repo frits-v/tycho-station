@@ -60,9 +60,12 @@ pub const AGENT_USER_ENV: &str = "TYCHO_AGENT_USER";
 pub const AGENT_USER_DEFAULT: &str = "tycho-agent";
 /// Shared with the developer's group so Ghostty can attach to agent sessions.
 pub const AGENT_SOCKET_DIR_DEFAULT: &str = "/Users/Shared/tycho-agent-zmx";
+/// The agent user and the developer share the group; others get nothing.
+pub const AGENT_DIR_MODE: u32 = 0o770;
 pub const LEASE_DIR: &str = "leases";
 pub const SPOOL_DIR: &str = "spool";
 pub const SPEC_DIR: &str = "specs";
+pub const SCROLLBACK_DIR: &str = "scrollback";
 
 pub const ENTIRE_GRAPH_ENV: &str = "TYCHO_ENTIRE_GRAPH";
 pub const GRAPH_INDEX_DIR: &str = "graph";
