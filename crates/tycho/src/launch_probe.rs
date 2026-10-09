@@ -1,7 +1,8 @@
 //! The launch probe, a virtual object for the launcher tests.
 //!
 //! Its exclusive `wait` handler awaits an awakeable a launcher resolves, and its `heartbeat`
-//! stands in for `Session/<name>/heartbeat` with the same input shape.
+//! stands in for `Session/<name>/heartbeat` with the same input shape. Its shared handlers
+//! return the awakeable id, so only a test endpoint binds it, never the production one.
 
 use restate_sdk::prelude::*;
 
