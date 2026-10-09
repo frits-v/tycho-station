@@ -743,16 +743,15 @@ mod tests {
         // `env` stands in for gh: this proves what the command builder hands a child, not how
         // gh treats the variables it receives.
         let config_dir = fresh_config_dir().unwrap();
-        let shown = run_bounded(
-            &mut credentialed_command(
-                "env",
-                "the-credential",
-                &[],
-                parent_with_credentials(),
-                &config_dir,
-            ),
-            Duration::from_secs(60),
+        let mut command = credentialed_command(
+            "env",
+            "the-credential",
+            &[],
+            parent_with_credentials(),
+            &config_dir,
         );
+        assert_eq!(command.get_current_dir(), Some(config_dir.as_path()));
+        let shown = run_bounded(&mut command, Duration::from_secs(60));
         fs::remove_dir(&config_dir).unwrap();
         let config_line = format!("GH_CONFIG_DIR={}", config_dir.display());
         assert!(shown.stdout.contains(&config_line), "{}", shown.stdout);

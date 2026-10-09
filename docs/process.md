@@ -87,8 +87,9 @@ GitHub App installation token that the xtask mints for each run:
   and the next step would run with that environment or binary and the key. Closing that
   takes a separate build job that passes the binary to the release job as an artifact
   checked against its digest; the workflow does not do that.
-- A failed revocation fails the job. A run cancelled between minting and revoking leaves
-  the token valid until GitHub expires it, one hour after it was issued.
+- A failed revocation fails the job. A run cancelled between minting and revoking, or a
+  token request that ends timed out or over its output cap after GitHub issued the token,
+  leaves the token valid until GitHub expires it, one hour after it was issued.
 - The release pull request's author is the App's bot account (`<app-name>[bot]`), not a
   person. The merge gate and any ruleset that names authors or bypass actors see that
   identity.
