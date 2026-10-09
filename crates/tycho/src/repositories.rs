@@ -288,7 +288,8 @@ impl Repositories {
     /// Checks that every level from the root down to the worktree is a real directory of the
     /// core or the agent user, opened without following a symlink.
     pub fn check_worktree(&self, path: &Path) -> Result<(), RepositoryError> {
-        if path == self.worktree_root {
+        let relative = self.relative_to_root(path)?;
+        if relative.as_os_str().is_empty() {
             return Err(RepositoryError::Refused(
                 text(path),
                 TreeRefusal::OutsideRoot,
@@ -296,10 +297,22 @@ impl Repositories {
         }
         drop(agent_tree::open_dirs(
             &self.worktree_root,
-            path,
+            &self.worktree_root.join(relative),
             self.owners,
         )?);
         Ok(())
+    }
+
+    /// The names below the root: `clone_worktree` reports a worktree under the resolved root,
+    /// which differs from the configured one when an ancestor of the root is a symlink.
+    fn relative_to_root<'a>(&self, path: &'a Path) -> Result<&'a Path, RepositoryError> {
+        if let Ok(relative) = path.strip_prefix(&self.worktree_root) {
+            return Ok(relative);
+        }
+        let root = fs::canonicalize(&self.worktree_root)
+            .map_err(|error| RepositoryError::Io(format!("{}: {error}", text(path))))?;
+        path.strip_prefix(root)
+            .map_err(|_| RepositoryError::Refused(text(path), TreeRefusal::OutsideRoot))
     }
 
     /// Runs git and returns whatever exit status it ends with.
@@ -779,6 +792,42 @@ pub(crate) mod tests {
             "untouched"
         );
         assert_eq!(fs::read_dir(&victim).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_worktree_under_a_root_reached_through_a_symlinked_ancestor_checks() {
+        let scratch = Scratch::new("aliased-root");
+        let (_, project) = fixture(&scratch);
+        let alias = scratch.0.join("alias");
+        std::os::unix::fs::symlink(&scratch.0, &alias).unwrap();
+        let repositories = Repositories::new(
+            PathBuf::from("git"),
+            alias.join("home"),
+            alias.join("worktrees"),
+        )
+        .unwrap();
+        let branch = unit_branch(&unit(), Attempt::FIRST).unwrap();
+        let worktree = repositories
+            .clone_worktree(&project, &alias.join("worktrees/cf7a/wu01/a1"), &branch)
+            .unwrap();
+        assert_eq!(worktree.path, scratch.0.join("worktrees/cf7a/wu01/a1"));
+        assert_eq!(repositories.check_worktree(&worktree.path), Ok(()));
+        let root = scratch.0.join("worktrees");
+        assert_eq!(
+            repositories.check_worktree(&root),
+            Err(RepositoryError::Refused(
+                text(&root),
+                TreeRefusal::OutsideRoot
+            ))
+        );
+        let outside = scratch.0.join("home");
+        assert_eq!(
+            repositories.check_worktree(&outside),
+            Err(RepositoryError::Refused(
+                text(&outside),
+                TreeRefusal::OutsideRoot
+            ))
+        );
     }
 
     #[test]
