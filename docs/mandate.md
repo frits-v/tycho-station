@@ -177,3 +177,20 @@ petition is not raised again without new evidence.
 
 14.5 Thresholds and periods in this article are set in the station's configuration,
 reported with every petition, and changed only by the operator.
+
+## 15. Measurement
+
+15.1 A rule that is never cited, or whose citation is unknown, is not in force in any
+sense that matters. Every citation of an article, a case or a convention, and every
+firing of a mechanism, is recorded in the store with what cited it and when.
+
+15.2 The station publishes a citation ledger: for every article and every mechanism,
+citations, firings, the last date and the citing instruments. The ledger is part of the
+station's reported metrics, beside cost, escalation depth and human interrupts.
+
+15.3 A rule with no citation and no firing over the review period is listed as dormant.
+A dormant rule raises a petition under article 14.4 to amend it, remove it, or record
+why it stays, and the reason is itself a case.
+
+15.4 A mechanism whose firings are not recorded does not count as a mechanism for
+article 13.2. A check that examines nothing and reports success is a failed check.
