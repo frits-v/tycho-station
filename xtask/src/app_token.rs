@@ -7,7 +7,11 @@
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
-use std::process::Command;
+use std::fs;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::{Path, PathBuf};
+use std::process::{self, Command};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
@@ -31,19 +35,8 @@ const GH_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUESTED_PERMISSIONS: [(&str, &str); 2] =
     [("contents", "write"), ("pull_requests", "write")];
 const IMPLICIT_PERMISSION: (&str, &str) = ("metadata", "read");
-const GH_INHERITED_VARIABLES: [&str; 11] = [
-    "PATH",
-    "HOME",
-    "TMPDIR",
-    "LANG",
-    "LC_ALL",
-    "SSL_CERT_FILE",
-    "SSL_CERT_DIR",
-    "HTTPS_PROXY",
-    "https_proxy",
-    "NO_PROXY",
-    "no_proxy",
-];
+static CONFIG_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const GH_INHERITED_VARIABLES: [&str; 4] = ["PATH", "TMPDIR", "LANG", "LC_ALL"];
 
 /// The App's identity and signing key, read from the environment.
 pub struct AppCredentials {
@@ -91,20 +84,22 @@ enum InstallationOutcome {
 }
 
 /// `Unrecognised` carries a fixed reason, never response text: a malformed success body may
-/// hold the token.
+/// hold the token. A token GitHub issued but the xtask refuses travels in its variant so it can
+/// be revoked.
 #[derive(Debug, PartialEq, Eq)]
 enum TokenOutcome {
     Issued(InstallationToken),
     Failed(Exit),
-    Overgranted,
+    Overgranted(InstallationToken),
+    UnreadableGrant(InstallationToken),
     Unrecognised(&'static str),
 }
 
 fn missing_credentials() -> String {
     format!(
-        "{APP_ID_VARIABLE} (repository variable) and {APP_KEY_VARIABLE} (repository secret) \
-         must both be set: the release pull request is opened with a GitHub App installation \
-         token (Releases in docs/process.md)"
+        "{APP_ID_VARIABLE} (variable) and {APP_KEY_VARIABLE} (secret) of the `release` \
+         environment must both be set: the release pull request is opened with a GitHub App \
+         installation token (Releases in docs/process.md)"
     )
 }
 
@@ -194,8 +189,9 @@ fn app_jwt(credentials: &AppCredentials, now: u64) -> Result<String, String> {
     })
 }
 
-/// The parent variables gh may see: where to find itself, its configuration, certificates and
-/// a proxy. Everything else, the App id and key included, stays out of its environment.
+/// The parent variables gh may see: where to find itself, a temporary directory and the locale.
+/// Everything else, the App id and key, `HOME`, proxies and certificate overrides included,
+/// stays out of its environment.
 fn gh_environment(
     parent: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Vec<(OsString, OsString)> {
@@ -215,32 +211,65 @@ pub fn without_app_credentials(
         .collect()
 }
 
-/// A command whose environment is the allowlisted parent variables and the credential in
-/// `GH_TOKEN`; the arguments carry no secret.
+/// A command run in an empty private directory, which is also its `GH_CONFIG_DIR`, with the
+/// allowlisted parent variables, telemetry off and the credential in `GH_TOKEN`; the arguments
+/// carry no secret. Without `HOME`, gh 2.102.0 resolves its state directory relative to the
+/// working directory and, with telemetry on, writes a device id there; the private working
+/// directory keeps any such write out of the checkout.
 fn credentialed_command(
     program: &str,
     credential: &str,
     args: &[&str],
     parent: impl IntoIterator<Item = (OsString, OsString)>,
+    config_dir: &Path,
 ) -> Command {
     let mut command = Command::new(program);
     command
         .args(args)
         .env_clear()
         .envs(gh_environment(parent))
+        .current_dir(config_dir)
+        .env("GH_CONFIG_DIR", config_dir)
+        .env("GH_TELEMETRY", "disabled")
         .env("GH_TOKEN", credential)
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1");
     command
 }
 
-fn gh_api(credential: &str, args: &[&str]) -> crate::process::Captured {
+/// A new directory private to this process, so gh reads no configuration that could redirect
+/// its requests; created with `create_dir`, which fails rather than reuse an existing path.
+fn fresh_config_dir() -> Result<PathBuf, String> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let sequence = CONFIG_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let dir = env::temp_dir().join(format!("tycho-gh-{}-{nanos}-{sequence}", process::id()));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Runs `gh api` in an empty private directory, removed afterwards. gh 2.102.0 writes nothing
+/// there for an API call with telemetry off; a directory left behind is reported, not fatal, so
+/// a token already issued still reaches its revocation.
+fn gh_api(credential: &str, args: &[&str]) -> Result<crate::process::Captured, String> {
     let mut gh_args = vec!["api"];
     gh_args.extend_from_slice(args);
-    run_bounded(
-        &mut credentialed_command("gh", credential, &gh_args, env::vars_os()),
+    let config_dir = fresh_config_dir()?;
+    let captured = run_bounded(
+        &mut credentialed_command("gh", credential, &gh_args, env::vars_os(), &config_dir),
         GH_TIMEOUT,
-    )
+    );
+    if let Err(error) = fs::remove_dir(&config_dir) {
+        eprintln!(
+            "xtask: gh left files in {}; not removed: {error}",
+            config_dir.display()
+        );
+    }
+    Ok(captured)
 }
 
 fn decode_installation(exit: Exit, stdout: &str) -> InstallationOutcome {
@@ -304,16 +333,17 @@ fn decode_access_token(exit: Exit, stdout: &str, repository: &Repository) -> Tok
         }
         _ => return TokenOutcome::Unrecognised("token response has no usable `token`"),
     };
+    let token = InstallationToken(token.to_string());
     let Some(permissions) = value
         .get("permissions")
         .and_then(serde_json::Value::as_object)
     else {
-        return TokenOutcome::Unrecognised("token response has no `permissions` object");
+        return TokenOutcome::UnreadableGrant(token);
     };
     if !grant_is_exact(permissions) || !single_repository(&value, repository) {
-        return TokenOutcome::Overgranted;
+        return TokenOutcome::Overgranted(token);
     }
-    TokenOutcome::Issued(InstallationToken(token.to_string()))
+    TokenOutcome::Issued(token)
 }
 
 fn access_token_args(installation: u64, repository: &Repository) -> Vec<String> {
@@ -335,9 +365,12 @@ fn describe_token_failure(outcome: &TokenOutcome) -> String {
     match outcome {
         TokenOutcome::Issued(_) => "token issued".to_string(),
         TokenOutcome::Failed(exit) => format!("gh api for the installation token ended {exit:?}"),
-        TokenOutcome::Overgranted => "the issued token's grant is not exactly contents and pull \
-                                      requests write on this repository; refusing it"
+        TokenOutcome::Overgranted(_) => "the issued token's grant is not exactly contents and \
+                                         pull requests write on this repository; refusing it"
             .to_string(),
+        TokenOutcome::UnreadableGrant(_) => {
+            "the token response has no `permissions` object; refusing the token".to_string()
+        }
         TokenOutcome::Unrecognised(reason) => reason.to_string(),
     }
 }
@@ -352,7 +385,7 @@ pub fn mint(
         "/repos/{}/{}/installation",
         repository.owner, repository.name
     );
-    let found = gh_api(&jwt, &[lookup_path.as_str()]);
+    let found = gh_api(&jwt, &[lookup_path.as_str()])?;
     let installation = match decode_installation(found.exit, &found.stdout) {
         InstallationOutcome::Found(id) => id,
         InstallationOutcome::Failed(exit) => {
@@ -366,10 +399,18 @@ pub fn mint(
     };
     let args = access_token_args(installation, repository);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let issued = gh_api(&jwt, &arg_refs);
-    match decode_access_token(issued.exit, &issued.stdout, repository) {
+    let issued = gh_api(&jwt, &arg_refs)?;
+    let outcome = decode_access_token(issued.exit, &issued.stdout, repository);
+    let reason = describe_token_failure(&outcome);
+    match outcome {
         TokenOutcome::Issued(token) => Ok(token),
-        outcome => Err(describe_token_failure(&outcome)),
+        TokenOutcome::Overgranted(token) | TokenOutcome::UnreadableGrant(token) => {
+            Err(match revoke(&token) {
+                Ok(()) => format!("{reason}; the token is revoked"),
+                Err(revocation) => format!("{reason}; {revocation}"),
+            })
+        }
+        TokenOutcome::Failed(_) | TokenOutcome::Unrecognised(_) => Err(reason),
     }
 }
 
@@ -378,7 +419,7 @@ pub fn revoke(token: &InstallationToken) -> Result<(), String> {
     let revoked = gh_api(
         token.expose(),
         &["--method", "DELETE", "/installation/token"],
-    );
+    )?;
     if revoked.exit == Exit::Code(0) {
         Ok(())
     } else {
@@ -486,6 +527,7 @@ mod tests {
             assert!(error.contains(APP_ID_VARIABLE), "{error}");
             assert!(error.contains(APP_KEY_VARIABLE), "{error}");
             assert!(error.contains("Releases"), "{error}");
+            assert!(error.contains("`release` environment"), "{error}");
         }
         assert!(read_credentials(Some("1".into()), Some(private)).is_ok());
     }
@@ -587,15 +629,42 @@ mod tests {
                     &token_response(permissions, repositories),
                     &repository()
                 ),
-                TokenOutcome::Overgranted,
+                TokenOutcome::Overgranted(InstallationToken(TOKEN.into())),
                 "{permissions} {repositories}"
             );
         }
         let all = token_response(exact, one_repository).replace("selected", "all");
         assert_eq!(
             decode_access_token(Exit::Code(0), &all, &repository()),
-            TokenOutcome::Overgranted
+            TokenOutcome::Overgranted(InstallationToken(TOKEN.into()))
         );
+    }
+
+    #[test]
+    fn a_refused_token_travels_in_its_variant_for_revocation() {
+        let without_permissions = format!(
+            r#"{{"token":"{TOKEN}","repository_selection":"selected","repositories":[{{"name":"tycho-station"}}]}}"#
+        );
+        assert_eq!(
+            decode_access_token(Exit::Code(0), &without_permissions, &repository()),
+            TokenOutcome::UnreadableGrant(InstallationToken(TOKEN.into()))
+        );
+        let permissions_not_an_object = format!(r#"{{"token":"{TOKEN}","permissions":"all"}}"#);
+        let refused = decode_access_token(Exit::Code(0), &permissions_not_an_object, &repository());
+        assert!(
+            matches!(&refused, TokenOutcome::UnreadableGrant(token) if token.expose() == TOKEN),
+            "{refused:?}"
+        );
+        let wider = token_response(
+            r#"{"contents":"write","pull_requests":"write","metadata":"read","administration":"write"}"#,
+            r#"[{"name":"tycho-station"}]"#,
+        );
+        let refused = decode_access_token(Exit::Code(0), &wider, &repository());
+        assert!(
+            matches!(&refused, TokenOutcome::Overgranted(token) if token.expose() == TOKEN),
+            "{refused:?}"
+        );
+        assert!(!describe_token_failure(&refused).contains(TOKEN));
     }
 
     #[test]
@@ -657,6 +726,7 @@ mod tests {
             ),
             ("GITHUB_TOKEN", "workflow-token"),
             ("CARGO_HOME", "/home/runner/.cargo"),
+            ("HTTPS_PROXY", "http://proxy.invalid"),
         ]
         .into_iter()
         .map(|(name, value)| (name.into(), value.into()))
@@ -669,25 +739,58 @@ mod tests {
             .into_iter()
             .map(|(name, _)| name)
             .collect();
-        assert_eq!(names, [OsString::from("PATH"), OsString::from("HOME")]);
+        assert_eq!(names, [OsString::from("PATH")]);
+        // `env` stands in for gh: this proves what the command builder hands a child, not how
+        // gh treats the variables it receives.
+        let config_dir = fresh_config_dir().unwrap();
         let shown = run_bounded(
-            &mut credentialed_command("env", "the-credential", &[], parent_with_credentials()),
+            &mut credentialed_command(
+                "env",
+                "the-credential",
+                &[],
+                parent_with_credentials(),
+                &config_dir,
+            ),
             Duration::from_secs(60),
         );
+        fs::remove_dir(&config_dir).unwrap();
+        let config_line = format!("GH_CONFIG_DIR={}", config_dir.display());
+        assert!(shown.stdout.contains(&config_line), "{}", shown.stdout);
         assert_eq!(shown.exit, Exit::Code(0));
-        assert!(
-            shown.stdout.contains("GH_TOKEN=the-credential"),
-            "{}",
-            shown.stdout
-        );
+        for present in ["GH_TOKEN=the-credential", "GH_TELEMETRY=disabled"] {
+            assert!(
+                shown.stdout.contains(present),
+                "{present}: {}",
+                shown.stdout
+            );
+        }
         for absent in [
             APP_ID_VARIABLE,
             APP_KEY_VARIABLE,
             "key-material",
             "GITHUB_TOKEN",
             "CARGO_HOME",
+            "HOME=",
+            "HTTPS_PROXY",
         ] {
             assert!(!shown.stdout.contains(absent), "{absent}: {}", shown.stdout);
+        }
+    }
+
+    #[test]
+    fn each_gh_configuration_directory_is_new_empty_and_private() {
+        let first = fresh_config_dir().unwrap();
+        let second = fresh_config_dir().unwrap();
+        assert_ne!(first, second);
+        for dir in [&first, &second] {
+            let metadata = fs::symlink_metadata(dir).unwrap();
+            assert!(metadata.is_dir());
+            assert_eq!(
+                std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o777,
+                0o700
+            );
+            assert_eq!(fs::read_dir(dir).unwrap().count(), 0);
+            fs::remove_dir(dir).unwrap();
         }
     }
 
@@ -699,7 +802,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["PATH", "HOME", "GITHUB_TOKEN", "CARGO_HOME"].map(OsString::from)
+            ["PATH", "HOME", "GITHUB_TOKEN", "CARGO_HOME", "HTTPS_PROXY"].map(OsString::from)
         );
     }
 }

@@ -73,14 +73,20 @@ GitHub App installation token that the xtask mints for each run:
 - The xtask signs an RS256 JWT with the App's private key (`iat` sixty seconds in the
   past, `exp` ten minutes after `iat`), looks up the App's installation on this
   repository, and requests an installation token limited to this repository and to
-  Contents and Pull requests write. It refuses a token whose grant is wider. The token
-  reaches release-plz as `GIT_TOKEN` in its environment and is revoked when release-plz
-  exits. The key, the JWT and the token never appear in arguments, output, errors or
-  child environments: gh gets an allowlisted environment and the credential in
-  `GH_TOKEN`, and release-plz and the processes it starts get the job's environment
-  without the App id and key.
+  Contents and Pull requests write. A token whose grant is wider, or whose grant the
+  response does not state, it refuses and revokes. The token reaches release-plz as
+  `GIT_TOKEN` in its environment and is revoked when release-plz exits. The key, the JWT
+  and the token never appear in arguments, output, errors or child environments: gh runs
+  in a new empty private directory that is also its `GH_CONFIG_DIR`, with `PATH`,
+  `TMPDIR` and the locale from the job, telemetry off and the credential in `GH_TOKEN`;
+  release-plz and the processes it starts get the job's environment without the App id
+  and key.
 - The workflow builds the xtask in a step without the key, then runs the built binary in
-  the step that holds it, so no build script or proc-macro sees the key.
+  the step that holds it, so no build script or proc-macro inherits the key. A build
+  script in the build step can still write `$GITHUB_ENV` or replace `target/debug/xtask`,
+  and the next step would run with that environment or binary and the key. Closing that
+  takes a separate build job that passes the binary to the release job as an artifact
+  checked against its digest; the workflow does not do that.
 - A failed revocation fails the job. A run cancelled between minting and revoking leaves
   the token valid until GitHub expires it, one hour after it was issued.
 - The release pull request's author is the App's bot account (`<app-name>[bot]`), not a
@@ -103,6 +109,9 @@ GitHub App installation token that the xtask mints for each run:
   gh secret set TYCHO_RELEASE_APP_PRIVATE_KEY -R frits-v/tycho-station --env release < key.pem
   rm key.pem
   ```
+
+  Then delete any repository secret that holds a user token for this workflow, and revoke
+  that token in the account settings of the user who issued it.
 
 - Rotation: generate a new private key in the App settings, store it with the same
   `gh secret set` command, delete the local file, then delete the old key in the App
