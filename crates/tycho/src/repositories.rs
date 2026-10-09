@@ -2,13 +2,15 @@
 //! attempt clones from one, and the pin refs that keep a worker's commit.
 //!
 //! Every git call runs through `command` with a timeout, an output cap, and the host's global
-//! and system configuration shut out.
+//! and system configuration shut out. git never runs on a path under the agent worktree root:
+//! a worktree is cloned and configured in a staging directory of the core and renamed into place.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -25,6 +27,8 @@ use crate::private_dir;
 
 pub const REPOSITORIES_DIR: &str = "repositories";
 pub const BRIEFS_DIR: &str = "briefs";
+/// Under the core home: where a worktree is cloned before it is renamed under the agent root.
+pub const STAGING_DIR: &str = "staging";
 pub const PIN_REF_PREFIX: &str = "refs/factory/checkpoints";
 pub const PROJECT_NAME_MAX_BYTES: usize = 64;
 /// A clone or fetch of a large repository over the local file system.
@@ -42,6 +46,7 @@ const WORKTREE_BOUNDS: Bounds = Bounds {
     depth: WORKTREE_DEPTH_MAX,
     entries: WORKTREE_ENTRIES_MAX,
 };
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 const GIT_ENVIRONMENT: [(&str, &str); 3] = [
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ("GIT_CONFIG_NOSYSTEM", "1"),
@@ -211,6 +216,28 @@ fn text(path: &Path) -> String {
     path.display().to_string()
 }
 
+/// A clone in the staging directory, named relative to that directory's descriptor.
+struct Staged {
+    directory: OwnedFd,
+    root: PathBuf,
+    name: OsString,
+    owners: Owners,
+}
+
+impl Staged {
+    /// Removes a clone that will not be placed; the caller reports the error that stopped it.
+    fn discard(&self) {
+        let _left_behind = agent_tree::remove_dir(
+            self.directory.as_fd(),
+            &self.root,
+            &self.name,
+            self.owners,
+            WORKTREE_BOUNDS,
+        )
+        .is_err();
+    }
+}
+
 /// The canonical repositories and the directory worktrees are cloned into.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repositories {
@@ -221,27 +248,24 @@ pub struct Repositories {
 }
 
 impl Repositories {
+    /// Directories under the worktree root may belong to the core or to `agent_uid`.
     pub fn new(
         git: PathBuf,
         core_home: PathBuf,
         worktree_root: PathBuf,
+        agent_uid: u32,
     ) -> Result<Self, RepositoryError> {
         absolute("core home", &core_home)?;
         absolute("worktree root", &worktree_root)?;
-        let core = current_uid();
         Ok(Self {
             git,
             core_home,
             worktree_root,
-            owners: Owners { core, agent: core },
+            owners: Owners {
+                core: current_uid(),
+                agent: agent_uid,
+            },
         })
-    }
-
-    /// Admits directories under the worktree root owned by `uid` as well as by the core.
-    #[must_use]
-    pub const fn with_agent_uid(mut self, uid: u32) -> Self {
-        self.owners.agent = uid;
-        self
     }
 
     #[must_use]
@@ -285,8 +309,7 @@ impl Repositories {
         Ok(self.brief_path(session))
     }
 
-    /// Checks that every level from the root down to the worktree is a real directory of the
-    /// core or the agent user, opened without following a symlink.
+    /// Opens every level from the root down to the worktree without following a symlink.
     pub fn check_worktree(&self, path: &Path) -> Result<(), RepositoryError> {
         let relative = self.relative_to_root(path)?;
         if relative.as_os_str().is_empty() {
@@ -303,14 +326,19 @@ impl Repositories {
         Ok(())
     }
 
-    /// The names below the root: `clone_worktree` reports a worktree under the resolved root,
-    /// which differs from the configured one when an ancestor of the root is a symlink.
+    /// The names below the configured root or below its resolved form.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the resolved root is compared with, never operated on"
+    )]
     fn relative_to_root<'a>(&self, path: &'a Path) -> Result<&'a Path, RepositoryError> {
+        // `clone_worktree` reports a worktree under the resolved root.
         if let Ok(relative) = path.strip_prefix(&self.worktree_root) {
             return Ok(relative);
         }
-        let root = fs::canonicalize(&self.worktree_root)
-            .map_err(|error| RepositoryError::Io(format!("{}: {error}", text(path))))?;
+        let root = fs::canonicalize(&self.worktree_root).map_err(|error| {
+            RepositoryError::Io(format!("{}: {error}", text(&self.worktree_root)))
+        })?;
         path.strip_prefix(root)
             .map_err(|_| RepositoryError::Refused(text(path), TreeRefusal::OutsideRoot))
     }
@@ -404,6 +432,12 @@ impl Repositories {
         branch: &BranchName,
     ) -> Result<Worktree, RepositoryError> {
         absolute("worktree", path)?;
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(RepositoryError::Input(format!(
+                "{} has no parent",
+                text(path)
+            )));
+        };
         if !path.starts_with(&self.worktree_root) || path == self.worktree_root {
             return Err(RepositoryError::Input(format!(
                 "{} is outside {}",
@@ -411,7 +445,93 @@ impl Repositories {
                 self.worktree_root.display()
             )));
         }
-        self.prepare_clone_target(path)?;
+        let target = self.prepare_clone_target(parent, name)?;
+        let (staged, base) = self.stage(project, branch)?;
+        let placed = agent_tree::move_dir(
+            staged.directory.as_fd(),
+            &staged.name,
+            target.as_fd(),
+            parent,
+            name,
+        );
+        if let Err(error) = placed {
+            staged.discard();
+            return Err(error.into());
+        }
+        Ok(Worktree {
+            path: self.resolved_inside_root(path)?,
+            branch: branch.clone(),
+            base,
+        })
+    }
+
+    /// Ensures the levels down to `parent`, clears a leftover `name`, returns the parent.
+    fn prepare_clone_target(
+        &self,
+        parent: &Path,
+        name: &OsStr,
+    ) -> Result<OwnedFd, RepositoryError> {
+        let directory = agent_tree::ensure_dirs(&self.worktree_root, parent, self.owners)?;
+        agent_tree::remove_dir(
+            directory.as_fd(),
+            parent,
+            name,
+            self.owners,
+            WORKTREE_BOUNDS,
+        )?;
+        Ok(directory)
+    }
+
+    /// The staging directory, private to the core, and the owners admitted in it.
+    fn staging_root(&self) -> Result<(PathBuf, OwnedFd, Owners), RepositoryError> {
+        let root = self.core_home.join(STAGING_DIR);
+        private_dir::ensure(&[self.core_home.clone(), root.clone()])
+            .map_err(|error| RepositoryError::Io(error.to_string()))?;
+        let core_only = Owners {
+            core: self.owners.core,
+            agent: self.owners.core,
+        };
+        let directory = agent_tree::open_dirs(&root, &root, core_only)?;
+        Ok((root, directory, core_only))
+    }
+
+    /// Clones and configures the worktree under a fresh name in the staging directory.
+    fn stage(
+        &self,
+        project: &ProjectName,
+        branch: &BranchName,
+    ) -> Result<(Staged, CommitSha), RepositoryError> {
+        let (root, directory, owners) = self.staging_root()?;
+        let count = STAGING_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let name = OsString::from(format!(
+            "{}-{}-{count}",
+            project.as_str(),
+            std::process::id()
+        ));
+        // A name reused from an earlier process with the same pid may still hold its clone.
+        agent_tree::remove_dir(directory.as_fd(), &root, &name, owners, WORKTREE_BOUNDS)?;
+        let staged = Staged {
+            directory,
+            root,
+            name,
+            owners,
+        };
+        match self.configure_clone(project, &staged.root.join(&staged.name), branch) {
+            Ok(base) => Ok((staged, base)),
+            Err(error) => {
+                staged.discard();
+                Err(error)
+            }
+        }
+    }
+
+    /// Clones into `path` and configures it; returns the checked-out commit.
+    fn configure_clone(
+        &self,
+        project: &ProjectName,
+        path: &Path,
+        branch: &BranchName,
+    ) -> Result<CommitSha, RepositoryError> {
         let canonical = self.canonical(project);
         self.git(&[
             "clone",
@@ -434,34 +554,14 @@ impl Repositories {
             words.extend(arguments.iter().filter(|word| !word.is_empty()));
             self.git(&words)?;
         }
-        let base = self.rev_parse(path, "HEAD")?;
-        Ok(Worktree {
-            path: self.resolved_inside_root(path)?,
-            branch: branch.clone(),
-            base,
-        })
-    }
-
-    /// Ensures the levels down to `path`'s parent, then removes what an interrupted clone left.
-    fn prepare_clone_target(&self, path: &Path) -> Result<(), RepositoryError> {
-        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
-            return Err(RepositoryError::Input(format!(
-                "{} has no parent",
-                path.display()
-            )));
-        };
-        let directory = agent_tree::ensure_dirs(&self.worktree_root, parent, self.owners)?;
-        agent_tree::remove_dir(
-            directory.as_fd(),
-            parent,
-            name,
-            self.owners,
-            WORKTREE_BOUNDS,
-        )?;
-        Ok(())
+        self.rev_parse(path, "HEAD")
     }
 
     /// The resolved `path`, which must be the resolved root joined with the same names.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "both resolved paths are compared, and the stored path names what was checked"
+    )]
     fn resolved_inside_root(&self, path: &Path) -> Result<PathBuf, RepositoryError> {
         let io =
             |error: std::io::Error| RepositoryError::Io(format!("{}: {error}", path.display()));
@@ -485,6 +585,7 @@ impl Repositories {
         head: &CommitSha,
         pin: &str,
     ) -> Result<(), RepositoryError> {
+        self.check_worktree(&worktree.path)?;
         let canonical = text(&self.canonical(project));
         let refspec = format!("refs/heads/{}", worktree.branch);
         self.git(&[
@@ -539,6 +640,10 @@ impl Repositories {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 pub(crate) mod tests {
     use super::*;
     use std::process::Command;
@@ -595,6 +700,7 @@ pub(crate) mod tests {
             PathBuf::from("git"),
             scratch.0.join("home"),
             scratch.0.join("worktrees"),
+            current_uid(),
         )
         .unwrap();
         let project = ProjectName::parse("widget").unwrap();
@@ -630,7 +736,7 @@ pub(crate) mod tests {
         let attempt = Attempt::new(2).unwrap();
         assert_eq!(unit_branch(&unit(), attempt).unwrap().as_str(), "wu01/a2");
         let repositories =
-            Repositories::new(PathBuf::from("git"), "/core".into(), "/agent/wt".into()).unwrap();
+            Repositories::new(PathBuf::from("git"), "/core".into(), "/agent/wt".into(), 0).unwrap();
         let epic = EpicId::parse("cf7a").unwrap();
         assert_eq!(
             repositories.worktree_path(&epic, &unit(), attempt),
@@ -648,7 +754,7 @@ pub(crate) mod tests {
         );
         assert!(ProjectName::parse("Widget").is_err());
         assert!(ProjectName::parse("../x").is_err());
-        assert!(Repositories::new(PathBuf::from("git"), "core".into(), "/w".into()).is_err());
+        assert!(Repositories::new(PathBuf::from("git"), "core".into(), "/w".into(), 0).is_err());
     }
 
     #[test]
@@ -804,6 +910,7 @@ pub(crate) mod tests {
             PathBuf::from("git"),
             alias.join("home"),
             alias.join("worktrees"),
+            current_uid(),
         )
         .unwrap();
         let branch = unit_branch(&unit(), Attempt::FIRST).unwrap();
@@ -828,6 +935,73 @@ pub(crate) mod tests {
                 TreeRefusal::OutsideRoot
             ))
         );
+        let epic = scratch.0.join("worktrees/cf7a");
+        let moved = scratch.0.join("moved");
+        fs::rename(&epic, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &epic).unwrap();
+        assert_eq!(
+            repositories.check_worktree(&worktree.path),
+            Err(RepositoryError::Refused(
+                text(&alias.join("worktrees/cf7a")),
+                TreeRefusal::Symlink
+            ))
+        );
+    }
+
+    /// A repository with one commit, and the bytes of its `HEAD` and `config`.
+    fn victim_repository(path: &Path) -> (Vec<u8>, Vec<u8>) {
+        fs::create_dir_all(path).unwrap();
+        git(path, &["init", "-q", "-b", "trunk"]);
+        fs::write(path.join("keep"), "untouched\n").unwrap();
+        git(path, &["add", "keep"]);
+        git(path, &["commit", "-q", "-m", "victim"]);
+        (
+            fs::read(path.join(".git/HEAD")).unwrap(),
+            fs::read(path.join(".git/config")).unwrap(),
+        )
+    }
+
+    #[test]
+    fn git_never_runs_under_the_agent_root_and_a_linked_parent_leaves_its_target_untouched() {
+        let scratch = Scratch::new("staged-clone");
+        let (repositories, project) = fixture(&scratch);
+        let victim = scratch.0.join("victim");
+        let (head, config) = victim_repository(&victim);
+        fs::create_dir_all(scratch.0.join("worktrees/cf7a")).unwrap();
+        let parent = scratch.0.join("worktrees/cf7a/wu01");
+        std::os::unix::fs::symlink(&victim, &parent).unwrap();
+        let branch = unit_branch(&unit(), Attempt::FIRST).unwrap();
+        assert_eq!(
+            repositories.clone_worktree(&project, &parent.join("a1"), &branch),
+            Err(RepositoryError::Refused(
+                text(&parent),
+                TreeRefusal::Symlink
+            ))
+        );
+        fs::remove_file(&parent).unwrap();
+        let path = parent.join("a1");
+        let worktree = repositories
+            .clone_worktree(&project, &path, &branch)
+            .unwrap();
+        assert_eq!(worktree.path, path);
+        assert_eq!(
+            git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "wu01/a1"
+        );
+        let staging = scratch.0.join("home").join(STAGING_DIR);
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+        let missing = ProjectName::parse("missing").unwrap();
+        assert!(repositories
+            .clone_worktree(&missing, &scratch.0.join("worktrees/cf7a/wu02/a1"), &branch)
+            .is_err());
+        assert_eq!(
+            fs::read_dir(&staging).unwrap().count(),
+            0,
+            "a failed clone is discarded"
+        );
+        assert_eq!(fs::read(victim.join(".git/HEAD")).unwrap(), head);
+        assert_eq!(fs::read(victim.join(".git/config")).unwrap(), config);
+        assert_eq!(git(&victim, &["status", "--porcelain"]), "");
     }
 
     #[test]

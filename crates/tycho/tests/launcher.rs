@@ -2,6 +2,10 @@
 //! fake vendor against a throwaway core; then the launcher and the Restate server are killed
 //! at the moments the design names. macOS only, run by `mise run launcher-tests`.
 #![allow(
+    clippy::disallowed_methods,
+    reason = "fixtures live in throwaway directories no other user can write"
+)]
+#![allow(
     clippy::print_stdout,
     clippy::print_stderr,
     reason = "the evidence lines are the test's report for the pull request"

@@ -13,6 +13,10 @@ use tycho_types::service::WorkUnitId;
 /// The commit a worker most recently added, which is what a reviewer asks about.
 const IMPACT_BASE: &str = "HEAD~1";
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the command line names a developer checkout, resolved to the one spelling the plugin keys on"
+)]
 fn open(checkout: &str) -> Result<(EntireGraph, StepKey, Checkout), String> {
     let home = config::core_home().map_err(|error| error.to_string())?;
     let index_root = home.join(GRAPH_INDEX_DIR);

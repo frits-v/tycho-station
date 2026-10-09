@@ -2,6 +2,10 @@
 //! while a probe invocation sleeps; each comes back and the invocation completes.
 //! macOS only, run by `mise run kill-tests`.
 #![allow(
+    clippy::disallowed_methods,
+    reason = "fixtures live in throwaway directories no other user can write"
+)]
+#![allow(
     clippy::print_stdout,
     clippy::print_stderr,
     reason = "the evidence lines are the test's report for the pull request"

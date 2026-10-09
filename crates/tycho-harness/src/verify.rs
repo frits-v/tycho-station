@@ -246,6 +246,10 @@ fn evaluate_command(
 }
 
 /// Splits on whitespace only; the fixture commands carry no quoted arguments.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the log directory belongs to the test run"
+)]
 fn spawn_command(
     checkout: &Path,
     index: usize,

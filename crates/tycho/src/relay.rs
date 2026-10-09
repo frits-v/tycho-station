@@ -341,6 +341,10 @@ pub fn relay_once(
 }
 
 /// Unlinks an ended session's relay directory and its entries; a missing one is removed.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "checked above as this user's directory; std removes a symlink at the top as a link and opens descendants without following links"
+)]
 pub fn remove_relay_dir(dirs: &AgentDirs, session: &SessionName) -> Result<(), String> {
     let dir = relay_dir(dirs, session);
     match fs::symlink_metadata(&dir) {
@@ -358,6 +362,10 @@ pub fn remove_relay_dir(dirs: &AgentDirs, session: &SessionName) -> Result<(), S
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 mod tests {
     use super::*;
     use crate::agent_files::current_uid;

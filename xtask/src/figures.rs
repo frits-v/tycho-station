@@ -460,6 +460,10 @@ fn spliced_page(page: &str, build_dir: &Path, renders: &[Render]) -> Result<Stri
     Ok(page)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the build directory is a fresh name under this user's temporary directory"
+)]
 fn build_dir() -> Result<PathBuf, String> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -469,6 +473,10 @@ fn build_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "removes the build directory this run created"
+)]
 fn remove(dir: &Path) {
     if let Err(error) = fs::remove_dir_all(dir) {
         eprintln!("xtask: could not remove {}: {error}", dir.display());
@@ -506,6 +514,10 @@ pub fn render_figures() -> i32 {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "figures are installed inside the developer's checkout"
+)]
 fn install(build_dir: &Path, renders: &[Render]) -> Result<(), String> {
     let output = Path::new(OUTPUT_DIR);
     fs::create_dir_all(output).map_err(|e| format!("cannot create {OUTPUT_DIR}: {e}"))?;

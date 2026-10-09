@@ -203,8 +203,7 @@ pub fn graph_key(unit: &WorkUnitId, attempt: Attempt, what: &str) -> Result<Step
     StepKey::parse(&format!("{unit}.a{}.{what}", attempt.get())).map_err(|error| error.to_string())
 }
 
-/// Builds the index of a fresh clone, or rebuilds it after a commit; never fails the step.
-/// The worktree is the core's own path, checked level by level just before the graph runs.
+/// Builds or rebuilds the index of the core's own worktree path, checked just before.
 #[must_use]
 pub fn index(
     graph: &dyn CodeGraph,
@@ -270,6 +269,10 @@ pub fn worker_command(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 mod tests {
     use super::*;
     use crate::code_graph::{Completeness, GraphCounts};

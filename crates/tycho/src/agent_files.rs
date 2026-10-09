@@ -215,6 +215,10 @@ pub fn current_uid() -> u32 {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;

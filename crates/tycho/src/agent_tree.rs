@@ -34,6 +34,8 @@ pub enum TreeRefusal {
     OutsideRoot,
     TooDeep(usize),
     TooManyEntries(usize),
+    NotAName,
+    OtherFilesystem,
 }
 
 impl fmt::Display for TreeRefusal {
@@ -46,6 +48,10 @@ impl fmt::Display for TreeRefusal {
             Self::OutsideRoot => formatter.write_str("is not below the root"),
             Self::TooDeep(depth) => write!(formatter, "is nested deeper than {depth} levels"),
             Self::TooManyEntries(entries) => write!(formatter, "holds more than {entries} entries"),
+            Self::NotAName => formatter.write_str("is not a single plain name"),
+            Self::OtherFilesystem => formatter.write_str(
+                "is on another filesystem than the core home: the agent worktree root must share it",
+            ),
         }
     }
 }
@@ -123,6 +129,15 @@ fn relative_names<'a>(root: &Path, path: &'a Path) -> Result<Vec<&'a OsStr>, Tre
     Ok(names)
 }
 
+/// Exactly one plain name: no separator, no `.` or `..`, not empty.
+fn check_name(name: &OsStr, path: &Path) -> Result<(), TreeError> {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(only)), None) if only == name => Ok(()),
+        _ => Err(refused(path, TreeRefusal::NotAName)),
+    }
+}
+
 fn check_owner(path: &Path, directory: &OwnedFd, owners: Owners) -> Result<(), TreeError> {
     let stat = fstat(directory).map_err(|errno| failed(path, errno))?;
     if owners.admit(stat.st_uid) {
@@ -133,6 +148,10 @@ fn check_owner(path: &Path, directory: &OwnedFd, owners: Owners) -> Result<(), T
 }
 
 /// Opens the root, creating it if missing; its ancestors are the core's, outside the agent's reach.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the root's ancestors belong to the core and are outside the agent's reach"
+)]
 fn open_root(root: &Path, owners: Owners) -> Result<OwnedFd, TreeError> {
     match fs::symlink_metadata(root) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -210,8 +229,7 @@ fn walk(root: &Path, path: &Path, owners: Owners, create: bool) -> Result<OwnedF
     Ok(current)
 }
 
-/// Replaces `name` in `directory` with a 0600 file of `bytes`: staged new, synced, then renamed
-/// onto a target that is absent or a regular file, and the directory synced.
+/// Replaces `name` in `directory` with a 0600 file of `bytes`, never onto a link.
 pub fn replace_file(
     directory: &OwnedFd,
     directory_path: &Path,
@@ -219,6 +237,7 @@ pub fn replace_file(
     bytes: &[u8],
 ) -> Result<(), TreeError> {
     let path = directory_path.join(name);
+    check_name(OsStr::new(name), &path)?;
     let count = STAGING_COUNTER.fetch_add(1, Ordering::SeqCst);
     let staging = format!(".{name}.staging-{}-{count}", std::process::id());
     let flags =
@@ -273,6 +292,7 @@ pub fn remove_dir(
     bounds: Bounds,
 ) -> Result<(), TreeError> {
     let path = parent_path.join(name);
+    check_name(name, &path)?;
     match fstatat(parent, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
         Err(Errno::ENOENT) => return Ok(()),
         Err(errno) => return Err(failed(&path, errno)),
@@ -287,6 +307,24 @@ pub fn remove_dir(
     let top = open_child(parent, name, &path, owners)?;
     empty_tree(top, &path, owners, bounds)?;
     unlinkat(parent, name, UnlinkatFlags::RemoveDir).map_err(|errno| failed(&path, errno))
+}
+
+/// Renames the directory `from_name` in `from` to `to_name` in `to`, both by descriptor.
+pub fn move_dir(
+    from: BorrowedFd<'_>,
+    from_name: &OsStr,
+    to: BorrowedFd<'_>,
+    to_path: &Path,
+    to_name: &OsStr,
+) -> Result<(), TreeError> {
+    let path = to_path.join(to_name);
+    check_name(from_name, &path)?;
+    check_name(to_name, &path)?;
+    match renameat(from, from_name, to, to_name) {
+        Ok(()) => fsync(to).map_err(|errno| failed(to_path, errno)),
+        Err(Errno::EXDEV) => Err(refused(&path, TreeRefusal::OtherFilesystem)),
+        Err(errno) => Err(failed(&path, errno)),
+    }
 }
 
 struct Frame {
@@ -427,6 +465,10 @@ fn list(frame: &Frame) -> Result<Vec<(CString, Option<Type>)>, TreeError> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 mod tests {
     use super::*;
     use crate::agent_files::current_uid;
@@ -606,6 +648,50 @@ mod tests {
             3,
             "no staging file left"
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_name_that_is_not_one_plain_component_is_refused() {
+        let root = scratch("names");
+        let directory = ensure_dirs(&root, &root, me()).unwrap();
+        fs::create_dir(root.join("kept")).unwrap();
+        for name in ["", ".", "..", "../kept", "kept/inner", "a/", "/kept"] {
+            assert_eq!(
+                replace_file(&directory, &root, name, b"x"),
+                Err(TreeError::Refused(root.join(name), TreeRefusal::NotAName)),
+                "{name:?}"
+            );
+            assert_eq!(
+                remove_dir(directory.as_fd(), &root, OsStr::new(name), me(), WIDE),
+                Err(TreeError::Refused(root.join(name), TreeRefusal::NotAName)),
+                "{name:?}"
+            );
+            assert_eq!(
+                move_dir(
+                    directory.as_fd(),
+                    OsStr::new("kept"),
+                    directory.as_fd(),
+                    &root,
+                    OsStr::new(name)
+                ),
+                Err(TreeError::Refused(root.join(name), TreeRefusal::NotAName)),
+                "{name:?}"
+            );
+        }
+        assert!(root.join("kept").is_dir());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(
+            move_dir(
+                directory.as_fd(),
+                OsStr::new("kept"),
+                directory.as_fd(),
+                &root,
+                OsStr::new("moved")
+            ),
+            Ok(())
+        );
+        assert!(root.join("moved").is_dir());
         fs::remove_dir_all(&root).unwrap();
     }
 

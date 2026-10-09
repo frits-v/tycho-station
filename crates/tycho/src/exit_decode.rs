@@ -234,6 +234,10 @@ fn decode_report(report: ResultReport, end: ChildEnd, session: &SessionName) -> 
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 pub mod tests {
     use super::*;
     use tycho_types::exit::Disposition;

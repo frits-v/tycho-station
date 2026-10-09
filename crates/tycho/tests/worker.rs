@@ -4,6 +4,10 @@
 //! of the synthetic epic is dispatched through the operator path. macOS only, needs a Claude
 //! login and the graph plugin (`mise run graph-plugin`); run by `mise run worker-tests`.
 #![allow(
+    clippy::disallowed_methods,
+    reason = "fixtures live in throwaway directories no other user can write"
+)]
+#![allow(
     clippy::print_stdout,
     clippy::print_stderr,
     reason = "the evidence lines are the test's report for the pull request"
@@ -324,6 +328,7 @@ fn worker_ports(core: &Core) -> (Arc<WorkerPorts>, CommitSha) {
         PathBuf::from("git"),
         core.config.home.clone(),
         core.worktree_root(),
+        current_uid(),
     )
     .unwrap();
     let head = canonical(core, &repositories);

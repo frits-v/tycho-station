@@ -402,6 +402,10 @@ const fn reversibility(value: Reversibility) -> &'static str {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 mod tests {
     use super::*;
     use std::fs;

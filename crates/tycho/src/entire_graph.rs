@@ -821,6 +821,10 @@ impl CodeGraph for EntireGraph {
 
 /// Creates the root if missing and resolves it, so the inside-the-checkout check compares
 /// real paths, not spellings.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the index root is private to the core and resolved for comparison"
+)]
 fn canonical_root(index_root: &Path) -> Result<PathBuf, GraphError> {
     private_dir::ensure(&[index_root.to_path_buf()])
         .map_err(|error| GraphError::CannotPrepare(index_root.to_path_buf(), error.to_string()))?;

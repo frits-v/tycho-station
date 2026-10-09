@@ -572,6 +572,10 @@ fn prepare_command(vendor: &dyn WorkerVendor, run: &Prepared<'_>) -> Result<Vec<
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 pub mod tests {
     use super::*;
     use crate::vendors::worker::{ModelName, VendorEnd, VendorSessionId};

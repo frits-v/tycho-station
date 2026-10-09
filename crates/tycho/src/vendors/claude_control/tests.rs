@@ -1,3 +1,8 @@
+#![expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
+
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::{symlink, PermissionsExt};

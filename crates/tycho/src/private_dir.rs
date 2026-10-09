@@ -218,6 +218,10 @@ pub fn read_private_file(path: &Path, max: usize) -> Result<Vec<u8>, DirError> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 mod tests {
     use super::*;
 
