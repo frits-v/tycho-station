@@ -79,3 +79,33 @@ fn read(sent: reqwest::Result<reqwest::blocking::Response>) -> Outcome {
         body: String::from_utf8_lossy(&bytes).into_owned(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::thread;
+
+    #[test]
+    fn a_body_over_the_cap_is_too_large() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _read = std::io::Read::read(&mut stream, &mut request).unwrap();
+            let length = HTTP_BODY_MAX_BYTES + 1;
+            let head =
+                format!("HTTP/1.1 200 OK\r\ncontent-length: {length}\r\nconnection: close\r\n\r\n");
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            if stream.write_all(&vec![b'a'; length]).is_err() {}
+        });
+        let http = Http::new(Duration::from_secs(5)).unwrap();
+        let outcome = http.get(&format!("http://{address}/"));
+        server.join().unwrap();
+        assert_eq!(outcome, Outcome::BodyTooLarge);
+    }
+}

@@ -3,6 +3,7 @@
 //! macOS only, run by `mise run kill-tests`.
 #![allow(
     clippy::print_stdout,
+    clippy::print_stderr,
     reason = "the evidence lines are the test's report for the pull request"
 )]
 #![allow(
@@ -20,13 +21,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tycho::config::{
-    CoreConfig, CoreRole, HOME_ENV, MISE_NO_INSTALL, RESTATE_INGRESS_PORT, RESTATE_SERVER_ENV,
-    ZMX_ENV,
+    CoreConfig, CoreRole, HOME_ENV, LAUNCHD_LABEL, MISE_NO_INSTALL, RESTATE_INGRESS_PORT,
+    RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::health::{self, Health};
 use tycho::http::Http;
 use tycho::launchd::{Agent, AgentState, THROTTLE_SECONDS};
-use tycho::zmx::{count_named, presence, Presence, Zmx};
+use tycho::zmx::{count_named, presence, ListEntry, Presence, Zmx};
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(120);
@@ -114,15 +115,75 @@ impl Core {
     }
 }
 
+impl Core {
+    /// Kills whatever `core stop` left by recorded pid and by name, then re-lists.
+    fn clear_sessions(&self) -> Result<(), String> {
+        let zmx = self.zmx();
+        let entries = zmx.list().map_err(|error| error.to_string())?;
+        for entry in &entries {
+            match entry {
+                ListEntry::Running { name, pid, .. } | ListEntry::Ended { name, pid, .. } => {
+                    println!("teardown: {name} survived core stop; killing pid {pid}");
+                    let killed = Command::new("/bin/kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .status();
+                    println!(
+                        "teardown: kill {pid}: {killed:?}; zmx kill {name}: {:?}",
+                        zmx.kill(name)
+                    );
+                }
+                ListEntry::Unrecognised(line) => {
+                    return Err(format!("unrecognised zmx line {line:?}"))
+                }
+            }
+        }
+        let remaining = zmx.list().map_err(|error| error.to_string())?;
+        println!(
+            "teardown: sessions left in the core socket directory: {}",
+            remaining.len()
+        );
+        if remaining.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} sessions remain: {remaining:?}",
+                remaining.len()
+            ))
+        }
+    }
+}
+
 impl Drop for Core {
     fn drop(&mut self) {
+        let mut problems = Vec::new();
         if let Some(agent) = &self.launchd {
             println!("teardown: {:?}", agent.uninstall());
+            match agent.state() {
+                Ok(AgentState::NotLoaded) => println!("teardown: {} is not loaded", agent.target()),
+                other => problems.push(format!("{} after uninstall: {other:?}", agent.target())),
+            }
         }
         self.tycho(&["core", "stop"]);
-        let remaining = self.zmx().list().map(|entries| entries.len());
-        println!("teardown: sessions left in the core socket directory: {remaining:?}");
-        let _removed = fs::remove_dir_all(&self.config.home);
+        match self.clear_sessions() {
+            Ok(()) => {
+                if let Err(error) = fs::remove_dir_all(&self.config.home) {
+                    problems.push(format!(
+                        "cannot remove {}: {error}",
+                        self.config.home.display()
+                    ));
+                }
+            }
+            Err(error) => problems.push(format!("{error}; leaving {}", self.config.home.display())),
+        }
+        if problems.is_empty() {
+            return;
+        }
+        let message = format!("teardown failed: {}", problems.join("; "));
+        if thread::panicking() {
+            eprintln!("{message}");
+        } else {
+            panic!("{message}");
+        }
     }
 }
 
@@ -251,7 +312,9 @@ fn endpoint_killed_returns_and_invocation_resumes() {
 fn agent_pid(agent: &Agent) -> Option<u32> {
     match agent.state().unwrap() {
         AgentState::Running { pid } => Some(pid),
-        AgentState::LoadedNotRunning | AgentState::NotLoaded | AgentState::Unrecognised => None,
+        AgentState::LoadedNotRunning | AgentState::NotLoaded | AgentState::Unrecognised { .. } => {
+            None
+        }
     }
 }
 
@@ -266,7 +329,8 @@ fn core_healthy() -> bool {
 #[ignore = "loads a launchd agent; run with mise run kill-tests"]
 fn watchdog_killed_is_restarted_by_launchd_without_duplicates() {
     let mut core = Core::new("watchdog");
-    let agent = Agent::for_default_label().unwrap();
+    let label = format!("{LAUNCHD_LABEL}.test.{}", std::process::id());
+    let agent = Agent::for_user(&label).unwrap();
     assert_eq!(
         agent.state().unwrap(),
         AgentState::NotLoaded,
@@ -274,7 +338,7 @@ fn watchdog_killed_is_restarted_by_launchd_without_duplicates() {
         agent.target()
     );
     core.launchd = Some(agent.clone());
-    assert!(core.tycho(&["watchdog", "install"]).status.success());
+    println!("evidence: {}", agent.install(&core.config).unwrap());
     wait_until("launchd watchdog brought the core up", core_healthy);
     wait_until("deployment registered", || {
         health::register(&http()).is_registered()

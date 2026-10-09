@@ -11,6 +11,16 @@ use nix::unistd::Uid;
 
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
 const GROUP_AND_OTHER_BITS: u32 = 0o077;
+const GROUP_AND_OTHER_WRITE_BITS: u32 = 0o022;
+
+/// How strict the mode check is; ownership and real-directory checks always apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Policy {
+    Private,
+    /// For a directory macOS creates 0755 and other programs read, such as
+    /// `~/Library/LaunchAgents`: readable is fine, writable by others is not.
+    OwnedNotWritableByOthers,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
@@ -59,14 +69,24 @@ impl fmt::Display for DirError {
 }
 
 /// The verdict on an existing path, from its own metadata, never a symlink's target.
-pub const fn judge(is_dir: bool, owner: u32, mode: u32, current_uid: u32) -> Result<(), Refusal> {
+pub const fn judge(
+    policy: Policy,
+    is_dir: bool,
+    owner: u32,
+    mode: u32,
+    current_uid: u32,
+) -> Result<(), Refusal> {
     if !is_dir {
         return Err(Refusal::NotADirectory);
     }
     if owner != current_uid {
         return Err(Refusal::OwnedBy(owner));
     }
-    if mode & GROUP_AND_OTHER_BITS != 0 {
+    let forbidden = match policy {
+        Policy::Private => GROUP_AND_OTHER_BITS,
+        Policy::OwnedNotWritableByOthers => GROUP_AND_OTHER_WRITE_BITS,
+    };
+    if mode & forbidden != 0 {
         return Err(Refusal::OpenToOthers(mode & 0o777));
     }
     Ok(())
@@ -76,12 +96,22 @@ pub const fn judge(is_dir: bool, owner: u32, mode: u32, current_uid: u32) -> Res
 pub fn ensure(dirs: &[PathBuf]) -> Result<(), DirError> {
     let current_uid = Uid::current().as_raw();
     for dir in dirs {
-        ensure_one(dir, current_uid)?;
+        ensure_one(dir, current_uid, Policy::Private)?;
     }
     Ok(())
 }
 
-fn ensure_one(dir: &Path, current_uid: u32) -> Result<(), DirError> {
+/// Creates the directory 0700 if missing; an existing one must be the user's own and not
+/// writable by others.
+pub fn ensure_owned(dir: &Path) -> Result<(), DirError> {
+    ensure_one(
+        dir,
+        Uid::current().as_raw(),
+        Policy::OwnedNotWritableByOthers,
+    )
+}
+
+fn ensure_one(dir: &Path, current_uid: u32, policy: Policy) -> Result<(), DirError> {
     match fs::symlink_metadata(dir) {
         Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -95,6 +125,7 @@ fn ensure_one(dir: &Path, current_uid: u32) -> Result<(), DirError> {
     let metadata =
         fs::symlink_metadata(dir).map_err(|error| DirError::Inspect(dir.to_path_buf(), error))?;
     judge(
+        policy,
         metadata.file_type().is_dir(),
         metadata.uid(),
         metadata.mode(),
@@ -111,17 +142,23 @@ mod tests {
 
     #[test]
     fn accepts_a_private_directory() {
-        assert_eq!(judge(true, ME, 0o40700, ME), Ok(()));
+        assert_eq!(judge(Policy::Private, true, ME, 0o40700, ME), Ok(()));
     }
 
     #[test]
     fn refuses_a_symlink_or_file() {
-        assert_eq!(judge(false, ME, 0o120_700, ME), Err(Refusal::NotADirectory));
+        assert_eq!(
+            judge(Policy::Private, false, ME, 0o120_700, ME),
+            Err(Refusal::NotADirectory)
+        );
     }
 
     #[test]
     fn refuses_another_owner() {
-        assert_eq!(judge(true, 0, 0o40700, ME), Err(Refusal::OwnedBy(0)));
+        assert_eq!(
+            judge(Policy::Private, true, 0, 0o40700, ME),
+            Err(Refusal::OwnedBy(0))
+        );
     }
 
     fn scratch(name: &str) -> PathBuf {
@@ -159,13 +196,31 @@ mod tests {
     }
 
     #[test]
+    fn accepts_a_readable_launch_agents_directory() {
+        let policy = Policy::OwnedNotWritableByOthers;
+        assert_eq!(judge(policy, true, ME, 0o40755, ME), Ok(()));
+        assert_eq!(
+            judge(policy, true, ME, 0o40775, ME),
+            Err(Refusal::OpenToOthers(0o775))
+        );
+        assert_eq!(
+            judge(policy, true, 0, 0o40755, ME),
+            Err(Refusal::OwnedBy(0))
+        );
+        assert_eq!(
+            judge(policy, false, ME, 0o40755, ME),
+            Err(Refusal::NotADirectory)
+        );
+    }
+
+    #[test]
     fn refuses_group_or_other_bits() {
         assert_eq!(
-            judge(true, ME, 0o40750, ME),
+            judge(Policy::Private, true, ME, 0o40750, ME),
             Err(Refusal::OpenToOthers(0o750))
         );
         assert_eq!(
-            judge(true, ME, 0o41777, ME),
+            judge(Policy::Private, true, ME, 0o41777, ME),
             Err(Refusal::OpenToOthers(0o777))
         );
     }

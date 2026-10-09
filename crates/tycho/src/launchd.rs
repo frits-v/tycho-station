@@ -2,9 +2,12 @@
 //! uninstall, and the decoder of `launchctl print`.
 
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
+use nix::fcntl::OFlag;
 use nix::unistd::{Uid, User};
 
 use crate::command::{self, CommandError};
@@ -16,6 +19,7 @@ use crate::private_dir::{self, DirError};
 const LAUNCHCTL: &str = "/bin/launchctl";
 /// launchd waits this long before restarting an agent that exited.
 pub const THROTTLE_SECONDS: u32 = 10;
+const PLIST_MODE: u32 = 0o644;
 
 #[must_use]
 pub fn render_plist(config: &CoreConfig, label: &str) -> String {
@@ -47,7 +51,10 @@ pub fn render_plist(config: &CoreConfig, label: &str) -> String {
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>ThrottleInterval</key>
   <integer>{THROTTLE_SECONDS}</integer>
   <key>StandardOutPath</key>
@@ -66,34 +73,49 @@ pub fn render_plist(config: &CoreConfig, label: &str) -> String {
 }
 
 /// What `launchctl print gui/<uid>/<label>` says about the agent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentState {
-    Running { pid: u32 },
+    Running {
+        pid: u32,
+    },
     LoadedNotRunning,
     NotLoaded,
-    Unrecognised,
+    Unrecognised {
+        code: Option<i32>,
+        stderr_head: String,
+    },
 }
 
-/// launchctl exits non-zero for an unknown service; a loaded one prints `state = ...`.
+/// launchctl exits 113 for a service missing from a domain that exists.
+pub const LAUNCHCTL_SERVICE_NOT_FOUND: i32 = 113;
+const STDERR_HEAD_MAX_CHARS: usize = 200;
+
+/// Reads only the service's own top-level fields, which carry exactly one tab of indent.
 #[must_use]
-pub fn decode_print(exit_success: bool, stdout: &str) -> AgentState {
-    if !exit_success {
-        return AgentState::NotLoaded;
+pub fn decode_print(code: Option<i32>, stdout: &str, stderr: &str) -> AgentState {
+    let unrecognised = || AgentState::Unrecognised {
+        code,
+        stderr_head: stderr.chars().take(STDERR_HEAD_MAX_CHARS).collect(),
+    };
+    match code {
+        Some(0) => {}
+        Some(LAUNCHCTL_SERVICE_NOT_FOUND) => return AgentState::NotLoaded,
+        _ => return unrecognised(),
     }
     let field = |key: &str| {
         stdout.lines().find_map(|line| {
-            line.trim()
-                .strip_prefix(key)
-                .and_then(|rest| rest.trim_start().strip_prefix('='))
-                .map(str::trim)
+            line.strip_prefix('\t')
+                .filter(|rest| !rest.starts_with('\t'))
+                .and_then(|rest| rest.strip_prefix(key))
+                .and_then(|rest| rest.strip_prefix(" = "))
         })
     };
     match (field("state"), field("pid")) {
         (Some("running"), Some(pid)) => pid
             .parse::<u32>()
-            .map_or(AgentState::Unrecognised, |pid| AgentState::Running { pid }),
-        (Some("not running" | "spawn scheduled" | "exited"), None) => AgentState::LoadedNotRunning,
-        _ => AgentState::Unrecognised,
+            .map_or_else(|_| unrecognised(), |pid| AgentState::Running { pid }),
+        (Some("not running" | "spawn scheduled"), None) => AgentState::LoadedNotRunning,
+        _ => unrecognised(),
     }
 }
 
@@ -101,6 +123,8 @@ pub fn decode_print(exit_success: bool, stdout: &str) -> AgentState {
 pub enum LaunchdError {
     Command(CommandError),
     AlreadyLoaded(String),
+    Unrecognised(String, AgentState),
+    PlistNotOwned(PathBuf),
     Io(PathBuf, std::io::Error),
     NoHome,
     UserLookup(String),
@@ -112,6 +136,17 @@ impl fmt::Display for LaunchdError {
         match self {
             Self::Command(error) => write!(formatter, "{error}"),
             Self::AlreadyLoaded(target) => write!(formatter, "{target} is already loaded"),
+            Self::Unrecognised(target, state) => {
+                write!(
+                    formatter,
+                    "{target}: launchctl print is unrecognised: {state:?}; not acting"
+                )
+            }
+            Self::PlistNotOwned(path) => write!(
+                formatter,
+                "{} exists and is not a regular file owned by the current user",
+                path.display()
+            ),
             Self::Io(path, error) => write!(formatter, "{}: {error}", path.display()),
             Self::NoHome => formatter.write_str("the current uid has no home directory"),
             Self::UserLookup(error) => {
@@ -164,35 +199,56 @@ impl Agent {
             COMMAND_TIMEOUT,
         )
         .map_err(LaunchdError::Command)?;
-        Ok(decode_print(captured.status.success(), &captured.stdout))
+        Ok(decode_print(
+            captured.status.code(),
+            &captured.stdout,
+            &captured.stderr,
+        ))
     }
 
-    /// Refuses when the label is already loaded, so it never replaces an agent it did not load.
+    /// The state, refusing an unrecognised one so nothing acts on a guess.
+    fn known_state(&self) -> Result<AgentState, LaunchdError> {
+        match self.state()? {
+            state @ AgentState::Unrecognised { .. } => {
+                Err(LaunchdError::Unrecognised(self.target(), state))
+            }
+            state => Ok(state),
+        }
+    }
+
+    /// Refuses when the label is loaded, so it never replaces an agent it did not load.
     pub fn install(&self, config: &CoreConfig) -> Result<String, LaunchdError> {
-        if self.state()? != AgentState::NotLoaded {
+        if self.known_state()? != AgentState::NotLoaded {
             return Err(LaunchdError::AlreadyLoaded(self.target()));
         }
         private_dir::ensure(&config.dirs()).map_err(LaunchdError::Dir)?;
+        remove_owned_file(&config.stop_file())?;
         if let Some(parent) = self.plist_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| LaunchdError::Io(parent.into(), error))?;
+            private_dir::ensure_owned(parent).map_err(LaunchdError::Dir)?;
         }
-        fs::write(&self.plist_path, render_plist(config, &self.label))
-            .map_err(|error| LaunchdError::Io(self.plist_path.clone(), error))?;
+        remove_owned_file(&self.plist_path)?;
+        write_new_file(
+            &self.plist_path,
+            render_plist(config, &self.label).as_bytes(),
+        )?;
         let plist = self.plist_path.display().to_string();
-        command::run_captured(
+        let bootstrapped = command::run_captured(
             Path::new(LAUNCHCTL),
             &["bootstrap", &self.domain, &plist],
             &[],
             COMMAND_TIMEOUT,
-        )
-        .map_err(LaunchdError::Command)?;
+        );
+        if let Err(error) = bootstrapped {
+            remove_owned_file(&self.plist_path)?;
+            return Err(LaunchdError::Command(error));
+        }
         Ok(format!("bootstrapped {} from {plist}", self.target()))
     }
 
     /// Boots the agent out if loaded and removes its plist if present.
     pub fn uninstall(&self) -> Result<String, LaunchdError> {
         let target = self.target();
-        let was_loaded = self.state()? != AgentState::NotLoaded;
+        let was_loaded = self.known_state()? != AgentState::NotLoaded;
         if was_loaded {
             command::run_captured(
                 Path::new(LAUNCHCTL),
@@ -202,15 +258,38 @@ impl Agent {
             )
             .map_err(LaunchdError::Command)?;
         }
-        let had_file = self.plist_path.exists();
-        if had_file {
-            fs::remove_file(&self.plist_path)
-                .map_err(|error| LaunchdError::Io(self.plist_path.clone(), error))?;
-        }
+        let had_file = remove_owned_file(&self.plist_path)?;
         Ok(format!(
             "{target}: booted out {was_loaded}, plist removed {had_file}"
         ))
     }
+}
+
+/// Removes a regular file the current user owns; refuses a symlink or a foreign file.
+fn remove_owned_file(path: &Path) -> Result<bool, LaunchdError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(LaunchdError::Io(path.to_path_buf(), error)),
+    };
+    if !metadata.file_type().is_file() || metadata.uid() != Uid::current().as_raw() {
+        return Err(LaunchdError::PlistNotOwned(path.to_path_buf()));
+    }
+    fs::remove_file(path).map_err(|error| LaunchdError::Io(path.to_path_buf(), error))?;
+    Ok(true)
+}
+
+/// Creates the file only if nothing is there, never through a symlink.
+fn write_new_file(path: &Path, contents: &[u8]) -> Result<(), LaunchdError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(PLIST_MODE)
+        .custom_flags(OFlag::O_NOFOLLOW.bits())
+        .open(path)
+        .map_err(|error| LaunchdError::Io(path.to_path_buf(), error))?;
+    file.write_all(contents)
+        .map_err(|error| LaunchdError::Io(path.to_path_buf(), error))
 }
 
 #[cfg(test)]
@@ -243,7 +322,10 @@ mod tests {
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>ThrottleInterval</key>
   <integer>10</integer>
   <key>StandardOutPath</key>
@@ -266,35 +348,61 @@ mod tests {
         assert_eq!(render_plist(&config, LAUNCHD_LABEL), EXPECTED);
     }
 
+    const RUNNING: &str = include_str!("fixtures/launchctl-print-running.txt");
+    const SCHEDULED: &str = include_str!("fixtures/launchctl-print-scheduled.txt");
+    const NOT_FOUND: &str = include_str!("fixtures/launchctl-print-113.txt");
+    const NO_DOMAIN: &str = include_str!("fixtures/launchctl-print-112.txt");
+
     #[test]
     fn decodes_a_running_agent() {
-        let stdout = "gui/501/dev.tycho.watchdog = {\n\tactive count = 1\n\tstate = running\n\tpid = 4242\n}";
         assert_eq!(
-            decode_print(true, stdout),
-            AgentState::Running { pid: 4242 }
+            decode_print(Some(0), RUNNING, ""),
+            AgentState::Running { pid: 94267 }
         );
     }
 
     #[test]
     fn decodes_a_loaded_agent_waiting_to_respawn() {
-        let stdout = "gui/501/dev.tycho.watchdog = {\n\tstate = spawn scheduled\n}";
-        assert_eq!(decode_print(true, stdout), AgentState::LoadedNotRunning);
+        assert_eq!(
+            decode_print(Some(0), SCHEDULED, ""),
+            AgentState::LoadedNotRunning
+        );
     }
 
     #[test]
-    fn decodes_an_unknown_service_as_not_loaded() {
-        assert_eq!(decode_print(false, ""), AgentState::NotLoaded);
+    fn decodes_exit_113_as_not_loaded() {
+        assert_eq!(
+            decode_print(Some(113), "", NOT_FOUND),
+            AgentState::NotLoaded
+        );
+    }
+
+    #[test]
+    fn decodes_a_missing_domain_as_unrecognised() {
+        assert_eq!(
+            decode_print(Some(112), "", NO_DOMAIN),
+            AgentState::Unrecognised {
+                code: Some(112),
+                stderr_head: NO_DOMAIN.to_string()
+            }
+        );
     }
 
     #[test]
     fn decodes_unexpected_output_as_unrecognised() {
-        assert_eq!(
-            decode_print(true, "state = sleeping"),
-            AgentState::Unrecognised
-        );
-        assert_eq!(
-            decode_print(true, "state = running\npid = minus one"),
-            AgentState::Unrecognised
-        );
+        for stdout in [
+            "\tstate = sleeping\n",
+            "\tstate = running\n\tpid = minus one\n",
+            "\t\tstate = running\n\t\tpid = 3\n",
+        ] {
+            assert!(matches!(
+                decode_print(Some(0), stdout, ""),
+                AgentState::Unrecognised { code: Some(0), .. }
+            ));
+        }
+        assert!(matches!(
+            decode_print(None, "", ""),
+            AgentState::Unrecognised { code: None, .. }
+        ));
     }
 }

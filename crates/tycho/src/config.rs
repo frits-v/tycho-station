@@ -3,6 +3,8 @@
 
 use std::env;
 use std::fmt;
+use std::fs;
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -33,6 +35,9 @@ pub const STOP_FILE: &str = "watchdog.stop";
 
 pub const LAUNCHD_LABEL: &str = "dev.tycho.watchdog";
 pub const LAUNCHD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+/// The whole environment of a core process besides `HOME` and its own settings, so the
+/// login shell zmx types into cannot leak configuration.
+pub const CORE_PROCESS_PATH: &str = "/usr/bin:/bin";
 
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
@@ -93,6 +98,8 @@ pub enum ConfigError {
     NoHome,
     UserLookup(String),
     HomeOutsideUserHome(PathBuf),
+    SymlinkInHome(PathBuf),
+    Inspect(PathBuf, io::Error),
     Resolve(&'static str, CommandError),
     NotFound(PathBuf),
     UnsafePath(PathBuf),
@@ -106,6 +113,16 @@ impl fmt::Display for ConfigError {
             Self::NoHome => formatter.write_str("the current uid has no home directory"),
             Self::UserLookup(error) => {
                 write!(formatter, "cannot look up the current user: {error}")
+            }
+            Self::SymlinkInHome(path) => {
+                write!(
+                    formatter,
+                    "{} is a symlink; refusing it in the core home",
+                    path.display()
+                )
+            }
+            Self::Inspect(path, error) => {
+                write!(formatter, "cannot inspect {}: {error}", path.display())
             }
             Self::HomeOutsideUserHome(path) => write!(
                 formatter,
@@ -224,17 +241,23 @@ impl CoreConfig {
     pub fn session_command(&self, role: CoreRole) -> String {
         match role {
             CoreRole::Restate => format!(
-                "exec env RESTATE_ADMIN__BIND_ADDRESS={admin} \
+                "exec /usr/bin/env -i HOME={home} PATH={CORE_PROCESS_PATH} \
+                 RESTATE_ADMIN__BIND_ADDRESS={admin} \
                  RESTATE_INGRESS__BIND_ADDRESS={ingress} RESTATE_BIND_ADDRESS={node} \
                  RESTATE_LISTEN_MODE=tcp RESTATE_NODE_NAME={RESTATE_NODE_NAME} \
                  RESTATE_DISABLE_TELEMETRY=true {server} --base-dir {data}",
+                home = self.home.display(),
                 admin = loopback(RESTATE_ADMIN_PORT),
                 ingress = loopback(RESTATE_INGRESS_PORT),
                 node = loopback(RESTATE_NODE_PORT),
                 server = self.restate_server.display(),
                 data = self.restate_data_dir().display(),
             ),
-            CoreRole::Endpoint => format!("exec {} endpoint", self.tycho.display()),
+            CoreRole::Endpoint => format!(
+                "exec /usr/bin/env -i HOME={} PATH={CORE_PROCESS_PATH} {} endpoint",
+                self.home.display(),
+                self.tycho.display()
+            ),
         }
     }
 }
@@ -253,11 +276,30 @@ fn checked_home_override(user_home: &Path, home: PathBuf) -> Result<PathBuf, Con
         && home
             .components()
             .all(|component| matches!(component, Component::RootDir | Component::Normal(_)));
-    if inside {
-        Ok(home)
-    } else {
-        Err(ConfigError::HomeOutsideUserHome(home))
+    if !inside {
+        return Err(ConfigError::HomeOutsideUserHome(home));
     }
+    refuse_symlinks_below(user_home, &home)?;
+    Ok(home)
+}
+
+/// A symlinked component would let the home resolve outside the user's home; a missing
+/// component ends the walk, since `private_dir` creates the rest without following links.
+fn refuse_symlinks_below(user_home: &Path, home: &Path) -> Result<(), ConfigError> {
+    let mut path = user_home.to_path_buf();
+    let below = home.strip_prefix(user_home).unwrap_or(home);
+    for component in below.components() {
+        path.push(component);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ConfigError::SymlinkInHome(path));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(ConfigError::Inspect(path, error)),
+        }
+    }
+    Ok(())
 }
 
 /// The environment for any mise call: resolving a tool never installs one.
@@ -366,7 +408,36 @@ mod tests {
         let config = config("/h").unwrap();
         assert_eq!(
             config.session_command(CoreRole::Endpoint),
-            "exec /opt/tycho endpoint"
+            "exec /usr/bin/env -i HOME=/h PATH=/usr/bin:/bin /opt/tycho endpoint"
         );
+    }
+
+    #[test]
+    fn restate_command_clears_the_environment() {
+        let config = config("/h").unwrap();
+        assert_eq!(
+            config.session_command(CoreRole::Restate),
+            "exec /usr/bin/env -i HOME=/h PATH=/usr/bin:/bin \
+             RESTATE_ADMIN__BIND_ADDRESS=127.0.0.1:19070 \
+             RESTATE_INGRESS__BIND_ADDRESS=127.0.0.1:18080 RESTATE_BIND_ADDRESS=127.0.0.1:15122 \
+             RESTATE_LISTEN_MODE=tcp RESTATE_NODE_NAME=tycho RESTATE_DISABLE_TELEMETRY=true \
+             /opt/restate-server --base-dir /h/restate"
+        );
+    }
+
+    #[test]
+    fn rejects_a_home_override_through_a_symlink() {
+        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("config-symlink-{}", std::process::id()));
+        fs::create_dir_all(base.join("outside")).unwrap();
+        let user_home = base.canonicalize().unwrap();
+        let outside = user_home.join("outside");
+        std::os::unix::fs::symlink(&outside, user_home.join("link")).unwrap();
+        let through_link = checked_home_override(&user_home, user_home.join("link/.tycho"));
+        let direct = checked_home_override(&user_home, user_home.join("real/.tycho"));
+        fs::remove_dir_all(&user_home).unwrap();
+        assert!(matches!(through_link, Err(ConfigError::SymlinkInHome(_))));
+        assert!(direct.is_ok());
     }
 }

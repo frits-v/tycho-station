@@ -13,7 +13,7 @@ use std::thread;
 use tycho::config::{self, CoreConfig, ENDPOINT_PORT, PROBE_TIMEOUT, WATCHDOG_INTERVAL};
 use tycho::http::Http;
 use tycho::launchd::Agent;
-use tycho::watchdog::{self, Supervisor};
+use tycho::watchdog::{self, LoopEnd, Supervisor};
 use tycho::{core, endpoint};
 
 const USAGE: &str = "usage: tycho <command>
@@ -104,7 +104,11 @@ fn finish(report: &impl Display, succeeded: bool, config: &CoreConfig) -> i32 {
     i32::from(!succeeded)
 }
 
-/// Exits after a bounded number of ticks; launchd's `KeepAlive` starts the next run.
+/// launchd restarts the watchdog only after an unsuccessful exit (`KeepAlive` with
+/// `SuccessfulExit` false), so reaching the tick bound must exit non-zero and the stop file
+/// exits zero.
+const EXIT_TICKS_EXHAUSTED: i32 = 3;
+
 fn run_watchdog(config: &CoreConfig, supervisor: &Supervisor) -> i32 {
     let stop_file = config.stop_file();
     let end = watchdog::run_bounded(
@@ -115,7 +119,10 @@ fn run_watchdog(config: &CoreConfig, supervisor: &Supervisor) -> i32 {
         thread::sleep,
     );
     println!("watchdog run ended: {end:?}");
-    0
+    match end {
+        LoopEnd::StopFile(_) => 0,
+        LoopEnd::IterationsExhausted(_) => EXIT_TICKS_EXHAUSTED,
+    }
 }
 
 fn report_result(result: Result<String, String>) -> i32 {

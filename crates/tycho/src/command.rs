@@ -4,6 +4,7 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -84,11 +85,13 @@ pub fn run_status(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| CommandError::Spawn(name.clone(), error))?;
+    let started = Instant::now();
+    let deadline = started.checked_add(timeout).unwrap_or(started);
     let stdout = child.stdout.take().map(bounded_reader);
     let stderr = child.stderr.take().map(bounded_reader);
     let status = wait_bounded(&mut child, &name, timeout)?;
-    let stdout = collect(stdout, &name)?;
-    let stderr = collect(stderr, &name)?;
+    let stdout = collect(stdout, &name, deadline, timeout)?;
+    let stderr = collect(stderr, &name, deadline, timeout)?;
     Ok(Captured {
         status,
         stdout,
@@ -132,27 +135,46 @@ fn wait_bounded(
     Err(CommandError::TimedOut(name.to_string(), timeout))
 }
 
-type Reader = thread::JoinHandle<io::Result<Vec<u8>>>;
+type Reader = mpsc::Receiver<io::Result<Vec<u8>>>;
 
+/// The reader thread is detached: a grandchild that inherited the pipe can hold it open
+/// past the deadline, and the caller must not wait for it.
 fn bounded_reader(source: impl Read + Send + 'static) -> Reader {
+    let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
         let mut bytes = Vec::new();
         let limit = u64::try_from(COMMAND_OUTPUT_MAX_BYTES).unwrap_or(u64::MAX);
-        source
+        let read = source
             .take(limit.saturating_add(1))
-            .read_to_end(&mut bytes)?;
-        Ok(bytes)
-    })
+            .read_to_end(&mut bytes)
+            .map(|_| bytes);
+        // The receiver is gone when the caller gave up at its deadline.
+        drop(sender.send(read));
+    });
+    receiver
 }
 
-fn collect(reader: Option<Reader>, name: &str) -> Result<String, CommandError> {
+fn collect(
+    reader: Option<Reader>,
+    name: &str,
+    deadline: Instant,
+    timeout: Duration,
+) -> Result<String, CommandError> {
     let Some(reader) = reader else {
         return Ok(String::new());
     };
-    let bytes = reader
-        .join()
-        .map_err(|_| CommandError::Wait(io::Error::other("output reader thread panicked")))?
-        .map_err(CommandError::Wait)?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let bytes = match reader.recv_timeout(remaining) {
+        Ok(read) => read.map_err(CommandError::Wait)?,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            return Err(CommandError::TimedOut(name.to_string(), timeout))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(CommandError::Wait(io::Error::other(
+                "output reader thread ended without a result",
+            )))
+        }
+    };
     if bytes.len() > COMMAND_OUTPUT_MAX_BYTES {
         return Err(CommandError::OutputTooLarge(name.to_string()));
     }
@@ -184,6 +206,19 @@ mod tests {
             Duration::from_millis(300),
         );
         assert!(matches!(result, Err(CommandError::TimedOut(_, _))));
+    }
+
+    #[test]
+    fn a_grandchild_holding_stdout_times_out() {
+        let started = Instant::now();
+        let result = run_captured(
+            Path::new("/bin/sh"),
+            &["-c", "sleep 3 & exit 0"],
+            &[],
+            Duration::from_millis(500),
+        );
+        assert!(matches!(result, Err(CommandError::TimedOut(_, _))));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
