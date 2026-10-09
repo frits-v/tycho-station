@@ -1,5 +1,5 @@
-//! Ports, paths, names and bounds of the core, in one place; issue 37 moves them to CUE
-//! configuration.
+//! Ports, paths, names and bounds of the core, in one place; a later migration
+//! moves them to CUE configuration.
 
 use std::env;
 use std::fmt;

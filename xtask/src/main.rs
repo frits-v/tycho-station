@@ -292,14 +292,70 @@ fn abbreviation_defects(path: &Path, text: &str) -> Vec<String> {
     defects
 }
 
+/// A `#` immediately followed by a digit, the shape of a tracker reference.
+fn has_hash_digit(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes
+        .iter()
+        .zip(bytes.iter().skip(1))
+        .any(|(byte, next)| *byte == b'#' && next.is_ascii_digit())
+}
+
+/// `#<digits>`, `issue <digits>` or `issue #<digits>`; `issue` must start a word, so
+/// "tissue 3" and "an issue with" do not match. Expects lowercase text.
+fn has_ticket_reference(lower: &str) -> bool {
+    let issue_number = lower.match_indices("issue ").any(|(start, marker)| {
+        let starts_word = lower
+            .get(..start)
+            .and_then(|before| before.chars().next_back())
+            .is_none_or(|previous| !previous.is_alphanumeric());
+        let rest = lower
+            .get(start.saturating_add(marker.len())..)
+            .unwrap_or("");
+        let number = rest.strip_prefix('#').unwrap_or(rest);
+        starts_word && number.starts_with(|character: char| character.is_ascii_digit())
+    });
+    issue_number || has_hash_digit(lower)
+}
+
+/// The line from the first `//` outside a double-quoted string, so a trailing comment
+/// after code is checked and a `//` inside a string literal is not.
+fn comment_text(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut in_string = false;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if *byte == b'"' {
+            in_string = true;
+        } else if *byte == b'/' && bytes.get(index.saturating_add(1)) == Some(&b'/') {
+            return line.get(index..);
+        }
+    }
+    None
+}
+
 fn narration_defects(path: &Path, text: &str, comments_only: bool) -> Vec<String> {
     let mut defects = Vec::new();
     for (index, line) in text.lines().enumerate() {
-        let trimmed = line.trim_start();
-        if comments_only && !trimmed.starts_with("//") {
-            continue;
-        }
-        let lower = trimmed.to_ascii_lowercase();
+        let scanned = if comments_only {
+            match comment_text(line) {
+                Some(comment) => comment,
+                None => continue,
+            }
+        } else {
+            line
+        };
+        let lower = scanned.to_ascii_lowercase();
         for marker in NARRATION_MARKERS {
             if lower.contains(marker) {
                 defects.push(format!(
@@ -308,6 +364,13 @@ fn narration_defects(path: &Path, text: &str, comments_only: bool) -> Vec<String
                     index.saturating_add(1)
                 ));
             }
+        }
+        if comments_only && has_ticket_reference(&lower) {
+            defects.push(format!(
+                "{}:{}: ticket reference",
+                path.display(),
+                index.saturating_add(1)
+            ));
         }
     }
     defects
@@ -553,6 +616,36 @@ mod tests {
         let text = "// previously this looped\nlet previously = 1;\n";
         assert_eq!(narration_defects(Path::new("a.rs"), text, true).len(), 1);
         assert_eq!(narration_defects(Path::new("a.md"), text, false).len(), 2);
+    }
+
+    #[test]
+    fn flags_ticket_and_issue_references_in_comments() {
+        let text = "// see issue 19 for background\n// fixed in #42\n// tracked as issue #7\nlet count = 1;\n";
+        let defects = narration_defects(Path::new("a.rs"), text, true);
+        assert_eq!(defects.len(), 3, "{defects:?}");
+    }
+
+    #[test]
+    fn does_not_flag_a_plain_comment_without_a_ticket_reference() {
+        let text = "// this stays bounded by the caller\nlet count = 1;\n";
+        assert!(narration_defects(Path::new("a.rs"), text, true).is_empty());
+    }
+
+    #[test]
+    fn does_not_flag_the_word_issue_in_ordinary_prose() {
+        let text = "// an issue with the splitter: tissue 3 is not a ticket\nlet count = 1;\n";
+        let defects = narration_defects(Path::new("a.rs"), text, true);
+        assert!(defects.is_empty(), "{defects:?}");
+    }
+
+    #[test]
+    fn flags_a_ticket_reference_in_a_trailing_comment_but_not_inside_a_string() {
+        let text = "let count = 1; // see issue 19\nlet url = \"https://host/#1\";\n";
+        let defects = narration_defects(Path::new("a.rs"), text, true);
+        assert_eq!(defects.len(), 1, "{defects:?}");
+        assert!(defects
+            .first()
+            .is_some_and(|defect| defect.contains("a.rs:1:")));
     }
 
     #[test]

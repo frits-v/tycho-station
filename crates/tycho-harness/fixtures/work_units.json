@@ -1,0 +1,133 @@
+[
+  {
+    "key": "trivial",
+    "pass_condition": "criteria_pass",
+    "packet": {
+      "objective": "sha256:7e3c0e3b34e15fbeb0e7e0573f11580e255f41792c5acee0a4d02fbb8eea1a25",
+      "done_criteria": [
+        { "kind": "command", "command": "cargo test --offline tests::answer_is_42 -- --exact", "expected_exit": 0 }
+      ],
+      "boundaries": {
+        "worktree": "/Users/agent/worktrees/wu-trivial",
+        "branch": "wu/trivial",
+        "writable_paths": ["src/lib.rs"],
+        "forbidden_actions": ["edit Cargo.toml", "edit POLICY.md"]
+      },
+      "inputs": [],
+      "routing": {
+        "class": "code-edit",
+        "tier": "worker",
+        "effort": "low",
+        "binding": null,
+        "rationale": "a single-line arithmetic fix needs no judgment call",
+        "fallback_tier": "worker-high"
+      },
+      "budget": { "tokens_max": 200000, "wall_clock_max_ms": 600000 },
+      "result_schema": "sha256:2fdaa039597af9108edd356a3a6e72e34f85e4eae7a34ac7a7137494ca786477"
+    }
+  },
+  {
+    "key": "moderate-and-ambiguous",
+    "pass_condition": "criteria_pass",
+    "packet": {
+      "objective": "sha256:a4b947b54f86cdfa2a8fe38ae1863a9c2504d7ef88517c8b17c16c78715d408d",
+      "done_criteria": [
+        { "kind": "command", "command": "cargo test --offline tests::greeting_contains_hello -- --exact", "expected_exit": 0 }
+      ],
+      "boundaries": {
+        "worktree": "/Users/agent/worktrees/wu-moderate",
+        "branch": "wu/moderate-ambiguous",
+        "writable_paths": ["src/lib.rs"],
+        "forbidden_actions": ["edit Cargo.toml", "edit POLICY.md"]
+      },
+      "inputs": [],
+      "routing": {
+        "class": "code-edit",
+        "tier": "worker",
+        "effort": "medium",
+        "binding": null,
+        "rationale": "several wordings satisfy the check; a worker picks one without raising a question",
+        "fallback_tier": "worker-high"
+      },
+      "budget": { "tokens_max": 400000, "wall_clock_max_ms": 900000 },
+      "result_schema": "sha256:2fdaa039597af9108edd356a3a6e72e34f85e4eae7a34ac7a7137494ca786477"
+    }
+  },
+  {
+    "key": "forced-escalation",
+    "pass_condition": "escalation_raised",
+    "packet": {
+      "objective": "sha256:04034684accc4cf760f9728274b4f48554b0f9caa90784591fdde4aa8e362fa4",
+      "done_criteria": [],
+      "boundaries": {
+        "worktree": "/Users/agent/worktrees/wu-forced-escalation",
+        "branch": "wu/forced-escalation",
+        "writable_paths": ["config/routing.json"],
+        "forbidden_actions": ["edit a budget ceiling value directly without a council ruling"]
+      },
+      "inputs": ["sha256:8eb939cc037d95e92bb9e3018e62986843202c782bd5a0d9f688efbb1422d09a"],
+      "routing": {
+        "class": "policy-change",
+        "tier": "control",
+        "effort": "high",
+        "binding": null,
+        "rationale": "a direct ceiling edit is forbidden by policy; the worker certifies a question instead of writing the change",
+        "fallback_tier": null
+      },
+      "budget": { "tokens_max": 300000, "wall_clock_max_ms": 1200000 },
+      "result_schema": "sha256:2fdaa039597af9108edd356a3a6e72e34f85e4eae7a34ac7a7137494ca786477"
+    }
+  },
+  {
+    "key": "forced-council-split",
+    "pass_condition": "escalation_raised",
+    "packet": {
+      "objective": "sha256:9a0f8c15dddd215e17cc3ca437c4ec92fd2b53074539d16ec1942a46d457784c",
+      "done_criteria": [],
+      "boundaries": {
+        "worktree": "/Users/agent/worktrees/wu-forced-council",
+        "branch": "wu/forced-council-split",
+        "writable_paths": ["src/lib.rs"],
+        "forbidden_actions": ["edit Cargo.toml", "edit POLICY.md"]
+      },
+      "inputs": [],
+      "routing": {
+        "class": "design-choice",
+        "tier": "control",
+        "effort": "high",
+        "binding": null,
+        "rationale": "two precedents carry equal weight; a worker should not break the tie alone",
+        "fallback_tier": null
+      },
+      "budget": { "tokens_max": 300000, "wall_clock_max_ms": 1200000 },
+      "result_schema": "sha256:2fdaa039597af9108edd356a3a6e72e34f85e4eae7a34ac7a7137494ca786477"
+    }
+  },
+  {
+    "key": "downstream-dependent",
+    "pass_condition": "criteria_pass",
+    "packet": {
+      "objective": "sha256:2117b73d0c7475fa835ce61e0107c380689a9aea27b388af73a16a963576d42e",
+      "done_criteria": [
+        { "kind": "command", "command": "cargo test --offline tests::answer_times_two_is_84 -- --exact", "expected_exit": 0 }
+      ],
+      "boundaries": {
+        "worktree": "/Users/agent/worktrees/wu-downstream",
+        "branch": "wu/downstream-dependent",
+        "writable_paths": [],
+        "forbidden_actions": ["edit Cargo.toml", "edit POLICY.md", "edit src/lib.rs"]
+      },
+      "inputs": ["sha256:7e3c0e3b34e15fbeb0e7e0573f11580e255f41792c5acee0a4d02fbb8eea1a25"],
+      "routing": {
+        "class": "verification",
+        "tier": "worker",
+        "effort": "minimal",
+        "binding": null,
+        "rationale": "this unit only confirms a result that another unit's change already produced",
+        "fallback_tier": null
+      },
+      "budget": { "tokens_max": 100000, "wall_clock_max_ms": 300000 },
+      "result_schema": "sha256:2fdaa039597af9108edd356a3a6e72e34f85e4eae7a34ac7a7137494ca786477"
+    }
+  }
+]

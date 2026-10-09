@@ -1,0 +1,11 @@
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,7 +1,7 @@
+ //! Synthetic target project for the tycho-station evaluation harness.
+ 
+ pub fn answer() -> u32 {
+-    0
++    42
+ }
+ 
+ pub fn greeting() -> String {
