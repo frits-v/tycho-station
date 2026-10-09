@@ -165,6 +165,8 @@ pub struct LauncherSettings {
     pub heartbeat: HeartbeatTarget,
     pub terminal: VendorTerminal,
     pub vendor_dir: Option<PathBuf>,
+    /// The core's uid from a spec it wrote; the relay reads only the core's files.
+    pub core_uid: Option<u32>,
     /// The spec pairs on the vendor allowlist; never the awaitable id or the secret.
     pub vendor_env: Vec<(String, String)>,
     /// The routing tier from `--tier`, handed to the vendor as `TYCHO_TIER`.
@@ -243,6 +245,7 @@ impl LauncherSettings {
             heartbeat,
             terminal,
             vendor_dir,
+            core_uid: None,
             vendor_env,
             tier: None,
             wall_clock: WALL_CLOCK_MAX,
@@ -251,9 +254,7 @@ impl LauncherSettings {
         })
     }
 
-    /// The vendor's whole environment: the allowlisted spec pairs, `HOME` and `PATH` from the
-    /// launcher, the user name, the terminal type when the vendor owns the pty, the tier, and
-    /// the two files the vendor may write.
+    /// The vendor's whole environment: allowlisted pairs, home, path, user, terminal, tier, files.
     #[must_use]
     pub fn vendor_environment(&self, progress: &Path, result: &Path) -> Vec<(String, String)> {
         let mut pairs = self.vendor_env.clone();
@@ -374,7 +375,11 @@ pub fn take_spec(
         .ok_or_else(|| SettingsError::Spec(format!("{} does not exist", path.display())))?;
     let checked = serde_json::from_slice::<LaunchSpec>(&bytes)
         .map_err(|error| SettingsError::Spec(error.to_string()))
-        .and_then(|spec| spec.settings().map(|settings| (settings, spec.vendor)));
+        .and_then(|spec| spec.settings().map(|settings| (settings, spec.vendor)))
+        .map(|(mut settings, vendor)| {
+            settings.core_uid = Some(core_uid);
+            (settings, vendor)
+        });
     // Across users the core removes the spec once the lease appears; a failure here is fine.
     drop(shred(path));
     checked

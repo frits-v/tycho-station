@@ -22,6 +22,7 @@ use crate::packets::{self, Blocker, PacketContext, PacketError};
 use crate::repositories::{pin_ref, unit_branch, RepositoryError, Worktree};
 use crate::services::epic::EpicClient;
 use crate::services::merge_gate::{Claim, GateError, GateVerdict, MergeGate, VerifyRequest};
+use crate::services::session::InstructionRecord;
 use crate::services::worker_run::{
     worker_key, WorkerRunClient, WorkerRunOutcome, WorkerRunRequest,
 };
@@ -164,8 +165,7 @@ pub struct WorkUnitRequest {
     pub epic: EpicId,
     pub control_vendor: Vendor,
     pub plan: Vec<PlannedTask>,
-    /// Set, the unit spawns its control session and instructs it with the task packet
-    /// reference before dispatch; the plan still comes from this request.
+    /// Set, the unit starts and instructs its control session; the plan still comes from here.
     #[serde(default)]
     pub control: Option<ControlStart>,
 }
@@ -202,6 +202,9 @@ pub struct WorkUnitView {
     pub index: Vec<IndexRecord>,
     #[serde(default)]
     pub checkpoints: Vec<Checkpoint>,
+    /// How the task packet reference reached the control session, when the unit started one.
+    #[serde(default)]
+    pub control_delivery: Option<InstructionRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -353,12 +356,19 @@ pub fn backoff(timing: &Timing, attempt: Attempt) -> Duration {
         .min(timing.retry_backoff_max)
 }
 
-pub fn check_plan(request: &WorkUnitRequest) -> Result<(), String> {
+pub fn check_plan(request: &WorkUnitRequest, vendor: &dyn SessionVendor) -> Result<(), String> {
     let count = request.plan.len();
     if count == 0 || count > spine::PLAN_TASKS_MAX {
         return Err(format!(
             "the plan has {count} tasks; expected 1..={}",
             spine::PLAN_TASKS_MAX
+        ));
+    }
+    if request.control.is_some() && !vendor.serves(request.control_vendor) {
+        return Err(format!(
+            "{} does not run {:?} control sessions",
+            vendor.describe(),
+            request.control_vendor
         ));
     }
     Ok(())
@@ -519,7 +529,8 @@ impl WorkUnit {
         request: Json<WorkUnitRequest>,
     ) -> HandlerResult<Json<WorkUnitView>> {
         let request = request.into_inner();
-        check_plan(&request).map_err(|error| refuse(CODE_BAD_REQUEST, error))?;
+        check_plan(&request, self.vendor.as_ref())
+            .map_err(|error| refuse(CODE_BAD_REQUEST, error))?;
         let unit_id = WorkUnitId::parse(workflow_context.key())
             .map_err(|error| refuse(CODE_BAD_REQUEST, error.to_string()))?;
         let listed = workflow_context
@@ -676,6 +687,7 @@ impl WorkUnit {
                 worktree: None,
                 index: Vec::new(),
                 checkpoints: Vec::new(),
+                control_delivery: None,
             },
             timing: start.timing,
         };
@@ -733,27 +745,23 @@ impl WorkUnit {
 
     async fn start_control(
         &self,
-        unit: &Unit<'_>,
+        unit: &mut Unit<'_>,
         unit_id: &WorkUnitId,
         start: &ControlStart,
     ) -> Result<(), TerminalError> {
         let session = SessionName::parse(&unit.view.control_session)
             .map_err(|error| failure(CODE_INTERNAL, error.to_string()))?;
-        let control_secret = unit
-            .workflow_context
-            .get::<String>(SECRET_KEY)
-            .await?
-            .ok_or_else(|| failure(CODE_INTERNAL, "the control secret is missing"))?;
-        control::start_control(
+        let record = control::start_control(
             unit.workflow_context,
             &self.vendor,
             unit_id,
             &session,
-            control_secret,
             start,
         )
-        .await
-        .map(drop)
+        .await?;
+        unit.view.control_delivery = Some(record);
+        unit.save();
+        Ok(())
     }
 
     fn after_criteria(
@@ -1426,6 +1434,9 @@ mod tests {
         }
     }
 
+    use crate::vendors::claude_control::ClaudeControl;
+    use crate::vendors::control::NoVendor;
+
     #[test]
     fn the_plan_is_bounded() {
         let mut request = WorkUnitRequest {
@@ -1434,11 +1445,33 @@ mod tests {
             plan: Vec::new(),
             control: None,
         };
-        assert!(check_plan(&request).is_err());
+        assert!(check_plan(&request, &NoVendor).is_err());
         request.plan = vec![planned(); spine::PLAN_TASKS_MAX];
-        assert!(check_plan(&request).is_ok());
+        assert!(check_plan(&request, &NoVendor).is_ok());
         request.plan.push(planned());
-        assert!(check_plan(&request).is_err());
+        assert!(check_plan(&request, &NoVendor).is_err());
+    }
+
+    #[test]
+    fn a_control_start_needs_a_port_that_runs_the_control_vendor() {
+        let mut request = WorkUnitRequest {
+            epic: EpicId::parse("cf7a").unwrap(),
+            control_vendor: Vendor::Codex,
+            plan: vec![planned()],
+            control: Some(
+                serde_json::from_str(r#"{"task_packet":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","model":"haiku","effort":"low","permission":"dont_ask","working_dir":"/w"}"#)
+                    .unwrap(),
+            ),
+        };
+        let claude = ClaudeControl::new("/c".into(), "/h".into());
+        let refused = check_plan(&request, &NoVendor).unwrap_err();
+        assert!(refused.contains("no vendor"), "{refused}");
+        assert!(
+            check_plan(&request, &claude).is_err(),
+            "claude does not run codex"
+        );
+        request.control_vendor = Vendor::Claude;
+        assert!(check_plan(&request, &claude).is_ok());
     }
 
     #[test]
@@ -1467,6 +1500,7 @@ mod tests {
             worktree: None,
             index: Vec::new(),
             checkpoints: Vec::new(),
+            control_delivery: None,
         }
     }
 

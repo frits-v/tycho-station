@@ -14,7 +14,7 @@ use crate::kill::{kill_by_name, kill_session, KillReport, KillRequest};
 use crate::launch_spec::{HeartbeatTarget, VendorTerminal};
 use crate::private_dir;
 use crate::process::now_unix_ms;
-use crate::services::spawner::{LeaseRead, SpawnSpec, Spawner, SpawnerError};
+use crate::services::spawner::{LeaseRead, SpawnSpec, SpawnTerminal, Spawner, SpawnerError};
 use crate::spawn::{
     read_lease, save_scrollback, send_line, spawn_session, split_tier, SpawnOutcome, SpawnRequest,
 };
@@ -89,6 +89,14 @@ impl Spawner for LauncherSpawner {
             .map(|word| word.as_str().to_string())
             .collect();
         let (vendor, tier) = split_tier(&words);
+        let terminal = match spec.terminal {
+            SpawnTerminal::Files => VendorTerminal::Files,
+            SpawnTerminal::Inherit => VendorTerminal::Inherit,
+        };
+        let vendor_dir = spec
+            .working_dir
+            .as_ref()
+            .map(|dir| PathBuf::from(dir.as_str()));
         spawn_session(&SpawnRequest {
             zmx: &self.zmx,
             dirs: &self.dirs,
@@ -99,8 +107,8 @@ impl Spawner for LauncherSpawner {
             vendor,
             agent_uid: self.agent_uid,
             tier,
-            terminal: VendorTerminal::Files,
-            vendor_dir: None,
+            terminal,
+            vendor_dir: vendor_dir.as_deref(),
         })
         .and_then(spawned_pid)
     }

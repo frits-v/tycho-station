@@ -25,10 +25,10 @@ use crate::services::reconciler::ReconcilerClient;
 use crate::services::session::{
     KillRequest, SessionClient, SessionView, SpawnOutcome, SpawnRequest,
 };
+use crate::services::spawner::SpawnTerminal;
 use crate::services::workers::{
     worker_command, WorkerCommand, WorkerEvidence, WorkerPorts, WorkerTaskRequest,
 };
-use crate::services::spawner::SpawnTerminal;
 use crate::services::{
     blocking, refuse, secret, wall_clock_unix_ms, Ports, Timing, CODE_BAD_REQUEST, CODE_CANCELLED,
     CODE_INTERNAL,
@@ -997,6 +997,7 @@ mod tests {
             handoff_present: false,
             scrollback: None,
             awaiting_reap: false,
+            last_instruction: None,
         }
     }
 

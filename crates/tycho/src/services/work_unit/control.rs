@@ -19,8 +19,7 @@ use crate::services::{secret, CODE_BAD_REQUEST, CODE_CONFLICT, CODE_INTERNAL};
 use crate::spawn::CLAUDE_SANDBOX_SETTINGS;
 use crate::vendors::control::{ControlLaunch, PermissionMode, SessionVendor, VendorSessionId};
 
-/// How the unit's control session runs; set, the unit spawns it and instructs it with the
-/// task packet reference before the plan is dispatched.
+/// How the unit's control session runs; it is instructed with the packet before dispatch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlStart {
@@ -31,7 +30,7 @@ pub struct ControlStart {
     pub working_dir: AbsolutePath,
 }
 
-/// The argv and resume handle the vendor port gives for the session, journaled once.
+/// The argv and resume handle the vendor port gives for the session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ControlPlan {
     argv: Vec<ShortText>,
@@ -75,15 +74,19 @@ async fn spawn_request(
     session: &SessionName,
     start: &ControlStart,
 ) -> Result<SpawnRequest, TerminalError> {
-    let vendor_session = workflow_context
+    let generated = workflow_context
         .run(|| async {
-            secret::generate()
-                .map_err(HandlerError::from)
-                .map(|generated| generated.expose().to_string())
+            let id = secret::generate().map_err(HandlerError::from)?;
+            let session_secret = secret::generate().map_err(HandlerError::from)?;
+            Ok(Json((
+                id.expose().to_string(),
+                session_secret.expose().to_string(),
+            )))
         })
-        .name("control vendor session id")
+        .name("control session id and secret")
         .await?;
-    let vendor_session = VendorSessionId::from_hex(&vendor_session)
+    let (id_hex, session_secret) = generated.into_inner();
+    let vendor_session = VendorSessionId::from_hex(&id_hex)
         .map_err(|error| failure(CODE_INTERNAL, error.to_string()))?;
     let launch = ControlLaunch {
         session: session.clone(),
@@ -96,12 +99,15 @@ async fn spawn_request(
         resume: false,
     };
     let control_plan = plan(vendor.as_ref(), &launch)?;
-    let (awaitable_id, _exit) = workflow_context.awakeable::<Json<serde_json::Value>>();
+    let (awaitable_id, exit) = workflow_context.awakeable::<Json<serde_json::Value>>();
+    // The unit does not wait for its control session to exit: the Session object and the
+    // reconciler track it, and the launcher resolves this awaitable only at exit.
+    drop(exit);
     Ok(SpawnRequest {
         argv: control_plan.argv,
         awaitable_id: AwaitableId::parse(&awaitable_id)
             .map_err(|error| failure(CODE_INTERNAL, error.to_string()))?,
-        secret: String::new(),
+        secret: session_secret,
         inbox_socket: None,
         resume_handle: Some(control_plan.resume_handle),
         terminal: SpawnTerminal::Inherit,
@@ -109,17 +115,16 @@ async fn spawn_request(
     })
 }
 
-/// Spawns the control session and instructs it with the packet reference.
+/// Spawns the control session under its own secret and instructs it with the packet reference.
 pub async fn start_control(
     workflow_context: &WorkflowContext<'_>,
     vendor: &Arc<dyn SessionVendor>,
     unit_id: &WorkUnitId,
     session: &SessionName,
-    control_secret: String,
     start: &ControlStart,
 ) -> Result<InstructionRecord, TerminalError> {
-    let mut request = spawn_request(workflow_context, vendor, session, start).await?;
-    request.secret.clone_from(&control_secret);
+    let request = spawn_request(workflow_context, vendor, session, start).await?;
+    let session_secret = request.secret.clone();
     let spawned = workflow_context
         .object_client::<SessionClient>(session.to_string())
         .spawn(Json(request))
@@ -135,7 +140,7 @@ pub async fn start_control(
     let key = ShortText::parse(&format!("{unit_id}:task_packet:1"))
         .map_err(|error| failure(CODE_INTERNAL, error.to_string()))?;
     let instruction = InstructRequest {
-        secret: control_secret,
+        secret: session_secret,
         key,
         text: packet_instruction(&start.task_packet)?,
     };
@@ -190,7 +195,9 @@ mod tests {
 
     #[test]
     fn a_control_start_refuses_unknown_fields() {
-        let json = r#"{"task_packet":"sha256:aa","model":"haiku","effort":"low","permission":"dont_ask","working_dir":"/w","extra":1}"#;
+        let json = r#"{"task_packet":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","model":"haiku","effort":"low","permission":"dont_ask","working_dir":"/w","extra":1}"#;
         assert!(serde_json::from_str::<ControlStart>(json).is_err());
+        let known = json.replace(r#","extra":1"#, "");
+        assert!(serde_json::from_str::<ControlStart>(&known).is_ok());
     }
 }

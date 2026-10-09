@@ -22,7 +22,7 @@ use crate::services::{
     blocking, refuse, secret, spawner_failure, wall_clock_unix_ms, Ports, Timing, CODE_BAD_REQUEST,
     CODE_CANCELLED, CODE_CONFLICT, CODE_FORBIDDEN, CODE_INTERNAL, CODE_NOT_FOUND,
 };
-use crate::vendors::control::{Delivery, SessionVendor, VendorSessionId};
+use crate::vendors::control::{AddressTarget, Delivery, SessionVendor, VendorSessionId};
 
 const STATE_KEY: &str = "session";
 const SECRET_KEY: &str = "secret";
@@ -70,8 +70,10 @@ pub struct SessionState {
 pub enum InstructionPath {
     /// Written to the vendor's per-session inbox socket.
     Socket,
-    /// Typed into the session's terminal, because the inbox took nothing.
-    Terminal,
+    /// Left for the session's launcher, which posts it to the socket as the vendor user.
+    Relay,
+    /// Neither the socket nor the relay took it; instructions are never typed.
+    Refused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,13 +103,12 @@ impl fmt::Debug for InstructRequest {
     }
 }
 
-/// The inbox when it may have taken the line, the terminal only when it took nothing.
 #[must_use]
 pub const fn path_for(delivery: &Delivery) -> InstructionPath {
-    if delivery.written() {
-        InstructionPath::Socket
-    } else {
-        InstructionPath::Terminal
+    match delivery {
+        Delivery::Relayed { .. } => InstructionPath::Relay,
+        written if written.written() => InstructionPath::Socket,
+        _ => InstructionPath::Refused,
     }
 }
 
@@ -120,8 +121,7 @@ pub fn kept_instruction<'a>(
     state.instructions.iter().find(|record| &record.key == key)
 }
 
-/// The state with the record kept, the oldest dropped past the bound, and the socket the
-/// inbox answered on as the last one observed.
+/// The state with the record kept, the oldest dropped, and the last socket observed.
 #[must_use]
 pub fn remember(state: &SessionState, record: InstructionRecord) -> SessionState {
     let mut next = state.clone();
@@ -169,6 +169,8 @@ pub struct SessionView {
     pub handoff_present: bool,
     pub scrollback: Option<ShortText>,
     pub awaiting_reap: bool,
+    /// The last instruction's key, path and delivery, a refusal included.
+    pub last_instruction: Option<InstructionRecord>,
 }
 
 impl From<&SessionState> for SessionView {
@@ -187,6 +189,7 @@ impl From<&SessionState> for SessionView {
             handoff_present: state.handoff.is_some(),
             scrollback: state.scrollback.clone(),
             awaiting_reap: state.awaiting_reap,
+            last_instruction: state.instructions.last().cloned(),
         }
     }
 }
@@ -534,8 +537,7 @@ impl Session {
         Ok(())
     }
 
-    /// Posts an instruction into the vendor's inbox, or types it into the terminal when the
-    /// inbox took nothing; a repeated key answers with the record kept for it.
+    /// Posts to the inbox or the relay and records the path; a repeated key returns its record.
     #[handler(ingress_private)]
     async fn instruct(
         &self,
@@ -550,21 +552,11 @@ impl Session {
             return Ok(Json(record.clone()));
         }
         let delivery = self
-            .post_instruction(&object_context, &state, &request.text)
+            .post_instruction(&object_context, &state, name, &request)
             .await?;
-        let path = path_for(&delivery);
-        if path == InstructionPath::Terminal {
-            let spawner = Arc::clone(&self.spawner);
-            let text = request.text.clone();
-            object_context
-                .run(|| blocking(move || spawner.send(&name, &text).map_err(spawner_failure)))
-                .name("instruct through the terminal")
-                .retry_policy(Timing::nudge_retry())
-                .await?;
-        }
         let record = InstructionRecord {
             key: request.key,
-            path,
+            path: path_for(&delivery),
             delivery,
         };
         object_context.set(STATE_KEY, Json(remember(&state, record.clone())));
@@ -730,12 +722,13 @@ impl Session {
         })
     }
 
-    /// One journaled post, never retried: a second write could deliver the line twice.
+    /// One journaled post with one attempt: a second write could deliver the line twice.
     async fn post_instruction(
         &self,
         object_context: &ObjectContext<'_>,
         state: &SessionState,
-        text: &ShortText,
+        session: SessionName,
+        request: &InstructRequest,
     ) -> Result<Delivery, HandlerError> {
         let Some(vendor_session) = state
             .resume_handle
@@ -745,10 +738,15 @@ impl Session {
             return Ok(Delivery::NoSession);
         };
         let vendor = Arc::clone(&self.vendor);
-        let text = text.clone();
+        let target = AddressTarget {
+            session,
+            vendor_session,
+        };
+        let (key, text) = (request.key.clone(), request.text.clone());
         let delivery = object_context
-            .run(|| blocking(move || Ok(Json(vendor.address(&vendor_session, &text)))))
+            .run(|| blocking(move || Ok(Json(vendor.address(&target, &key, &text)))))
             .name("instruct over the inbox")
+            .retry_policy(RunRetryPolicy::new().max_attempts(1))
             .await?;
         Ok(delivery.into_inner())
     }
@@ -1076,7 +1074,7 @@ mod tests {
     }
 
     #[test]
-    fn the_terminal_is_used_only_when_the_inbox_took_nothing() {
+    fn an_instruction_takes_the_socket_or_the_relay_and_is_never_typed() {
         let socket = "/tmp/cc-socks/7.sock".to_string();
         assert_eq!(
             path_for(&Delivery::Posted {
@@ -1091,14 +1089,31 @@ mod tests {
             }),
             InstructionPath::Socket
         );
+        assert_eq!(
+            path_for(&Delivery::WriteInterrupted {
+                socket: socket.clone(),
+                sent: 3,
+                reason: "reset".to_string()
+            }),
+            InstructionPath::Socket
+        );
+        assert_eq!(
+            path_for(&Delivery::Relayed {
+                file: "a.json".to_string()
+            }),
+            InstructionPath::Relay
+        );
         for unwritten in [
             Delivery::NoSession,
             Delivery::Denied {
                 socket: socket.clone(),
             },
             Delivery::Refused { socket },
+            Delivery::RelayFailed {
+                reason: "r".to_string(),
+            },
         ] {
-            assert_eq!(path_for(&unwritten), InstructionPath::Terminal);
+            assert_eq!(path_for(&unwritten), InstructionPath::Refused);
         }
     }
 
@@ -1130,7 +1145,7 @@ mod tests {
         assert_eq!(
             many.inbox_socket.as_ref().map(AbsolutePath::as_str),
             Some(socket.as_str()),
-            "a terminal fallback keeps the last observed socket"
+            "a refusal keeps the last observed socket"
         );
     }
 

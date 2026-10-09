@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
+use std::os::unix::net::UnixStream;
 use std::thread;
 
 use tycho_types::session::SessionName;
@@ -9,9 +10,12 @@ use tycho_types::task_packet::AbsolutePath;
 
 use super::*;
 use crate::spawn::CLAUDE_SANDBOX_SETTINGS;
+use crate::vendors::control::AddressTarget;
 
 const REGISTRY_IDLE: &str = include_str!("../../fixtures/claude-registry-idle.json");
 const REGISTRY_WAITING: &str = include_str!("../../fixtures/claude-registry-waiting.json");
+// Captured from 2.1.280: the peer turn as written, and an assistant line trimmed to its type,
+// ids, model and usage, with its content cut to one word.
 const TRANSCRIPT_TAIL: &str = include_str!("../../fixtures/claude-transcript-tail.jsonl");
 const SESSION_ID: &str = "56736586-cf23-4aaa-955f-7ea9c1fb1e15";
 const SETTINGS: &str = r#"{"autoCompactWindow":1000000,"crossSessionInbound":"accept","sandbox":{"allowUnsandboxedCommands":false,"enabled":true,"excludedCommands":[],"failIfUnavailable":true,"network":{"allowAllUnixSockets":false,"allowLocalBinding":false,"allowedDomains":[]}}}"#;
@@ -47,6 +51,21 @@ fn launch(resume: bool) -> ControlLaunch {
 
 fn session() -> VendorSessionId {
     VendorSessionId::parse(SESSION_ID).unwrap()
+}
+
+fn target() -> AddressTarget {
+    AddressTarget {
+        session: SessionName::parse("cf7a.wu03.ctl.claude").unwrap(),
+        vendor_session: session(),
+    }
+}
+
+fn go(control: &ClaudeControl) -> Delivery {
+    control.address(
+        &target(),
+        &ShortText::parse("wu03:task_packet:1").unwrap(),
+        &ShortText::parse("go").unwrap(),
+    )
 }
 
 #[test]
@@ -135,6 +154,7 @@ fn registry_files_decode_to_every_observed_state() {
             waiting_for: WaitingFor::PermissionPrompt
         }
     );
+    // Synthetic: `busy` was observed in `claude agents --json`, not captured in a registry file.
     let mut busy = idle.clone();
     busy.status = "busy".to_string();
     assert_eq!(observation_of(&busy), Observation::Busy { pid: 69821 });
@@ -259,17 +279,14 @@ fn a_session_is_found_only_through_a_live_process_holding_its_id() {
     assert_eq!(control.locate(&session()), Located::Absent);
     registry_file(&dir, "1.json", PID_MAX, &socket);
     assert_eq!(control.locate(&session()), Located::Absent, "a dead pid");
-    assert_eq!(
-        control.address(&session(), &ShortText::parse("go").unwrap()),
-        Delivery::NoSession
-    );
+    assert_eq!(go(&control), Delivery::NoSession);
     registry_file(&dir, "2.json", std::process::id(), &socket);
     fs::write(dir.join("sessions").join("2.key"), "not a record").unwrap();
     assert!(
         matches!(control.locate(&session()), Located::Found(entry) if entry.pid == std::process::id())
     );
     let server = listener(&socket, b"");
-    let delivered = control.address(&session(), &ShortText::parse("go").unwrap());
+    let delivered = go(&control);
     assert_eq!(
         delivered,
         Delivery::Posted {
@@ -299,10 +316,7 @@ fn a_registry_over_its_bound_is_unreadable_not_partly_scanned() {
         adapter(&dir).locate(&session()),
         Located::Unreadable(_)
     ));
-    assert!(matches!(
-        adapter(&dir).address(&session(), &ShortText::parse("go").unwrap()),
-        Delivery::Unreadable { .. }
-    ));
+    assert!(matches!(go(&adapter(&dir)), Delivery::Unreadable { .. }));
     fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -318,5 +332,162 @@ fn the_context_size_reads_the_sessions_transcript() {
         adapter(&dir).context_size(&session()),
         ContextReport::Tokens { tokens: 41_913 }
     );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A channel whose write takes `accept` bytes and then fails, and whose half-close can fail.
+struct Failing {
+    accept: usize,
+    taken: usize,
+    shutdown_fails: bool,
+}
+
+impl Channel for Failing {
+    fn write_some(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let room = self.accept.saturating_sub(self.taken);
+        if room == 0 {
+            return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+        }
+        let count = room.min(bytes.len()).min(3);
+        self.taken = self.taken.saturating_add(count);
+        Ok(count)
+    }
+
+    fn half_close(&mut self) -> io::Result<()> {
+        if self.shutdown_fails {
+            return Err(io::Error::from(io::ErrorKind::NotConnected));
+        }
+        Ok(())
+    }
+
+    fn read_reply(&mut self, _reply: &mut Vec<u8>) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_failure_after_the_first_byte_or_at_the_half_close_counts_as_written() {
+    let line = instruction_line(&ShortText::parse("go").unwrap());
+    let post_with = |accept, shutdown_fails| {
+        let mut channel = Failing {
+            accept,
+            taken: 0,
+            shutdown_fails,
+        };
+        post_on(&mut channel, "s".to_string(), &line)
+    };
+    assert!(matches!(post_with(0, false), Delivery::WriteFailed { .. }));
+    let partial = post_with(5, false);
+    assert!(
+        matches!(partial, Delivery::WriteInterrupted { sent: 5, .. }),
+        "{partial:?}"
+    );
+    let unclosed = post_with(line.len(), true);
+    assert!(
+        matches!(unclosed, Delivery::WriteInterrupted { sent, .. } if sent == line.len()),
+        "{unclosed:?}"
+    );
+    assert_eq!(
+        post_with(line.len(), false),
+        Delivery::Posted {
+            socket: "s".to_string()
+        }
+    );
+    assert!(partial.written() && unclosed.written());
+}
+
+/// A real stream whose half-close waits until the peer has read the line and hung up.
+struct AfterPeerClosed {
+    stream: UnixStream,
+    peer: Option<thread::JoinHandle<String>>,
+}
+
+impl Channel for AfterPeerClosed {
+    fn write_some(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.stream.write_some(bytes)
+    }
+
+    fn half_close(&mut self) -> io::Result<()> {
+        if let Some(peer) = self.peer.take() {
+            peer.join().unwrap();
+        }
+        self.stream.half_close()
+    }
+
+    fn read_reply(&mut self, reply: &mut Vec<u8>) -> io::Result<()> {
+        self.stream.read_reply(reply)
+    }
+}
+
+#[test]
+fn a_peer_that_hangs_up_before_the_half_close_never_triggers_a_fallback() {
+    let dir = scratch("hangup");
+    let socket = dir.join("i.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let peer = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream).read_line(&mut line).unwrap();
+        line
+    });
+    let mut channel = AfterPeerClosed {
+        stream: UnixStream::connect(&socket).unwrap(),
+        peer: Some(peer),
+    };
+    let line = instruction_line(&ShortText::parse("go").unwrap());
+    let delivery = post_on(&mut channel, socket.display().to_string(), &line);
+    assert!(delivery.written(), "{delivery:?}");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_socket_or_registry_of_another_user_sends_the_instruction_to_the_relay() {
+    let dir = scratch("relay");
+    let agent = AgentDirs::new(dir.join("agent")).unwrap();
+    fs::create_dir_all(&agent.socket_dir).unwrap();
+    let socket = dir.join("i.sock");
+    registry_file(&dir, "2.json", std::process::id(), &socket);
+    let _held = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(
+        go(&adapter(&dir)),
+        Delivery::RelayFailed {
+            reason: "no relay directory is configured".to_string()
+        }
+    );
+    let relaying = adapter(&dir).with_relay(agent.clone(), RelayMode::OnRefusal);
+    let file = crate::relay::relay_file_name(&ShortText::parse("wu03:task_packet:1").unwrap());
+    assert_eq!(go(&relaying), Delivery::Relayed { file: file.clone() });
+    let written = crate::relay::relay_dir(&agent, &target().session).join(&file);
+    assert!(fs::read_to_string(written)
+        .unwrap()
+        .contains("\"content\":\"go\""));
+    fs::set_permissions(dir.join("sessions"), fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(matches!(relaying.locate(&session()), Located::Denied(_)));
+    assert_eq!(go(&relaying), Delivery::Relayed { file: file.clone() });
+    fs::set_permissions(dir.join("sessions"), fs::Permissions::from_mode(0o755)).unwrap();
+    let always = adapter(&dir).with_relay(agent, RelayMode::Always);
+    assert_eq!(go(&always), Delivery::Relayed { file });
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_registry_file_that_cannot_be_read_or_decoded_is_unreadable_not_absent() {
+    let dir = scratch("undecodable");
+    fs::write(dir.join("sessions").join("9.json"), "{\"pid\":").unwrap();
+    assert!(matches!(
+        adapter(&dir).locate(&session()),
+        Located::Unreadable(reason) if reason.contains("9.json")
+    ));
+    fs::write(dir.join("sessions").join("9.json"), "{}").unwrap();
+    fs::set_permissions(
+        dir.join("sessions").join("9.json"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    assert!(matches!(
+        adapter(&dir).observe(&session()),
+        Observation::Unreadable { .. }
+    ));
     fs::remove_dir_all(&dir).unwrap();
 }

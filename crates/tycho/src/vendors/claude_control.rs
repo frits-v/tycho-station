@@ -18,20 +18,21 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tycho_types::envelope::{ShortText, TEXT_MAX_BYTES};
 use tycho_types::lease::PID_MAX;
+use tycho_types::session::Vendor;
 use tycho_types::task_packet::Effort;
 
 use crate::agent_files::read_checked;
+use crate::config::AgentDirs;
 use crate::launch_spec::VendorTerminal;
+use crate::relay::write_instruction;
 use crate::vendors::control::{
-    bounded, ContextReport, ControlCommand, ControlLaunch, Delivery, Observation, PermissionMode,
-    SessionVendor, VendorError, VendorSessionId, WaitingFor, MODEL_NAME_MAX_BYTES,
+    bounded, AddressTarget, ContextReport, ControlCommand, ControlLaunch, Delivery, Observation,
+    PermissionMode, SessionVendor, VendorError, VendorSessionId, WaitingFor, MODEL_NAME_MAX_BYTES,
 };
 
-/// The inbox socket's documented line limit is 1,048,576 characters; an instruction is a
-/// `ShortText`, far below it, which also keeps it inside one typed line for the fallback.
+/// One `ShortText`, far below the inbox's documented 1,048,576-character message limit.
 pub const INSTRUCTION_MAX_BYTES: usize = TEXT_MAX_BYTES;
-/// The largest auto-compact window the vendor accepts; it is capped at the model's window,
-/// so compaction runs only at the vendor's default fraction of the full window.
+/// The largest auto-compact window the vendor accepts; it caps it at the model's window.
 pub const AUTO_COMPACT_WINDOW_MAX: u64 = 1_000_000;
 pub const REGISTRY_FILES_MAX: usize = 1024;
 pub const REGISTRY_FILE_MAX_BYTES: usize = 16 * 1024;
@@ -41,12 +42,23 @@ pub const TRANSCRIPT_TAIL_MAX_BYTES: u64 = 512 * 1024;
 pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 const STATUS_PERMISSION_PROMPT: &str = "permission prompt";
 
-/// The adapter for one vendor user's Claude Code: its binary and its configuration directory.
+/// When the adapter hands an instruction to the session's launcher instead of the socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayMode {
+    /// Only when the socket or the registry refuses the core as another user.
+    OnRefusal,
+    /// Always: the core and the session run as different users.
+    Always,
+}
+
+/// The adapter for one vendor user's Claude Code: binary, configuration and relay directory.
 #[derive(Debug, Clone)]
 pub struct ClaudeControl {
     pub binary: PathBuf,
     /// The vendor user's `~/.claude` (or `CLAUDE_CONFIG_DIR`).
     pub config_dir: PathBuf,
+    pub relay_dirs: Option<AgentDirs>,
+    pub relay_mode: RelayMode,
 }
 
 /// One registry file, decoded; fields the adapter does not use are ignored.
@@ -68,6 +80,8 @@ pub enum Located {
     Found(RegistryEntry),
     Absent,
     Unreadable(String),
+    /// The registry belongs to another user.
+    Denied(String),
     /// More than one live process claims the id.
     Ambiguous(usize),
 }
@@ -95,9 +109,9 @@ pub const fn permission_word(mode: PermissionMode) -> &'static str {
     }
 }
 
-/// The one `--settings` object: the spec's sandbox, inbound messages accepted, and the
-/// widest auto-compact window. Re-passed on every resume: the vendor does not keep it.
+/// The one `--settings` object: sandbox, inbound accepted, widest auto-compact window.
 pub fn settings_json(sandbox_settings: &str) -> Result<String, VendorError> {
+    // Passed on every start and resume: the vendor does not keep it with the session.
     let mut settings: Map<String, Value> = serde_json::from_str(sandbox_settings)
         .map_err(|error| VendorError::Argument(format!("sandbox settings: {error}")))?;
     if !settings.get("sandbox").is_some_and(Value::is_object) {
@@ -136,8 +150,7 @@ fn check_model(model: &str) -> Result<(), VendorError> {
     Ok(())
 }
 
-/// The registry's directory name for a working directory: every byte outside `[A-Za-z0-9]`
-/// becomes `-`, as observed for `/Users/frits/.tw12/work` and `-Users-frits--tw12-work`.
+/// The transcript directory name for a working directory: non-alphanumerics become `-`.
 #[must_use]
 pub fn project_slug(cwd: &str) -> String {
     cwd.chars()
@@ -182,8 +195,7 @@ pub fn observation_of(entry: &RegistryEntry) -> Observation {
     }
 }
 
-/// Context held after the last assistant turn in a transcript tail: input, cache creation
-/// and cache read tokens of its usage.
+/// Input plus cache tokens of the last assistant turn in a transcript tail.
 #[must_use]
 pub fn context_of(tail: &str) -> ContextReport {
     // The first line of a tail window may be cut; a line that is not JSON is skipped.
@@ -234,30 +246,69 @@ pub fn instruction_line(instruction: &ShortText) -> String {
     format!("{line}\n")
 }
 
-/// Writes the line, half-closes, and reads what comes back within the bound.
-#[must_use]
-pub fn post(socket: &Path, line: &str) -> Delivery {
-    let mut stream = match UnixStream::connect(socket) {
-        Ok(stream) => stream,
-        Err(error) => return connect_failure(socket, &error),
-    };
-    let label = socket.display().to_string();
-    let written = stream
-        .set_write_timeout(Some(IO_TIMEOUT))
-        .and_then(|()| stream.set_read_timeout(Some(IO_TIMEOUT)))
-        .and_then(|()| stream.write_all(line.as_bytes()))
-        .and_then(|()| stream.shutdown(std::net::Shutdown::Write));
-    if let Err(error) = written {
-        return Delivery::WriteFailed {
-            socket: label,
-            reason: bounded(&error.to_string()),
+/// The three operations a post makes on a connection, so a test can fail each one.
+pub trait Channel {
+    fn write_some(&mut self, bytes: &[u8]) -> io::Result<usize>;
+    fn half_close(&mut self) -> io::Result<()>;
+    fn read_reply(&mut self, reply: &mut Vec<u8>) -> io::Result<()>;
+}
+
+impl Channel for UnixStream {
+    fn write_some(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.write(bytes)
+    }
+
+    fn half_close(&mut self) -> io::Result<()> {
+        self.shutdown(std::net::Shutdown::Write)
+    }
+
+    fn read_reply(&mut self, reply: &mut Vec<u8>) -> io::Result<()> {
+        let limit = u64::try_from(REPLY_MAX_BYTES).unwrap_or(u64::MAX);
+        self.take(limit).read_to_end(reply).map(drop)
+    }
+}
+
+/// Writes the line counting bytes; once one byte is out the instruction counts as written.
+fn write_counted(channel: &mut impl Channel, line: &[u8]) -> (usize, io::Result<()>) {
+    let mut sent = 0_usize;
+    for _ in 0..=line.len() {
+        let Some(rest) = line.get(sent..).filter(|rest| !rest.is_empty()) else {
+            return (sent, Ok(()));
         };
+        match channel.write_some(rest) {
+            Ok(0) => return (sent, Err(io::Error::from(io::ErrorKind::WriteZero))),
+            Ok(count) => sent = sent.saturating_add(count),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return (sent, Err(error)),
+        }
+    }
+    (sent, Ok(()))
+}
+
+/// Writes the line, half-closes, and decodes what comes back.
+pub fn post_on(channel: &mut impl Channel, label: String, line: &str) -> Delivery {
+    let (sent, written) = write_counted(channel, line.as_bytes());
+    let written = written.and_then(|()| channel.half_close());
+    match written {
+        Err(error) if sent == 0 => {
+            return Delivery::WriteFailed {
+                socket: label,
+                reason: bounded(&error.to_string()),
+            }
+        }
+        Err(error) => {
+            return Delivery::WriteInterrupted {
+                socket: label,
+                sent,
+                reason: bounded(&error.to_string()),
+            }
+        }
+        Ok(()) => {}
     }
     let mut reply = Vec::new();
-    let limit = u64::try_from(REPLY_MAX_BYTES).unwrap_or(u64::MAX);
-    match (&mut stream).take(limit).read_to_end(&mut reply) {
-        Ok(_) if reply.is_empty() => Delivery::Posted { socket: label },
-        Ok(_) => Delivery::Replied {
+    match channel.read_reply(&mut reply) {
+        Ok(()) if reply.is_empty() => Delivery::Posted { socket: label },
+        Ok(()) => Delivery::Replied {
             socket: label,
             reply: bounded(&String::from_utf8_lossy(&reply)),
         },
@@ -276,6 +327,38 @@ pub fn post(socket: &Path, line: &str) -> Delivery {
     }
 }
 
+/// Connects and posts the line within the timeouts.
+#[must_use]
+pub fn post(socket: &Path, line: &str) -> Delivery {
+    let mut stream = match UnixStream::connect(socket) {
+        Ok(stream) => stream,
+        Err(error) => return connect_failure(socket, &error),
+    };
+    let label = socket.display().to_string();
+    let timeouts = stream
+        .set_write_timeout(Some(IO_TIMEOUT))
+        .and_then(|()| stream.set_read_timeout(Some(IO_TIMEOUT)));
+    if let Err(error) = timeouts {
+        return Delivery::WriteFailed {
+            socket: label,
+            reason: bounded(&error.to_string()),
+        };
+    }
+    post_on(&mut stream, label, line)
+}
+
+/// The socket of the vendor process `pid` from its registry file, for the launcher.
+pub fn socket_of_pid(config_dir: &Path, pid: u32) -> Result<Option<PathBuf>, String> {
+    let path = config_dir.join("sessions").join(format!("{pid}.json"));
+    let bytes = read_checked(&path, REGISTRY_FILE_MAX_BYTES, None)
+        .map_err(|error| bounded(&error.to_string()))?;
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    let entry = decode_registry(&bytes)?;
+    Ok(entry.messaging_socket_path.map(PathBuf::from))
+}
+
 /// Whether a pid names a live process; another user's process counts as live.
 fn alive(pid: u32) -> bool {
     i32::try_from(pid).is_ok_and(|raw| {
@@ -289,17 +372,45 @@ fn alive(pid: u32) -> bool {
 impl ClaudeControl {
     #[must_use]
     pub const fn new(binary: PathBuf, config_dir: PathBuf) -> Self {
-        Self { binary, config_dir }
+        Self {
+            binary,
+            config_dir,
+            relay_dirs: None,
+            relay_mode: RelayMode::OnRefusal,
+        }
     }
 
-    /// Scans the registry for live processes holding the id; more files than the bound is an
-    /// error, never a partial scan.
+    #[must_use]
+    pub fn with_relay(mut self, dirs: AgentDirs, mode: RelayMode) -> Self {
+        self.relay_dirs = Some(dirs);
+        self.relay_mode = mode;
+        self
+    }
+
+    fn relay(&self, target: &AddressTarget, key: &ShortText, line: &str) -> Delivery {
+        let Some(dirs) = &self.relay_dirs else {
+            return Delivery::RelayFailed {
+                reason: "no relay directory is configured".to_string(),
+            };
+        };
+        match write_instruction(dirs, &target.session, key, line) {
+            Ok(file) => Delivery::Relayed { file },
+            Err(reason) => Delivery::RelayFailed {
+                reason: bounded(&reason),
+            },
+        }
+    }
+
+    /// Scans the registry for live processes holding the id; over the bound is an error.
     #[must_use]
     pub fn locate(&self, session: &VendorSessionId) -> Located {
         let dir = self.config_dir.join("sessions");
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Located::Absent,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                return Located::Denied(bounded(&format!("{}: {error}", dir.display())))
+            }
             Err(error) => {
                 return Located::Unreadable(bounded(&format!("{}: {error}", dir.display())))
             }
@@ -312,13 +423,17 @@ impl ClaudeControl {
                     dir.display()
                 ));
             }
-            let Ok(entry) = entry else { continue };
-            let path = entry.path();
+            let path = match entry {
+                Ok(entry) => entry.path(),
+                Err(error) => return Located::Unreadable(bounded(&error.to_string())),
+            };
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
-            if let Some(record) = Self::read_entry(&path, session) {
-                found.push(record);
+            match Self::read_entry(&path, session) {
+                Ok(Some(record)) => found.push(record),
+                Ok(None) => {}
+                Err(reason) => return Located::Unreadable(reason),
             }
         }
         match found.len() {
@@ -328,11 +443,17 @@ impl ClaudeControl {
         }
     }
 
-    /// A registry file for this id whose process is alive; anything else is skipped.
-    fn read_entry(path: &Path, session: &VendorSessionId) -> Option<RegistryEntry> {
-        let bytes = read_checked(path, REGISTRY_FILE_MAX_BYTES, None).ok()??;
-        let entry = decode_registry(&bytes).ok()?;
-        (entry.session_id == session.as_str() && alive(entry.pid)).then_some(entry)
+    /// The entry for this id with a live process; an unreadable or undecodable file is an error.
+    fn read_entry(path: &Path, session: &VendorSessionId) -> Result<Option<RegistryEntry>, String> {
+        let bytes = match read_checked(path, REGISTRY_FILE_MAX_BYTES, None) {
+            Ok(Some(bytes)) => bytes,
+            // Removed between the listing and the read: the process ended.
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(bounded(&format!("{}: {error}", path.display()))),
+        };
+        let entry =
+            decode_registry(&bytes).map_err(|reason| format!("{}: {reason}", path.display()))?;
+        Ok((entry.session_id == session.as_str() && alive(entry.pid)).then_some(entry))
     }
 
     fn transcript_tail(&self, entry: &RegistryEntry) -> Result<Option<String>, String> {
@@ -361,6 +482,10 @@ impl ClaudeControl {
 impl SessionVendor for ClaudeControl {
     fn describe(&self) -> String {
         format!("claude control at {}", self.binary.display())
+    }
+
+    fn serves(&self, vendor: Vendor) -> bool {
+        vendor == Vendor::Claude
     }
 
     fn control_command(&self, launch: &ControlLaunch) -> Result<ControlCommand, VendorError> {
@@ -394,14 +519,27 @@ impl SessionVendor for ClaudeControl {
         })
     }
 
-    fn address(&self, session: &VendorSessionId, instruction: &ShortText) -> Delivery {
-        match self.locate(session) {
+    fn address(
+        &self,
+        target: &AddressTarget,
+        key: &ShortText,
+        instruction: &ShortText,
+    ) -> Delivery {
+        let line = instruction_line(instruction);
+        if self.relay_mode == RelayMode::Always {
+            return self.relay(target, key, &line);
+        }
+        match self.locate(&target.vendor_session) {
             Located::Found(entry) => entry.messaging_socket_path.map_or_else(
                 || Delivery::Unrecognised {
                     reason: "the registry entry names no inbox socket".to_string(),
                 },
-                |socket| post(Path::new(&socket), &instruction_line(instruction)),
+                |socket| match post(Path::new(&socket), &line) {
+                    Delivery::Denied { .. } => self.relay(target, key, &line),
+                    delivery => delivery,
+                },
             ),
+            Located::Denied(_) => self.relay(target, key, &line),
             Located::Absent => Delivery::NoSession,
             Located::Unreadable(reason) => Delivery::Unreadable { reason },
             Located::Ambiguous(count) => Delivery::Unrecognised {
@@ -414,7 +552,9 @@ impl SessionVendor for ClaudeControl {
         match self.locate(session) {
             Located::Found(entry) => observation_of(&entry),
             Located::Absent => Observation::Absent,
-            Located::Unreadable(reason) => Observation::Unreadable { reason },
+            Located::Unreadable(reason) | Located::Denied(reason) => {
+                Observation::Unreadable { reason }
+            }
             Located::Ambiguous(count) => Observation::Unrecognised {
                 reason: format!("{count} live processes hold the session id"),
             },
@@ -429,7 +569,9 @@ impl SessionVendor for ClaudeControl {
         let entry = match self.locate(session) {
             Located::Found(entry) => entry,
             Located::Absent => return ContextReport::Absent,
-            Located::Unreadable(reason) => return ContextReport::Unreadable { reason },
+            Located::Unreadable(reason) | Located::Denied(reason) => {
+                return ContextReport::Unreadable { reason }
+            }
             Located::Ambiguous(count) => {
                 return ContextReport::Unrecognised {
                     reason: format!("{count} live processes hold the session id"),

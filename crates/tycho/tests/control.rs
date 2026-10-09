@@ -19,6 +19,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -36,6 +37,7 @@ use tycho::http::Http;
 use tycho::kill::{kill_session, KillRequest};
 use tycho::launch_probe::LaunchProbe;
 use tycho::launcher::{HeartbeatTarget, SessionFiles, VendorRecord, VendorTerminal};
+use tycho::relay::relay_dir;
 use tycho::services::merge_gate::NoGate;
 use tycho::services::reconciler::Reconciler;
 use tycho::services::secret;
@@ -49,15 +51,15 @@ use tycho::spawn::{
     read_lease, save_scrollback, send_line, spawn_session, SpawnOutcome as LaunchOutcome,
     SpawnRequest, CLAUDE_SANDBOX_SETTINGS,
 };
-use tycho::vendors::claude_control::ClaudeControl;
+use tycho::vendors::claude_control::{ClaudeControl, RelayMode};
 use tycho::vendors::control::{
-    ContextReport, ControlLaunch, Delivery, Observation, PermissionMode, SessionVendor,
-    VendorSessionId, WaitingFor,
+    AddressTarget, ContextReport, ControlCommand, ControlLaunch, Delivery, Observation,
+    PermissionMode, SessionVendor, VendorError, VendorSessionId, WaitingFor,
 };
 use tycho::zmx::{ListEntry, Zmx};
 use tycho_types::envelope::ShortText;
 use tycho_types::launcher::AwaitableId;
-use tycho_types::session::SessionName;
+use tycho_types::session::{SessionName, Vendor};
 use tycho_types::task_packet::{AbsolutePath, Effort};
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
@@ -66,8 +68,8 @@ const WAIT_LIMIT: Duration = Duration::from_secs(120);
 const TURN_LIMIT: Duration = Duration::from_secs(150);
 const MODEL: &str = "haiku";
 const TRUST_DIALOG: &str = "Quick safety check";
-/// Keeps the developer's own hooks and plugins out of the test sessions; the factory's agent
-/// user has core-owned user settings, so the adapter itself never passes this.
+// Keeps the developer's own hooks and plugins out of the test sessions; the agent user's
+// settings are core-owned, so the adapter itself never passes this.
 const TEST_SETTING_SOURCES: [&str; 2] = ["--setting-sources", "project,local"];
 
 fn mise_which(tool: &str) -> PathBuf {
@@ -249,6 +251,60 @@ impl ControlDriver {
     }
 }
 
+/// The vendor port's test hook: while `force` is set, instructions take the relay.
+// A socket of another user, which sends instructions to the relay, cannot be made here.
+#[derive(Debug, Clone)]
+struct ForcedRelay {
+    direct: ClaudeControl,
+    relay: ClaudeControl,
+    force: Arc<AtomicBool>,
+}
+
+impl ForcedRelay {
+    fn active(&self) -> &ClaudeControl {
+        if self.force.load(Ordering::SeqCst) {
+            &self.relay
+        } else {
+            &self.direct
+        }
+    }
+}
+
+impl SessionVendor for ForcedRelay {
+    fn describe(&self) -> String {
+        self.direct.describe()
+    }
+
+    fn serves(&self, vendor: Vendor) -> bool {
+        self.direct.serves(vendor)
+    }
+
+    fn control_command(&self, launch: &ControlLaunch) -> Result<ControlCommand, VendorError> {
+        self.direct.control_command(launch)
+    }
+
+    fn address(
+        &self,
+        target: &AddressTarget,
+        key: &ShortText,
+        instruction: &ShortText,
+    ) -> Delivery {
+        self.active().address(target, key, instruction)
+    }
+
+    fn observe(&self, session: &VendorSessionId) -> Observation {
+        self.direct.observe(session)
+    }
+
+    fn resume_handle(&self, session: &VendorSessionId) -> Result<ShortText, VendorError> {
+        self.direct.resume_handle(session)
+    }
+
+    fn context_size(&self, session: &VendorSessionId) -> ContextReport {
+        self.direct.context_size(session)
+    }
+}
+
 /// One control session the test started: its zmx name, vendor id and secret.
 #[derive(Debug, Clone)]
 struct Control {
@@ -262,7 +318,8 @@ struct Harness {
     config: CoreConfig,
     environment: Vec<(&'static str, String)>,
     spawner: LauncherSpawner,
-    vendor: ClaudeControl,
+    vendor: ForcedRelay,
+    force_relay: Arc<AtomicBool>,
     work: PathBuf,
     controls: Vec<Control>,
 }
@@ -293,7 +350,14 @@ impl Harness {
                 "{role} already answers on its port; stop the running core first"
             );
         }
-        let work = home.join("work");
+        // No pid in the name, so the vendor's per-directory entries stay one per case.
+        let work = user_home().join(format!(".tycho-test-control-work-{tag}"));
+        if work.exists() {
+            fs::remove_dir_all(&work).unwrap();
+        }
+        let dirs = AgentDirs::new(agent.clone()).unwrap();
+        let claude = ClaudeControl::new(claude_binary(), user_home().join(".claude"));
+        let force_relay = Arc::new(AtomicBool::new(false));
         let harness = Self {
             endpoint: None,
             environment: vec![
@@ -304,10 +368,15 @@ impl Harness {
             ],
             spawner: LauncherSpawner {
                 zmx: Zmx::agent(&zmx_binary, &agent),
-                dirs: AgentDirs::new(agent).unwrap(),
+                dirs: dirs.clone(),
                 core_home: home,
             },
-            vendor: ClaudeControl::new(claude_binary(), user_home().join(".claude")),
+            vendor: ForcedRelay {
+                relay: claude.clone().with_relay(dirs.clone(), RelayMode::Always),
+                direct: claude.with_relay(dirs, RelayMode::OnRefusal),
+                force: Arc::clone(&force_relay),
+            },
+            force_relay,
             config,
             work,
             controls: Vec::new(),
@@ -604,8 +673,7 @@ fn clear_sessions(zmx: &Zmx, label: &str) -> usize {
     left
 }
 
-/// A vendor the core declines to signal (it runs as the core's own user here) is killed by the
-/// test; true when one was running.
+/// Kills a vendor the core declines to signal as its own user; true when one was running.
 fn kill_orphan_vendor(files: &SessionFiles) -> bool {
     let Ok(bytes) = fs::read(&files.vendor) else {
         return false;
@@ -626,8 +694,7 @@ fn kill_orphan_vendor(files: &SessionFiles) -> bool {
     running
 }
 
-/// Removes what the vendor wrote under the developer's `~/.claude` for the test sessions:
-/// the project transcripts of the test working directory and per-session state.
+/// Removes the transcripts and per-session state the vendor wrote under `~/.claude`.
 fn remove_vendor_state(work: &Path, controls: &[Control]) -> Vec<String> {
     let config = user_home().join(".claude");
     let slug = tycho::vendors::claude_control::project_slug(&work.display().to_string());
@@ -689,7 +756,7 @@ impl Drop for Harness {
         }
         let removed = remove_vendor_state(&self.work, &self.controls);
         println!("teardown: removed vendor state {removed:?}");
-        for dir in [&self.config.home, &self.spawner.dirs.socket_dir] {
+        for dir in [&self.config.home, &self.spawner.dirs.socket_dir, &self.work] {
             if let Err(error) = fs::remove_dir_all(dir) {
                 problems.push(format!("cannot remove {}: {error}", dir.display()));
             }
@@ -760,7 +827,29 @@ fn an_instruction_posted_from_a_handler_step_reaches_the_session_over_its_socket
     );
     println!("evidence: context size {held:?}");
     assert!(matches!(held, ContextReport::Tokens { tokens } if tokens > 0));
+    relay_reaches_the_session(&harness, &control);
     harness.kill(&control);
+}
+
+/// With the socket path forced off, the instruction goes to the relay and the launcher posts it.
+fn relay_reaches_the_session(harness: &Harness, control: &Control) {
+    harness.force_relay.store(true, Ordering::SeqCst);
+    let record = instruct(
+        control,
+        "wu01:task_packet:2",
+        "Use the Write tool to create control-relay.txt in the current directory containing the word relay. Do nothing else.",
+    );
+    harness.force_relay.store(false, Ordering::SeqCst);
+    assert_eq!(record.path, InstructionPath::Relay, "{record:?}");
+    let Delivery::Relayed { file } = &record.delivery else {
+        panic!("not relayed: {record:?}");
+    };
+    let content = file_appears(&harness.file("control-relay.txt"));
+    println!("evidence: control-relay.txt holds {content:?}");
+    let marker = relay_dir(&harness.spawner.dirs, &control.name).join(format!("{file}.posted"));
+    let posted = fs::read_to_string(&marker).unwrap();
+    println!("evidence: launcher marker {} -> {posted}", marker.display());
+    assert!(posted.contains("\"state\":\"posted\""), "{posted}");
 }
 
 /// The same write in `dontAsk` is decided without a prompt: the session never waits.

@@ -34,7 +34,7 @@ use tycho::config_store::FactoryConfig;
 use tycho::endpoint;
 use tycho::health;
 use tycho::http::Http;
-use tycho::services::doubles::{FixedGate, RecordingSpawner};
+use tycho::services::doubles::{FixedGate, RecordingSpawner, RecordingVendor, DOUBLE_SOCKET};
 use tycho::services::merge_gate::{GateVerdict, MergeGate, NoGate};
 use tycho::services::operator::read_secret_file;
 use tycho::services::spawner::{SpawnSpec, Spawner};
@@ -556,6 +556,10 @@ fn plan_file(core: &Core, tasks: &[&str]) -> PathBuf {
 
 /// Starts the epic, lists `wu01`, dispatches it through the CLI, and returns the invocation.
 fn dispatch(core: &Core, tasks: &[&str]) -> String {
+    dispatch_plan(core, &plan_file(core, tasks))
+}
+
+fn dispatch_plan(core: &Core, plan: &Path) -> String {
     assert!(core
         .tycho(&["epic", "start", "cf7a", "split the orders table"])
         .status
@@ -564,7 +568,6 @@ fn dispatch(core: &Core, tasks: &[&str]) -> String {
         .tycho(&["epic", "add-unit", "cf7a", "wu01"])
         .status
         .success());
-    let plan = plan_file(core, tasks);
     let dispatched = core.tycho(&["epic", "dispatch", "cf7a", "wu01", plan.to_str().unwrap()]);
     assert!(dispatched.status.success());
     let body: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
@@ -1283,4 +1286,74 @@ fn a_packet_that_cannot_be_written_stays_on_the_view_and_is_written_on_the_next_
     let view = unit_status();
     assert!(view["packet_error"].is_null(), "{view}");
     assert_eq!(view["lifecycle"], "escalated");
+}
+
+const PACKET_REF: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+fn control_plan_file(core: &Core) -> PathBuf {
+    let path = core.config.home.join("control-plan.json");
+    let control = format!(
+        r#"{{"task_packet":"{PACKET_REF}","model":"haiku","effort":"low","permission":"dont_ask","working_dir":"{}"}}"#,
+        core.config.home.display()
+    );
+    fs::write(
+        &path,
+        format!(
+            r#"{{"control_vendor":"claude","plan":[{{"task":"wu01-t1","worker":{}}}],"control":{control}}}"#,
+            worker("implement", "standard")
+        ),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+#[ignore = "starts real processes; run with mise run spine-tests"]
+fn a_unit_with_a_control_start_spawns_and_instructs_its_control_session_before_dispatch() {
+    let spawner = launcher_double(Launcher::Resolve("a1", Duration::from_millis(500)));
+    let vendor = RecordingVendor::new(&spawner);
+    let gate = FixedGate::new(GateVerdict::Merged {
+        default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
+    });
+    let ports_vendor = vendor.clone();
+    let (core, _doubles, _ports) = start_core_with_spawner(
+        "control",
+        Arc::new(spawner.clone()),
+        Arc::new(gate),
+        test_timing(),
+        &move |ports, _| ports.vendor = Arc::new(ports_vendor.clone()),
+    );
+    let invocation = dispatch_plan(&core, &control_plan_file(&core));
+    let (status, body) = attach(&invocation);
+    assert_eq!(status, 200, "{body}");
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["lifecycle"], "done");
+    assert_eq!(view["control_delivery"]["key"], "wu01:task_packet:1");
+    assert_eq!(view["control_delivery"]["path"], "socket");
+    assert_eq!(
+        view["control_delivery"]["delivery"]["socket"],
+        DOUBLE_SOCKET
+    );
+    let sessions: Vec<String> = spawner
+        .log()
+        .spawned
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    println!("evidence: spawned in order {sessions:?}");
+    assert_eq!(sessions.len(), 2, "the control session and one worker");
+    assert_eq!(sessions[0], "cf7a.wu01.ctl.claude");
+    let calls = vendor.calls();
+    println!("evidence: vendor address calls {calls:?}");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].session, "cf7a.wu01.ctl.claude");
+    assert_eq!(calls[0].key, "wu01:task_packet:1");
+    assert!(calls[0].instruction.contains(PACKET_REF));
+    assert_eq!(
+        calls[0].spawns_before, 1,
+        "instructed after its own spawn and before any worker claimed a lease"
+    );
+    let (_, session_view) = call("/Session/cf7a.wu01.ctl.claude/status", "", None);
+    let session_view: serde_json::Value = serde_json::from_str(&session_view).unwrap();
+    assert_eq!(session_view["last_instruction"]["path"], "socket");
 }

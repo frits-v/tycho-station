@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use tycho_types::envelope::ShortText;
-use tycho_types::session::SessionName;
+use tycho_types::session::{SessionName, Vendor};
 use tycho_types::task_packet::{AbsolutePath, Effort};
 
 use crate::launch_spec::VendorTerminal;
@@ -80,8 +80,7 @@ pub struct ControlCommand {
     pub working_dir: PathBuf,
 }
 
-/// What became of one instruction posted to a session's inbox; `written` decides the
-/// fallback, because a second delivery through the terminal would repeat it.
+/// What became of one instruction; once `written`, nothing may deliver it again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Delivery {
@@ -93,10 +92,20 @@ pub enum Delivery {
     PostedUnclosed {
         socket: String,
     },
+    /// Some or all bytes were written, then the write or the half-close failed.
+    WriteInterrupted {
+        socket: String,
+        sent: usize,
+        reason: String,
+    },
     /// Written; the vendor answered with bytes no observed version sends.
     Replied {
         socket: String,
         reply: String,
+    },
+    /// Left in the session's relay directory for its launcher to post as the vendor user.
+    Relayed {
+        file: String,
     },
     /// No running process of the vendor holds this session id.
     NoSession,
@@ -114,8 +123,13 @@ pub enum Delivery {
     Denied {
         socket: String,
     },
+    /// Nothing was written before the write failed.
     WriteFailed {
         socket: String,
+        reason: String,
+    },
+    /// The socket refused the core and the relay could not take the instruction either.
+    RelayFailed {
         reason: String,
     },
     Unrecognised {
@@ -124,20 +138,32 @@ pub enum Delivery {
 }
 
 impl Delivery {
-    /// True when the instruction line may have reached the vendor.
+    /// True when the instruction may have reached the vendor or is held by the relay.
     #[must_use]
     pub const fn written(&self) -> bool {
         match self {
-            Self::Posted { .. } | Self::PostedUnclosed { .. } | Self::Replied { .. } => true,
+            Self::Posted { .. }
+            | Self::PostedUnclosed { .. }
+            | Self::WriteInterrupted { .. }
+            | Self::Replied { .. }
+            | Self::Relayed { .. } => true,
             Self::NoSession
             | Self::Unreadable { .. }
             | Self::NoSocket { .. }
             | Self::Refused { .. }
             | Self::Denied { .. }
             | Self::WriteFailed { .. }
+            | Self::RelayFailed { .. }
             | Self::Unrecognised { .. } => false,
         }
     }
+}
+
+/// The zmx session and the vendor session one instruction is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressTarget {
+    pub session: SessionName,
+    pub vendor_session: VendorSessionId,
 }
 
 /// Why a waiting session waits.
@@ -174,10 +200,13 @@ pub enum ContextReport {
 /// Blocking calls; services run them off the async runtime inside journaled steps.
 pub trait SessionVendor: Send + Sync + 'static {
     fn describe(&self) -> String;
+    /// Whether this port runs control sessions of the vendor.
+    fn serves(&self, vendor: Vendor) -> bool;
     /// The command for a fresh or resumed control session; the sandbox is passed every time.
     fn control_command(&self, launch: &ControlLaunch) -> Result<ControlCommand, VendorError>;
-    /// Posts one instruction into the running session's inbox; never retried once written.
-    fn address(&self, session: &VendorSessionId, instruction: &ShortText) -> Delivery;
+    /// Posts to the session's inbox, or relays it under the key when the socket refuses the core.
+    fn address(&self, target: &AddressTarget, key: &ShortText, instruction: &ShortText)
+        -> Delivery;
     fn observe(&self, session: &VendorSessionId) -> Observation;
     /// The handle a later `control_command` with `resume` takes.
     fn resume_handle(&self, session: &VendorSessionId) -> Result<ShortText, VendorError>;
@@ -195,11 +224,20 @@ impl SessionVendor for NoVendor {
         "no vendor".to_string()
     }
 
+    fn serves(&self, _vendor: Vendor) -> bool {
+        false
+    }
+
     fn control_command(&self, _launch: &ControlLaunch) -> Result<ControlCommand, VendorError> {
         Err(VendorError::Unsupported(NO_VENDOR))
     }
 
-    fn address(&self, _session: &VendorSessionId, _instruction: &ShortText) -> Delivery {
+    fn address(
+        &self,
+        _target: &AddressTarget,
+        _key: &ShortText,
+        _instruction: &ShortText,
+    ) -> Delivery {
         Delivery::Unrecognised {
             reason: NO_VENDOR.to_string(),
         }
@@ -240,6 +278,14 @@ mod tests {
                 socket: socket.clone(),
                 reply: "x".to_string(),
             },
+            Delivery::WriteInterrupted {
+                socket: socket.clone(),
+                sent: 1,
+                reason: "broken pipe".to_string(),
+            },
+            Delivery::Relayed {
+                file: "a.json".to_string(),
+            },
         ];
         let unwritten = [
             Delivery::NoSession,
@@ -258,6 +304,9 @@ mod tests {
             Delivery::WriteFailed {
                 socket,
                 reason: "broken pipe".to_string(),
+            },
+            Delivery::RelayFailed {
+                reason: "r".to_string(),
             },
             Delivery::Unrecognised {
                 reason: "r".to_string(),

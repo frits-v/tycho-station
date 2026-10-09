@@ -39,16 +39,20 @@ pub use crate::launch_spec::{
     VENDOR_TERMINAL_ENV,
 };
 use crate::process::{now_unix_ms, send};
+use crate::relay::{relay_dir, relay_once};
 use crate::spool::{
     spool_then_deliver, write_spool, Ack, Delivery, HeartbeatSend, Ingress, SpoolRecord,
     SPOOL_FILE, SPOOL_SCHEMA_VERSION,
 };
+use crate::vendors::claude_control::socket_of_pid;
 use crate::zmx::Zmx;
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// Three missed heartbeats make a lease stale.
 pub const LEASE_FRESH_MS: u64 = 30_000;
 pub const SUPERVISE_POLL: Duration = Duration::from_millis(250);
+/// Supervise polls between relay polls: one relay poll a second, ten per heartbeat interval.
+pub const RELAY_POLL_EVERY: u32 = 4;
 pub const LOG_FILE_MAX_BYTES: u64 = 1024 * 1024;
 const SEQUENCE_FILE_MAX_BYTES: usize = 32;
 const TERM_GRACE_POLLS_MAX: u32 = 20;
@@ -416,8 +420,38 @@ impl<I: Ingress> Run<'_, I> {
         Ok(child)
     }
 
-    /// Makes the vendor's group the pty's foreground group, so its reads are not stopped
-    /// with SIGTTIN; a read that raced the hand-over is resumed with SIGCONT.
+    /// Posts the instructions the core left in the relay directory to the vendor's inbox.
+    fn relay(&mut self, vendor_pid: u32) {
+        let (VendorTerminal::Inherit, Some(core_uid)) =
+            (self.settings.terminal, self.settings.core_uid)
+        else {
+            return;
+        };
+        let dir = relay_dir(&self.settings.dirs, &self.settings.env.session_name);
+        if !dir.exists() {
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME") else {
+            self.log.line("relay: HOME is not set");
+            return;
+        };
+        let config_dir = PathBuf::from(home).join(".claude");
+        let outcome = match socket_of_pid(&config_dir, vendor_pid) {
+            Ok(Some(socket)) => relay_once(&dir, core_uid, &socket),
+            Ok(None) => Ok(Vec::new()),
+            Err(reason) => Err(reason),
+        };
+        match outcome {
+            Ok(deliveries) => {
+                for delivery in deliveries {
+                    self.log.line(&format!("relay: {delivery:?}"));
+                }
+            }
+            Err(reason) => self.log.line(&format!("relay: {reason}")),
+        }
+    }
+
+    /// Makes the vendor's group the pty's foreground group so its reads are not stopped.
     fn hand_over_terminal(&mut self, pid: u32) {
         let Ok(raw) = i32::try_from(pid) else {
             self.log.line(&format!("vendor pid {pid} is not a pid"));
@@ -427,6 +461,7 @@ impl<I: Ingress> Run<'_, I> {
             self.log
                 .line(&format!("terminal not handed to the vendor: {error}"));
         }
+        // A read that raced the hand-over was stopped with SIGTTIN.
         if let Err(error) = send(pid, true, Signal::SIGCONT) {
             self.log.line(&error);
         }
@@ -434,6 +469,7 @@ impl<I: Ingress> Run<'_, I> {
 
     fn supervise(&mut self, child: &mut Child, stop_flag: &AtomicBool) -> (ChildEnd, Stop) {
         let mut last_beat: Option<Instant> = None;
+        let mut polls: u32 = 0;
         let started = Instant::now();
         let deadline = started
             .checked_add(self.settings.wall_clock)
@@ -459,6 +495,10 @@ impl<I: Ingress> Run<'_, I> {
             if last_beat.is_none_or(|beat| beat.elapsed() >= HEARTBEAT_INTERVAL) {
                 self.beat();
                 last_beat = Some(Instant::now());
+            }
+            polls = polls.wrapping_add(1);
+            if polls.is_multiple_of(RELAY_POLL_EVERY) {
+                self.relay(child.id());
             }
             thread::sleep(SUPERVISE_POLL);
         }

@@ -19,8 +19,7 @@ pub enum SpawnTerminal {
     Inherit,
 }
 
-/// One detached zmx session: the name, the launcher's argv, the launcher environment, and
-/// how and where the vendor runs.
+/// One detached zmx session: name, launcher argv and environment, and how the vendor runs.
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
     pub session: SessionName,
@@ -70,8 +69,7 @@ pub trait Spawner: Send + Sync + 'static {
     fn kill_by_name(&self, session: &SessionName) -> Result<(), SpawnerError>;
     /// Saves the session's scrollback as evidence and returns where it went.
     fn save_scrollback(&self, session: &SessionName) -> Result<ShortText, SpawnerError>;
-    /// Types one line into the session's stdin and submits it: a nudge, or an instruction
-    /// the vendor's inbox did not take.
+    /// Types one line into the session's stdin and submits it, for a nudge.
     fn send(&self, session: &SessionName, text: &ShortText) -> Result<(), SpawnerError>;
     /// Reads the lease file the launcher keeps for this session name.
     fn read_lease(&self, session: &SessionName) -> LeaseRead;

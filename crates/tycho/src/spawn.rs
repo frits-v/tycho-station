@@ -380,8 +380,7 @@ pub fn save_scrollback(
     Ok(path)
 }
 
-/// The bytes `send_line` types: zmx sends text without a carriage return, and a TUI submits
-/// the line only on one.
+/// The bytes `send_line` types: the text and the carriage return zmx does not add.
 #[must_use]
 pub fn typed_line(text: &ShortText) -> String {
     format!("{}\r", text.as_str())
