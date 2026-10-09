@@ -12,8 +12,12 @@ described in the design.
 
 ## Layout
 
+- `docs/mandate.md`: the station's highest instrument; every brief, ruling and case
+  operates under it.
 - `docs/design.html`: the design and requirements document, with mocks. Open it in a
   browser. The same page is published as a Claude artifact for comments.
+- `docs/slices.md`: the build plan, three slices with exit tests. Tracked as GitHub
+  issues and milestones.
 - `.worktrees/`: per-task git worktrees, ignored.
 - `xtask/`: build, check and release logic in Rust. `mise run ci` runs it.
 
