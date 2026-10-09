@@ -54,6 +54,12 @@ pub fn probe(http: &Http, ports: CorePorts, role: CoreRole) -> Health {
     }
 }
 
+/// Restate's ingress health route, which answers only once the ingress listens.
+#[must_use]
+pub fn probe_ingress(http: &Http, ports: CorePorts) -> Health {
+    decode_health(http.get(&ports.ingress_url("/restate/health")))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Registration {
     Created,
