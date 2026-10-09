@@ -236,11 +236,13 @@ fn run(program: &str, args: &[&str]) -> ExitStatus {
         })
 }
 
+/// A cargo build started here finds rustup's cargo on `PATH`, not the mise wrapper that
+/// routes it through the mbx cache, so builds start `mbx` with the cargo subcommand.
 fn ci() -> i32 {
     let steps: [(&str, &[&str]); 5] = [
         ("cargo", &["fmt", "--all", "--", "--check"]),
         (
-            "cargo",
+            "mbx",
             &[
                 "clippy",
                 "--workspace",
@@ -250,7 +252,7 @@ fn ci() -> i32 {
                 "warnings",
             ],
         ),
-        ("cargo", &["test", "--workspace"]),
+        ("mbx", &["test", "--workspace"]),
         (
             "zizmor",
             &["--pedantic", "--no-progress", ".github/workflows"],
@@ -555,7 +557,7 @@ fn hook_post_tool_use() -> i32 {
 fn hook_rust(path: &str) -> i32 {
     capture("cargo", &["fmt", "--", path]);
     let Some(output) = capture(
-        "cargo",
+        "mbx",
         &[
             "clippy",
             "-q",
