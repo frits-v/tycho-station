@@ -1,6 +1,7 @@
 //! Facts about a process from `ps` (uid, process group, start time, command line), decoded
 //! with an unrecognised state, and signals.
 
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -89,6 +90,28 @@ pub const fn start_matches(process_start_unix_seconds: u64, recorded_unix_ms: u6
     let recorded = recorded_unix_ms / 1000;
     process_start_unix_seconds <= recorded.saturating_add(START_LAG_MAX_SECONDS)
         && recorded.saturating_sub(process_start_unix_seconds) <= START_LEAD_MAX_SECONDS
+}
+
+/// `tycho session-leader -- <program> <arguments>`: becomes the leader of a new session with
+/// no controlling terminal, then execs the program; returns only the reason it could not.
+///
+/// Under zmx the pty is the launcher's controlling terminal, and a vendor in a background
+/// group there is stopped with `SIGTTOU` by any tool that sets terminal modes, such as `stty`
+/// in a login shell's startup file. The new session's group id is the vendor's pid, so the
+/// launcher's group signal reaches it and everything it starts.
+#[must_use]
+pub fn exec_session_leader(words: &[String]) -> String {
+    let Some(([separator, program], arguments)) = words.split_first_chunk::<2>() else {
+        return "expected -- <program> [arguments]".to_string();
+    };
+    if separator != "--" {
+        return format!("expected -- before the program, found {separator:?}");
+    }
+    if let Err(error) = nix::unistd::setsid() {
+        return format!("setsid: {error}");
+    }
+    let error = std::process::Command::new(program).args(arguments).exec();
+    format!("{program}: {error}")
 }
 
 #[must_use]

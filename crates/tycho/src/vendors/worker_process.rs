@@ -7,16 +7,11 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::Duration;
 
 use nix::sys::signal::Signal;
-use nix::unistd::{setsid, Uid, User};
+use nix::unistd::{Uid, User};
 use serde_json::{json, Value};
 use tycho_types::envelope::{
     CommitSha, Envelope, EscalationPayload, Payload, RecordId, ResultPayload, ENVELOPE_MAX_BYTES,
@@ -24,15 +19,13 @@ use tycho_types::envelope::{
 use tycho_types::launcher::ENV_SESSION_NAME;
 use tycho_types::session::{SessionName, Vendor};
 
-use crate::agent_files::{current_uid, read_checked, write_durable};
+use crate::agent_files::{current_uid, ensure_private_dir, read_checked, write_durable};
 use crate::command::run_captured;
 use crate::config::COMMAND_TIMEOUT;
 use crate::exit_decode::ChildEnd;
 use crate::launch_spec::{
     AGENT_TELEMETRY_ENV, PROGRESS_FILE_ENV, RESULT_FILE_ENV, VENDOR_SANDBOX_SETTINGS_ENV,
-    WALL_CLOCK_MAX,
 };
-use crate::launcher::watch_signals;
 use crate::process::{now_unix_ms, send};
 use crate::vendors::claude_worker::ClaudeWorker;
 use crate::vendors::codex_worker::{CodexWorker, CODEX_OUTPUT_SCHEMA};
@@ -47,9 +40,8 @@ pub const OUTPUT_SCHEMA_FILE: &str = "output-schema.json";
 pub const EXIT_COMPLETED: i32 = 0;
 pub const EXIT_NOT_COMPLETED: i32 = 1;
 pub const EXIT_REFUSED: i32 = 2;
-pub const SESSION_COMMAND: &str = "worker-session";
-/// Where the worker writes a certified question it raises instead of finishing, beside the
-/// result file; the vendor finds the path in `TYCHO_ESCALATION_FILE`.
+/// The spool subdirectory for a certified question, the only one the vendor's sandbox writes.
+pub const ESCALATION_DIR: &str = "escalation";
 pub const ESCALATION_FILE: &str = "escalation.json";
 pub const ESCALATION_FILE_ENV: &str = "TYCHO_ESCALATION_FILE";
 pub const WORD_ESCALATION_INVALID: &str = "vendor_escalation_invalid";
@@ -87,10 +79,13 @@ impl WorkerEnvironment {
             })
             .collect();
         let result = PathBuf::from(required(environment, RESULT_FILE_ENV)?);
-        let escalation = result.parent().map_or_else(
-            || PathBuf::from(ESCALATION_FILE),
-            |dir| dir.join(ESCALATION_FILE),
-        );
+        let escalation = result
+            .parent()
+            .map_or_else(
+                || PathBuf::from(ESCALATION_DIR),
+                |dir| dir.join(ESCALATION_DIR),
+            )
+            .join(ESCALATION_FILE);
         Ok(Self {
             escalation,
             result,
@@ -232,8 +227,58 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     write_durable(path, &bytes).map_err(|error| format!("{}: {error}", path.display()))
 }
 
+/// Bytes of detail a result file carries, well inside the launcher's result file cap.
+pub const DETAIL_MAX_BYTES: usize = 512;
+
+/// What the worker concluded: the state word, the envelope it carries, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conclusion {
+    pub word: String,
+    pub envelope: Option<Value>,
+    pub detail: Option<String>,
+}
+
+impl Conclusion {
+    fn bare(word: impl Into<String>) -> Self {
+        Self {
+            word: word.into(),
+            envelope: None,
+            detail: None,
+        }
+    }
+
+    fn failed(word: &str, detail: &str) -> Self {
+        let mut kept = String::new();
+        for character in detail.chars() {
+            if kept.len().saturating_add(character.len_utf8()) > DETAIL_MAX_BYTES {
+                break;
+            }
+            kept.push(character);
+        }
+        Self {
+            word: word.to_string(),
+            envelope: None,
+            detail: Some(kept),
+        }
+    }
+}
+
 fn write_result(path: &Path, state: &str, envelope: Option<&Value>) -> Result<(), String> {
-    write_json(path, &json!({"state": state, "envelope": envelope}))
+    write_conclusion(
+        path,
+        &Conclusion {
+            word: state.to_string(),
+            envelope: envelope.cloned(),
+            detail: None,
+        },
+    )
+}
+
+fn write_conclusion(path: &Path, conclusion: &Conclusion) -> Result<(), String> {
+    write_json(
+        path,
+        &json!({"state": conclusion.word, "envelope": conclusion.envelope, "detail": conclusion.detail}),
+    )
 }
 
 /// The worktree's HEAD, read by the worker after the vendor exits.
@@ -284,60 +329,18 @@ pub fn fold_stream(
     stream
 }
 
-/// `tycho worker-session -- <program> <arguments>`: leaves the launcher's terminal session,
-/// then becomes the vendor; returns only the reason it could not.
-///
-/// Under zmx the pty is the controlling terminal and the launcher puts the vendor in a
-/// background process group, so a vendor tool that touches the terminal, such as `stty` in a
-/// login shell's startup file, would stop the whole group with `SIGTTOU`.
-#[must_use]
-pub fn session_leader(words: &[String]) -> String {
-    let Some(([separator, program], arguments)) = words.split_first_chunk::<2>() else {
-        return "expected -- <program> [arguments]".to_string();
-    };
-    if separator != "--" {
-        return format!("expected -- before the program, found {separator:?}");
-    }
-    if let Err(error) = setsid() {
-        return format!("setsid: {error}");
-    }
-    let error = Command::new(program).args(arguments).exec();
-    format!("{program}: {error}")
-}
-
-/// Polls of the stop flag a run may take; the launcher's wall clock ends a run sooner.
-const FORWARD_POLLS_MAX: u64 = WALL_CLOCK_MAX.as_secs() * 4;
-const FORWARD_POLL: Duration = Duration::from_millis(250);
-const FORWARD_GRACE: Duration = Duration::from_secs(2);
-
-/// The vendor leads its own session, so the launcher's signal to this process's group does
-/// not reach it; a stop is passed on as SIGTERM, then SIGKILL, to the vendor's group.
-fn forward_stop(stop: &AtomicBool, done: &AtomicBool, vendor: u32) {
-    for _ in 0..FORWARD_POLLS_MAX {
-        if done.load(Ordering::SeqCst) {
-            return;
-        }
-        if stop.load(Ordering::SeqCst) {
-            drop(send(vendor, true, Signal::SIGTERM));
-            thread::sleep(FORWARD_GRACE);
-            drop(send(vendor, true, Signal::SIGKILL));
-            return;
-        }
-        thread::sleep(FORWARD_POLL);
-    }
-}
-
 fn spawn_vendor(
     command: &[String],
     args: &WorkerArgs,
     environment: &[(String, String)],
 ) -> Result<Child, String> {
-    let trampoline = std::env::current_exe().map_err(|error| error.to_string())?;
+    let (program, arguments) = command
+        .split_first()
+        .ok_or_else(|| "empty vendor command".to_string())?;
     let brief =
         File::open(&args.brief).map_err(|error| format!("{}: {error}", args.brief.display()))?;
-    Command::new(&trampoline)
-        .args([SESSION_COMMAND, "--"])
-        .args(command)
+    Command::new(program)
+        .args(arguments)
         .current_dir(&args.worktree)
         .env_clear()
         .envs(environment.iter().map(|(name, value)| (name, value)))
@@ -345,7 +348,7 @@ fn spawn_vendor(
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|error| format!("{}: {error}", trampoline.display()))
+        .map_err(|error| format!("{program}: {error}"))
 }
 
 /// Runs the vendor to its end; a refused stream kills it before it spends more.
@@ -355,11 +358,7 @@ fn run_vendor(
     run: &Prepared<'_>,
     events: &mut dyn Write,
 ) -> Result<(Stream, ChildEnd), String> {
-    let stop = watch_signals().map_err(|error| error.to_string())?;
     let mut child = spawn_vendor(command, run.args, &run.vendor_environment)?;
-    let done = Arc::new(AtomicBool::new(false));
-    let (vendor_pid, done_flag) = (child.id(), Arc::clone(&done));
-    let forwarder = thread::spawn(move || forward_stop(&stop, &done_flag, vendor_pid));
     let mut write_progress = |stream: &Stream| {
         drop(write_json(
             &run.environment.progress,
@@ -370,13 +369,23 @@ fn run_vendor(
         fold_stream(vendor, stdout, events, &mut write_progress)
     });
     if stream.refusal.is_some() {
-        drop(send(child.id(), true, Signal::SIGKILL));
+        // The vendor shares this process's group, which the launcher signals as a whole.
+        drop(send(child.id(), false, Signal::SIGKILL));
     }
     let end = child.wait().map_or(ChildEnd::Unknown, ChildEnd::from);
-    done.store(true, Ordering::SeqCst);
-    drop(forwarder.join());
     write_progress(&stream);
     Ok((stream, end))
+}
+
+/// Creates the escalation directory and returns the settings that let the vendor write it.
+fn escalation_settings(run: &Prepared<'_>) -> Result<String, String> {
+    let dir = run
+        .environment
+        .escalation
+        .parent()
+        .ok_or_else(|| "the escalation file has no directory".to_string())?;
+    ensure_private_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
+    worker_settings(&run.environment.settings, dir)
 }
 
 /// Everything checked before the vendor runs.
@@ -404,7 +413,7 @@ fn check_version(vendor: &dyn WorkerVendor, run: &Prepared<'_>) -> Result<(), Re
 }
 
 /// The state word and the envelope a completed run carries.
-fn conclude(run: &Prepared<'_>, stream: &Stream, end: ChildEnd) -> (String, Option<Value>) {
+fn conclude(run: &Prepared<'_>, stream: &Stream, end: ChildEnd) -> Conclusion {
     if stream.refusal.is_none() {
         if let Some(escalated) = escalated(run) {
             return escalated;
@@ -412,7 +421,7 @@ fn conclude(run: &Prepared<'_>, stream: &Stream, end: ChildEnd) -> (String, Opti
     }
     let word = state_word(stream, end);
     if word != "completed" {
-        return (word, None);
+        return Conclusion::bare(word);
     }
     let claim = head_commit(&run.args.worktree).and_then(|head| {
         result_envelope(
@@ -426,22 +435,30 @@ fn conclude(run: &Prepared<'_>, stream: &Stream, end: ChildEnd) -> (String, Opti
         )
     });
     claim.map_or_else(
-        |_| ("failed".to_string(), None),
-        |envelope| (word, Some(envelope)),
+        |error| Conclusion::failed("failed", &format!("no result envelope: {error}")),
+        |envelope| Conclusion {
+            word,
+            envelope: Some(envelope),
+            detail: None,
+        },
     )
 }
 
 /// A certified question the worker raised outranks how its stream ended.
-fn escalated(run: &Prepared<'_>) -> Option<(String, Option<Value>)> {
-    let invalid = || (WORD_ESCALATION_INVALID.to_string(), None);
+fn escalated(run: &Prepared<'_>) -> Option<Conclusion> {
+    let invalid = |error: &str| Conclusion::failed(WORD_ESCALATION_INVALID, error);
     match read_escalation(&run.environment.escalation) {
         EscalationRead::Absent => None,
-        EscalationRead::Invalid(_) => Some(invalid()),
+        EscalationRead::Invalid(error) => Some(invalid(&error)),
         EscalationRead::Certified(payload) => Some(
             escalation_envelope(run.args, &run.environment.session, payload, now_unix_ms())
                 .map_or_else(
-                    |_| invalid(),
-                    |envelope| ("escalated".to_string(), Some(envelope)),
+                    |error| invalid(&error),
+                    |envelope| Conclusion {
+                        word: "escalated".to_string(),
+                        envelope: Some(envelope),
+                        detail: None,
+                    },
                 ),
         ),
     }
@@ -487,14 +504,43 @@ pub fn run(
             return Err(error);
         }
     };
-    let (word, envelope) = conclude(&prepared, &stream, end);
-    let completed = word == "completed";
-    write_result(&environment.result, &word, envelope.as_ref())?;
+    let conclusion = conclude(&prepared, &stream, end);
+    let completed = conclusion.word == "completed";
+    write_conclusion(&environment.result, &conclusion)?;
     Ok(if completed {
         EXIT_COMPLETED
     } else {
         EXIT_NOT_COMPLETED
     })
+}
+
+/// The sandbox settings the launcher handed over, with the escalation directory added to the
+/// sandbox's writable paths and to the session's directories; nothing else of the spool is.
+pub fn worker_settings(base: &str, escalation_dir: &Path) -> Result<String, String> {
+    let mut settings: Value =
+        serde_json::from_str(base).map_err(|error| format!("sandbox settings: {error}"))?;
+    let dir = Value::String(escalation_dir.display().to_string());
+    for (section, key) in [
+        (["sandbox", "filesystem"], "allowWrite"),
+        (["permissions", ""], "additionalDirectories"),
+    ] {
+        let mut node = &mut settings;
+        for part in section.iter().filter(|part| !part.is_empty()) {
+            node = node
+                .as_object_mut()
+                .ok_or_else(|| format!("sandbox settings: {part} is not an object"))?
+                .entry(*part)
+                .or_insert_with(|| json!({}));
+        }
+        node.as_object_mut()
+            .ok_or_else(|| format!("sandbox settings: {key}'s parent is not an object"))?
+            .entry(key)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| format!("sandbox settings: {key} is not a list"))?
+            .push(dir.clone());
+    }
+    serde_json::to_string(&settings).map_err(|error| error.to_string())
 }
 
 /// Writes the output schema beside the result file and builds the vendor's command.
@@ -513,7 +559,7 @@ fn prepare_command(vendor: &dyn WorkerVendor, run: &Prepared<'_>) -> Result<Vec<
         // The result is the branch head, so every headless task commits.
         requires_commit: true,
         session_id: run.args.session_id.clone(),
-        settings: run.environment.settings.clone(),
+        settings: escalation_settings(run)?,
         output_schema: schema,
     };
     match vendor.command(&run.args.binary, &task) {
@@ -577,7 +623,7 @@ pub mod tests {
         assert_eq!(tycho, vec![&ESCALATION_FILE_ENV], "{names:?}");
         assert!(pairs.contains(&(
             ESCALATION_FILE_ENV.to_string(),
-            "/spool/escalation.json".to_string()
+            "/spool/escalation/escalation.json".to_string()
         )));
         assert_eq!(names.len(), 5 + AGENT_TELEMETRY_ENV.len());
     }
@@ -722,6 +768,63 @@ pub mod tests {
         );
         let other = SessionName::parse("cf7a.wu03.wrk.claude.b2c4").unwrap();
         assert!(crate::spool::escalation_rejection(&envelope, &other).is_err());
+    }
+
+    #[test]
+    fn a_completed_stream_without_a_head_says_why_it_failed() {
+        let environment = WorkerEnvironment::from_map(&launcher_environment()).unwrap();
+        let args = WorkerArgs {
+            worktree: PathBuf::from("/nonexistent/worktree"),
+            ..args()
+        };
+        let prepared = Prepared {
+            args: &args,
+            environment: &environment,
+            vendor_environment: Vec::new(),
+        };
+        let stream = Stream {
+            end: Some(crate::vendors::worker::VendorEnd::Completed),
+            ..Stream::default()
+        };
+        let conclusion = conclude(&prepared, &stream, ChildEnd::Exited(0));
+        assert_eq!(conclusion.word, "failed");
+        assert!(conclusion.envelope.is_none());
+        let detail = conclusion.detail.unwrap();
+        assert!(detail.starts_with("no result envelope: "), "{detail}");
+        let long = Conclusion::failed("failed", &"é".repeat(DETAIL_MAX_BYTES));
+        assert!(long.detail.unwrap().len() <= DETAIL_MAX_BYTES);
+    }
+
+    #[test]
+    fn only_the_escalation_directory_is_added_to_the_sandbox() {
+        let base = crate::spawn::CLAUDE_SANDBOX_SETTINGS;
+        let settings: Value =
+            serde_json::from_str(&worker_settings(base, Path::new("/spool/escalation")).unwrap())
+                .unwrap();
+        assert_eq!(
+            settings["sandbox"]["filesystem"]["allowWrite"],
+            json!(["/spool/escalation"])
+        );
+        assert_eq!(
+            settings["permissions"]["additionalDirectories"],
+            json!(["/spool/escalation"])
+        );
+        assert_eq!(settings["sandbox"]["enabled"], json!(true));
+        assert_eq!(
+            settings["sandbox"]["allowUnsandboxedCommands"],
+            json!(false)
+        );
+        let text = settings.to_string();
+        assert!(
+            !text.contains("result.json") && !text.contains("progress.json"),
+            "{text}"
+        );
+        assert!(worker_settings("[]", Path::new("/e")).is_err());
+        assert!(worker_settings(
+            r#"{"sandbox":{"filesystem":{"allowWrite":"x"}}}"#,
+            Path::new("/e")
+        )
+        .is_err());
     }
 
     #[test]

@@ -1,5 +1,5 @@
-//! The session trampoline a headless worker runs its vendor through: under a pseudo-terminal,
-//! a program started through `tycho worker-session` has no controlling terminal, so a tool
+//! The session trampoline the launcher runs every vendor through: under a pseudo-terminal,
+//! a program started through `tycho session-leader` has no controlling terminal, so a tool
 //! that touches the terminal cannot stop the vendor's process group.
 #![allow(
     clippy::unwrap_used,
@@ -51,13 +51,13 @@ fn probe(prefix: &str) -> String {
 #[test]
 fn a_program_under_the_trampoline_has_no_controlling_terminal() {
     assert_eq!(probe(""), "attached");
-    assert_eq!(probe(&format!("{TYCHO} worker-session --")), "detached");
+    assert_eq!(probe(&format!("{TYCHO} session-leader --")), "detached");
 }
 
 #[test]
 fn the_trampoline_refuses_a_command_without_its_separator() {
     let output = Command::new(TYCHO)
-        .args(["worker-session", "/bin/true"])
+        .args(["session-leader", "/bin/true"])
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2));

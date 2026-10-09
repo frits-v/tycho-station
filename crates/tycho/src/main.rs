@@ -45,7 +45,7 @@ const USAGE: &str = "usage: tycho <command>
   launch --spec <spec file> [--tier <tier>]   run a vendor session: lease, heartbeat, spool, resolve
   launch --replay <spool file>    deliver a spooled result that was never acknowledged
   worker --vendor <vendor> ...    run one headless worker inside a launcher session
-  worker-session -- <program> ... run a program as the leader of a new session";
+  session-leader -- <program> ... run a program as the leader of a new session";
 
 fn main() {
     let arguments: Vec<String> = env::args().skip(1).collect();
@@ -91,7 +91,7 @@ fn main() {
         ["launch", "--replay", spool] => replay(spool),
         ["launch", "--spec", spec] => launch(spec, None),
         ["launch", "--spec", spec, "--tier", tier] => launch(spec, Some(tier)),
-        ["worker" | "worker-session", ..] => worker(&arguments),
+        ["worker" | "session-leader", ..] => worker(&arguments),
         ["graph", "build", checkout, unit] => report_result(graph::build(checkout, unit)),
         ["graph", "query", checkout, kind, argument] => {
             report_result(graph::query(checkout, kind, argument))
@@ -118,7 +118,15 @@ fn launch(spec: &str, tier: Option<&str>) -> i32 {
     let taken = launcher::core_uid_from_environment().and_then(|core_uid| {
         let tier = tier.map(launcher::check_tier).transpose()?;
         let (settings, vendor) = launcher::take_spec(Path::new(spec), core_uid)?;
-        Ok((launcher::LauncherSettings { tier, ..settings }, vendor))
+        let session_leader = Some(env::current_exe().map_err(launcher::SettingsError::CurrentExe)?);
+        Ok((
+            launcher::LauncherSettings {
+                tier,
+                session_leader,
+                ..settings
+            },
+            vendor,
+        ))
     });
     let (settings, vendor) = match taken {
         Ok(taken) => taken,
@@ -144,14 +152,14 @@ fn launch(spec: &str, tier: Option<&str>) -> i32 {
 }
 
 /// The launcher's vendor command for a headless worker, whose event stream goes to stdout,
-/// and the session trampoline it runs the vendor through.
+/// and the session trampoline the launcher runs every vendor through.
 fn worker(arguments: &[String]) -> i32 {
     let words = arguments.get(1..).unwrap_or_default();
     if arguments
         .first()
-        .is_some_and(|command| command == "worker-session")
+        .is_some_and(|command| command == "session-leader")
     {
-        return worker_session(words);
+        return session_leader(words);
     }
     let environment = env::vars().collect();
     let mut stdout = std::io::stdout();
@@ -165,10 +173,10 @@ fn worker(arguments: &[String]) -> i32 {
 }
 
 /// Never returns on success: the process becomes the vendor in a session of its own.
-fn worker_session(words: &[String]) -> i32 {
-    let error = tycho::vendors::worker_process::session_leader(words);
-    eprintln!("tycho: worker-session: {error}");
-    tycho::vendors::worker_process::EXIT_REFUSED
+fn session_leader(words: &[String]) -> i32 {
+    let error = tycho::process::exec_session_leader(words);
+    eprintln!("tycho: session-leader: {error}");
+    launcher::EXIT_REFUSED_TO_START
 }
 
 fn replay(spool: &str) -> i32 {

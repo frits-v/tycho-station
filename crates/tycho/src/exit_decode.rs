@@ -117,6 +117,9 @@ pub fn status_payload(
 pub struct ResultReport {
     pub state: String,
     pub envelope: Option<serde_json::Value>,
+    /// Why the vendor adapter chose this state, for the launcher's log; never decoded.
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -270,6 +273,7 @@ pub mod tests {
         ResultFile::Report(ResultReport {
             state: state.to_string(),
             envelope,
+            detail: None,
         })
     }
 

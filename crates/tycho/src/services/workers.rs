@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tycho_types::envelope::{CommitSha, ShortText};
+use tycho_types::envelope::CommitSha;
 use tycho_types::service::{Attempt, WorkUnitId};
 use tycho_types::session::{SessionName, Vendor};
 use tycho_types::task_packet::Effort;
@@ -58,12 +58,67 @@ pub struct WorkerPlacement {
     pub control: SessionName,
 }
 
+impl WorkerPlacement {
+    /// The placement for the next task of the attempt, based on the head the last one left.
+    #[must_use]
+    pub fn after(&self, head: &CommitSha) -> Self {
+        Self {
+            worktree: Worktree {
+                base: head.clone(),
+                ..self.worktree.clone()
+            },
+            control: self.control.clone(),
+        }
+    }
+}
+
+/// Bytes a brief may hold; it is journaled with the task, so it stays small.
+pub const BRIEF_MAX_BYTES: usize = 8192;
+
+/// A worker's brief: up to 8 KiB of text, newlines allowed, no other control characters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Brief(String);
+
+impl Brief {
+    pub fn parse(text: &str) -> Result<Self, String> {
+        if text.is_empty() || text.len() > BRIEF_MAX_BYTES {
+            return Err(format!(
+                "a brief is 1..={BRIEF_MAX_BYTES} bytes, not {}",
+                text.len()
+            ));
+        }
+        if let Some(control) = text.chars().find(|c| c.is_control() && *c != '\n') {
+            return Err(format!("a brief holds the control character {control:?}"));
+        }
+        Ok(Self(text.to_string()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for Brief {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(&value)
+    }
+}
+
+impl From<Brief> for String {
+    fn from(value: Brief) -> Self {
+        value.0
+    }
+}
+
 /// A headless task in the plan; the unit adds the placement before the worker run starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerTaskRequest {
     /// The brief the worker receives on stdin.
-    pub brief: ShortText,
+    pub brief: Brief,
     pub max_turns: Option<NonZeroU16>,
     #[serde(default)]
     pub placement: Option<WorkerPlacement>,
@@ -75,7 +130,8 @@ pub struct WorkerTaskRequest {
 pub struct WorkerEvidence {
     pub session: SessionName,
     pub resume_handle: Option<String>,
-    pub context_tokens: u64,
+    /// `None` when the session has no view to read it from.
+    pub context_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,7 +425,7 @@ mod tests {
             .unwrap();
         let ports = ports(repositories, project);
         let task = WorkerTaskRequest {
-            brief: ShortText::parse("Make widget::answer return 42.").unwrap(),
+            brief: Brief::parse("Make widget::answer return 42.").unwrap(),
             max_turns: NonZeroU16::new(8),
             placement: Some(WorkerPlacement {
                 worktree: worktree.clone(),
@@ -418,5 +474,38 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn briefs_are_bounded_text() {
+        assert!(Brief::parse("line one\nline two").is_ok());
+        assert!(Brief::parse(&"b".repeat(BRIEF_MAX_BYTES)).is_ok());
+        for bad in [
+            String::new(),
+            "b".repeat(BRIEF_MAX_BYTES + 1),
+            "tab\there".to_string(),
+        ] {
+            assert!(Brief::parse(&bad).is_err(), "{bad:?}");
+        }
+        assert!(serde_json::from_str::<Brief>("\"\"").is_err());
+    }
+
+    #[test]
+    fn a_second_task_starts_from_the_head_the_first_one_left() {
+        let worktree = Worktree {
+            path: PathBuf::from("/agent/worktrees/cf7a/wu01/a1"),
+            branch: unit_branch(&unit(), Attempt::FIRST).unwrap(),
+            base: CommitSha::parse("0123456789abcdef0123456789abcdef01234567").unwrap(),
+        };
+        let placement = WorkerPlacement {
+            worktree: worktree.clone(),
+            control: SessionName::parse("cf7a.wu01.ctl.claude").unwrap(),
+        };
+        let head = CommitSha::parse("1123456789abcdef0123456789abcdef01234567").unwrap();
+        let next = placement.after(&head);
+        assert_eq!(next.worktree.base, head);
+        assert_eq!(next.worktree.path, worktree.path);
+        assert_eq!(next.worktree.branch, worktree.branch);
+        assert_eq!(next.control, placement.control);
     }
 }

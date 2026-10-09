@@ -6,14 +6,22 @@ use std::path::PathBuf;
 use tycho_types::envelope::ShortText;
 use tycho_types::session::SessionName;
 
-use crate::config::AgentDirs;
-use crate::kill::{kill_by_name, kill_session, KillRequest};
+use std::io::Write;
+
+use crate::agent_files::open_append;
+use crate::config::{AgentDirs, LOG_DIR};
+use crate::kill::{kill_by_name, kill_session, KillReport, KillRequest};
 use crate::launch_spec::HeartbeatTarget;
+use crate::private_dir;
+use crate::process::now_unix_ms;
 use crate::services::spawner::{LeaseRead, SpawnSpec, Spawner, SpawnerError};
 use crate::spawn::{
     read_lease, save_scrollback, send_line, spawn_session, split_tier, SpawnOutcome, SpawnRequest,
 };
 use crate::zmx::Zmx;
+
+/// Under the core home's log directory.
+pub const KILL_LOG: &str = "kills.log";
 
 #[derive(Debug, Clone)]
 pub struct LauncherSpawner {
@@ -45,6 +53,30 @@ fn spawned_pid(outcome: SpawnOutcome) -> Result<u32, SpawnerError> {
     }
 }
 
+/// One line of the kill log: when, which session and pid, and every verdict of the report.
+#[must_use]
+pub fn kill_line(session: &SessionName, pid: u32, report: &KillReport) -> String {
+    format!(
+        "{} kill {session} pid {pid}: zmx {:?}, launcher {:?}, vendor {:?}\n",
+        now_unix_ms(),
+        report.zmx_kill,
+        report.launcher,
+        report.vendor
+    )
+}
+
+impl LauncherSpawner {
+    fn log_kill(&self, line: &str) -> Result<(), SpawnerError> {
+        let dir = self.core_home.join(LOG_DIR);
+        let path = dir.join(KILL_LOG);
+        private_dir::ensure(&[self.core_home.clone(), dir])
+            .map_err(|error| SpawnerError::Transient(error.to_string()))?;
+        open_append(&path)
+            .and_then(|mut file| file.write_all(line.as_bytes()))
+            .map_err(|error| SpawnerError::Transient(format!("{}: {error}", path.display())))
+    }
+}
+
 impl Spawner for LauncherSpawner {
     fn describe(&self) -> String {
         format!("launcher under zmx in {}", self.dirs.socket_dir.display())
@@ -71,7 +103,8 @@ impl Spawner for LauncherSpawner {
         .and_then(spawned_pid)
     }
 
-    /// Succeeds once zmx killed the session by name; the report's signals are best effort.
+    /// Succeeds once zmx killed the session by name; the launcher and vendor verdicts go to
+    /// the kill log, and a log that cannot be written fails the kill so the step retries.
     fn kill(&self, session: &SessionName, pid: u32) -> Result<(), SpawnerError> {
         let report = kill_session(&KillRequest {
             zmx: &self.zmx,
@@ -81,6 +114,7 @@ impl Spawner for LauncherSpawner {
             agent_uid: self.agent_uid,
             tycho: &self.tycho,
         });
+        self.log_kill(&kill_line(session, pid, &report))?;
         report.zmx_kill.map_err(SpawnerError::Transient)
     }
 
@@ -106,7 +140,42 @@ impl Spawner for LauncherSpawner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use tycho_types::lease::RequeueReason;
+
+    #[test]
+    fn a_kill_logs_both_verdicts() {
+        use crate::kill::{KillRefusal, KillVerdict};
+        let home = std::env::temp_dir().join(format!("tycho-kill-log-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&home));
+        std::fs::create_dir_all(&home).unwrap();
+        let spawner = LauncherSpawner {
+            zmx: Zmx::agent(Path::new("/usr/bin/true"), &home),
+            dirs: AgentDirs::new(home.join("agent")).unwrap(),
+            tycho: PathBuf::from("/opt/tycho"),
+            home: home.clone(),
+            core_home: home.join("core"),
+            agent_uid: 1,
+            heartbeat: HeartbeatTarget::Session,
+        };
+        let report = KillReport {
+            zmx_kill: Ok(()),
+            launcher: KillVerdict::Refused(KillRefusal::CoreUid),
+            vendor: Some(KillVerdict::Signalled),
+        };
+        let session = SessionName::parse("cf7a.wu01.wrk.claude.a1f3").unwrap();
+        spawner.log_kill(&kill_line(&session, 42, &report)).unwrap();
+        let log = std::fs::read_to_string(home.join("core").join(LOG_DIR).join(KILL_LOG)).unwrap();
+        assert!(
+            log.contains("kill cf7a.wu01.wrk.claude.a1f3 pid 42"),
+            "{log}"
+        );
+        assert!(
+            log.contains("launcher Refused(CoreUid)") && log.contains("vendor Some(Signalled)"),
+            "{log}"
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
 
     #[test]
     fn every_spawn_outcome_maps_to_a_pid_or_a_refusal() {

@@ -19,7 +19,7 @@ use crate::code_graph::StepKey;
 use crate::config::spine;
 use crate::config_store::{FactoryConfig, UnitConfig};
 use crate::packets::{self, Blocker, PacketContext, PacketError};
-use crate::repositories::{pin_ref, unit_branch, Worktree};
+use crate::repositories::{pin_ref, unit_branch, RepositoryError, Worktree};
 use crate::services::epic::EpicClient;
 use crate::services::merge_gate::{Claim, GateError, GateVerdict, MergeGate, VerifyRequest};
 use crate::services::worker_run::{
@@ -892,7 +892,7 @@ impl WorkUnit {
         attempt: Attempt,
     ) -> Result<AttemptEnd, TerminalError> {
         let mut claims = Vec::new();
-        let placement = self.place(unit, unit_id, request, attempt).await?;
+        let mut placement = self.place(unit, unit_id, request, attempt).await?;
         for planned in &request.plan {
             let mut worker = planned.worker.clone();
             worker.epic = request.epic.clone();
@@ -920,6 +920,7 @@ impl WorkUnit {
                         self.checkpoint(unit, unit_id, attempt, &checkpointed)
                             .await?;
                     }
+                    placement = placement.map(|placed| placed.after(&result.head_sha));
                     claims.push(Claim {
                         task: planned.task.clone(),
                         branch: result.branch,
@@ -981,10 +982,11 @@ impl WorkUnit {
                         .repositories
                         .clone_worktree(&cloner.project, &path, &branch)
                         .map(Json)
-                        .map_err(|error| refuse(CODE_INTERNAL, error.to_string()))
+                        .map_err(repository_failure)
                 })
             })
             .name("worktree")
+            .retry_policy(unit.timing.port_retry())
             .await?
             .into_inner();
         unit.view.worktree = Some(worktree.clone());
@@ -1066,10 +1068,11 @@ impl WorkUnit {
                     pinner
                         .repositories
                         .pin(&pinner.project, &worktree, &head, &pin_name)
-                        .map_err(|error| refuse(CODE_INTERNAL, error.to_string()))
+                        .map_err(repository_failure)
                 })
             })
             .name("pin")
+            .retry_policy(unit.timing.port_retry())
             .await?;
         unit.view
             .checkpoints
@@ -1144,9 +1147,37 @@ impl Checkpointed<'_> {
                 .evidence
                 .and_then(|evidence| evidence.resume_handle.clone()),
             session: self.evidence.map(|evidence| evidence.session.to_string()),
-            context_tokens: self.evidence.map(|evidence| evidence.context_tokens),
+            context_tokens: self.evidence.and_then(|evidence| evidence.context_tokens),
             reason: "result".to_string(),
         }
+    }
+}
+
+/// What a repository step does with an error: retry under the port policy, or stop the unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepFailure {
+    Retry(String),
+    Refuse(String),
+}
+
+#[must_use]
+pub fn classify_repository(error: &RepositoryError) -> StepFailure {
+    if error.is_transient() {
+        StepFailure::Retry(error.to_string())
+    } else {
+        StepFailure::Refuse(error.to_string())
+    }
+}
+
+/// A git that could not run retries; a decoded refusal is terminal.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "map_err hands the error over by value"
+)]
+fn repository_failure(error: RepositoryError) -> HandlerError {
+    match classify_repository(&error) {
+        StepFailure::Retry(reason) => HandlerError::from(std::io::Error::other(reason)),
+        StepFailure::Refuse(reason) => refuse(CODE_INTERNAL, reason),
     }
 }
 
@@ -1224,6 +1255,30 @@ mod tests {
             Lifecycle::Done,
         ),
     ];
+
+    #[test]
+    fn a_git_that_could_not_run_retries_and_a_refusal_stops_the_unit() {
+        let timed_out = RepositoryError::CouldNotRun("fetch: did not finish within 300s".into());
+        assert!(matches!(
+            classify_repository(&timed_out),
+            StepFailure::Retry(_)
+        ));
+        assert!(matches!(
+            classify_repository(&RepositoryError::Io("disk full".into())),
+            StepFailure::Retry(_)
+        ));
+        for refusal in [
+            RepositoryError::Git("clone exited with 128".into()),
+            RepositoryError::NotFetched("1123".into()),
+            RepositoryError::Input("outside the root".into()),
+            RepositoryError::Unrecognised("merge-base exited 128".into()),
+        ] {
+            assert!(
+                matches!(classify_repository(&refusal), StepFailure::Refuse(_)),
+                "{refusal}"
+            );
+        }
+    }
 
     #[test]
     fn the_transition_table_is_exactly_the_figure() {

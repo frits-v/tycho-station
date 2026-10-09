@@ -29,6 +29,8 @@ pub const GIT_TIMEOUT: Duration = Duration::from_secs(300);
 /// The identity of commits made in a worktree; the worktree never signs.
 pub const WORKER_NAME: &str = "Tycho Worker";
 pub const WORKER_EMAIL: &str = "worker@tycho.invalid";
+/// A worktree's `origin` push URL: a path that cannot exist, so a push from the worktree fails.
+pub const PUSH_DISABLED: &str = "/dev/null/push-disabled";
 const GIT_ENVIRONMENT: [(&str, &str); 3] = [
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ("GIT_CONFIG_NOSYSTEM", "1"),
@@ -45,9 +47,24 @@ const GIT_REMOVED: [&str; 4] = [
 pub enum RepositoryError {
     Input(String),
     Io(String),
-    /// git could not run, or ran and failed: the command and its report.
+    /// git could not start, timed out or overran its output cap: worth a retry.
+    CouldNotRun(String),
+    /// git ran and refused: the command and its report.
     Git(String),
+    /// The worker's head is not on the branch the fetch brought in.
+    NotFetched(String),
     Unrecognised(String),
+}
+
+impl RepositoryError {
+    /// Only a git that could not run, or a file system error, is worth another try.
+    #[must_use]
+    pub const fn is_transient(&self) -> bool {
+        match self {
+            Self::Io(_) | Self::CouldNotRun(_) => true,
+            Self::Input(_) | Self::Git(_) | Self::NotFetched(_) | Self::Unrecognised(_) => false,
+        }
+    }
 }
 
 impl fmt::Display for RepositoryError {
@@ -55,7 +72,9 @@ impl fmt::Display for RepositoryError {
         match self {
             Self::Input(reason) => write!(formatter, "repository input: {reason}"),
             Self::Io(reason) => write!(formatter, "repository file system: {reason}"),
+            Self::CouldNotRun(reason) => write!(formatter, "git could not run: {reason}"),
             Self::Git(reason) => write!(formatter, "git {reason}"),
+            Self::NotFetched(reason) => write!(formatter, "not from the fetched branch: {reason}"),
             Self::Unrecognised(reason) => write!(formatter, "git output not recognised: {reason}"),
         }
     }
@@ -217,9 +236,10 @@ impl Repositories {
             .join(format!("{session}.md"))
     }
 
-    fn git(&self, arguments: &[&str]) -> Result<Captured, RepositoryError> {
+    /// Runs git and returns whatever exit status it ends with.
+    fn git_status(&self, arguments: &[&str]) -> Result<Captured, RepositoryError> {
         let removed: Vec<OsString> = GIT_REMOVED.iter().map(OsString::from).collect();
-        let captured = run_status_capped(
+        run_status_capped(
             &self.git,
             arguments,
             &GIT_ENVIRONMENT,
@@ -227,7 +247,11 @@ impl Repositories {
             GIT_TIMEOUT,
             COMMAND_OUTPUT_MAX_BYTES,
         )
-        .map_err(|error| RepositoryError::Git(format!("{}: {error}", arguments.join(" "))))?;
+        .map_err(|error| RepositoryError::CouldNotRun(format!("{}: {error}", arguments.join(" "))))
+    }
+
+    fn git(&self, arguments: &[&str]) -> Result<Captured, RepositoryError> {
+        let captured = self.git_status(arguments)?;
         if !captured.status.success() {
             return Err(RepositoryError::Git(format!(
                 "{} exited with {}: {}",
@@ -321,6 +345,8 @@ impl Repositories {
         let worktree = text(path);
         for arguments in [
             ["checkout", "-q", "-b", branch.as_str()],
+            // Only the core moves work out of a worktree, by fetching from it.
+            ["config", "remote.origin.pushurl", PUSH_DISABLED, ""],
             ["config", "commit.gpgsign", "false", ""],
             ["config", "user.name", WORKER_NAME, ""],
             ["config", "user.email", WORKER_EMAIL, ""],
@@ -359,6 +385,7 @@ impl Repositories {
             &text(&worktree.path),
             &refspec,
         ])?;
+        self.check_fetched(&canonical, head)?;
         self.git(&["-C", &canonical, "update-ref", pin, head.as_str()])?;
         let pinned = self.rev_parse(Path::new(&canonical), pin)?;
         if pinned != *head {
@@ -367,6 +394,27 @@ impl Repositories {
             )));
         }
         Ok(())
+    }
+
+    /// `merge-base --is-ancestor <head> FETCH_HEAD`: exit 0 is on the branch, 1 is not, and
+    /// anything else is unrecognised.
+    fn check_fetched(&self, canonical: &str, head: &CommitSha) -> Result<(), RepositoryError> {
+        let captured = self.git_status(&[
+            "-C",
+            canonical,
+            "merge-base",
+            "--is-ancestor",
+            head.as_str(),
+            "FETCH_HEAD",
+        ])?;
+        match captured.status.code() {
+            Some(0) => Ok(()),
+            Some(1) => Err(RepositoryError::NotFetched(head.to_string())),
+            other => Err(RepositoryError::Unrecognised(format!(
+                "merge-base exited {other:?}: {}",
+                captured.stderr.trim()
+            ))),
+        }
     }
 
     /// The commit a ref of the canonical repository points at.
@@ -533,6 +581,26 @@ pub(crate) mod tests {
         assert_eq!(git(&path, &["branch", "--show-current"]).trim(), "wu01/a1");
         assert_eq!(git(&path, &["config", "commit.gpgsign"]).trim(), "false");
         assert_eq!(
+            git(&path, &["config", "remote.origin.pushurl"]).trim(),
+            PUSH_DISABLED
+        );
+        let push = Command::new("git")
+            .args([
+                "-C",
+                &text(&path),
+                "push",
+                "-q",
+                "origin",
+                "HEAD:refs/heads/escape",
+            ])
+            .envs(GIT_ENVIRONMENT)
+            .output()
+            .unwrap();
+        assert!(
+            !push.status.success(),
+            "a push from the worktree reached origin"
+        );
+        assert_eq!(
             git(&path, &["rev-parse", "HEAD"]).trim(),
             worktree.base.as_str()
         );
@@ -574,6 +642,27 @@ pub(crate) mod tests {
         let missing = CommitSha::parse("1123456789abcdef0123456789abcdef01234567").unwrap();
         assert!(repositories
             .pin(&project, &worktree, &missing, &pin_ref(&unit(), 2))
+            .is_err());
+        let canonical = repositories.canonical(&project);
+        let stranger = scratch.0.join("stranger");
+        fs::create_dir_all(&stranger).unwrap();
+        git(&stranger, &["init", "-q", "-b", "x"]);
+        git(
+            &stranger,
+            &["commit", "-q", "--allow-empty", "-m", "unrelated"],
+        );
+        git(
+            &canonical,
+            &["fetch", "-q", &text(&stranger), "x:refs/heads/stranger"],
+        );
+        let unrelated =
+            CommitSha::parse(git(&canonical, &["rev-parse", "stranger"]).trim()).unwrap();
+        assert_eq!(
+            repositories.pin(&project, &worktree, &unrelated, &pin_ref(&unit(), 3)),
+            Err(RepositoryError::NotFetched(unrelated.to_string()))
+        );
+        assert!(repositories
+            .resolve(&project, &pin_ref(&unit(), 3))
             .is_err());
     }
 }

@@ -39,6 +39,7 @@ use tycho::services::merge_gate::{GateVerdict, MergeGate, NoGate};
 use tycho::services::operator::read_secret_file;
 use tycho::services::spawner::{SpawnSpec, Spawner};
 use tycho::services::{Ports, Timing};
+use tycho::spool::check_result_envelope;
 use tycho::zmx::{ListEntry, Zmx};
 use tycho_types::envelope::{
     CommitSha, EscalationOption, EscalationPayload, QuestionType, Reversibility, ShortText,
@@ -46,6 +47,7 @@ use tycho_types::envelope::{
 use tycho_types::rejection::encode_escalation;
 use tycho_types::service::{handler, Service, RECONCILER_KEY};
 use tycho_types::session::Level;
+use tycho_types::session::SessionName;
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
 const DOUBLES_PORT: u16 = 19_081;
@@ -457,11 +459,18 @@ fn session_and_reconciler_refuse_agents_outside_their_scope() {
 const HEAD_SHA: &str = "1111111111111111111111111111111111111111";
 const DEFAULT_SHA: &str = "2222222222222222222222222222222222222222";
 
-/// The result envelope a launcher resolves with, from the worker session to its control session.
+/// The result envelope a launcher resolves with, checked by the launcher's own spool check.
 fn result_json(session: &str, branch: &str) -> String {
-    format!(
-        r#"{{"schema_version":1,"id":"01J9Z3K7Q8R2W5X6Y7Z8A9B0C1","type":"result","work_unit_id":"wu01","from":"{session}","to":"cf7a.wu01.ctl.codex","causation_id":null,"correlation_id":"cf7a","created_at_unix_ms":1,"expires_at_unix_ms":null,"payload":{{"outcome":"done","branch":"{branch}","head_sha":"{HEAD_SHA}","criteria":[],"usage":{{"input_tokens":1200,"output_tokens":300,"cost_micro_dollars":42000}}}}}}"#
-    )
+    let envelope = serde_json::json!({
+        "schema_version": 1, "id": "01J9Z3K7Q8R2W5X6Y7Z8A9B0C1", "type": "result",
+        "work_unit_id": "wu01", "from": session, "to": "cf7a.wu01.ctl.codex",
+        "causation_id": null, "correlation_id": "cf7a", "created_at_unix_ms": 1,
+        "expires_at_unix_ms": null,
+        "payload": {"outcome": "done", "branch": branch, "head_sha": HEAD_SHA, "criteria": [],
+                    "usage": {"input_tokens": 1200, "output_tokens": 300,
+                              "cost_micro_dollars": 42000}}
+    });
+    check_result_envelope(&envelope, &SessionName::parse(session).unwrap()).unwrap()
 }
 
 /// What the launcher double does with a spawned session's awaitable.

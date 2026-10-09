@@ -50,6 +50,8 @@ const VENDOR_SCRIPT: &str = r#"#!/bin/sh
 if test -f "$1"; then echo seen > "$4.lease-seen"; fi
 printf '%s' "$TYCHO_TIER" > "$4.tier"
 /usr/bin/env > "$4.env"
+# Under the zmx pty a background group that sets terminal modes is stopped by SIGTTOU.
+if (: < /dev/tty) 2>/dev/null; then stty -ixon < /dev/tty; echo attached > "$4.tty"; else echo detached > "$4.tty"; fi
 sleep "$2"
 if [ -n "$3" ]; then printf '%s' "$3" > "$TYCHO_RESULT_FILE"; fi
 exit 0
@@ -477,6 +479,12 @@ fn launch_spools_resolves_and_ends_its_session() {
         harness.marker(&name, ".lease-seen").exists().then_some(())
     });
     assert_vendor_saw_only_its_allowlist(&harness, &name, &awaitable);
+    let terminal = fs::read_to_string(harness.marker(&name, ".tty")).unwrap();
+    println!(
+        "evidence: the vendor's controlling terminal: {}",
+        terminal.trim()
+    );
+    assert_eq!(terminal.trim(), "detached");
     let (count, last) = wait_until("two heartbeats arrived", WAIT_LIMIT, || {
         let (count, last) = heartbeats(&name);
         (count >= 2).then_some((count, last))

@@ -28,7 +28,8 @@ use crate::agent_files::{
 };
 use crate::config::AgentDirs;
 use crate::exit_decode::{
-    decode_exit, read_progress, read_result_file, status_payload, ChildEnd, Decoded, Stop,
+    decode_exit, read_progress, read_result_file, status_payload, ChildEnd, Decoded, ResultFile,
+    ResultReport, Stop,
 };
 pub use crate::launch_spec::{
     check_tier, check_vendor, core_uid_from_environment, take_spec, HeartbeatTarget, LaunchSpec,
@@ -241,6 +242,25 @@ impl fmt::Display for LaunchEnd {
     }
 }
 
+/// The vendor as the leader of its own session through `tycho session-leader`, or, without
+/// the trampoline, in its own process group; either way its group id is its pid.
+fn vendor_command(session_leader: Option<&Path>, program: &str, arguments: &[String]) -> Command {
+    session_leader.map_or_else(
+        || {
+            let mut command = Command::new(program);
+            command.args(arguments).process_group(0);
+            command
+        },
+        |tycho| {
+            let mut command = Command::new(tycho);
+            command
+                .args(["session-leader", "--", program])
+                .args(arguments);
+            command
+        },
+    )
+}
+
 /// The running launcher: its settings, files, lease and the ingress it reports to.
 struct Run<'a, I: Ingress> {
     settings: &'a LauncherSettings,
@@ -337,7 +357,15 @@ impl<I: Ingress> Run<'_, I> {
             // session before the result does; a run shorter than one interval has no other beat.
             self.beat();
         }
-        decode_exit(stop, end, read_result_file(&self.files.result), &session)
+        let result = read_result_file(&self.files.result);
+        if let ResultFile::Report(ResultReport {
+            detail: Some(detail),
+            ..
+        }) = &result
+        {
+            self.log.line(&format!("vendor detail: {detail}"));
+        }
+        decode_exit(stop, end, result, &session)
     }
 
     fn start_vendor(&mut self, vendor: &[String]) -> io::Result<Child> {
@@ -347,11 +375,11 @@ impl<I: Ingress> Run<'_, I> {
         let environment = self
             .settings
             .vendor_environment(&self.files.progress, &self.files.result);
-        let child = Command::new(program)
-            .args(arguments)
+        let mut command =
+            vendor_command(self.settings.session_leader.as_deref(), program, arguments);
+        let child = command
             .env_clear()
             .envs(environment)
-            .process_group(0)
             .stdin(Stdio::null())
             .stdout(create_new(&self.files.stdout)?)
             .stderr(create_new(&self.files.stderr)?)
@@ -789,6 +817,27 @@ mod tests {
         let last = events.last().unwrap();
         assert!(last.starts_with("deliver sign_1abc escalated\n{"), "{last}");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_vendor_runs_through_the_session_trampoline() {
+        let words = |command: &Command| {
+            std::iter::once(command.get_program())
+                .chain(command.get_args())
+                .map(|word| word.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let arguments = ["-c".to_string(), "true".to_string()];
+        let through = vendor_command(Some(Path::new("/opt/tycho")), "/bin/sh", &arguments);
+        assert_eq!(
+            words(&through),
+            "/opt/tycho session-leader -- /bin/sh -c true"
+        );
+        assert_eq!(
+            words(&vendor_command(None, "/bin/sh", &arguments)),
+            "/bin/sh -c true"
+        );
     }
 
     #[test]

@@ -840,7 +840,7 @@ async fn with_evidence(
         evidence: Some(WorkerEvidence {
             session: session.clone(),
             resume_handle: resume_handle.map(|handle| handle.as_str().to_string()),
-            context_tokens: view.map_or(0, |view| view.context_tokens),
+            context_tokens: view.map(|view| view.context_tokens),
         }),
         ..end
     })
@@ -1036,7 +1036,7 @@ mod tests {
         let evidence = WorkerEvidence {
             session: SessionName::parse("cf7a.wu03.wrk.claude.a1f3").unwrap(),
             resume_handle: Some("3f0c6c1e-6b1a-4a51-9a0e-2a8c5d0c1a10".to_string()),
-            context_tokens: 33_390,
+            context_tokens: Some(33_390),
         };
         assert_eq!(
             attach(
@@ -1232,7 +1232,8 @@ mod tests {
         assert_eq!(check_request(&request(0)), Err(RequestError::Argv(0)));
         let headless = WorkerRunRequest {
             task: Some(WorkerTaskRequest {
-                brief: ShortText::parse("Make widget::answer return 42.").unwrap(),
+                brief: crate::services::workers::Brief::parse("Make widget::answer return 42.")
+                    .unwrap(),
                 max_turns: std::num::NonZeroU16::new(8),
                 placement: None,
             }),
