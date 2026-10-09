@@ -12,6 +12,8 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus, Output};
 
+mod release;
+
 const TYPES: [&str; 11] = [
     "feat", "fix", "docs", "chore", "refactor", "test", "build", "ci", "perf", "style", "revert",
 ];
@@ -24,7 +26,7 @@ const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
 const DOC_DIRS: [&str; 1] = ["docs"];
 const RULES_DIR: &str = ".claude/rules";
 const RULE_MAX_LINES: usize = 24;
-const COMMANDS: [(&str, &str); 7] = [
+const COMMANDS: [(&str, &str); 10] = [
     (
         "ci",
         "format check, clippy, tests, the repository checks, workflow lints, PR title",
@@ -45,6 +47,18 @@ const COMMANDS: [(&str, &str); 7] = [
     (
         "check-rules",
         "rule files carry paths frontmatter and stay short",
+    ),
+    (
+        "release-pr [--dry-run]",
+        "open the release pull request; --dry-run shows it locally",
+    ),
+    (
+        "release",
+        "tag a merged release pull request, create its GitHub release",
+    ),
+    (
+        "release-binaries [tag]",
+        "build this host's archives with dist, upload to the release",
     ),
     (
         "hook post-tool-use",
@@ -546,6 +560,16 @@ fn main() {
         Some("check-names") => check_names(),
         Some("check-comments") => check_comments(),
         Some("check-rules") => check_rules(),
+        Some("release-pr") => match args.get(1).map(String::as_str) {
+            None => release::release_pr(false),
+            Some("--dry-run") => release::release_pr(true),
+            Some(other) => {
+                eprintln!("usage: xtask release-pr [--dry-run]; got {other}");
+                2
+            }
+        },
+        Some("release") => release::release(),
+        Some("release-binaries") => release::release_binaries(args.get(1).cloned()),
         Some("hook") if args.get(1).map(String::as_str) == Some("post-tool-use") => {
             hook_post_tool_use()
         }
