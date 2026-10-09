@@ -16,6 +16,7 @@ mod config;
 mod figures;
 mod process;
 mod release;
+mod setup;
 
 const TYPES: [&str; 11] = [
     "feat", "fix", "docs", "chore", "refactor", "test", "build", "ci", "perf", "style", "revert",
@@ -29,7 +30,7 @@ const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
 const DOC_DIRS: [&str; 1] = ["docs"];
 const RULES_DIR: &str = ".claude/rules";
 const RULE_MAX_LINES: usize = 24;
-const COMMANDS: [(&str, &str); 14] = [
+const COMMANDS: [(&str, &str); 15] = [
     (
         "ci",
         "format check, clippy, tests, the repository checks, workflow lints, PR title",
@@ -82,6 +83,10 @@ const COMMANDS: [(&str, &str); 14] = [
     (
         "hook post-tool-use",
         "after an edit: format and lint Rust, check documents and CUE",
+    ),
+    (
+        "setup",
+        "operator preconditions for running the factory on this machine",
     ),
 ];
 const ABBREVIATIONS: [&str; 5] = ["tmp", "ctx", "obj", "arr", "cfg"];
@@ -611,6 +616,7 @@ fn main() {
             eprintln!("usage: xtask hook post-tool-use");
             2
         }
+        Some("setup") => setup::run(),
         Some("help") | None => help(),
         _ => {
             help();
