@@ -173,7 +173,11 @@ fn svg_heads_without_fonts_or_with_other_styles_are_not_usable() {
 
 #[test]
 fn the_page_form_drops_fonts_and_prefixes_every_id_and_reference() {
-    let page = page_svg(&fixture("stencil-head.svg"), &render("dark")).unwrap_or_default();
+    let head = format!(
+        "{}    <text x=\"1\" y=\"2\" {SVG_FONT} font-size=\"12\">a</text>\n",
+        fixture("stencil-head.svg")
+    );
+    let page = page_svg(&head, &render("dark")).unwrap_or_default();
     assert!(page.starts_with(
         "<svg class=\"fig-dark\" role=\"img\" aria-label=\"Sample: a &quot;quoted&quot; lede\" xmlns="
     ));
@@ -181,6 +185,98 @@ fn the_page_form_drops_fonts_and_prefixes_every_id_and_reference() {
     assert!(page.contains(" id=\"sample-dark-arrow-clear-solid-3\""));
     assert!(page.contains("data-id=\"\""));
     assert!(!page.contains(" id=\"arrow-"));
+    assert!(!page.contains(SVG_FONT));
+    assert!(page.contains(PAGE_FONT));
+}
+
+#[test]
+fn committed_page_svgs_name_a_font_stack_not_bare_inter() {
+    let files = listed_files(Path::new(RENDERED)).unwrap_or_default();
+    let svgs: Vec<&String> = files
+        .iter()
+        .filter(|f| Path::new(f).extension().is_some_and(|e| e == "svg"))
+        .collect();
+    assert_eq!(svgs.len(), 8, "{files:?}");
+    for file in svgs {
+        let svg = fs::read_to_string(format!("{RENDERED}/{file}")).unwrap_or_default();
+        assert!(!svg.contains(SVG_FONT), "{file} names bare Inter");
+        assert!(svg.contains(PAGE_FONT), "{file} has no font stack");
+    }
+}
+
+/// A fresh directory under the system temp directory, unique to the test.
+fn scratch(name: &str) -> PathBuf {
+    let dir = env::temp_dir().join(format!("tycho-figures-test-{}-{name}", process::id()));
+    if dir.exists() {
+        fs::remove_dir_all(&dir).unwrap();
+    }
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn more_figures_than_the_limit_fail_and_only_cue_files_count() {
+    let dir = scratch("figure-limit");
+    for index in 0..FIGURES_MAX {
+        fs::write(dir.join(format!("f{index:02}.cue")), "").unwrap();
+    }
+    fs::write(dir.join("notes.txt"), "").unwrap();
+    assert_eq!(figure_names(&dir).map(|n| n.len()), Ok(FIGURES_MAX));
+    fs::write(dir.join("one-more.cue"), "").unwrap();
+    assert!(figure_names(&dir).is_err());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_directory_over_the_entry_limit_is_an_error_not_a_truncation() {
+    let dir = scratch("entry-limit");
+    for index in 0..DIR_ENTRIES_MAX {
+        fs::write(dir.join(format!("e{index:03}")), "").unwrap();
+    }
+    assert_eq!(listed_files(&dir).map(|n| n.len()), Ok(DIR_ENTRIES_MAX));
+    fs::write(dir.join("one-more"), "").unwrap();
+    assert!(listed_files(&dir).is_err());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_file_one_byte_over_the_limit_is_refused() {
+    let dir = scratch("file-limit");
+    let path = dir.join("large");
+    let limit = usize::try_from(FILE_MAX_BYTES).unwrap();
+    fs::write(&path, vec![b'a'; limit]).unwrap();
+    assert_eq!(read_bounded(&path).map(|b| b.len()), Ok(limit));
+    fs::write(&path, vec![b'a'; limit + 1]).unwrap();
+    assert!(read_bounded(&path).is_err());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn vendored_files_must_match_the_pin_and_their_recorded_digests() {
+    let dir = scratch("vendored");
+    fs::write(dir.join("core.cue"), "package stencil\n").unwrap();
+    let digest = sha256_hex(b"package stencil\n");
+    fs::write(dir.join("rev"), format!("abc\n{digest}  core.cue\n")).unwrap();
+    assert_eq!(vendored_defects(&dir, "abc"), Vec::<String>::new());
+    assert_eq!(vendored_defects(&dir, "def").len(), 1);
+    fs::write(dir.join("extra.cue"), "").unwrap();
+    assert_eq!(vendored_defects(&dir, "abc").len(), 1);
+    fs::remove_file(dir.join("extra.cue")).unwrap();
+    fs::write(dir.join("core.cue"), "package changed\n").unwrap();
+    assert_eq!(vendored_defects(&dir, "abc").len(), 1);
+    fs::write(dir.join("rev"), "abc\n").unwrap();
+    assert!(!vendored_defects(&dir, "abc").is_empty());
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn the_committed_vendored_package_matches_the_pin() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+    let dir = Path::new(root).join(VENDORED_DIR);
+    let rev = fs::read_to_string(dir.join("rev")).unwrap_or_default();
+    let commit = rev.lines().next().unwrap_or_default();
+    assert_eq!(commit.len(), 40);
+    assert_eq!(vendored_defects(&dir, commit), Vec::<String>::new());
 }
 
 #[test]
@@ -322,6 +418,13 @@ fn compare_labels(figure: &str, added: &[&str]) {
         .iter()
         .map(|a| a.split_whitespace().collect::<String>())
         .collect();
+    for label in &added {
+        let count = rendered.iter().filter(|r| *r == label).count();
+        assert_eq!(
+            count, 1,
+            "{figure}: added label {label} appears {count} times"
+        );
+    }
     rendered.retain(|label| !added.contains(label));
     assert!(!original.is_empty(), "{figure}: no original labels");
     let missing: Vec<&String> = original.iter().filter(|l| !rendered.contains(l)).collect();

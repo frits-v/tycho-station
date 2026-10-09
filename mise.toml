@@ -17,6 +17,10 @@ gh = "2.102.0"
 description = "Format check, lints, tests, and the pull request title check when run in CI"
 run = "cargo run -q -p xtask -- ci"
 
+[tasks.render-figures]
+description = "Render figures/ with cue and stencil into docs/figures and the design page"
+run = "cargo run -q -p xtask -- render-figures"
+
 [tasks.check-commit]
 description = "Check one commit message file against the conventional commit grammar"
 run = "cargo run -q -p xtask -- check-commit-msg"

@@ -9,27 +9,32 @@ use std::process::{self, Command};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
-use crate::release::{run_bounded, Exit};
+use crate::process::{run_bounded, Exit};
 
 const FIGURES_DIR: &str = "figures";
 const OUTPUT_DIR: &str = "docs/figures";
 const DESIGN_PAGE: &str = "docs/design.html";
 const GRAMMAR_PACKAGE: &str = "./grammar:tycho";
 const GRAMMAR_FILE: &str = "tycho.json";
-const VENDORED_REV_FILE: &str = "figures/cue.mod/pkg/github.com/frits-v/stencil/cue/rev";
+const VENDORED_DIR: &str = "figures/cue.mod/pkg/github.com/frits-v/stencil/cue";
+const VENDORED_REV_FILE: &str = "rev";
 const MISE_FILE: &str = "mise.toml";
 const STENCIL_PIN: &str = "\"cargo:https://github.com/frits-v/stencil\" = { version = \"rev:";
 const VARIANTS: [&str; 2] = ["light", "dark"];
 const OUTPUT_EXTENSIONS: [&str; 2] = ["svg", "png"];
 const PNG_SCALE: &str = "1";
 const FIGURES_MAX: usize = 16;
+const DIR_ENTRIES_MAX: usize = 128;
 const FILE_MAX_BYTES: u64 = 8 << 20;
 const DEFECTS_MAX_LINES: usize = 40;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 const FONT_BLOCK_OPEN: &str = "  <defs>\n    <style>\n";
 const FONT_BLOCK_CLOSE: &str = "    </style>\n  </defs>\n";
 const FONT_FACE_LINE: &str = "      @font-face ";
+const SVG_FONT: &str = "font-family=\"Inter\"";
+const PAGE_FONT: &str = "font-family=\"Inter, 'Public Sans', system-ui, sans-serif\"";
 
 /// How a `cue` run ended: 0 passed, 1 rejected the input; anything else is unusable.
 #[derive(Debug, PartialEq, Eq)]
@@ -220,7 +225,8 @@ fn escape_attribute(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// The SVG as the design page inlines it: no embedded fonts (the page loads Inter), every
+/// The SVG as the design page inlines it: no embedded fonts (the page loads Inter, and the
+/// text falls back to the page's own faces without the network), every
 /// id and reference prefixed with the render's stem so two inlined figures never share an
 /// id, and a class that the page's theme rules show or hide.
 fn page_svg(svg: &str, render: &Render) -> Result<String, String> {
@@ -239,26 +245,21 @@ fn page_svg(svg: &str, render: &Render) -> Result<String, String> {
     let drawing = drawing
         .replace(" id=\"", &format!(" id=\"{prefix}"))
         .replace("url(#", &format!("url(#{prefix}"))
-        .replace("href=\"#", &format!("href=\"#{prefix}"));
+        .replace("href=\"#", &format!("href=\"#{prefix}"))
+        .replace(SVG_FONT, PAGE_FONT);
     Ok(format!("{open_tag}\n{drawing}"))
 }
 
-fn figure_names() -> Result<Vec<String>, String> {
-    let entries =
-        fs::read_dir(FIGURES_DIR).map_err(|e| format!("cannot read {FIGURES_DIR}: {e}"))?;
-    let mut names = Vec::new();
-    for entry in entries.flatten().take(FIGURES_MAX.saturating_add(1)) {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("cue") {
-            continue;
-        }
-        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            names.push(stem.to_string());
-        }
-    }
+fn figure_names(dir: &Path) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = listed_files(dir)?
+        .iter()
+        .filter_map(|file| file.strip_suffix(".cue").map(str::to_string))
+        .collect();
     if names.len() > FIGURES_MAX {
         return Err(format!(
-            "more than {FIGURES_MAX} figures under {FIGURES_DIR}"
+            "{} figures under {}; the limit is {FIGURES_MAX}",
+            names.len(),
+            dir.display()
         ));
     }
     names.sort();
@@ -368,7 +369,7 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// Exports, checks and renders every figure into `build`, leaving `<stem>.svg` (the page
 /// form) and `<stem>.png` there. Returns the renders in figure order.
 fn build(build_dir: &Path) -> Result<Vec<Render>, String> {
-    let names = figure_names()?;
+    let names = figure_names(Path::new(FIGURES_DIR))?;
     if names.is_empty() {
         return Err(format!("no figures under {FIGURES_DIR}"));
     }
@@ -530,13 +531,23 @@ fn read_page() -> Result<String, String> {
     String::from_utf8(bytes).map_err(|e| format!("{DESIGN_PAGE} is not UTF-8: {e}"))
 }
 
+/// The file names in a directory; more than `DIR_ENTRIES_MAX` entries is an error.
 fn listed_files(dir: &Path) -> Result<Vec<String>, String> {
     let entries = fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-    Ok(entries
-        .flatten()
-        .take(FIGURES_MAX.saturating_mul(VARIANTS.len()).saturating_mul(4))
-        .filter_map(|e| e.file_name().to_str().map(str::to_string))
-        .collect())
+    let mut names = Vec::new();
+    for entry in entries.take(DIR_ENTRIES_MAX.saturating_add(1)) {
+        let entry = entry.map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+        if names.len() >= DIR_ENTRIES_MAX {
+            return Err(format!(
+                "{} holds more than {DIR_ENTRIES_MAX} entries",
+                dir.display()
+            ));
+        }
+        if entry.path().is_file() {
+            names.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(names)
 }
 
 fn count_figures(renders: &[Render]) -> usize {
@@ -551,23 +562,68 @@ fn fail(name: &str, error: &str) -> i32 {
 }
 
 /// The pinned stencil revision in `mise.toml` must be the one the vendored CUE package was
-/// copied from.
+/// copied from, and each copied file must still hash to what the `rev` file records.
 fn pin_defects() -> Vec<String> {
     let pinned = fs::read_to_string(MISE_FILE).ok().and_then(|text| {
         let (_, rest) = text.split_once(STENCIL_PIN)?;
         rest.split_once('"').map(|(rev, _)| rev.to_string())
     });
-    let vendored = fs::read_to_string(VENDORED_REV_FILE)
-        .ok()
-        .map(|text| text.trim().to_string());
-    match (pinned, vendored) {
-        (Some(pinned), Some(vendored)) if pinned == vendored => Vec::new(),
-        (Some(pinned), Some(vendored)) => vec![format!(
-            "{MISE_FILE} pins stencil {pinned}; {VENDORED_REV_FILE} says {vendored}"
-        )],
-        (None, _) => vec![format!("{MISE_FILE} has no stencil pin by rev")],
-        (_, None) => vec![format!("cannot read {VENDORED_REV_FILE}")],
+    pinned.map_or_else(
+        || vec![format!("{MISE_FILE} has no stencil pin by rev")],
+        |pinned| vendored_defects(Path::new(VENDORED_DIR), &pinned),
+    )
+}
+
+/// The `rev` file: the commit on its first line, then `<sha256>  <file>` for every `.cue`
+/// file in the directory.
+fn vendored_defects(dir: &Path, pinned: &str) -> Vec<String> {
+    let rev_path = dir.join(VENDORED_REV_FILE);
+    let Ok(rev) = fs::read_to_string(&rev_path) else {
+        return vec![format!("cannot read {}", rev_path.display())];
+    };
+    let mut lines = rev.lines();
+    let mut defects = Vec::new();
+    let commit = lines.next().unwrap_or_default().trim();
+    if commit != pinned {
+        defects.push(format!(
+            "{MISE_FILE} pins stencil {pinned}; {} says {commit}",
+            rev_path.display()
+        ));
     }
+    let mut recorded = Vec::new();
+    for line in lines {
+        let Some((digest, file)) = line.split_once("  ") else {
+            defects.push(format!(
+                "{}: unrecognised line `{line}`",
+                rev_path.display()
+            ));
+            continue;
+        };
+        recorded.push(file.to_string());
+        match read_bounded(&dir.join(file)) {
+            Ok(bytes) if sha256_hex(&bytes) == digest => {}
+            Ok(_) => defects.push(format!("{file} differs from stencil {commit}")),
+            Err(error) => defects.push(error),
+        }
+    }
+    match listed_files(dir) {
+        Ok(files) => {
+            for file in files.iter().filter(|f| {
+                Path::new(f).extension().is_some_and(|e| e == "cue") && !recorded.contains(f)
+            }) {
+                defects.push(format!("{file} has no digest in {}", rev_path.display()));
+            }
+        }
+        Err(error) => defects.push(error),
+    }
+    if recorded.is_empty() {
+        defects.push(format!("{} records no file digest", rev_path.display()));
+    }
+    defects
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn compare_outputs(build_dir: &Path, renders: &[Render]) -> Result<Vec<String>, String> {

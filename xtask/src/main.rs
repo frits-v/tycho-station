@@ -10,9 +10,10 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{self, Command, ExitStatus, Output};
+use std::process::{Command, ExitStatus, Output};
 
 mod figures;
+mod process;
 mod release;
 
 const TYPES: [&str; 11] = [
@@ -211,7 +212,7 @@ fn run(program: &str, args: &[&str]) -> ExitStatus {
         .status()
         .unwrap_or_else(|e| {
             eprintln!("xtask: failed to start {program}: {e}");
-            process::exit(2)
+            std::process::exit(2)
         })
 }
 
@@ -603,7 +604,7 @@ fn main() {
             2
         }
     };
-    process::exit(code);
+    std::process::exit(code);
 }
 
 #[cfg(test)]

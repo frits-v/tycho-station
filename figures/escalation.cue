@@ -13,15 +13,15 @@ figures: escalation: tycho.#Figure & {
 			children: [
 				_rung & {children: [
 					{tag: "Item", kind: "human", id: "human", title: "Human", subtitle: "decision packet in; binding case out"},
-					{tag: "Text", heading: "GIVE-UP RULE TO REACH THIS RUNG", body: ["Council failed, or authority reserved to the human: spend, external commitments, data deletion, epic scope, hook-marked human-only, or the ruling would overrule a human case."]},
+					{tag: "Col", gap: 12, children: [{tag: "Text", heading: "GIVE-UP RULE TO REACH THIS RUNG", body: ["Council failed, or authority reserved to the human: spend, external commitments, data deletion, epic scope, hook-marked human-only, or the ruling would overrule a human case."]}]},
 				]},
 				_rung & {children: [
 					{tag: "Item", kind: "control", id: "parent", title: "Parent control, arbiter L2 .. root", subtitle: "same steps, wider scope"},
-					{tag: "Text", body: ["Council failed (no quorum, or an unrefuted blocking dissent), or the question crosses the work unit boundary: other worktrees, shared interfaces, epic acceptance criteria, budget."]},
+					{tag: "Col", gap: 12, children: [{tag: "Text", body: ["Council failed (no quorum, or an unrefuted blocking dissent), or the question crosses the work unit boundary: other worktrees, shared interfaces, epic acceptance criteria, budget."]}]},
 				]},
 				_rung & {children: [
 					{tag: "Item", kind: "control", id: "control", title: "Control session, arbiter L1", subtitle: "rules alone or convenes a council"},
-					{tag: "Text", body: ["Blocker reproduced; at least two distinct attempts logged with outcomes; case law queried; question typed with options. Immediate if outside worker authority: scope, interface, irreversible action, security."]},
+					{tag: "Col", gap: 12, children: [{tag: "Text", body: ["Blocker reproduced; at least two distinct attempts logged with outcomes; case law queried; question typed with options. Immediate if outside worker authority: scope, interface, irreversible action, security."]}]},
 				]},
 				_rung & {children: [
 					{tag: "Item", kind: "worker", id: "worker", title: "Worker", subtitle: "implements; may not rule"},

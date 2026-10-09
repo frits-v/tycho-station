@@ -18,9 +18,9 @@ figures: topology: tycho.#Figure & {
 					id:    "surfaces"
 					label: "HUMAN SURFACES, DISPOSABLE READERS"
 					children: [{tag: "Row", children: [
-						_surface & {id: "ghostty", title: "Ghostty", subtitle: "tabs via AppleScript"},
 						_surface & {id: "tui", title: "TUI", subtitle: "inbox, feed, focus"},
 						_surface & {id: "web", title: "Web view", subtitle: "localhost, SSE"},
+						_surface & {id: "ghostty", title: "Ghostty", subtitle: "tabs via AppleScript"},
 						_surface & {id: "notifications", title: "Notifications", subtitle: "link to web"},
 					]}]
 				},
@@ -32,8 +32,8 @@ figures: topology: tycho.#Figure & {
 						label: "ZMX: ONE DAEMON PER SESSION, OWNS THE PTY"
 						children: [{tag: "Col", gap: 28, children: [
 							{tag: "Row", grow: [1, 1], gap: 24, children: [
-								{tag: "Item", kind: "root", id: "root", title: "Root control session", subtitle: "orchestrator of orchestrators; never edits", facts: [{text: "cf7a.root.claude", source: "built"}]},
 								{tag: "Item", kind: "process", id: "reader", title: "Reader binary", subtitle: "serves TUI and web view from the store; restartable at any time"},
+								{tag: "Item", kind: "root", id: "root", title: "Root control session", subtitle: "orchestrator of orchestrators; never edits", facts: [{text: "cf7a.root.claude", source: "built"}]},
 							]},
 							{tag: "Row", gap: 24, children: [
 								{tag: "Col", gap: 28, children: [
@@ -72,9 +72,9 @@ figures: topology: tycho.#Figure & {
 		}]
 		legend: [tycho.legend.awaitable, tycho.legend.signal, tycho.legend.attach]
 		links: [
-			tycho.#Attach & {from: "ghostty", to: "root", label: "zmx attach"},
-			tycho.#Attach & {from: "tui", to: "reader", from_side: "bottom", to_side: "top"},
-			tycho.#Attach & {from: "web", to: "reader", label: "reads store via reader", from_side: "bottom", to_side: "top"},
+			tycho.#Attach & {from: "ghostty", to: "root", label: "zmx attach", from_side: "bottom", to_side: "top"},
+			tycho.#Attach & {from: "tui", to: "reader", from_side: "bottom", to_side: "left", via: [{x: 10, y: 139}]},
+			tycho.#Attach & {from: "web", to: "reader", label: "reads store via reader", from_side: "bottom", to_side: "left", via: [{x: 10, y: 139}]},
 			tycho.#Attach & {from: "notifications", to: "core", label: "read only"},
 			tycho.#Awaitable & {from: "root", to: "wu03", from_side: "bottom", to_side: "top"},
 			tycho.#Awaitable & {from: "root", to: "wu04", from_side: "bottom", to_side: "top"},
@@ -82,7 +82,7 @@ figures: topology: tycho.#Figure & {
 			tycho.#Awaitable & {from: "wu03", to: "w2"},
 			tycho.#Awaitable & {from: "wu04", to: "w3"},
 			tycho.#Awaitable & {from: "wu04", to: "w4"},
-			tycho.#Signal & {from: "root", to: "restate"},
+			tycho.#Signal & {from: "root", to: "restate", from_side: "right", to_side: "left"},
 			tycho.#Signal & {from: "wu04", to: "services"},
 		]
 	}
