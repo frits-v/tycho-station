@@ -7,8 +7,11 @@ use std::process::ExitStatus;
 
 use tycho_types::lease::PID_MAX;
 
+use nix::sys::signal::Signal;
+
 use crate::command::{self, Captured, CommandError};
 use crate::config::{COMMAND_OUTPUT_MAX_BYTES, COMMAND_TIMEOUT, LIST_SESSIONS_MAX};
+use crate::process::{self, ProcessFacts};
 
 /// Set inside a zmx session: zmx refuses to attach from inside one, and nothing zmx runs for
 /// the core inherits the caller's session.
@@ -309,11 +312,108 @@ impl Zmx {
         self.status(&["kill", name, "--force"], COMMAND_OUTPUT_MAX_BYTES)
             .map(|_| ())
     }
+
+    /// Ends every listed session by name. A running entry's pid is killed first, and only when
+    /// `ps` shows it running a command that starts with one of `programs`; an ended entry's
+    /// pid may belong to another process by now and is never signalled.
+    pub fn clear(&self, programs: &[String]) -> Result<ClearReport, ZmxError> {
+        let mut lines = Vec::new();
+        for entry in self.list()? {
+            let line = match entry {
+                ListEntry::Running { name, pid, .. } => {
+                    let signalled = expected_program(&process::process_facts(pid), programs)
+                        .and_then(|()| process::send(pid, false, Signal::SIGKILL));
+                    let verdict = match signalled {
+                        Ok(()) => "killed".to_string(),
+                        Err(reason) => format!("not signalled: {reason}"),
+                    };
+                    format!(
+                        "{name} running as pid {pid}, {verdict}; zmx kill: {:?}",
+                        self.kill(&name)
+                    )
+                }
+                ListEntry::Ended { name, pid, .. } => format!(
+                    "{name} ended (pid {pid} not signalled); zmx kill: {:?}",
+                    self.kill(&name)
+                ),
+                ListEntry::Unrecognised(text) => format!("unrecognised entry {text:?}"),
+            };
+            lines.push(line);
+        }
+        let remaining = self.list()?.len();
+        Ok(ClearReport { lines, remaining })
+    }
+}
+
+/// What `Zmx::clear` did with each listed entry, and how many entries are still listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearReport {
+    pub lines: Vec<String>,
+    pub remaining: usize,
+}
+
+const COMMAND_ECHO_MAX_CHARS: usize = 120;
+
+/// Whether `ps`'s answer for a listed pid shows a command starting with one of `programs`.
+pub fn expected_program(facts: &ProcessFacts, programs: &[String]) -> Result<(), String> {
+    match facts {
+        ProcessFacts::Running(facts)
+            if programs
+                .iter()
+                .any(|program| facts.command.starts_with(program.as_str())) =>
+        {
+            Ok(())
+        }
+        ProcessFacts::Running(facts) => Err(format!(
+            "it runs {:?}",
+            facts
+                .command
+                .chars()
+                .take(COMMAND_ECHO_MAX_CHARS)
+                .collect::<String>()
+        )),
+        ProcessFacts::Gone => Err("it is gone".to_string()),
+        ProcessFacts::Unrecognised(text) => Err(format!("ps answered {text:?}")),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::Facts;
+
+    fn running(command: &str) -> ProcessFacts {
+        ProcessFacts::Running(Facts {
+            uid: 501,
+            pgid: 42,
+            started_unix_seconds: 0,
+            command: command.to_string(),
+        })
+    }
+
+    #[test]
+    fn only_a_pid_running_an_expected_program_is_signalled() {
+        let programs = vec![
+            "/opt/restate-server".to_string(),
+            "/opt/tycho endpoint".to_string(),
+        ];
+        assert_eq!(
+            expected_program(&running("/opt/restate-server --base-dir /h"), &programs),
+            Ok(())
+        );
+        assert_eq!(
+            expected_program(&running("/opt/tycho endpoint"), &programs),
+            Ok(())
+        );
+        for other in [
+            running("/bin/zsh -l"),
+            running("/opt/tycho launch --spec x"),
+            ProcessFacts::Gone,
+            ProcessFacts::Unrecognised("?".to_string()),
+        ] {
+            assert!(expected_program(&other, &programs).is_err(), "{other:?}");
+        }
+    }
 
     const RUNNING: &str = "  name=core.restate\tpid=60889\tclients=0\tcreated=1791528126\tcwd=file://host/Users/someone\n";
     const ENDED: &str = "  name=core.endpoint\tpid=60267\tclients=0\tcreated=1791528101\tcwd=file://host/Users/someone\tended=1791528114\texit_code=137\n";
