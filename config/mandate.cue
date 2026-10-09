@@ -38,7 +38,7 @@ mandate: #Mandate & {
 			what:    "xtask setup checks, on the agent user's side, that the agent user's primary group is tycho-agent and not staff, that no credential file exists, and that no keychain item exists for a forbidden service."
 			runs:    "on demand, once per side"
 			record:  "not_recorded"
-			pending: true
+			pending: false
 		}
 		spine_services: {
 			what:    "Epic reserve and settle are exclusive and private to service calls; reserve answers budget_exhausted past a ledger's limit, seat and metered ledgers are separate, and settlement charges the larger of reservation and usage. Session heartbeat and handoff check the session secret in constant time; handoff validates and caps the note; spawn, nudge, kill and expire are private; kill goes by the recorded pid and saves scrollback when asked."
@@ -198,7 +198,7 @@ mandate: #Mandate & {
 		"7.1": {
 			requires: "Agents hold no credentials; only the core touches remotes, the canonical repository, the admin surfaces and the store."
 			mechanisms: ["core_directory_check", "setup"]
-			coverage: "core directory check; setup (pending)"
+			coverage: "core directory check; setup"
 			partial:  true
 			slices: ["zero"]
 		}
