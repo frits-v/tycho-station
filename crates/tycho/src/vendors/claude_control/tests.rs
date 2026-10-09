@@ -35,8 +35,9 @@ fn adapter(config_dir: &Path) -> ClaudeControl {
     ClaudeControl::new(
         PathBuf::from("/opt/claude/bin/claude"),
         config_dir.to_path_buf(),
+        current_uid(),
     )
-    .with_sockets_dir(config_dir.to_path_buf())
+    .with_sockets_dirs(vec![config_dir.to_path_buf()])
 }
 
 /// The socket path a registry entry of this test process names in `dir`.
@@ -260,21 +261,35 @@ fn each_socket_outcome_has_its_own_state() {
     let socket = dir.join("i.sock");
     let line = instruction_line(&ShortText::parse("go").unwrap());
     let server = listener(&socket, b"");
-    assert!(matches!(post(&socket, &line), Delivery::Posted { .. }));
+    assert!(matches!(
+        post(&socket, &line, current_uid()),
+        Delivery::Posted { .. }
+    ));
     assert_eq!(server.join().unwrap(), line);
     fs::remove_file(&socket).unwrap();
     let server = listener(&socket, b"ok");
-    assert!(matches!(post(&socket, &line), Delivery::Replied { reply, .. } if reply == "ok"));
+    assert!(
+        matches!(post(&socket, &line, current_uid()), Delivery::Replied { reply, .. } if reply == "ok")
+    );
     server.join().unwrap();
     assert!(
-        matches!(post(&socket, &line), Delivery::Refused { .. }),
+        matches!(
+            post(&socket, &line, current_uid()),
+            Delivery::Refused { .. }
+        ),
         "a stale socket"
     );
     fs::remove_file(&socket).unwrap();
-    assert!(matches!(post(&socket, &line), Delivery::NoSocket { .. }));
+    assert!(matches!(
+        post(&socket, &line, current_uid()),
+        Delivery::NoSocket { .. }
+    ));
     let _held = UnixListener::bind(&socket).unwrap();
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o000)).unwrap();
-    assert!(matches!(post(&socket, &line), Delivery::Denied { .. }));
+    assert!(matches!(
+        post(&socket, &line, current_uid()),
+        Delivery::Denied { .. }
+    ));
     fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -561,12 +576,25 @@ fn never_connected(listener: &UnixListener) -> bool {
 }
 
 #[test]
-fn a_socket_path_must_be_absolute_and_named_for_the_pid_in_the_sockets_directory() {
-    let sockets = Path::new(SOCKETS_DIR);
+fn a_socket_path_must_be_absolute_and_named_for_the_pid_in_a_vendor_directory() {
+    let sockets = sockets_dirs(Some(Path::new("/run/user/501")), 501);
     assert_eq!(
-        socket_shape("/tmp/cc-socks/7.sock", 7, sockets).unwrap(),
-        PathBuf::from("/tmp/cc-socks/7.sock")
+        sockets,
+        [
+            PathBuf::from("/run/user/501/cc-socks"),
+            PathBuf::from("/tmp/cc-socks"),
+            PathBuf::from("/tmp/cc-socks-501"),
+        ]
     );
+    assert_eq!(sockets_dirs(None, 501).len(), 2);
+    assert_eq!(sockets_dirs(Some(Path::new("run")), 501).len(), 2);
+    for dir in &sockets {
+        let raw = dir.join("7.sock");
+        assert_eq!(
+            socket_shape(&raw.display().to_string(), 7, &sockets).unwrap(),
+            raw
+        );
+    }
     for raw in [
         "",
         "7.sock",
@@ -574,12 +602,14 @@ fn a_socket_path_must_be_absolute_and_named_for_the_pid_in_the_sockets_directory
         "/tmp/cc-socks/../cc-socks/7.sock",
         "/tmp/cc-socks/sub/../7.sock",
         "/tmp/cc-socks/sub/7.sock",
+        "/tmp/cc-socks-502/7.sock",
+        "/run/user/501/7.sock",
         "/tmp/7.sock",
         "/tmp/cc-socks/8.sock",
         "/tmp/cc-socks/7.sock.x",
         "/tmp/cc-socks",
     ] {
-        assert!(socket_shape(raw, 7, sockets).is_err(), "{raw:?}");
+        assert!(socket_shape(raw, 7, &sockets).is_err(), "{raw:?}");
     }
 }
 
@@ -657,7 +687,7 @@ fn a_socket_of_another_owner_is_refused_unconnected() {
     let other = current_uid().wrapping_add(1);
     let delivery = go(&adapter(&dir).with_agent_uid(other));
     assert!(
-        matches!(&delivery, Delivery::Untrusted { reason } if reason.contains("owned by uid")),
+        matches!(&delivery, Delivery::Untrusted { reason } if reason.contains(&format!("expected a directory of uid {other}"))),
         "{delivery:?}"
     );
     assert!(never_connected(&held));
@@ -722,6 +752,178 @@ fn a_transcript_outside_the_projects_directory_reports_no_context() {
     assert_eq!(
         adapter(&dir).context_size(&session()),
         ContextReport::Tokens { tokens: 41_913 }
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_listener_of_another_uid_is_refused_before_any_byte_is_written() {
+    let dir = scratch("peer");
+    let socket = own_socket(&dir);
+    let listener = untouched(&socket);
+    let line = instruction_line(&ShortText::parse("go").unwrap());
+    let delivery = post(&socket, &line, current_uid().wrapping_add(1));
+    assert!(
+        matches!(&delivery, Delivery::Untrusted { reason } if reason.contains("listener runs as uid")),
+        "{delivery:?}"
+    );
+    assert!(!delivery.written());
+    let (mut accepted, _) = listener.accept().unwrap();
+    accepted.set_nonblocking(false).unwrap();
+    let mut received = Vec::new();
+    accepted.read_to_end(&mut received).unwrap();
+    assert!(received.is_empty(), "{received:?}");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_socket_in_any_vendor_directory_is_posted_and_one_elsewhere_refused() {
+    let dir = scratch("dirs");
+    let first = dir.join("first");
+    let second = dir.join("second");
+    let other = dir.join("other");
+    for each in [&first, &second, &other] {
+        fs::create_dir_all(each).unwrap();
+    }
+    let control = adapter(&dir).with_sockets_dirs(vec![first.clone(), second.clone()]);
+    for each in [&first, &second] {
+        let socket = own_socket(each);
+        registry_file(&dir, "2.json", std::process::id(), &socket);
+        let server = listener(&socket, b"");
+        assert!(matches!(go(&control), Delivery::Posted { .. }), "{each:?}");
+        server.join().unwrap();
+    }
+    let socket = own_socket(&other);
+    let held = untouched(&socket);
+    registry_file(&dir, "2.json", std::process::id(), &socket);
+    assert!(matches!(go(&control), Delivery::Untrusted { .. }));
+    assert!(never_connected(&held));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_symlinked_sockets_directory_is_refused_by_real_dir() {
+    let dir = scratch("dirlink");
+    let real = dir.join("real");
+    fs::create_dir_all(&real).unwrap();
+    let link = dir.join("cc-socks");
+    symlink(&real, &link).unwrap();
+    assert!(matches!(real_dir(&real, current_uid()), DirState::Real));
+    assert!(matches!(
+        real_dir(&link, current_uid()),
+        DirState::Refused(_)
+    ));
+    assert!(matches!(
+        real_dir(&dir.join("absent"), current_uid()),
+        DirState::Missing
+    ));
+    assert!(matches!(
+        real_dir(&real, current_uid().wrapping_add(1)),
+        DirState::Refused(_)
+    ));
+    let held = untouched(&own_socket(&real));
+    registry_file(&dir, "2.json", std::process::id(), &own_socket(&link));
+    let delivery = go(&adapter(&dir).with_sockets_dirs(vec![link]));
+    assert!(
+        matches!(&delivery, Delivery::Untrusted { reason } if reason.contains("Symlink")),
+        "{delivery:?}"
+    );
+    assert!(never_connected(&held));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_sockets_directory_the_core_cannot_search_sends_the_instruction_to_the_relay() {
+    let dir = scratch("eacces");
+    let sockets = dir.join("socks");
+    fs::create_dir_all(&sockets).unwrap();
+    let socket = own_socket(&sockets);
+    let _held = UnixListener::bind(&socket).unwrap();
+    registry_file(&dir, "2.json", std::process::id(), &socket);
+    fs::set_permissions(&sockets, fs::Permissions::from_mode(0o000)).unwrap();
+    let checked = check_socket(&socket, current_uid());
+    let agent = AgentDirs::new(dir.join("agent")).unwrap();
+    fs::create_dir_all(&agent.socket_dir).unwrap();
+    let relaying = adapter(&dir)
+        .with_sockets_dirs(vec![sockets.clone()])
+        .with_relay(agent, RelayMode::OnRefusal);
+    let delivery = go(&relaying);
+    fs::set_permissions(&sockets, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        matches!(checked, Err(Delivery::Denied { .. })),
+        "{checked:?}"
+    );
+    assert!(matches!(delivery, Delivery::Relayed { .. }), "{delivery:?}");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn the_launchers_lookup_refuses_a_mismatched_pid_and_hands_on_an_unbound_socket() {
+    let dir = scratch("launcher-pid");
+    let pid = std::process::id();
+    let sockets = [dir.clone()];
+    let lookup = || socket_in_registry(&dir, pid, &sockets, current_uid());
+    assert_eq!(lookup(), Ok(None));
+    let socket = own_socket(&dir);
+    registry_file(&dir, &format!("{pid}.json"), pid.wrapping_add(1), &socket);
+    assert!(matches!(lookup(), Err(reason) if reason.contains("names pid")));
+    registry_file(&dir, &format!("{pid}.json"), pid, &socket);
+    assert_eq!(lookup(), Ok(Some(socket.clone())), "not bound yet");
+    let _held = UnixListener::bind(&socket).unwrap();
+    assert_eq!(lookup(), Ok(Some(socket)));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn the_launchers_lookup_refuses_an_untrusted_socket() {
+    let dir = scratch("launcher-refused");
+    let pid = std::process::id();
+    let sockets = [dir.clone()];
+    let lookup = |uid| socket_in_registry(&dir, pid, &sockets, uid);
+    let socket = own_socket(&dir);
+    registry_file(&dir, &format!("{pid}.json"), pid, &socket);
+    let held = UnixListener::bind(&socket).unwrap();
+    assert!(
+        matches!(lookup(current_uid().wrapping_add(1)), Err(reason) if reason.contains("Untrusted"))
+    );
+    drop(held);
+    fs::remove_file(&socket).unwrap();
+    fs::write(&socket, "").unwrap();
+    assert!(matches!(lookup(current_uid()), Err(reason) if reason.contains("Regular")));
+    let elsewhere = dir.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    registry_file(&dir, &format!("{pid}.json"), pid, &own_socket(&elsewhere));
+    assert!(matches!(lookup(current_uid()), Err(reason) if reason.contains("is not in")));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_fifo_or_directory_at_the_transcript_path_reports_no_context_without_blocking() {
+    let dir = scratch("transcript-type");
+    registry_file(&dir, "2.json", std::process::id(), &own_socket(&dir));
+    let project = dir.join("projects").join("-w");
+    fs::create_dir_all(&project).unwrap();
+    let transcript = project.join(format!("{SESSION_ID}.jsonl"));
+    nix::unistd::mkfifo(&transcript, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let config_dir = dir.clone();
+    thread::spawn(move || {
+        if sender
+            .send(adapter(&config_dir).context_size(&session()))
+            .is_err()
+        {}
+    });
+    let fifo = receiver.recv_timeout(Duration::from_secs(2));
+    assert!(
+        matches!(fifo, Ok(ContextReport::Unrecognised { .. })),
+        "{fifo:?}"
+    );
+    fs::remove_file(&transcript).unwrap();
+    fs::create_dir(&transcript).unwrap();
+    let directory = adapter(&dir).context_size(&session());
+    assert!(
+        matches!(directory, ContextReport::Unrecognised { .. }),
+        "{directory:?}"
     );
     fs::remove_dir_all(&dir).unwrap();
 }

@@ -174,7 +174,7 @@ mod tests {
 
     #[test]
     fn the_control_plan_is_the_vendor_argv_and_its_resume_handle() {
-        let vendor = ClaudeControl::new(PathBuf::from("/opt/claude"), PathBuf::from("/c"));
+        let vendor = ClaudeControl::new(PathBuf::from("/opt/claude"), PathBuf::from("/c"), 501);
         let control_plan = plan(&vendor, &launch()).unwrap();
         assert_eq!(control_plan.argv.len(), 13);
         assert_eq!(

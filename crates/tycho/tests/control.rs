@@ -360,7 +360,8 @@ impl Harness {
             fs::remove_dir_all(&work).unwrap();
         }
         let dirs = AgentDirs::new(agent.clone()).unwrap();
-        let claude = ClaudeControl::new(claude_binary(), user_home().join(".claude"));
+        let claude =
+            ClaudeControl::new(claude_binary(), user_home().join(".claude"), current_uid());
         let force_relay = Arc::new(AtomicBool::new(false));
         let harness = Self {
             endpoint: None,

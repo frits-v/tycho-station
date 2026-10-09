@@ -132,8 +132,7 @@ pub enum Delivery {
     RelayFailed {
         reason: String,
     },
-    /// The registry named a socket outside the vendor's directory, name or owner; nothing was
-    /// connected.
+    /// The socket's path, owner or listener failed a check; nothing was written.
     Untrusted {
         reason: String,
     },
