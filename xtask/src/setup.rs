@@ -2072,13 +2072,20 @@ mod tests {
             ..
         } = capture
         else {
-            panic!("env did not run: {capture:?}");
+            panic!("env did not run to a successful exit");
         };
-        let mut lines: Vec<&str> = stdout.lines().collect();
-        lines.sort_unstable();
-        assert_eq!(lines.len(), 2, "env printed {stdout:?}");
-        assert_eq!(lines.first(), Some(&"HOME=/Users/tycho-agent"));
-        assert!(lines.get(1).is_some_and(|line| line.starts_with("PATH=")));
+        let lines: Vec<&str> = stdout.lines().collect();
+        let mut names: Vec<&str> = lines
+            .iter()
+            .map(|line| line.split('=').next().unwrap_or_default())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["HOME", "PATH"],
+            "env printed the variables {names:?}"
+        );
+        assert!(lines.contains(&"HOME=/Users/tycho-agent"));
     }
 
     #[test]
