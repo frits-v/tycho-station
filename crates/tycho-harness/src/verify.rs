@@ -15,24 +15,65 @@ use tycho_types::task_packet::DoneCriterion;
 
 use crate::work_units::{PassCondition, WorkUnit};
 
-/// Default wall clock given to one `Command` criterion before it is killed.
-pub const COMMAND_TIMEOUT_MAX_MS: u64 = 60_000;
+/// Wall clock given to one `Command` criterion when the caller names none.
+pub const COMMAND_TIMEOUT_DEFAULT_MS: u64 = 60_000;
+/// A requested timeout above this is rejected by `VerifyOptions::new`.
+pub const COMMAND_TIMEOUT_MAX_MS: u64 = 600_000;
+/// `VerifyOptions::default` skips `new`'s check, so the default is held to the maximum here.
+const _: () = assert!(COMMAND_TIMEOUT_DEFAULT_MS <= COMMAND_TIMEOUT_MAX_MS);
 /// Captured stdout and stderr, combined, larger than this is a failure, not a truncation.
 pub const CRITERION_OUTPUT_MAX_BYTES: usize = 65_536;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Under the checkout's git-ignored `target`, which `CARGO_TARGET_DIR` already points at,
+/// so logs neither dirty the tree being verified nor outlive the checkout.
+const DEFAULT_LOG_SUBDIRECTORY: &str = "target/tycho-criterion-logs";
 
-/// `log_dir` defaults to a sibling of the checkout, so criterion output never
-/// dirties the tree being verified.
+/// Fields are private so a timeout above `COMMAND_TIMEOUT_MAX_MS` cannot be represented.
 #[derive(Debug, Clone)]
 pub struct VerifyOptions {
-    pub command_timeout_ms: u64,
-    pub log_dir: Option<PathBuf>,
+    command_timeout_ms: u64,
+    log_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeoutAboveMaximum {
+    pub requested_ms: u64,
+}
+
+impl std::fmt::Display for TimeoutAboveMaximum {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "command timeout {} ms; maximum is {COMMAND_TIMEOUT_MAX_MS} ms",
+            self.requested_ms
+        )
+    }
+}
+
+impl std::error::Error for TimeoutAboveMaximum {}
+
+impl VerifyOptions {
+    /// `log_dir` of `None` means the checkout's `target/tycho-criterion-logs`.
+    pub fn new(
+        command_timeout_ms: u64,
+        log_dir: Option<PathBuf>,
+    ) -> Result<Self, TimeoutAboveMaximum> {
+        if command_timeout_ms > COMMAND_TIMEOUT_MAX_MS {
+            return Err(TimeoutAboveMaximum {
+                requested_ms: command_timeout_ms,
+            });
+        }
+        Ok(Self {
+            command_timeout_ms,
+            log_dir,
+        })
+    }
 }
 
 impl Default for VerifyOptions {
     fn default() -> Self {
         Self {
-            command_timeout_ms: COMMAND_TIMEOUT_MAX_MS,
+            command_timeout_ms: COMMAND_TIMEOUT_DEFAULT_MS,
             log_dir: None,
         }
     }
@@ -110,10 +151,14 @@ pub fn run_criteria_with(
         .collect()
 }
 
-/// Runs the done criteria of one work unit against a checkout, with the default options.
+/// Runs the done criteria of one work unit against a checkout.
 #[must_use]
-pub fn verify_unit(checkout: &Path, unit: &WorkUnit) -> Vec<CriterionReport> {
-    run_criteria(checkout, &unit.packet.done_criteria)
+pub fn verify_unit(
+    checkout: &Path,
+    unit: &WorkUnit,
+    options: &VerifyOptions,
+) -> Vec<CriterionReport> {
+    run_criteria_with(checkout, &unit.packet.done_criteria, options)
 }
 
 /// Whether a unit passed: `EscalationRaised` never does here; `CriteriaPass` needs all reports passing and at least one.
@@ -200,16 +245,6 @@ fn evaluate_command(
     }
 }
 
-/// A sibling of the checkout, so criterion logs never land inside the tree being verified.
-fn default_log_dir(checkout: &Path) -> PathBuf {
-    let name = checkout.file_name().map_or_else(
-        || "checkout".to_string(),
-        |value| value.to_string_lossy().into_owned(),
-    );
-    let parent = checkout.parent().unwrap_or(checkout);
-    parent.join(format!("{name}.criterion-logs"))
-}
-
 /// Splits on whitespace only; the fixture commands carry no quoted arguments.
 fn spawn_command(
     checkout: &Path,
@@ -224,7 +259,7 @@ fn spawn_command(
     let log_dir = options
         .log_dir
         .clone()
-        .unwrap_or_else(|| default_log_dir(checkout));
+        .unwrap_or_else(|| checkout.join(DEFAULT_LOG_SUBDIRECTORY));
     fs::create_dir_all(&log_dir).map_err(|error| error.to_string())?;
     let output_path = log_dir.join(format!("criterion-{index}.log"));
     let output_file = fs::File::create(&output_path).map_err(|error| error.to_string())?;
@@ -253,14 +288,42 @@ fn set_own_process_group(builder: &mut Command) {
 #[cfg(not(unix))]
 fn set_own_process_group(_builder: &mut Command) {}
 
+/// Kills the child's whole process group through `program` (`kill` in production)
+/// and describes the result; a group kill that could not run is reported, not hidden.
 #[cfg(unix)]
-fn kill_group(pid: u32) {
+fn kill_group(program: &str, pid: u32) -> String {
     let group = format!("-{pid}");
-    drop(Command::new("kill").args(["-KILL", &group]).status());
+    let status = Command::new(program)
+        .args(["-KILL", &group])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match status {
+        Ok(status) => format!("group kill {status}"),
+        Err(error) => format!("group kill could not run: {error}"),
+    }
 }
 
 #[cfg(not(unix))]
-fn kill_group(_pid: u32) {}
+fn kill_group(_program: &str, _pid: u32) -> String {
+    "group kill not supported on this platform".to_string()
+}
+
+/// Group kill first so grandchildren die too, then `Child::kill` so the direct
+/// child dies even when the group kill could not run, then reap it.
+fn terminate(child: &mut Child) -> String {
+    let group = kill_group("kill", child.id());
+    let direct = match child.kill() {
+        Ok(()) => "direct kill sent".to_string(),
+        Err(error) => format!("direct kill failed: {error}"),
+    };
+    let reaped = match child.wait() {
+        Ok(status) => format!("reaped with {status}"),
+        Err(error) => format!("could not reap: {error}"),
+    };
+    format!("{group}; {direct}; {reaped}")
+}
 
 /// Polls in bounded steps so a runaway process is killed rather than waited on forever.
 fn wait_bounded(child: &mut Child, timeout_ms: u64) -> WaitOutcome {
@@ -341,36 +404,65 @@ fn run_command(
             (outcome, detail, Some(pid))
         }
         WaitOutcome::TimedOut => {
-            kill_group(pid);
-            drop(child.wait());
-            (
-                CommandOutcome::TimedOut,
-                "exceeded its timeout".to_string(),
-                Some(pid),
-            )
+            let termination = terminate(&mut child);
+            let detail = format!(
+                "exceeded its timeout of {} ms; {termination}",
+                options.command_timeout_ms
+            );
+            (CommandOutcome::TimedOut, detail, Some(pid))
         }
         WaitOutcome::PollFailed => {
-            kill_group(pid);
-            drop(child.wait());
-            (
-                CommandOutcome::WaitFailed,
-                "could not poll the child process".to_string(),
-                Some(pid),
-            )
+            let termination = terminate(&mut child);
+            let detail = format!("could not poll the child process; {termination}");
+            (CommandOutcome::WaitFailed, detail, Some(pid))
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::*;
     use crate::repository;
     use crate::work_units::{self, FixtureError};
 
-    fn built_checkout() -> tempfile::TempDir {
-        let checkout = tempfile::tempdir().unwrap();
-        repository::build(checkout.path()).unwrap();
-        checkout
+    const GRANDCHILD_FIXTURE: &str = "fixtures/scripts/background_sleep.sh";
+    /// An orphaned grandchild stays a zombie until init reaps it, and `kill -0` succeeds on a zombie.
+    const GONE_POLLS_MAX: usize = 40;
+
+    /// The checkout and the criterion logs share one temporary root, so nothing a test
+    /// writes lands outside a directory the test owns.
+    struct Sandbox {
+        root: tempfile::TempDir,
+    }
+
+    impl Sandbox {
+        fn empty() -> Self {
+            let sandbox = Self {
+                root: tempfile::tempdir().unwrap(),
+            };
+            fs::create_dir(sandbox.checkout()).unwrap();
+            sandbox
+        }
+
+        fn built() -> Self {
+            let sandbox = Self::empty();
+            repository::build(&sandbox.checkout()).unwrap();
+            sandbox
+        }
+
+        fn checkout(&self) -> PathBuf {
+            self.root.path().join("checkout")
+        }
+
+        fn options_with_timeout(&self, command_timeout_ms: u64) -> VerifyOptions {
+            VerifyOptions::new(command_timeout_ms, Some(self.root.path().join("logs"))).unwrap()
+        }
+
+        fn options(&self) -> VerifyOptions {
+            self.options_with_timeout(COMMAND_TIMEOUT_DEFAULT_MS)
+        }
     }
 
     fn command_criterion(command: &str) -> DoneCriterion {
@@ -387,55 +479,55 @@ mod tests {
 
     #[test]
     fn the_trivial_units_own_fixture_criteria_fail_fresh_then_pass_after_the_patch() {
-        let checkout = built_checkout();
+        let sandbox = Sandbox::built();
         let unit = unit_by_key("trivial").unwrap();
 
-        let before = verify_unit(checkout.path(), &unit);
+        let before = verify_unit(&sandbox.checkout(), &unit, &sandbox.options());
         assert!(!unit_passed(unit.pass_condition, &before));
         assert_named_test_failed(&before, "tests::answer_is_42");
 
         repository::apply_patch(
-            checkout.path(),
+            &sandbox.checkout(),
             include_bytes!("../fixtures/patches/trivial.patch"),
         )
         .unwrap();
-        let after = verify_unit(checkout.path(), &unit);
+        let after = verify_unit(&sandbox.checkout(), &unit, &sandbox.options());
         assert!(unit_passed(unit.pass_condition, &after));
     }
 
     #[test]
     fn the_downstream_unit_depends_only_on_the_trivial_patch() {
-        let checkout = built_checkout();
+        let sandbox = Sandbox::built();
         let unit = unit_by_key("downstream-dependent").unwrap();
 
-        let before = verify_unit(checkout.path(), &unit);
+        let before = verify_unit(&sandbox.checkout(), &unit, &sandbox.options());
         assert!(!unit_passed(unit.pass_condition, &before));
         assert_named_test_failed(&before, "tests::answer_times_two_is_84");
 
         repository::apply_patch(
-            checkout.path(),
+            &sandbox.checkout(),
             include_bytes!("../fixtures/patches/trivial.patch"),
         )
         .unwrap();
-        let after = verify_unit(checkout.path(), &unit);
+        let after = verify_unit(&sandbox.checkout(), &unit, &sandbox.options());
         assert!(unit_passed(unit.pass_condition, &after));
     }
 
     #[test]
     fn the_ambiguous_unit_fails_fresh_then_passes_after_its_own_patch() {
-        let checkout = built_checkout();
+        let sandbox = Sandbox::built();
         let unit = unit_by_key("moderate-and-ambiguous").unwrap();
 
-        let before = verify_unit(checkout.path(), &unit);
+        let before = verify_unit(&sandbox.checkout(), &unit, &sandbox.options());
         assert!(!unit_passed(unit.pass_condition, &before));
         assert_named_test_failed(&before, "tests::greeting_contains_hello");
 
         repository::apply_patch(
-            checkout.path(),
+            &sandbox.checkout(),
             include_bytes!("../fixtures/patches/moderate.patch"),
         )
         .unwrap();
-        let after = verify_unit(checkout.path(), &unit);
+        let after = verify_unit(&sandbox.checkout(), &unit, &sandbox.options());
         assert!(unit_passed(unit.pass_condition, &after));
     }
 
@@ -452,10 +544,10 @@ mod tests {
     #[test]
     fn forced_units_never_pass_by_criteria_even_with_nothing_to_check() {
         for key in ["forced-escalation", "forced-council-split"] {
-            let checkout = built_checkout();
+            let sandbox = Sandbox::built();
             let unit = unit_by_key(key).unwrap();
             assert!(unit.packet.done_criteria.is_empty(), "{key}");
-            let reports = verify_unit(checkout.path(), &unit);
+            let reports = verify_unit(&sandbox.checkout(), &unit, &sandbox.options());
             assert!(reports.is_empty());
             assert!(!unit_passed(unit.pass_condition, &reports), "{key}");
         }
@@ -468,9 +560,9 @@ mod tests {
 
     #[test]
     fn a_command_that_cannot_spawn_fails_with_the_spawn_failed_outcome() {
-        let checkout = built_checkout();
+        let sandbox = Sandbox::empty();
         let criteria = [command_criterion("tycho-harness-nonexistent-binary")];
-        let reports = run_criteria(checkout.path(), &criteria);
+        let reports = run_criteria_with(&sandbox.checkout(), &criteria, &sandbox.options());
         assert_eq!(reports[0].status, CriterionStatus::Failed);
         assert_eq!(
             reports[0].outcome,
@@ -480,10 +572,10 @@ mod tests {
 
     #[test]
     fn output_over_the_cap_fails_as_output_too_large_not_a_truncation() {
-        let checkout = built_checkout();
+        let sandbox = Sandbox::empty();
         let bytes = CRITERION_OUTPUT_MAX_BYTES.saturating_add(1);
         let criteria = [command_criterion(&format!("head -c {bytes} /dev/zero"))];
-        let reports = run_criteria(checkout.path(), &criteria);
+        let reports = run_criteria_with(&sandbox.checkout(), &criteria, &sandbox.options());
         assert_eq!(reports[0].status, CriterionStatus::Failed);
         assert_eq!(
             reports[0].outcome,
@@ -492,41 +584,146 @@ mod tests {
     }
 
     #[test]
-    fn a_timed_out_command_is_killed_and_its_child_is_gone() {
-        let checkout = built_checkout();
-        let logs = tempfile::tempdir().unwrap();
-        let options = VerifyOptions {
-            command_timeout_ms: 200,
-            log_dir: Some(logs.path().to_path_buf()),
-        };
-        let (outcome, _detail, pid) = run_command(checkout.path(), 0, "sleep 2", &options);
-        assert_eq!(outcome, CommandOutcome::TimedOut);
-        let pid = pid.expect("a timed-out command reports its pid");
-        let still_alive = Command::new("kill")
+    fn a_timeout_above_the_maximum_is_rejected_and_the_default_is_separate() {
+        let over = COMMAND_TIMEOUT_MAX_MS.saturating_add(1);
+        assert_eq!(
+            VerifyOptions::new(over, None).unwrap_err(),
+            TimeoutAboveMaximum { requested_ms: over }
+        );
+        let at_max = VerifyOptions::new(COMMAND_TIMEOUT_MAX_MS, None).unwrap();
+        assert_eq!(at_max.command_timeout_ms, COMMAND_TIMEOUT_MAX_MS);
+        assert_eq!(
+            VerifyOptions::default().command_timeout_ms,
+            COMMAND_TIMEOUT_DEFAULT_MS
+        );
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Liveness {
+        Alive,
+        Gone,
+    }
+
+    /// `kill -0` decoded: success is alive, "No such process" is gone, and anything
+    /// else means the probe could not answer, which fails the test.
+    fn probe_process(pid: u32) -> Liveness {
+        let output = Command::new("kill")
             .args(["-0", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        assert!(!still_alive, "the killed process should no longer exist");
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|error| panic!("kill -0 {pid} could not run: {error}"));
+        if output.status.success() {
+            return Liveness::Alive;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("No such process"),
+            "kill -0 {pid} could not answer: {} {stderr}",
+            output.status
+        );
+        Liveness::Gone
+    }
+
+    fn wait_until_gone(pid: u32) -> Liveness {
+        for _ in 0..GONE_POLLS_MAX {
+            if probe_process(pid) == Liveness::Gone {
+                return Liveness::Gone;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
+        probe_process(pid)
+    }
+
+    #[test]
+    fn a_timed_out_command_is_killed_and_its_child_is_gone() {
+        let sandbox = Sandbox::empty();
+        let options = sandbox.options_with_timeout(200);
+        let started = Instant::now();
+        let (outcome, detail, pid) = run_command(&sandbox.checkout(), 0, "sleep 2", &options);
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, CommandOutcome::TimedOut, "{detail}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "took {elapsed:?}: {detail}"
+        );
+        assert!(detail.contains("group kill exit status: 0"), "{detail}");
+        let pid = pid.expect("a timed-out command reports its pid");
+        assert_eq!(probe_process(pid), Liveness::Gone, "{detail}");
+    }
+
+    fn read_recorded_pid(path: &Path) -> u32 {
+        let text = fs::read_to_string(path)
+            .unwrap_or_else(|error| panic!("{}: no recorded pid: {error}", path.display()));
+        text.trim()
+            .parse()
+            .unwrap_or_else(|error| panic!("{}: {text:?} is not a pid: {error}", path.display()))
+    }
+
+    /// Without the group kill, `Child::kill` takes only the shell and the
+    /// backgrounded `sleep 30` outlives the timeout; this test then fails.
+    #[test]
+    fn a_timeout_kills_the_whole_process_group_including_a_backgrounded_grandchild() {
+        let sandbox = Sandbox::empty();
+        let pid_file = sandbox.root.path().join("grandchild.pid");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join(GRANDCHILD_FIXTURE);
+        let command = format!("sh {} {}", script.display(), pid_file.display());
+        assert_eq!(command.split_whitespace().count(), 3, "{command}");
+        let options = sandbox.options_with_timeout(500);
+        let started = Instant::now();
+        let (outcome, detail, _pid) = run_command(&sandbox.checkout(), 0, &command, &options);
+        let elapsed = started.elapsed();
+        assert_eq!(outcome, CommandOutcome::TimedOut, "{detail}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "took {elapsed:?}: {detail}"
+        );
+        let grandchild = read_recorded_pid(&pid_file);
+        assert_eq!(wait_until_gone(grandchild), Liveness::Gone, "{detail}");
+    }
+
+    #[test]
+    fn a_group_kill_that_cannot_run_is_reported_not_hidden() {
+        let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+        let report = kill_group("tycho-harness-nonexistent-kill", child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(report.starts_with("group kill could not run:"), "{report}");
     }
 
     #[test]
     fn the_checkout_stays_clean_after_running_a_command_criterion() {
-        let checkout = built_checkout();
+        let sandbox = Sandbox::built();
         let criteria = [command_criterion(
             "cargo test --offline --quiet tests::has_tag_is_false_when_unknown -- --exact",
         )];
-        let reports = run_criteria(checkout.path(), &criteria);
+        let reports = run_criteria_with(&sandbox.checkout(), &criteria, &sandbox.options());
         assert_eq!(reports[0].status, CriterionStatus::Passed);
-        let status = repository::status_porcelain(checkout.path()).unwrap();
+        let status = repository::status_porcelain(&sandbox.checkout()).unwrap();
+        assert!(status.is_empty(), "git status --porcelain: {status}");
+    }
+
+    #[test]
+    fn default_options_write_logs_inside_the_checkouts_target_not_beside_it() {
+        let sandbox = Sandbox::built();
+        let reports = run_criteria(&sandbox.checkout(), &[command_criterion("echo logged")]);
+        assert_eq!(reports[0].status, CriterionStatus::Passed, "{reports:?}");
+        let siblings: Vec<_> = fs::read_dir(sandbox.root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(siblings, ["checkout"], "beside the checkout: {siblings:?}");
+        let log = sandbox
+            .checkout()
+            .join(DEFAULT_LOG_SUBDIRECTORY)
+            .join("criterion-0.log");
+        assert_eq!(fs::read_to_string(log).unwrap(), "logged\n");
+        let status = repository::status_porcelain(&sandbox.checkout()).unwrap();
         assert!(status.is_empty(), "git status --porcelain: {status}");
     }
 
     #[test]
     fn file_present_and_absent_criteria_read_the_checkout() {
-        let checkout = built_checkout();
+        let sandbox = Sandbox::built();
         let criteria = [
             DoneCriterion::FilePresent {
                 path: tycho_types::task_packet::RelativePath::parse("Cargo.toml").unwrap(),
@@ -535,7 +732,7 @@ mod tests {
                 path: tycho_types::task_packet::RelativePath::parse("does-not-exist").unwrap(),
             },
         ];
-        let reports = run_criteria(checkout.path(), &criteria);
+        let reports = run_criteria_with(&sandbox.checkout(), &criteria, &sandbox.options());
         assert_eq!(reports[0].status, CriterionStatus::Passed);
         assert_eq!(reports[1].status, CriterionStatus::Passed);
     }

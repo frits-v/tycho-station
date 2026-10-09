@@ -226,22 +226,9 @@ mod tests {
 
     const EXPECTED_HEAD_SHA: &str = "3711d61ebf71d9117a6d46772eb40fc05d86f03a";
 
-    struct EnvVarGuard {
-        key: &'static str,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            std::env::set_var(key, value);
-            Self { key }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            std::env::remove_var(self.key);
-        }
-    }
+    const BOGUS_GIT_DIR: &str = "/nonexistent-should-be-ignored";
+    const INHERITED_GIT_DIR_CHILD: &str =
+        "repository::tests::build_under_an_inherited_git_dir_in_a_child_process";
 
     #[test]
     fn build_produces_a_stable_head_sha() {
@@ -250,12 +237,31 @@ mod tests {
         assert_eq!(built.head_sha.as_str(), EXPECTED_HEAD_SHA);
     }
 
+    /// Runs only in a child process that `build_ignores_an_inherited_git_dir`
+    /// starts with `GIT_DIR` set, so no test mutates this process's environment.
     #[test]
-    fn build_ignores_an_inherited_git_dir() {
-        let _guard = EnvVarGuard::set("GIT_DIR", "/nonexistent-should-be-ignored");
+    #[ignore = "run by build_ignores_an_inherited_git_dir in a child process"]
+    fn build_under_an_inherited_git_dir_in_a_child_process() {
+        assert_eq!(std::env::var("GIT_DIR").unwrap(), BOGUS_GIT_DIR);
         let checkout = tempfile::tempdir().unwrap();
         let built = build(checkout.path()).unwrap();
         assert_eq!(built.head_sha.as_str(), EXPECTED_HEAD_SHA);
+    }
+
+    #[test]
+    fn build_ignores_an_inherited_git_dir() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", INHERITED_GIT_DIR_CHILD])
+            .env("GIT_DIR", BOGUS_GIT_DIR)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}{stderr}");
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "the child must run exactly one test: {stdout}"
+        );
     }
 
     #[test]
