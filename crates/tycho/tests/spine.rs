@@ -27,6 +27,7 @@ use tycho::config::{
     admin_url, ingress_url, loopback, CoreConfig, CoreRole, HOME_ENV, MISE_NO_INSTALL,
     RESTATE_INGRESS_PORT, RESTATE_SERVER_ENV, ZMX_ENV,
 };
+use tycho::config_store::FactoryConfig;
 use tycho::endpoint;
 use tycho::health;
 use tycho::http::Http;
@@ -277,8 +278,17 @@ fn start_core_with_doubles(test: &str, spawner: &RecordingSpawner) -> (Core, Dou
 fn test_timing() -> Timing {
     Timing {
         reconciler_interval: Duration::from_secs(1),
-        ..Timing::default()
+        ..Timing::from_thresholds(&test_config().thresholds.value)
     }
+}
+
+/// A unit cap no constant carries, so a view that shows it came from the endpoint's ports.
+const UNIT_CAP_UNDER_TEST: u16 = 5;
+
+fn test_config() -> FactoryConfig {
+    let mut config = FactoryConfig::embedded().unwrap();
+    config.thresholds.value.retry.unit_attempt_cap = UNIT_CAP_UNDER_TEST;
+    config
 }
 
 fn start_core_with(
@@ -297,6 +307,7 @@ fn start_core_with(
         spawner: Arc::new(spawner.clone()),
         merge_gate,
         timing,
+        config: Arc::new(test_config()),
         operator_secret: Some(core.config.operator_secret_file()),
     };
     let doubles = DoublesEndpoint::start(&ports);
@@ -476,16 +487,21 @@ fn answer(awaitable: String, delay: Duration, action: &'static str, body: String
     });
 }
 
-fn worker(fallback: &str) -> String {
+fn worker(class: &str, tier: &str) -> String {
     format!(
-        r#"{{"epic":"cf7a","work_unit":"wu01","vendor":"claude","argv":["tycho-launcher"],"routing":{{"class":"implement","tier":"standard","effort":"medium","binding":null,"rationale":"routine change","fallback_tier":"{fallback}"}},"ledger":"seat","reservation":1000}}"#
+        r#"{{"epic":"cf7a","work_unit":"wu01","vendor":"claude","argv":["tycho-launcher"],"routing":{{"class":"{class}","tier":"{tier}","effort":"medium","binding":null,"rationale":"routine change"}},"ledger":"seat","reservation":1000}}"#
     )
 }
 
 fn plan_file(core: &Core, tasks: &[&str]) -> PathBuf {
     let plan: Vec<String> = tasks
         .iter()
-        .map(|task| format!(r#"{{"task":"{task}","worker":{}}}"#, worker("strong")))
+        .map(|task| {
+            format!(
+                r#"{{"task":"{task}","worker":{}}}"#,
+                worker("implement", "standard")
+            )
+        })
         .collect();
     let path = core.config.home.join("plan.json");
     fs::write(
@@ -553,6 +569,38 @@ fn operator_secret(core: &Core) -> String {
         .to_string()
 }
 
+/// The unit journaled the endpoint's configuration at its start, and its attempt loop reads
+/// the cap from that journaled view.
+fn assert_started_with(view: &serde_json::Value, ports: &Ports) {
+    let expected = serde_json::to_value(ports.config.unit_config()).unwrap();
+    assert_eq!(view["config"], expected);
+    assert_eq!(view["config"]["unit_attempt_cap"], UNIT_CAP_UNDER_TEST);
+    println!(
+        "evidence: unit started with configuration {}",
+        view["config"]
+    );
+}
+
+/// A class the routing table does not list, or a tier below the class minimum, is refused at
+/// dispatch before any run starts.
+fn assert_dispatch_refuses_bad_routes(core: &Core) {
+    let path = format!("/Operator/{}", handler::OPERATOR_DISPATCH_UNIT);
+    for (class, tier, reason) in [
+        ("unlisted", "standard", "not in the routing table"),
+        ("implement", "light", "below the class minimum"),
+    ] {
+        let body = format!(
+            r#"{{"secret":"{}","unit":"wu01","request":{{"epic":"cf7a","control_vendor":"codex","plan":[{{"task":"t","worker":{}}}]}}}}"#,
+            operator_secret(core),
+            worker(class, tier)
+        );
+        let (status, answer) = call(&path, &body, None);
+        assert_eq!(status, 400, "{class} {tier}: {answer}");
+        assert!(answer.contains(reason), "{answer}");
+        println!("evidence: dispatch of {class} at {tier} -> {status}");
+    }
+}
+
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
@@ -560,7 +608,7 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     let gate = FixedGate::new(GateVerdict::Merged {
         default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
     });
-    let (core, _doubles, _) =
+    let (core, _doubles, ports) =
         start_core_with("unit", &spawner, Arc::new(gate.clone()), test_timing());
     assert_private(
         Service::WorkUnit,
@@ -571,7 +619,7 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     let unlisted = format!(
         r#"{{"secret":"{}","unit":"wu09","request":{{"epic":"cf7a","control_vendor":"codex","plan":[{{"task":"t","worker":{}}}]}}}}"#,
         operator_secret(&core),
-        worker("strong")
+        worker("implement", "standard")
     );
     let invocation = dispatch(&core, &["wu01-t1", "wu01-t2"]);
     let path = format!("/Operator/{}", handler::OPERATOR_DISPATCH_UNIT);
@@ -585,6 +633,8 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(view["lifecycle"], "done");
     assert_eq!(view["head_sha"], DEFAULT_SHA);
+    assert_started_with(&view, &ports);
+    assert_dispatch_refuses_bad_routes(&core);
     let requests = gate.requests();
     assert_eq!(requests.len(), 1, "one verify");
     let tasks: Vec<&str> = requests[0]

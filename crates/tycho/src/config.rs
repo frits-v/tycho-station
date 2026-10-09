@@ -1,5 +1,5 @@
-//! Ports, paths, names and bounds of the core, in one place; a later migration
-//! moves them to CUE configuration.
+//! Ports, paths, names and bounds of the core; the policy numbers of the spine live in the
+//! CUE configuration under `config/` and reach the services through `config_store`.
 
 use std::env;
 use std::fmt;
@@ -13,6 +13,7 @@ use nix::unistd::{Uid, User};
 use tycho_types::session::{SessionName, SOCKET_PATH_MAX_BYTES};
 
 use crate::command::{self, CommandError};
+use crate::config_store::CONFIG_DIR_ENV;
 
 pub const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
 pub const RESTATE_ADMIN_PORT: u16 = 19070;
@@ -78,29 +79,8 @@ pub const GRAPH_QUERY_TIMEOUT: Duration = Duration::from_secs(300);
 pub const GRAPH_DIFF_BUDGET_SECONDS: u64 = 120;
 pub const GRAPH_OUTPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
-/// Spine numbers: placeholders until the harness measures them.
+/// Input and loop bounds of the spine services; the timers, slots and caps are configuration.
 pub mod spine {
-    use std::time::Duration;
-
-    /// T1: silence before a nudge.
-    pub const STALL_SILENCE: Duration = Duration::from_secs(5 * 60);
-    /// T2: an unchanged progress marker before kill and re-queue.
-    pub const STALL_PROGRESS: Duration = Duration::from_secs(15 * 60);
-    pub const RETRY_BACKOFF_INITIAL: Duration = Duration::from_secs(10);
-    pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
-    /// Tries per port step; with the backoff above, about 35 minutes before it turns terminal.
-    pub const PORT_STEP_ATTEMPTS_MAX: u32 = 12;
-    /// The delay before a caller re-sends a reservation that met a full slot.
-    pub const SLOT_RETRY_DELAY: Duration = Duration::from_secs(10);
-    pub const CONTROL_SLOTS: u16 = 2;
-    pub const WORKER_SLOTS: u16 = 2;
-    /// Attempts per task class before the run gives up; one tier up per failed attempt.
-    pub const ATTEMPT_CAP_DEFAULT: u16 = 3;
-    /// A heartbeat older than this makes a lease stale.
-    pub const LEASE_FRESH: Duration = Duration::from_secs(30);
-    /// A session with no lease file younger than this is still starting.
-    pub const SPAWN_GRACE: Duration = Duration::from_secs(60);
-    pub const RECONCILER_INTERVAL: Duration = Duration::from_secs(30);
     pub const RECONCILER_SESSIONS_MAX_PER_TICK: usize = 32;
     pub const RECONCILER_EXPECTED_MAX_SESSIONS: usize = 256;
     pub const EPIC_UNITS_MAX: usize = 64;
@@ -299,6 +279,8 @@ pub struct CoreConfig {
     pub zmx: PathBuf,
     pub restate_server: PathBuf,
     pub tycho: PathBuf,
+    /// `TYCHO_CONFIG_DIR`, forwarded to the endpoint's session when set.
+    pub config_dir: Option<PathBuf>,
 }
 
 impl CoreConfig {
@@ -309,7 +291,22 @@ impl CoreConfig {
         let zmx = tool_path(ZMX_ENV, "zmx")?;
         let restate_server = tool_path(RESTATE_SERVER_ENV, "restate-server")?;
         let tycho = env::current_exe().map_err(ConfigError::CurrentExe)?;
-        Self::new(home, zmx, restate_server, tycho)
+        Self::new(home, zmx, restate_server, tycho)?
+            .with_config_dir(env::var_os(CONFIG_DIR_ENV).map(PathBuf::from))
+    }
+
+    /// The directory is typed into the endpoint's session, so it must be absolute and shell-safe.
+    pub fn with_config_dir(mut self, dir: Option<PathBuf>) -> Result<Self, ConfigError> {
+        if let Some(dir) = &dir {
+            if !dir.is_absolute() {
+                return Err(ConfigError::RelativePath(CONFIG_DIR_ENV, dir.clone()));
+            }
+            if !is_shell_safe(dir) {
+                return Err(ConfigError::UnsafePath(dir.clone()));
+            }
+        }
+        self.config_dir = dir;
+        Ok(self)
     }
 
     /// Every path is typed into a shell by zmx, so each must be shell-safe text.
@@ -329,6 +326,7 @@ impl CoreConfig {
             zmx,
             restate_server,
             tycho,
+            config_dir: None,
         };
         let longest = CoreRole::ALL
             .iter()
@@ -402,9 +400,14 @@ impl CoreConfig {
                 data = self.restate_data_dir().display(),
             ),
             CoreRole::Endpoint => format!(
-                "exec /usr/bin/env -i HOME={home} PATH={CORE_PROCESS_PATH} {HOME_ENV}={home} {} endpoint",
+                "exec /usr/bin/env -i HOME={home} PATH={CORE_PROCESS_PATH} {HOME_ENV}={home} {config_dir}{} endpoint",
                 self.tycho.display(),
                 home = self.home.display(),
+                config_dir = self
+                    .config_dir
+                    .as_ref()
+                    .map(|dir| format!("{CONFIG_DIR_ENV}={} ", dir.display()))
+                    .unwrap_or_default(),
             ),
         }
     }
@@ -610,6 +613,23 @@ mod tests {
             config.session_command(CoreRole::Endpoint),
             "exec /usr/bin/env -i HOME=/h PATH=/usr/bin:/bin TYCHO_HOME=/h /opt/tycho endpoint"
         );
+    }
+
+    #[test]
+    fn endpoint_command_forwards_a_config_dir_and_refuses_a_relative_one() {
+        let config = config("/h")
+            .unwrap()
+            .with_config_dir(Some(PathBuf::from("/h/config")))
+            .unwrap();
+        assert_eq!(
+            config.session_command(CoreRole::Endpoint),
+            "exec /usr/bin/env -i HOME=/h PATH=/usr/bin:/bin TYCHO_HOME=/h \
+             TYCHO_CONFIG_DIR=/h/config /opt/tycho endpoint"
+        );
+        assert!(matches!(
+            config.with_config_dir(Some(PathBuf::from("config"))),
+            Err(ConfigError::RelativePath(CONFIG_DIR_ENV, _))
+        ));
     }
 
     #[test]

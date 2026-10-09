@@ -24,26 +24,25 @@ import (
 		claude!: #Model
 		codex!:  #Model
 	}
-	// The tier a failed attempt moves up to; null at the top.
+	// null at the top of the ladder.
 	fallback!: #Name | null
 }
 
-// A class's minimum tier and a tier's fallback each name a tier in the table.
+// A class's minimum tier and a tier's fallback each name a tier in the table; a run whose
+// class the table does not list is refused at dispatch.
 #Routing: {
 	classes!: {[#Name]: #Class & {minimum_tier: or(_tier_names)}} &
 		struct.MinFields(1) & struct.MaxFields(32)
 	tiers!: {[#Name]: #Tier & {fallback: null | or(_tier_names)}} &
 		struct.MinFields(1) & struct.MaxFields(8)
-	// The attempt cap of a class the table does not list.
-	attempt_cap_default!: int & >=1 & <=99
 	_tier_names: [for name, _ in tiers {name}]
 }
 
 #Thresholds: {
 	stall!: {
-		// T1: silence before a nudge.
+		// T1, before a nudge.
 		silence_seconds!: #Seconds
-		// T2: an unchanged progress marker before kill and re-queue.
+		// T2, on an unchanged progress marker, before kill and re-queue.
 		progress_seconds!: #Seconds & >silence_seconds
 	}
 	slots!: {
@@ -56,8 +55,7 @@ import (
 		backoff_factor!:           2
 		port_step_attempts_max!:   int & >=1 & <=100
 		slot_retry_delay_seconds!: #Seconds
-		// Attempts one work unit makes before it is abandoned.
-		unit_attempt_cap!: int & >=1 & <=99
+		unit_attempt_cap!:         int & >=1 & <=99
 	}
 	session!: {
 		heartbeat_interval_seconds!:  #Seconds
@@ -114,14 +112,23 @@ import (
 	}
 }
 
+#ClauseIds: [
+	"1.1", "1.2", "1.3", "2.1", "2.2", "2.3", "3.1", "3.2", "4.1", "4.2",
+	"4.3", "4.4", "4.5", "5.1", "5.2", "5.3", "5.4", "5.5", "6.1", "6.2",
+	"6.3", "7.1", "7.2", "7.3", "8.1", "8.2", "8.3", "8.4", "9.1", "9.2",
+	"9.3", "10.1", "10.2", "10.3", "10.4", "11.1", "11.2", "12.1", "12.2", "13.1",
+	"13.2", "14.1", "14.2", "14.3", "14.4", "14.5", "15.1", "15.2", "15.3", "15.4",
+]
+
 #MechanismId: "ruleset" | "ci" | "lefthook" | "post_edit_hook" | "core_directory_check" |
 	"setup" | "spine_services"
 
 #Mandate: {
 	mechanisms!: {[#MechanismId]: #Mechanism}
 	mechanisms: struct.MaxFields(16)
-	// Every numbered clause of docs/mandate.md, 1.1 to 15.4.
-	clauses!: {[=~"^(1[0-5]|[1-9])\\.[1-9]$"]: #Clause} & struct.MinFields(50) & struct.MaxFields(50)
+	// Each numbered clause of docs/mandate.md is required by its id, and no other id is allowed;
+	// `xtask check-config` compares the list with the document.
+	clauses!: {for id in #ClauseIds {"\(id)"!: #Clause}}
 	// The design table's status and record per clause, derived from the mechanism table so
 	// neither can drift from it. A clause is pending when every mechanism it cites is.
 	rows: {for id, clause in clauses {

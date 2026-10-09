@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use restate_sdk::context::DurableFuture;
@@ -12,9 +13,10 @@ use tycho_types::envelope::{Outcome, ResultPayload, ShortText, Usage};
 use tycho_types::exit::{Disposition, ExitState};
 use tycho_types::service::{Attempt, EpicId, TaskId, WorkUnitId, RECONCILER_KEY};
 use tycho_types::session::{SessionKind, SessionName, Suffix, Vendor};
-use tycho_types::task_packet::{Routing, RoutingName};
+use tycho_types::task_packet::{Effort, RoutingName};
 
 use crate::config::spine;
+use crate::config_store::{FactoryConfig, Route};
 use crate::services::epic::{
     EpicClient, LedgerKind, ReserveAnswer, ReserveRequest, SettleRequest, SlotLevel,
 };
@@ -24,6 +26,7 @@ use crate::services::session::{
 };
 use crate::services::{
     refuse, secret, wall_clock_unix_ms, Ports, Timing, CODE_BAD_REQUEST, CODE_CANCELLED,
+    CODE_INTERNAL,
 };
 
 const VIEW_KEY: &str = "view";
@@ -37,10 +40,28 @@ pub struct WorkerRunRequest {
     pub work_unit: WorkUnitId,
     pub vendor: Vendor,
     pub argv: Vec<ShortText>,
-    pub routing: Routing,
+    pub routing: WorkerRouting,
     pub ledger: LedgerKind,
     /// Budget reserved per attempt, in the ledger's unit.
     pub reservation: u64,
+}
+
+/// The run's class and starting tier; the fallback tiers come from the routing table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerRouting {
+    pub class: RoutingName,
+    pub tier: RoutingName,
+    pub effort: Effort,
+    pub binding: Option<Vendor>,
+    pub rationale: ShortText,
+}
+
+/// What a run journals at its start and uses for every attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Started {
+    route: Route,
+    timing: Timing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,18 +129,15 @@ pub fn after_attempt(
     }
 }
 
-/// The attempt cap for a task class; every class takes the default until routing tables land.
+/// The tier after `current` on the route, or `current` at the top.
 #[must_use]
-pub fn attempt_cap(_class: &RoutingName) -> Attempt {
-    Attempt::new(spine::ATTEMPT_CAP_DEFAULT).unwrap_or(Attempt::FIRST)
-}
-
-#[must_use]
-pub fn next_tier(routing: &Routing, current: &RoutingName) -> RoutingName {
-    routing
-        .fallback_tier
+pub fn next_tier(tiers: &[RoutingName], current: &RoutingName) -> RoutingName {
+    tiers
+        .iter()
+        .skip_while(|tier| *tier != current)
+        .nth(1)
+        .unwrap_or(current)
         .clone()
-        .unwrap_or_else(|| current.clone())
 }
 
 /// A claim of done decodes as completed; a claim of not done is a failure to re-queue.
@@ -307,13 +325,15 @@ impl AttemptEnd {
 
 pub struct WorkerRun {
     timing: Timing,
+    config: Arc<FactoryConfig>,
 }
 
 impl WorkerRun {
     #[must_use]
-    pub const fn new(ports: &Ports) -> Self {
+    pub fn new(ports: &Ports) -> Self {
         Self {
             timing: ports.timing,
+            config: Arc::clone(&ports.config),
         }
     }
 }
@@ -323,6 +343,7 @@ impl fmt::Debug for WorkerRun {
         formatter
             .debug_struct("WorkerRun")
             .field("timing", &self.timing)
+            .field("config", &self.config.hashes())
             .finish()
     }
 }
@@ -340,13 +361,16 @@ impl WorkerRun {
         let (task, _) = parse_worker_key(&key)
             .map_err(|error| refuse(CODE_BAD_REQUEST, RequestError::Key(error).to_string()))?;
         check_request(&request).map_err(|error| refuse(CODE_BAD_REQUEST, error.to_string()))?;
-        let cap = attempt_cap(&request.routing.class);
+        let started = self.start(&workflow_context, &request).await?;
+        let cap = Attempt::new(started.route.attempt_cap)
+            .map_err(|error| refuse(CODE_INTERNAL, error.to_string()))?;
         let mut tier = request.routing.tier.clone();
         let mut attempt = Attempt::FIRST;
         let run = Run {
             key: &key,
             task: &task,
             request: &request,
+            timing: started.timing,
         };
         for _ in 0..cap.get() {
             let end = self
@@ -371,7 +395,7 @@ impl WorkerRun {
                     return Ok(Json(outcome));
                 }
                 AfterAttempt::Next => {
-                    tier = next_tier(&request.routing, &tier);
+                    tier = next_tier(&started.route.tiers, &tier);
                     attempt = attempt
                         .next()
                         .map_err(|error| refuse(CODE_BAD_REQUEST, error.to_string()))?;
@@ -406,6 +430,7 @@ struct Run<'a> {
     key: &'a str,
     task: &'a TaskId,
     request: &'a WorkerRunRequest,
+    timing: Timing,
 }
 
 fn record(
@@ -425,6 +450,29 @@ fn record(
 }
 
 impl WorkerRun {
+    /// Journals the route and timing; a class the table does not list, or a tier below its
+    /// minimum, ends the run with a bad request.
+    async fn start(
+        &self,
+        workflow_context: &WorkflowContext<'_>,
+        request: &WorkerRunRequest,
+    ) -> Result<Started, HandlerError> {
+        let config = Arc::clone(&self.config);
+        let timing = self.timing;
+        let class = request.routing.class.clone();
+        let tier = request.routing.tier.clone();
+        let started = workflow_context
+            .run(|| async move {
+                config
+                    .route(&class, &tier)
+                    .map(|route| Json(Started { route, timing }))
+                    .map_err(|error| refuse(CODE_BAD_REQUEST, error.to_string()))
+            })
+            .name("route")
+            .await?;
+        Ok(started.into_inner())
+    }
+
     /// One attempt; budget is settled on every way out, an error included.
     async fn attempt(
         &self,
@@ -439,7 +487,7 @@ impl WorkerRun {
         let session = session_name(run.request, run.key, attempt);
         record(workflow_context, attempt, tier, Some(&session), None);
         let watched = self
-            .spawn_and_watch(workflow_context, run.request, &session, tier)
+            .spawn_and_watch(workflow_context, run, &session, tier)
             .await;
         match watched {
             Ok(end) => {
@@ -485,7 +533,7 @@ impl WorkerRun {
                 ReserveAnswer::Granted | ReserveAnswer::AlreadyHeld => return Ok(true),
                 ReserveAnswer::BudgetExhausted => return Ok(false),
                 ReserveAnswer::RetryLater => {
-                    workflow_context.sleep(self.timing.slot_retry_delay).await?;
+                    workflow_context.sleep(run.timing.slot_retry_delay).await?;
                 }
             }
         }
@@ -499,11 +547,11 @@ impl WorkerRun {
     async fn spawn_and_watch(
         &self,
         workflow_context: &WorkflowContext<'_>,
-        request: &WorkerRunRequest,
+        run: &Run<'_>,
         session: &SessionName,
         tier: &RoutingName,
     ) -> Result<AttemptEnd, TerminalError> {
-        let argv = argv_with_tier(request, tier)?;
+        let argv = argv_with_tier(run.request, tier)?;
         let session_secret = workflow_context
             .run(|| async {
                 secret::generate()
@@ -529,7 +577,9 @@ impl WorkerRun {
         match spawned.map(Json::into_inner) {
             Ok(SpawnOutcome::Spawned { .. } | SpawnOutcome::Adopted { .. }) => {
                 let awaitable: WakeFuture<'_> = Box::pin(awaitable.map(Wake::Result));
-                let watched = self.watch(workflow_context, session, awaitable).await;
+                let watched = self
+                    .watch(workflow_context, session, awaitable, &run.timing)
+                    .await;
                 if watched.is_err() {
                     kill(workflow_context, session, false).await;
                 }
@@ -555,10 +605,11 @@ impl WorkerRun {
         workflow_context: &'run WorkflowContext<'_>,
         session: &SessionName,
         awaitable: WakeFuture<'run>,
+        timing: &Timing,
     ) -> Result<AttemptEnd, TerminalError> {
         let mut futures: DurableFuturesUnordered<WakeFuture<'run>> = DurableFuturesUnordered::new();
         futures.push(awaitable);
-        futures.push(timer(workflow_context, self.timing.stall_silence));
+        futures.push(timer(workflow_context, timing.stall_silence));
         let mut nudged_unix_ms = None;
         for _ in 0..spine::WATCH_ROUNDS_MAX {
             let Some((_, woke)) = futures.next().await? else {
@@ -574,7 +625,7 @@ impl WorkerRun {
                 });
             }
             let (step, now) = self
-                .check(workflow_context, session, nudged_unix_ms)
+                .check(workflow_context, session, nudged_unix_ms, timing)
                 .await?;
             let wait = match step {
                 WatchStep::Stall => break,
@@ -597,6 +648,7 @@ impl WorkerRun {
         workflow_context: &WorkflowContext<'_>,
         session: &SessionName,
         nudged_unix_ms: Option<u64>,
+        timing: &Timing,
     ) -> Result<(WatchStep, u64), TerminalError> {
         let view = workflow_context
             .object_client::<SessionClient>(session.to_string())
@@ -609,7 +661,7 @@ impl WorkerRun {
             .name("clock")
             .await?;
         let step = view.map_or(WatchStep::Stall, |view| {
-            watch_step(now, &view, nudged_unix_ms, &self.timing)
+            watch_step(now, &view, nudged_unix_ms, timing)
         });
         Ok((step, now))
     }
@@ -707,14 +759,13 @@ mod tests {
         }
     }
 
-    fn routing(fallback: Option<&str>) -> Routing {
-        Routing {
+    fn routing() -> WorkerRouting {
+        WorkerRouting {
             class: RoutingName::parse("implement").unwrap(),
             tier: RoutingName::parse("standard").unwrap(),
             effort: Effort::Medium,
             binding: None,
             rationale: ShortText::parse("routine change").unwrap(),
-            fallback_tier: fallback.map(|tier| RoutingName::parse(tier).unwrap()),
         }
     }
 
@@ -812,13 +863,13 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_moves_up_to_the_fallback_tier() {
-        let current = RoutingName::parse("standard").unwrap();
-        assert_eq!(
-            next_tier(&routing(Some("strong")), &current).as_str(),
-            "strong"
-        );
-        assert_eq!(next_tier(&routing(None), &current).as_str(), "standard");
+    fn a_failure_moves_up_the_route_and_stays_at_the_top() {
+        let tiers: Vec<RoutingName> = ["standard", "strong"]
+            .iter()
+            .map(|tier| RoutingName::parse(tier).unwrap())
+            .collect();
+        assert_eq!(next_tier(&tiers, &tiers[0]), tiers[1]);
+        assert_eq!(next_tier(&tiers, &tiers[1]), tiers[1]);
     }
 
     #[test]
@@ -865,7 +916,7 @@ mod tests {
             work_unit: WorkUnitId::parse("wu03").unwrap(),
             vendor: Vendor::Claude,
             argv: vec![ShortText::parse("launcher").unwrap(); argv],
-            routing: routing(None),
+            routing: routing(),
             ledger: LedgerKind::Seat,
             reservation: 10,
         }

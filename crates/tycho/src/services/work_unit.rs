@@ -12,6 +12,7 @@ use tycho_types::service::{Attempt, EpicId, Phase, PromiseName, TaskId, WorkUnit
 use tycho_types::session::{SessionKind, SessionName, Vendor};
 
 use crate::config::spine;
+use crate::config_store::{FactoryConfig, UnitConfig};
 use crate::services::epic::EpicClient;
 use crate::services::merge_gate::{Claim, GateError, GateVerdict, MergeGate, VerifyRequest};
 use crate::services::worker_run::{
@@ -158,6 +159,9 @@ pub struct WorkUnitView {
     pub findings: Vec<String>,
     /// Why the unit was abandoned, when it was.
     pub reason: Option<String>,
+    /// The configuration the unit started with, journaled once; the run uses these values.
+    #[serde(default)]
+    pub config: UnitConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +308,7 @@ fn failure(code: u16, message: impl Into<String>) -> TerminalError {
 pub struct WorkUnit {
     merge_gate: Arc<dyn MergeGate>,
     timing: Timing,
+    config: Arc<FactoryConfig>,
 }
 
 impl WorkUnit {
@@ -312,6 +317,7 @@ impl WorkUnit {
         Self {
             merge_gate: Arc::clone(&ports.merge_gate),
             timing: ports.timing,
+            config: Arc::clone(&ports.config),
         }
     }
 }
@@ -322,6 +328,7 @@ impl fmt::Debug for WorkUnit {
             .debug_struct("WorkUnit")
             .field("merge_gate", &self.merge_gate.describe())
             .field("timing", &self.timing)
+            .field("config", &self.config.hashes())
             .finish()
     }
 }
@@ -329,6 +336,15 @@ impl fmt::Debug for WorkUnit {
 struct Unit<'a> {
     workflow_context: &'a WorkflowContext<'a>,
     view: WorkUnitView,
+    /// Journaled with the view's configuration at the start of the run.
+    timing: Timing,
+}
+
+/// What the run journals at its start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct UnitStart {
+    config: UnitConfig,
+    timing: Timing,
 }
 
 impl Unit<'_> {
@@ -486,6 +502,15 @@ impl WorkUnit {
             .name("control secret")
             .await?;
         workflow_context.set(SECRET_KEY, control_secret);
+        let start = UnitStart {
+            config: self.config.unit_config(),
+            timing: self.timing,
+        };
+        let start = workflow_context
+            .run(|| async move { Ok(Json(start)) })
+            .name("configuration")
+            .await?
+            .into_inner();
         let unit = Unit {
             workflow_context,
             view: WorkUnitView {
@@ -495,7 +520,9 @@ impl WorkUnit {
                 control_session: control.to_string(),
                 findings: Vec::new(),
                 reason: None,
+                config: start.config,
             },
+            timing: start.timing,
         };
         unit.save();
         Ok(unit)
@@ -507,7 +534,8 @@ impl WorkUnit {
         unit_id: &WorkUnitId,
         request: &WorkUnitRequest,
     ) -> Result<(), TerminalError> {
-        let cap = Attempt::new(spine::ATTEMPT_CAP_DEFAULT).unwrap_or(Attempt::FIRST);
+        let cap = Attempt::new(unit.view.config.unit_attempt_cap)
+            .map_err(|error| failure(CODE_INTERNAL, error.to_string()))?;
         let mut attempt = Attempt::FIRST;
         unit.step(Event::ChildClaimsLease)?;
         unit.step(Event::FirstStatus)?;
@@ -563,7 +591,7 @@ impl WorkUnit {
             return Ok(After::Escalate);
         }
         unit.workflow_context
-            .sleep(backoff(&self.timing, attempt))
+            .sleep(backoff(&unit.timing, attempt))
             .await?;
         unit.step(Event::BackoffDone)?;
         unit.step(Event::ChildClaimsLease)?;
@@ -660,7 +688,7 @@ impl WorkUnit {
                 })
             })
             .name("verify")
-            .retry_policy(self.timing.port_retry())
+            .retry_policy(unit.timing.port_retry())
             .await?
             .into_inner();
         match verdict {
@@ -850,7 +878,7 @@ mod tests {
 
     fn planned() -> PlannedTask {
         let worker: WorkerRunRequest = serde_json::from_str(
-            r#"{"epic":"cf7a","work_unit":"wu01","vendor":"claude","argv":["l"],"routing":{"class":"c","tier":"t","effort":"low","binding":null,"rationale":"r","fallback_tier":null},"ledger":"seat","reservation":1}"#,
+            r#"{"epic":"cf7a","work_unit":"wu01","vendor":"claude","argv":["l"],"routing":{"class":"c","tier":"t","effort":"low","binding":null,"rationale":"r"},"ledger":"seat","reservation":1}"#,
         )
         .unwrap();
         PlannedTask {

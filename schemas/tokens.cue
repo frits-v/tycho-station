@@ -37,10 +37,11 @@ import "strings"
 #Level:  "root" | "control" | "worker"
 
 #VendorPattern: "(claude|codex|antigravity|amp|opencode)"
-#SlugPattern:   "[a-z0-9][a-z0-9-]*"
+#IdPattern:     "[a-z0-9][a-z0-9-]{0,15}"
+#SuffixPattern: "[a-z0-9][a-z0-9-]{0,12}"
 
 // `<epic>.<unit>.<ctl|wrk>.<vendor>[.<suffix>]` or `<epic>.root.<vendor>[.<suffix>]`; a unit
 // named `root` is the root form, so `<epic>.root.ctl.` is refused.
 #SessionName: string & strings.MaxRunes(64) &
-	=~"^\(#SlugPattern)\\.(root|\(#SlugPattern)\\.(ctl|wrk))\\.\(#VendorPattern)(\\.\(#SlugPattern))?$" &
+	=~"^\(#IdPattern)\\.(root|\(#IdPattern)\\.(ctl|wrk))\\.\(#VendorPattern)(\\.\(#SuffixPattern))?$" &
 	!~"^[^.]*\\.root\\.(ctl|wrk)\\."
