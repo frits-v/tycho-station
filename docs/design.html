@@ -498,7 +498,7 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
 <p>The judge literature behind this: majority voting explains most of what debate gains; extra debate rounds can talk models out of correct answers; models within one vendor share mistakes; the minority was right in about one split vote in four, which is why dissents travel.</p>
 
 <h3>Case law</h3>
-<p>One JSON file per case plus a SQLite index, linked into the graph. Retrieval filters by scope, then searches by keyword and embedding. When the fingerprinted files have changed, a binding case drops to persuasive. An arbiter must say, for each retrieved case, whether it applies or how this situation differs. A level is bound by its own level and those above; only a human overrules a human. Human cases carry a short review date and are suspended after two failed citations, so a hurried ruling cannot bind forever. Cases that prove reliable get promoted into hooks or lint rules. Case state lives in Restate; the files and the index are projections, so an agent with filesystem access cannot write a case. Every citation is recorded: when an arbiter applies or distinguishes a case, when a packet lists a precedent, when a mechanism fires naming its article. The citation ledger is what tells a dormant rule from a load-bearing one, and a rule the ledger has never seen is a petition to amend or remove it.</p>
+<p>One JSON file per case plus a SQLite index, linked into the graph. Retrieval filters by scope, then searches by keyword and embedding. When the fingerprinted files have changed, a binding case drops to persuasive. An arbiter must say, for each retrieved case, whether it applies or how this situation differs. A level is bound by its own level and those above; only a human overrules a human. Human cases carry a short review date and are suspended after two failed citations, so a hurried ruling cannot bind forever. Cases that prove reliable get promoted into hooks or lint rules. Case state lives in Restate; the files and the index are projections, so an agent with filesystem access cannot write a case. Every citation is recorded: when an arbiter applies or distinguishes a case, when a packet lists a precedent, when a mechanism fires naming its article. The <a href="#citation-ledger">citation ledger</a> is what tells a dormant rule from a load-bearing one, and a rule the ledger has never seen is a petition to amend or remove it.</p>
 <div class="case">
   <div class="hd"><code>case-2026-10-08-0042</code><span class="pill ok">binding</span><span>scope: repo <code>org/service</code>, paths <code>src/auth/**</code>, epic token-rotation</span><span>review after 2027-01-08</span></div>
   <div class="hold">Work units in this epic use the existing crypto module for token handling; no new crypto dependencies.</div>
@@ -670,6 +670,46 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
   <li>An escalation points to the checkpoint taken just before it left the unit. The packet names that checkpoint's commit. The ruling becomes a case linked to both, and the unit resumes with the case in force.</li>
 </ul>
 
+<h3 id="citation-ledger">Citation ledger</h3>
+<p>Article 15 and R35 make every citation of a rule and every firing of a mechanism a record. A Ledger virtual object keyed by rule id holds the records as Restate state, written through one exclusive handler, record, private to service calls; the factory graph carries them as nodes so the report is a join. A rule is a mandate clause, a case, a convention or a mechanism. A firing is a run of a mechanism that refused, blocked, reported a defect or could not run; a run that found nothing is an examination, recorded with what it examined. Dormancy counts citations and firings, never examinations.</p>
+<div class="tblwrap"><table>
+<tr><th>Node</th><th>Written by</th><th>Read by</th><th>Edges</th></tr>
+<tr><td>rule</td><td>the article-to-mechanism map, read at epic start; CaseLaw for cases and conventions</td><td>ledger report, arbiters</td><td>mechanism enforces clause, cited by citation, fired by firing, supersedes</td></tr>
+<tr><td>citation</td><td>Ledger record, in the step that cites</td><td>ledger report, CaseLaw</td><td>cites rule, made in instrument, by session, in work unit</td></tr>
+<tr><td>firing</td><td>Ledger record, from a handler step, the launcher or the drain</td><td>ledger report, readers</td><td>of mechanism, on subject, in work unit</td></tr>
+<tr><td>examination</td><td>as firing</td><td>ledger check</td><td>of mechanism, on subject</td></tr>
+</table></div>
+<div class="tblwrap"><table>
+<tr><th>Field</th><th>Citation</th><th>Firing or examination</th></tr>
+<tr><td>id</td><td>ULID</td><td>ULID</td></tr>
+<tr><td>instrument cited</td><td>rule id: a clause number such as <code>7.1</code>, a case id, a convention id</td><td>mechanism id from the map, such as <code>xtask:check-comments</code> or <code>ruleset:main:required_status_checks</code>; its clauses come from the map's enforces edges</td></tr>
+<tr><td>citing instrument</td><td>kind (brief, task packet, escalation, ruling, case, decision packet, verdict, petition, handoff note) and record id</td><td>the map entry by content hash</td></tr>
+<tr><td>session or mechanism</td><td>session name, council id, or the human</td><td>where it ran: handler invocation id, launcher session, ci run id, rule suite id, or spool file</td></tr>
+<tr><td>subject</td><td>epic and work unit</td><td>commit SHA, path, session name or handler key examined, and the examined count</td></tr>
+<tr><td>timestamp</td><td>unix milliseconds of the citing step</td><td>unix milliseconds of the run, and of ingest</td></tr>
+<tr><td>outcome</td><td>applied, distinguished, verified, failed, void, refused instruction, unrecognised</td><td>refused, defect, could not run, passed (an examination), unrecognised</td></tr>
+<tr><td>domain</td><td>core or human</td><td>core, forge or agent</td></tr>
+<tr><td>idempotency key</td><td>the journal step</td><td>launcher session plus sequence, forge suite or run id, or spool file digest</td></tr>
+</table></div>
+<p>A citation fails, for article 8.4, when the case's check fails as it is cited, or when a ruling above reverses the holding on the same facts. Every outcome field is an enumerated state with an unrecognised state that the report shows and never counts as a pass.</p>
+<h4>How a record reaches the store</h4>
+<ul>
+  <li>Handler checks, arbiters, the packet lint and CaseLaw run inside Restate. The handler calls Ledger record as a journaled step beside the decision it records, so a replay writes it once.</li>
+  <li>The launcher runs in the core's domain outside the engine. Its firings (a refused spawn, bare mode detected, an oversized journal entry) travel in the ingress call that resolves the awaitable or sends the heartbeat, under the session name plus sequence idempotency key.</li>
+  <li>Hooks and lints outside Restate (lefthook, the post-edit hook, vendor hooks in agent sessions, the pre-compaction hook) write one JSON record per run into a spool directory, under a temporary name and then renamed. The Reconciler tick drains each spool into Ledger record with the file's digest as idempotency key and deletes a file only after Restate acknowledges it. Records from the agent user's spool are tagged with the agent domain: a session can forge or withhold them, so they are data, and never the only evidence that a core mechanism held.</li>
+  <li>Forge records (ruleset rule suites, ci check runs) are read by a core step keyed by suite id and run id, each state decoded into an enumerated set with an unrecognised state. The step runs well inside the forge's retention; a gap longer than the retention is recorded as a could-not-run firing of the step.</li>
+</ul>
+<h4>Report</h4>
+<ul>
+  <li>One row per clause in the map, per case and convention in force, and per mechanism in the map.</li>
+  <li>Columns: citations, firings, examinations, last citation, last firing, citing instruments as kinds with counts, enforcing mechanisms, and state: in force, dormant, unmeasured (a mechanism with no record source), or gap (no mechanism, as listed in <a href="#mandate-map">section 14</a>).</li>
+  <li>Dormant (article 15.3): no citation and no firing within the review period. A dormant rule raises a petition under article 14.4, and the report shows the petition or the case recording why the rule stays.</li>
+  <li>The review period, the convention threshold and the petition thresholds are keys in the station's content-hashed CUE configuration, owned by the operator (article 14.5), and printed with the ledger and with every petition.</li>
+  <li>Published by <code>tycho ledger</code> as JSON and markdown, as the "Rule citation ledger" row of the metric table (<a href="#s17">section 17</a>), and in the reader's TUI and web view.</li>
+</ul>
+<h4>What the ledger check examines</h4>
+<p>The ledger check counts three sets: the numbered clauses parsed from <code>docs/mandate.md</code>, the rules and mechanisms in the map, and the records in the review period. It prints each count. It fails when any count is zero, when the map holds fewer clauses than the mandate, when a mapped mechanism has no record source, and when the drain or the forge step could not run. An empty ledger fails the check.</p>
+
 <h2 id="s12"><span class="num">12</span>Pane host</h2>
 <p>The host for the panes a human looks at is Ghostty itself, driven by the reader. Nothing else sits between the human and the session.</p>
 <div class="tblwrap"><table>
@@ -740,6 +780,124 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
 <tr><td>R34</td><td><span class="kw must">must</span></td><td>A task tracker is intake and projection only; outbound mirroring is off the critical path and a unit's lifecycle never depends on tracker state.</td></tr>
 <tr><td>R35</td><td><span class="kw must">must</span></td><td>Every citation of a mandate article, case or convention, and every firing of a mechanism, is recorded in the store with what cited it. The station publishes a citation ledger per rule and lists rules with no citation or firing over the review period as dormant. A mechanism whose firings are not recorded does not count as a mechanism.</td></tr>
 </table></div>
+
+<h3 id="mandate-map">Mandate articles and their mechanisms</h3>
+<p>Article 13.2 requires every mechanism to name the article it enforces, and every article without one to be listed in the design until a mechanism closes it. The tables below state that map for every numbered clause of the mandate. The map itself is authored in CUE with the rest of the configuration (<a href="#s17">section 17</a>); this section is the design's statement of it. Three rules decide each row.</p>
+<ul>
+  <li>A mechanism is listed only when something runs it on the default branch, or an open pull request adds it, and it refuses or reports a breach of the clause's text. Code that only tests call is a building block: the gap list names it, and it does not count.</li>
+  <li>Partial means the mechanism covers part of the clause, or covers it for this repository only. The rest of the clause stays in the gap list.</li>
+  <li>Record says where a firing ends up: store (the citation ledger, <a href="#citation-ledger">section 11</a>), forge (a GitHub rule suite or check run the ledger can ingest), or not recorded. Under article 15.4 a mechanism counts for article 13.2 only once its firings reach the store, so no row is closed until the ledger ingests them. No mechanism on the default branch names an article.</li>
+</ul>
+<div class="tblwrap"><table>
+<tr><th>Mechanism</th><th>What it does</th><th>Runs</th><th>Record</th></tr>
+<tr><td>ruleset</td><td>Repository ruleset on the default branch: pull request required, the <code>ci</code> check required and up to date, signed commits, linear history, no deletion, no force push, no bypass actors.</td><td>every push and merge to the default branch</td><td>forge (rule suites)</td></tr>
+<tr><td>ci</td><td><code>xtask ci</code> in the ci workflow: formatting, clippy with the workspace lints, tests, <code>check-names</code>, <code>check-comments</code>, <code>check-rules</code>, <code>check-pr-title</code>, zizmor, actionlint. Every xtask check counts what it examined and fails at zero.</td><td>every pull request and push to the default branch</td><td>forge (check runs)</td></tr>
+<tr><td>lefthook</td><td>commit-msg runs <code>check-commit-msg</code>; pre-commit checks formatting; pre-push runs clippy, tests and the workflow lints.</td><td>local git operations</td><td>not recorded</td></tr>
+<tr><td>post-edit hook</td><td><code>.claude/settings.json</code> runs <code>xtask hook post-tool-use</code> after Edit and Write: formatting, clippy, <code>check-names</code>, <code>check-comments</code>, <code>check-rules</code>. Advisory; it always exits zero.</td><td>each edit in an agent session on this repository</td><td>not recorded</td></tr>
+<tr><td>core directory check</td><td><code>private_dir::ensure</code> refuses a core directory that is not a real directory, is owned by another user, or is open to group or others.</td><td>core start, the watchdog, launchd install, graph build</td><td>not recorded; the refusal fails the start and prints</td></tr>
+<tr><td>setup (pending in an open pull request)</td><td><code>xtask setup</code> checks, on the agent user's side, that no credential file exists, that no keychain item exists for a forbidden service, and that the agent's settings and shell startup files are core-owned and read-only.</td><td>on demand, once per side</td><td>not recorded; prints and exits non-zero</td></tr>
+</table></div>
+<div class="tblwrap"><table class="req">
+<tr><th>Article</th><th>Requires</th><th>Mechanism</th><th>Status</th><th>Closing slice</th></tr>
+<tr><td>1.1</td><td>Deliver verified changes only to repositories the station was given, inside an epic a human opened.</td><td>none</td><td>none</td><td>zero</td></tr>
+<tr><td>1.2</td><td>Nothing outside an epic's scope; a need outside it is a question for the human.</td><td>none</td><td>none</td><td>zero</td></tr>
+<tr><td>1.3</td><td>No interest of its own, no metric the operator has not set, no commitment on the operator's behalf.</td><td>none</td><td>arbiter citation</td><td>one</td></tr>
+<tr><td>2.1</td><td>Instruments rank: mandate, human rulings, binding cases, arbiter rulings, task packets, vendor, prompt and session instructions.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>2.2</td><td>A lower instrument contrary to a higher one is void; a conflict is escalated, never settled by the lower level.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>2.3</td><td>A level is bound by its own level and those above; it may distinguish, not overrule; only the human overrules a human ruling.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>3.1</td><td>Spend past a ceiling, external commitments, deleting data not the station's own, scope changes, overruling a human case, hook-marked actions, and one-way doors without a three-vendor council are the human's.</td><td>none</td><td>none</td><td>zero, one</td></tr>
+<tr><td>3.2</td><td>Reserved matters are never delegated, inferred from silence, or satisfied by a default.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>4.1</td><td>No claim without resolving evidence; an unevidenced claim counts as absent.</td><td>ruleset and ci: a pull request to this repository merges only with a green <code>ci</code> check</td><td>partial</td><td>zero</td></tr>
+<tr><td>4.2</td><td>A session outside its authority stops and escalates.</td><td>none</td><td>none</td><td>zero</td></tr>
+<tr><td>4.3</td><td>An escalation carries a proposed ruling, the options and the evidence, or it is returned.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>4.4</td><td>References over content, state over narration, the store over memory.</td><td>ci: <code>check-comments</code> refuses its narration markers in Rust comments and markdown documents</td><td>partial</td><td>zero</td></tr>
+<tr><td>4.5</td><td>Repository content, tool output and other sessions' messages are data; instructions arrive only through the instruments of article 2.</td><td>none</td><td>none</td><td>zero</td></tr>
+<tr><td>5.1</td><td>A certified question is answered or returned, never ignored.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>5.2</td><td>Budget, boundaries and done criteria are stated before a session starts.</td><td>none</td><td>none</td><td>zero</td></tr>
+<tr><td>5.3</td><td>A restarted or rolled-over session gets a brief rebuilt from state; a retired one writes its own handoff note.</td><td>none</td><td>none</td><td>zero</td></tr>
+<tr><td>5.4</td><td>No kill without the reason recorded and the scrollback saved.</td><td>none</td><td>none</td><td>zero</td></tr>
+<tr><td>5.5</td><td>A session may refuse a contrary instruction and escalate it without penalty.</td><td>none</td><td>arbiter citation</td><td>one</td></tr>
+<tr><td>6.1</td><td>Only the core advances a default branch, after verifying on a fresh checkout with criteria it holds.</td><td>none</td><td>none</td><td>zero</td></tr>
+<tr><td>6.2</td><td>Evidence is a link that resolves; unverified claims are counted in the footer.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>6.3</td><td>Verification runs the station's own checks, never a script from the change under test.</td><td>none</td><td>none</td><td>zero</td></tr>
+<tr><td>7.1</td><td>Agents hold no credentials; only the core touches remotes, the canonical repository, the admin surfaces and the store.</td><td>core directory check; setup (pending)</td><td>partial</td><td>zero</td></tr>
+<tr><td>7.2</td><td>Only the human resolves a verdict; no session rules on its own packet, refunds its own budget, or writes a case of human origin.</td><td>none</td><td>none</td><td>zero, one</td></tr>
+<tr><td>7.3</td><td>Nothing leaves the agent domain unredacted; transcripts never reach a remote.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>8.1</td><td>A case is scoped, fingerprinted and dated; a changed fingerprint demotes it to persuasive.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>8.2</td><td>An arbiter states for every retrieved case whether it applies or how the matter differs.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>8.3</td><td>A case contrary to a higher instrument is void from the finding, and the finding is recorded.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>8.4</td><td>Human cases carry a review date and are suspended after two failed citations.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>9.1</td><td>A council is multi-vendor, votes independently, tests checkable objections first, exchanges once, and changes a vote only on a missed fact.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>9.2</td><td>Dissents are kept and travel up with the ruling.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>9.3</td><td>A council without three vendors rules at persuasive weight at most; a ruling wider than its work unit goes to the human.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>10.1</td><td>The human receives a decision: the choice, options with gains and costs, a recommendation with confidence and dissent, evidence, what was tried, precedents.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>10.2</td><td>Nothing material is omitted from a packet, and nothing is padded.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>10.3</td><td>No default on a one-way door; silence pauses the unit.</td><td>none</td><td>none</td><td>zero, one</td></tr>
+<tr><td>10.4</td><td>The human may interrupt, redirect or stop any unit; a reason given is recorded, none is required.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>11.1</td><td>Ceilings are mechanical; budgets settle on every exit; retries are capped per class; seat capacity and metered spend are separate ledgers.</td><td>none</td><td>none</td><td>zero</td></tr>
+<tr><td>11.2</td><td>Cost per unit, escalation depth and human interrupts are reported.</td><td>none</td><td>none</td><td>zero, one</td></tr>
+<tr><td>12.1</td><td>Control sessions roll over from a handoff note and do not compact; a compaction that fires is a defect.</td><td>none</td><td>none</td><td>zero</td></tr>
+<tr><td>12.2</td><td>What the station learns is written to the store as cases, checkpoints and notes.</td><td>none</td><td>none</td><td>zero</td></tr>
+<tr><td>13.1</td><td>Only the operator amends the mandate, by pull request, effective for work units started after the merge.</td><td>ruleset: every change to the default branch, the mandate included, goes through a pull request</td><td>partial</td><td>zero</td></tr>
+<tr><td>13.2</td><td>Every mechanism names its article; an article without one is listed in the design until closed.</td><td>none; this section lists the gaps</td><td>none</td><td>zero</td></tr>
+<tr><td>14.1</td><td>The text changes only by amendment; no session or council changes it.</td><td>none</td><td>none</td><td>zero</td></tr>
+<tr><td>14.2</td><td>An interpretation is a case scoped to its article, persuasive until a human confirms it; a void finding is a case.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>14.3</td><td>A case cited and verified past a threshold becomes a convention; promotion into a mechanism goes through a pull request.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>14.4</td><td>The store raises a petition when a count crosses a threshold; a rejection is a case and blocks the same petition without new evidence.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>14.5</td><td>Thresholds and periods live in configuration, are reported with every petition, and change only by the operator.</td><td>none</td><td>none</td><td>zero</td></tr>
+<tr><td>15.1</td><td>Every citation and every firing is recorded in the store with what cited it and when.</td><td>none</td><td>none</td><td>zero, one</td></tr>
+<tr><td>15.2</td><td>The station publishes a citation ledger beside cost, escalation depth and human interrupts.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>15.3</td><td>A rule with no citation and no firing over the review period is dormant and raises a petition.</td><td>none</td><td>none</td><td>one</td></tr>
+<tr><td>15.4</td><td>A mechanism without recorded firings does not count; a check that examines nothing and reports success has failed.</td><td>ci: every xtask check fails when it examined zero files</td><td>partial</td><td>zero</td></tr>
+</table></div>
+<p>Of the 50 clauses, 5 have a partial mechanism on the default branch (4.1, 4.4, 7.1, 13.1, 15.4), one of them with a second mechanism pending (7.1), and 45 have none. Of the six mechanisms, two leave a forge record and four leave no record.</p>
+<h4>Articles without a mechanism</h4>
+<p>Until a mechanism closes it, each clause below is enforced by arbiters citing it (article 13.2). A clause marked remainder has a partial mechanism above.</p>
+<p>Slice zero</p>
+<ul>
+  <li>13.2: the article-to-mechanism map in CUE, and <code>xtask check-mandate</code>, which parses the numbered clauses of <code>docs/mandate.md</code>, requires each clause in the map with a mechanism or a gap entry, requires each mapped mechanism to exist (an xtask command, a workspace lint, a ruleset rule, a handler), and fails at zero clauses. Every firing record carries its mechanism id, so its articles come from the map.</li>
+  <li>13.1 remainder, 14.1: code owner review on <code>docs/mandate.md</code> in the ruleset, with the operator as the only owner; the WorkUnit run handler records the mandate's content hash at unit start, as it does for prompts and routing tables.</li>
+  <li>14.5: thresholds and periods in the content-hashed CUE configuration, owned by the core user, with no agent write path.</li>
+  <li>15.1 for mechanisms, 15.4 remainder: the ledger store, the spool drain and the forge ingest (<a href="#citation-ledger">section 11</a>); the ledger check fails on an empty ledger.</li>
+  <li>1.1, 1.2: Epic start accepts only an epic created by the operator's command line; envelope validation runs on every ingress handler (building block: the envelope rejects a sender, recipient or correlation id naming a different epic or work unit); the launcher refuses a task packet whose writable paths leave the unit's worktree.</li>
+  <li>3.1 for spend, credentials, deletion and scope: Epic reserve refuses past the ceiling and raises the budget inbox item; adding a unit is not callable by an agent; the boundary tests run as the agent user.</li>
+  <li>4.1 remainder: the verify step fails a done criterion reported without evidence (building blocks: the result outcome has no merged state; criterion reports carry evidence references).</li>
+  <li>4.2: agent-callable handlers are scoped to the caller's session key and check its secret (building block: <code>SessionSecret::verify</code>, constant time); authority handlers are private (R25); a hook denies write tools in control sessions (R3).</li>
+  <li>4.4 remainder: the launcher enforces the journal entry size limit (R23) (building block: task packet inputs and evidence are content references).</li>
+  <li>4.5: a session receives instructions only as a task packet through a handler (building block: the envelope direction check sends task packets only down the tree); sandbox settings are passed on every launch. A session acting on injected text stays an arbiter citation.</li>
+  <li>5.2: the launcher refuses a spawn without a parsed task packet carrying budget, boundaries and at least one done criterion, unless the unit's pass condition is an escalation (building block: the task packet type requires the fields; an empty done criteria list parses).</li>
+  <li>5.3: every spawn renders the brief from WorkUnit and Session state; the Session handoff handler validates the note (building block: <code>spawn_decision</code> adopts only a fresh lease with the expected session and awaitable).</li>
+  <li>5.4: the Session kill handler takes an enumerated reason and saves <code>zmx history</code> before the signal (building block: enumerated requeue reasons).</li>
+  <li>6.1, 6.3: the merge gate (<a href="#s7">section 7</a>): a core-owned canonical repository, verification on a fresh checkout with criteria pinned by content hash in the store, and the three negative tests as a hard gate (building block: the harness verifier reports an enumerated outcome per criterion).</li>
+  <li>7.1 remainder: the boundary tests of slice zero step 5 as the agent user; <code>xtask setup</code> on the default branch.</li>
+  <li>7.2 for budgets: settle is private to service calls.</li>
+  <li>10.3 for the file blocker path: a verdict file has no timer default; the unit waits.</li>
+  <li>11.1: Epic reserve and settle with two ledgers; WorkerRun settles on every exit and caps attempts per class (building block: every exit state has a disposition, held by an exhaustive match with an unrecognised state that goes to the inbox).</li>
+  <li>11.2 for cost: the harness measures cost per work unit.</li>
+  <li>12.1: rollover at the context threshold and at phase boundaries; in Claude control sessions a PreCompact hook with the automatic trigger records a defect firing; the Codex equivalent is settled in the slice.</li>
+  <li>12.2: a checkpoint at every phase boundary; handoff notes stored through the Session handoff handler.</li>
+</ul>
+<p>Slice one</p>
+<ul>
+  <li>1.3, 5.5: arbiter citation, recorded in the ledger; for 5.5 an attempt that ends in an escalation citing an article does not count against the retry cap.</li>
+  <li>2.1, 2.2, 2.3: an instrument kind with its rank in the shared types; CaseLaw record refuses a case that supersedes one of a higher level; a conflict between instruments is sorted as an authority question and goes up; only the rule handler supersedes a human case; a distinction carries the stated facts.</li>
+  <li>3.1 for one-way doors and overruling, 3.2, 9.3: the Council tally caps weight by the number of distinct vendors; a one-way door without three vendors goes to a decision packet; the packet lint refuses a timeout default on a one-way door.</li>
+  <li>4.3: Escalation returns a question without a proposed ruling, two options and evidence. The escalation payload type allows a missing proposed ruling and tightens with this check.</li>
+  <li>5.1: every open escalation carries a durable timer that sends it up a level; a packet bounced twice reaches the inbox.</li>
+  <li>6.2, 10.1, 10.2 for padding: the packet lint (R12) with link resolution and the footer count. Omission stays an arbiter citation, measured by requests for more information.</li>
+  <li>7.2 for verdicts and cases: rule is authenticated with the reader's secret; record is private to service calls.</li>
+  <li>7.3: the three-part push exclusion, hidden refs, and the push test in every git form.</li>
+  <li>8.1 to 8.4: CaseLaw record refuses a case without scope, fingerprint and date, and a human case without a review date; a ruling carries one disposition per retrieved case or is refused; a void finding is a case kind; the ledger counts failed citations and the second suspends the case.</li>
+  <li>9.1, 9.2: Council refuses a single-vendor judge set, seals briefs, allows one exchange round, and accepts a changed vote only with a cited fact; dissents travel in the ruling and the packet.</li>
+  <li>10.3 for packets, 10.4: the packet lint; a stop verdict cancels the unit, with the reason as an optional field.</li>
+  <li>11.2 for escalation depth: measured from cases.</li>
+  <li>14.2, 14.3, 14.4: case kinds for interpretations and conventions; weight capped at persuasive until a human confirms; the ledger report marks convention candidates and raises petitions; a rejected petition is a case whose fingerprint suppresses the same petition.</li>
+  <li>15.1 for citations, 15.2, 15.3: arbiter and packet citations recorded in the citing step; <code>tycho ledger</code> publishes the report; dormant rules are listed with their petitions.</li>
+</ul>
+<p>Slice two</p>
+<ul>
+  <li>11.2 for human interrupts, 15.2: the reader shows the ledger and the interrupt count beside cost; petitions reach the inbox.</li>
+</ul>
 
 <h2 id="s15"><span class="num">15</span>Open choices</h2>
 <p>Every choice is now settled. For the record: the durable execution engine is Restate, chosen over Temporal for a single binary with an embedded journal, a first-class Rust SDK, and keyed objects that give one invocation per work unit; the reader and core are Rust; the pane host is Ghostty driven by the reader, with no dedicated terminal app on the critical path; entire.io's parts are adopted as below, after an empirical probe of the CLI and the graph plugin.</p>
