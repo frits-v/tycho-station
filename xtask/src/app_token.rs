@@ -4,6 +4,8 @@
 //! scoped to one repository and two permissions. Credentials travel only through child
 //! process environments (`GH_TOKEN`), never through arguments, output or error text.
 
+use std::env;
+use std::ffi::OsString;
 use std::fmt;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -29,6 +31,19 @@ const GH_TIMEOUT: Duration = Duration::from_secs(60);
 const REQUESTED_PERMISSIONS: [(&str, &str); 2] =
     [("contents", "write"), ("pull_requests", "write")];
 const IMPLICIT_PERMISSION: (&str, &str) = ("metadata", "read");
+const GH_INHERITED_VARIABLES: [&str; 11] = [
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
 
 /// The App's identity and signing key, read from the environment.
 pub struct AppCredentials {
@@ -173,16 +188,51 @@ fn app_jwt(credentials: &AppCredentials, now: u64) -> Result<String, String> {
     })
 }
 
-/// Runs `gh api` with the credential in `GH_TOKEN` only; the arguments carry no secret.
+/// The parent variables gh may see: where to find itself, its configuration, certificates and
+/// a proxy. Everything else, the App id and key included, stays out of its environment.
+fn gh_environment(
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    parent
+        .into_iter()
+        .filter(|(name, _)| GH_INHERITED_VARIABLES.iter().any(|allowed| name == allowed))
+        .collect()
+}
+
+/// The parent environment minus the App id and key, for a child that needs the rest of it.
+pub fn without_app_credentials(
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    parent
+        .into_iter()
+        .filter(|(name, _)| name != APP_ID_VARIABLE && name != APP_KEY_VARIABLE)
+        .collect()
+}
+
+/// A command whose environment is the allowlisted parent variables and the credential in
+/// `GH_TOKEN`; the arguments carry no secret.
+fn credentialed_command(
+    program: &str,
+    credential: &str,
+    args: &[&str],
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .env_clear()
+        .envs(gh_environment(parent))
+        .env("GH_TOKEN", credential)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    command
+}
+
 fn gh_api(credential: &str, args: &[&str]) -> crate::process::Captured {
+    let mut gh_args = vec!["api"];
+    gh_args.extend_from_slice(args);
     run_bounded(
-        Command::new("gh")
-            .arg("api")
-            .args(args)
-            .env("GH_TOKEN", credential)
-            .env_remove("GITHUB_TOKEN")
-            .env("GH_PROMPT_DISABLED", "1")
-            .env("GH_NO_UPDATE_NOTIFIER", "1"),
+        &mut credentialed_command("gh", credential, &gh_args, env::vars_os()),
         GH_TIMEOUT,
     )
 }
@@ -571,6 +621,63 @@ mod tests {
                 "-f",
                 "permissions[pull_requests]=write",
             ]
+        );
+    }
+
+    fn parent_with_credentials() -> Vec<(OsString, OsString)> {
+        [
+            ("PATH", "/usr/bin:/bin"),
+            ("HOME", "/home/runner"),
+            (APP_ID_VARIABLE, "123456"),
+            (
+                APP_KEY_VARIABLE,
+                "-----BEGIN RSA PRIVATE KEY-----\nkey-material",
+            ),
+            ("GITHUB_TOKEN", "workflow-token"),
+            ("CARGO_HOME", "/home/runner/.cargo"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect()
+    }
+
+    #[test]
+    fn gh_sees_only_allowlisted_variables_and_the_credential() {
+        let names: Vec<OsString> = gh_environment(parent_with_credentials())
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, [OsString::from("PATH"), OsString::from("HOME")]);
+        let shown = run_bounded(
+            &mut credentialed_command("env", "the-credential", &[], parent_with_credentials()),
+            Duration::from_secs(60),
+        );
+        assert_eq!(shown.exit, Exit::Code(0));
+        assert!(
+            shown.stdout.contains("GH_TOKEN=the-credential"),
+            "{}",
+            shown.stdout
+        );
+        for absent in [
+            APP_ID_VARIABLE,
+            APP_KEY_VARIABLE,
+            "key-material",
+            "GITHUB_TOKEN",
+            "CARGO_HOME",
+        ] {
+            assert!(!shown.stdout.contains(absent), "{absent}: {}", shown.stdout);
+        }
+    }
+
+    #[test]
+    fn other_children_inherit_everything_but_the_app_credentials() {
+        let names: Vec<OsString> = without_app_credentials(parent_with_credentials())
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            ["PATH", "HOME", "GITHUB_TOKEN", "CARGO_HOME"].map(OsString::from)
         );
     }
 }

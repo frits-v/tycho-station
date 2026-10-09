@@ -61,6 +61,8 @@ jobs:
   release-pr:
     name: release-pr
     runs-on: ubuntu-latest
+    # The App key is an environment secret; the environment admits only the default branch.
+    environment: release
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
     permissions:
@@ -77,7 +79,9 @@ jobs:
         with:
           cache: false
           install_args: rust release-plz gh
-      - run: mise run release-pr
+      # Built without the key, so no build script or proc-macro runs with it in its environment.
+      - run: cargo build --locked -p xtask
+      - run: target/debug/xtask release-pr
         env:
           TYCHO_RELEASE_APP_ID: ${{ vars.TYCHO_RELEASE_APP_ID }}
           TYCHO_RELEASE_APP_PRIVATE_KEY: ${{ secrets.TYCHO_RELEASE_APP_PRIVATE_KEY }}

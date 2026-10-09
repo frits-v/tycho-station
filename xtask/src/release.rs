@@ -1,6 +1,7 @@
 //! Release commands: release pull requests and tags through release-plz, binaries through dist.
 
 use std::env;
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -256,8 +257,7 @@ pub fn release_pr(dry_run: bool) -> i32 {
         }
     };
     let captured = run_bounded(
-        Command::new("release-plz")
-            .args(["release-pr", "--output", "json"])
+        release_plz_command(&["release-pr", "--output", "json"], env::vars_os())
             .env("GIT_TOKEN", token.expose()),
         RELEASE_PLZ_TIMEOUT,
     );
@@ -269,6 +269,19 @@ pub fn release_pr(dry_run: bool) -> i32 {
             1
         }
     }
+}
+
+/// release-plz and the cargo and git processes it starts never see the App id or key.
+fn release_plz_command(
+    args: &[&str],
+    parent: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Command {
+    let mut command = Command::new("release-plz");
+    command
+        .args(args)
+        .env_clear()
+        .envs(app_token::without_app_credentials(parent));
+    command
 }
 
 fn report_release_pr(captured: Captured) -> i32 {
@@ -344,8 +357,8 @@ fn release_pr_dry_run() -> i32 {
 }
 
 fn dry_run_in(scratch: &Path) -> i32 {
-    let mut update = Command::new("release-plz");
-    update.current_dir(scratch).arg("update");
+    let mut update = release_plz_command(&["update"], env::vars_os());
+    update.current_dir(scratch);
     if let Ok(token) = env::var("GITHUB_TOKEN") {
         update.env("GIT_TOKEN", token);
     }
@@ -712,6 +725,21 @@ mod tests {
             decode_head_tags(Exit::Code(0), "v0.1.0\nv0.1.1\n"),
             HeadTag::Unrecognised(_)
         ));
+    }
+
+    #[test]
+    fn release_plz_never_receives_the_app_credentials() {
+        let parent: Vec<(OsString, OsString)> = [
+            ("PATH", "/usr/bin"),
+            (APP_ID_VARIABLE, "1"),
+            (APP_KEY_VARIABLE, "key-material"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect();
+        let command = release_plz_command(&["release-pr"], parent);
+        let names: Vec<&std::ffi::OsStr> = command.get_envs().map(|(name, _)| name).collect();
+        assert_eq!(names, [std::ffi::OsStr::new("PATH")]);
     }
 
     #[test]

@@ -75,25 +75,42 @@ GitHub App installation token that the xtask mints for each run:
   repository, and requests an installation token limited to this repository and to
   Contents and Pull requests write. It refuses a token whose grant is wider. The token
   reaches release-plz as `GIT_TOKEN` in its environment and is revoked when release-plz
-  exits; the key, the JWT and the token never appear in arguments, output or errors.
+  exits. The key, the JWT and the token never appear in arguments, output, errors or
+  child environments: gh gets an allowlisted environment and the credential in
+  `GH_TOKEN`, and release-plz and the processes it starts get the job's environment
+  without the App id and key.
+- The workflow builds the xtask in a step without the key, then runs the built binary in
+  the step that holds it, so no build script or proc-macro sees the key.
+- A failed revocation fails the job. A run cancelled between minting and revoking leaves
+  the token valid until GitHub expires it, one hour after it was issued.
 - The release pull request's author is the App's bot account (`<app-name>[bot]`), not a
   person. The merge gate and any ruleset that names authors or bypass actors see that
   identity.
 - Setup, once: create a GitHub App owned by the operator's account with webhooks off,
   repository permissions Contents and Pull requests set to read and write and nothing
-  else, installable only on this account. Install it on this repository only. Generate a
-  private key, then store the App id and the key and delete the downloaded file:
+  else, installable only on this account. Install it on this repository only. Create the
+  `release` environment limited to the default branch, so a workflow on any other branch
+  cannot read its secret. Generate a private key, then store the App id and the key in
+  the environment and delete the downloaded file:
 
   ```sh
-  gh variable set TYCHO_RELEASE_APP_ID -R frits-v/tycho-station --body <app-id>
-  gh secret set TYCHO_RELEASE_APP_PRIVATE_KEY -R frits-v/tycho-station < key.pem
+  gh api -X PUT repos/frits-v/tycho-station/environments/release \
+    -F 'deployment_branch_policy[protected_branches]=false' \
+    -F 'deployment_branch_policy[custom_branch_policies]=true'
+  gh api -X POST repos/frits-v/tycho-station/environments/release/deployment-branch-policies \
+    -f name=main -f type=branch
+  gh variable set TYCHO_RELEASE_APP_ID -R frits-v/tycho-station --env release --body <app-id>
+  gh secret set TYCHO_RELEASE_APP_PRIVATE_KEY -R frits-v/tycho-station --env release < key.pem
   rm key.pem
   ```
 
 - Rotation: generate a new private key in the App settings, store it with the same
   `gh secret set` command, delete the local file, then delete the old key in the App
   settings. The next `release-pr` run uses the new key.
-- Until the variable and the secret exist, the `release-pr` job fails with a message
-  naming both and this section; the `release` and `binaries` jobs use the workflow's own
-  `GITHUB_TOKEN` and are unaffected. A key that does not belong to the App id, or an App
-  not installed on this repository, fails the installation lookup with GitHub's message.
+- The first run that names the `release` environment creates it without a branch policy
+  if it does not exist yet; the `PUT` above sets the policy either way. Until the variable
+  and the secret exist in it, the `release-pr` job fails with a message naming both and
+  this section; the `release` and `binaries` jobs use the
+  workflow's own `GITHUB_TOKEN` and are unaffected. A key that does not belong to the App
+  id, or an App not installed on this repository, fails the installation lookup with
+  GitHub's message.
