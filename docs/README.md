@@ -5,3 +5,4 @@
 - `slices.md`: the build plan, three slices with exit tests, tracked as GitHub issues and milestones.
 - `style.md`: code and documentation rules, each naming what enforces it.
 - `process.md`: what happens when something goes wrong, where mechanisms live, how a change is verified and reported.
+- `prompts/`: prompts that start a session on a slice. `prompts/slice-zero.md` runs slice zero in fan-out.
