@@ -793,6 +793,38 @@ fn file_appears(path: &Path) -> String {
     })
 }
 
+impl Harness {
+    /// An instruction to write one word to a file named by its absolute path in the work dir.
+    fn write_task(&self, name: &str, word: &str) -> String {
+        format!(
+            "Use the Write tool to create the file {} containing the word {word}. Do nothing else.",
+            self.file(name).display()
+        )
+    }
+
+    /// Waits for the file the instruction asks for; on a timeout the screen is the evidence.
+    fn file_from(&self, control: &Control, name: &str) -> String {
+        let path = self.file(name);
+        let started = Instant::now();
+        while started.elapsed() < TURN_LIMIT {
+            if let Ok(content) = fs::read_to_string(&path) {
+                println!(
+                    "evidence: {name} appeared after {:.1}s",
+                    started.elapsed().as_secs_f64()
+                );
+                return content;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        let screen = self.screen(&control.name);
+        let tail: Vec<&str> = screen.lines().rev().take(40).collect();
+        panic!(
+            "{name} did not appear; screen, last lines first:\n{}",
+            tail.join("\n")
+        );
+    }
+}
+
 #[test]
 #[ignore = "spawns a real claude session with the developer's login; run with mise run control-tests"]
 fn an_instruction_posted_from_a_handler_step_reaches_the_session_over_its_socket() {
@@ -802,14 +834,14 @@ fn an_instruction_posted_from_a_handler_step_reaches_the_session_over_its_socket
     let record = instruct(
         &control,
         "wu01:task_packet:1",
-        "Use the Write tool to create control-one.txt in the current directory containing the word one. Do nothing else.",
+        &harness.write_task("control-one.txt", "one"),
     );
     assert_eq!(record.path, InstructionPath::Socket);
     assert!(
         matches!(&record.delivery, Delivery::Posted { socket } if socket.ends_with(&format!("{pid}.sock"))),
         "{record:?}"
     );
-    let content = file_appears(&harness.file("control-one.txt"));
+    let content = harness.file_from(&control, "control-one.txt");
     println!("evidence: control-one.txt holds {content:?}");
     assert!(content.contains("one"));
     let repeated = instruct(&control, "wu01:task_packet:1", "Ignored: a repeated key.");
@@ -837,14 +869,14 @@ fn relay_reaches_the_session(harness: &Harness, control: &Control) {
     let record = instruct(
         control,
         "wu01:task_packet:2",
-        "Use the Write tool to create control-relay.txt in the current directory containing the word relay. Do nothing else.",
+        &harness.write_task("control-relay.txt", "relay"),
     );
     harness.force_relay.store(false, Ordering::SeqCst);
     assert_eq!(record.path, InstructionPath::Relay, "{record:?}");
     let Delivery::Relayed { file } = &record.delivery else {
         panic!("not relayed: {record:?}");
     };
-    let content = file_appears(&harness.file("control-relay.txt"));
+    let content = harness.file_from(control, "control-relay.txt");
     println!("evidence: control-relay.txt holds {content:?}");
     let marker = relay_dir(&harness.spawner.dirs, &control.name).join(format!("{file}.posted"));
     let posted = fs::read_to_string(&marker).unwrap();
@@ -859,7 +891,7 @@ fn dont_ask_never_waits(harness: &mut Harness) {
     instruct(
         &dont_ask,
         "wu01:task_packet:1",
-        "Use the Write tool to create control-three.txt in the current directory containing the word three. Do nothing else.",
+        &harness.write_task("control-three.txt", "three"),
     );
     let mut observed = Vec::new();
     let started = Instant::now();
@@ -898,7 +930,7 @@ fn a_permission_prompt_stalls_the_session_and_queues_the_inbox_while_dont_ask_do
     instruct(
         &manual,
         "wu01:task_packet:1",
-        "Use the Write tool to create control-two.txt in the current directory containing the word two. Do nothing else.",
+        &harness.write_task("control-two.txt", "two"),
     );
     let waiting = wait_until(
         "the session to wait at a prompt",
@@ -946,7 +978,7 @@ fn a_killed_session_resumes_under_its_id_with_the_settings_passed_again() {
     instruct(
         &first,
         "wu01:task_packet:1",
-        "Use the Write tool to create control-four.txt in the current directory containing the word four. Do nothing else.",
+        &harness.write_task("control-four.txt", "four"),
     );
     file_appears(&harness.file("control-four.txt"));
     harness.kill(&first);
@@ -967,7 +999,7 @@ fn a_killed_session_resumes_under_its_id_with_the_settings_passed_again() {
     let record = instruct(
         &resumed,
         "wu01:task_packet:2",
-        "Use the Write tool to create control-five.txt in the current directory containing the word five. Do nothing else.",
+        &harness.write_task("control-five.txt", "five"),
     );
     assert!(
         matches!(&record.delivery, Delivery::Posted { socket } if socket.ends_with(&format!("{resumed_pid}.sock"))),
