@@ -8,6 +8,7 @@ use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tycho_types::agent_call::{HandoffCall, HandoffNote, HeartbeatCall, CONTEXT_TOKENS_MAX};
 use tycho_types::envelope::{ProgressMarker, ShortText};
+use tycho_types::exit::ExitState;
 use tycho_types::launcher::{AwaitableId, LauncherEnv, SessionSecret, SEQUENCE_MAX};
 use tycho_types::lease::{spawn_decision, RequeueReason, SpawnDecision};
 use tycho_types::service::RECONCILER_KEY;
@@ -15,7 +16,7 @@ use tycho_types::session::{SessionName, Vendor};
 use tycho_types::task_packet::AbsolutePath;
 
 use crate::config::spine;
-use crate::services::reconciler::{ExpectRequest, ReconcilerClient};
+use crate::services::reconciler::{fingerprint, ExpectRequest, ReconcilerClient};
 use crate::services::spawner::{LeaseRead, SpawnSpec, Spawner};
 use crate::services::{
     blocking, refuse, secret, spawner_failure, wall_clock_unix_ms, Ports, Timing, CODE_BAD_REQUEST,
@@ -30,6 +31,8 @@ const SECRET_KEY: &str = "secret";
 pub enum SessionPhase {
     Running,
     Killed,
+    /// The reconciler found the lease dead; the awaitable was rejected and no pid is trusted.
+    Lost,
 }
 
 /// Everything about a session except its secret, which lives under its own state key.
@@ -51,6 +54,55 @@ pub struct SessionState {
     pub inbox_socket: Option<AbsolutePath>,
     pub handoff: Option<HandoffNote>,
     pub scrollback: Option<ShortText>,
+}
+
+/// What `status` answers: no secret and no capability, so no awaitable id and no note content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionView {
+    pub phase: SessionPhase,
+    pub vendor: Vendor,
+    pub control: bool,
+    pub pid: u32,
+    pub spawned_unix_ms: u64,
+    pub heartbeat_unix_ms: Option<u64>,
+    pub progress: Option<ProgressMarker>,
+    pub progress_changed_unix_ms: u64,
+    pub context_tokens: u64,
+    pub has_resume_handle: bool,
+    pub inbox_socket: Option<AbsolutePath>,
+    pub handoff_present: bool,
+    pub scrollback: Option<ShortText>,
+}
+
+impl From<&SessionState> for SessionView {
+    fn from(state: &SessionState) -> Self {
+        Self {
+            phase: state.phase,
+            vendor: state.vendor,
+            control: state.control,
+            pid: state.pid,
+            spawned_unix_ms: state.spawned_unix_ms,
+            heartbeat_unix_ms: state.heartbeat_unix_ms,
+            progress: state.progress.clone(),
+            progress_changed_unix_ms: state.progress_changed_unix_ms,
+            context_tokens: state.context_tokens,
+            has_resume_handle: state.resume_handle.is_some(),
+            inbox_socket: state.inbox_socket.clone(),
+            handoff_present: state.handoff.is_some(),
+            scrollback: state.scrollback.clone(),
+        }
+    }
+}
+
+/// A running session becomes lost; any other phase stays as it is.
+#[must_use]
+pub fn expire(state: &SessionState) -> Option<SessionState> {
+    if state.phase != SessionPhase::Running {
+        return None;
+    }
+    let mut next = state.clone();
+    next.phase = SessionPhase::Lost;
+    Some(next)
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,7 +396,7 @@ impl Session {
         object_context
             .run(|| blocking(move || spawner.send(&name, &text).map_err(spawner_failure)))
             .name("nudge")
-            .retry_policy(self.timing.spawn_retry())
+            .retry_policy(self.timing.port_retry())
             .await?;
         Ok(())
     }
@@ -384,7 +436,7 @@ impl Session {
         object_context
             .run(|| blocking(move || spawner.kill(&target, pid).map_err(spawner_failure)))
             .name("kill")
-            .retry_policy(self.timing.spawn_retry())
+            .retry_policy(self.timing.port_retry())
             .await?;
         state.phase = SessionPhase::Killed;
         state.scrollback.clone_from(&scrollback);
@@ -396,13 +448,35 @@ impl Session {
         Ok(Json(KillOutcome::Killed { scrollback }))
     }
 
+    /// The reconciler's verdict: rejects the awaitable with the exit state, trusts no pid after.
+    #[handler(ingress_private)]
+    async fn expire(
+        &self,
+        object_context: ObjectContext<'_>,
+        exit: Json<ExitState>,
+    ) -> HandlerResult<bool> {
+        let Some(state) = object_context.get::<Json<SessionState>>(STATE_KEY).await? else {
+            return Ok(false);
+        };
+        let state = state.into_inner();
+        let Some(next) = expire(&state) else {
+            return Ok(false);
+        };
+        let wire: String = exit.into_inner().into();
+        object_context.reject_awakeable(state.awaitable_id.as_str(), TerminalError::new(wire));
+        object_context.set(STATE_KEY, Json(next));
+        Ok(true)
+    }
+
     #[handler]
     async fn status(
         &self,
         shared_context: SharedObjectContext<'_>,
-    ) -> HandlerResult<Json<Option<SessionState>>> {
+    ) -> HandlerResult<Json<Option<SessionView>>> {
         let state = shared_context.get::<Json<SessionState>>(STATE_KEY).await?;
-        Ok(Json(state.map(Json::into_inner)))
+        Ok(Json(
+            state.map(|state| SessionView::from(&state.into_inner())),
+        ))
     }
 }
 
@@ -449,7 +523,7 @@ impl Session {
         object_context
             .run(|| blocking(move || spawner.spawn(&spec).map_err(spawner_failure)))
             .name("spawn")
-            .retry_policy(self.timing.spawn_retry())
+            .retry_policy(self.timing.port_retry())
             .await
             .map_err(HandlerError::from)
     }
@@ -471,7 +545,7 @@ impl Session {
                 })
             })
             .name("save scrollback")
-            .retry_policy(self.timing.spawn_retry())
+            .retry_policy(self.timing.port_retry())
             .await?;
         Ok(saved.into_inner())
     }
@@ -507,7 +581,7 @@ fn record_spawn(
         .object_client::<ReconcilerClient>(RECONCILER_KEY)
         .expect(Json(ExpectRequest {
             session: name.clone(),
-            awaitable_id: request.awaitable_id,
+            awaitable_fingerprint: fingerprint(&request.awaitable_id),
             since_unix_ms: now_unix_ms,
         }))
         .send();
@@ -724,6 +798,35 @@ mod tests {
         let mut request = spawn_request(1);
         request.secret = "short".to_string();
         assert_eq!(check_spawn(&request), Err(SessionError::Secret));
+    }
+
+    #[test]
+    fn status_view_carries_no_secret_and_no_capability() {
+        let mut state = running();
+        state.resume_handle = Some(ShortText::parse("resume-7f3a").unwrap());
+        state.handoff = Some(HandoffNote {
+            workers_in_flight: vec![tycho_types::agent_call::WorkerInFlight {
+                task: tycho_types::service::TaskId::parse("wu03-t07").unwrap(),
+                awaitable_id: AwaitableId::parse("sign_1worker").unwrap(),
+            }],
+            ..note(0, 1)
+        });
+        let view = serde_json::to_string(&SessionView::from(&state)).unwrap();
+        for hidden in ["sign_1abc", "sign_1worker", "resume-7f3a", &the_secret()] {
+            assert!(!view.contains(hidden), "{hidden} in {view}");
+        }
+        assert!(view.contains("\"handoff_present\":true"));
+    }
+
+    #[test]
+    fn expire_loses_a_running_session_once() {
+        let lost = expire(&running()).unwrap();
+        assert_eq!(lost.phase, SessionPhase::Lost);
+        assert_eq!(expire(&lost), None);
+        assert_eq!(
+            apply_heartbeat(&lost, &the_secret(), &beat(None, 0, 1), 2_000),
+            Err(SessionError::Ended)
+        );
     }
 
     #[test]

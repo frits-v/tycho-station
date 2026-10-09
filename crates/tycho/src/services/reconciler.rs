@@ -1,5 +1,6 @@
 //! The Reconciler virtual object, one key: compares expected sessions against lease files,
-//! rejects a dead session's awaitable so the owning workflow re-queues, and re-sends itself.
+//! expires a dead session so its awaitable is rejected and the owner re-queues, and re-sends
+//! itself.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -7,6 +8,7 @@ use std::sync::Arc;
 
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tycho_types::exit::ExitState;
 use tycho_types::launcher::AwaitableId;
 use tycho_types::lease::{spawn_decision, RequeueReason, SpawnDecision};
@@ -14,6 +16,7 @@ use tycho_types::service::RECONCILER_KEY;
 use tycho_types::session::SessionName;
 
 use crate::config::spine;
+use crate::services::session::SessionClient;
 use crate::services::spawner::{LeaseRead, Spawner};
 use crate::services::{blocking, refuse, wall_clock_unix_ms, Ports, Timing, CODE_BAD_REQUEST};
 
@@ -25,14 +28,53 @@ const CURSOR_KEY: &str = "cursor";
 #[serde(deny_unknown_fields)]
 pub struct ExpectRequest {
     pub session: SessionName,
-    pub awaitable_id: AwaitableId,
+    pub awaitable_fingerprint: String,
+    pub since_unix_ms: u64,
+}
+
+/// The awaitable id is a capability, so the reconciler holds only its SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Expected {
+    pub awaitable_fingerprint: String,
     pub since_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Expected {
-    pub awaitable_id: AwaitableId,
+pub struct ExpectedView {
+    pub session: String,
     pub since_unix_ms: u64,
+}
+
+/// What `status` answers: names and ages, never a fingerprint or an awaitable id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconcilerView {
+    pub generation: u64,
+    pub expected: Vec<ExpectedView>,
+}
+
+impl ReconcilerView {
+    #[must_use]
+    pub fn new(generation: u64, expected: &BTreeMap<String, Expected>) -> Self {
+        Self {
+            generation,
+            expected: expected
+                .iter()
+                .map(|(session, entry)| ExpectedView {
+                    session: session.clone(),
+                    since_unix_ms: entry.since_unix_ms,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[must_use]
+pub fn fingerprint(awaitable_id: &AwaitableId) -> String {
+    Sha256::digest(awaitable_id.as_str().as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .concat()
 }
 
 /// What one tick concludes about one expected session.
@@ -59,6 +101,7 @@ pub const fn dead_state(reason: Option<RequeueReason>) -> ExitState {
     }
 }
 
+/// Decides from the lease alone; the lease's awaitable counts only when its fingerprint matches.
 #[must_use]
 pub fn judge(
     session: &SessionName,
@@ -69,27 +112,30 @@ pub fn judge(
 ) -> Verdict {
     let lease = match lease {
         LeaseRead::Unreadable { .. } => return Verdict::Unreadable,
-        LeaseRead::Absent => None,
-        LeaseRead::Present { lease } => Some(lease),
-    };
-    let fresh_ms = Timing::millis(timing.lease_fresh);
-    match spawn_decision(
-        lease,
-        session,
-        &expected.awaitable_id,
-        now_unix_ms,
-        fresh_ms,
-    ) {
-        SpawnDecision::Adopt => Verdict::Alive,
-        SpawnDecision::Spawn => {
+        LeaseRead::Absent => {
             let age = now_unix_ms.saturating_sub(expected.since_unix_ms);
             if age <= Timing::millis(timing.spawn_grace) {
-                Verdict::Starting
-            } else {
-                Verdict::Dead(dead_state(None))
+                return Verdict::Starting;
             }
+            return Verdict::Dead(dead_state(None));
         }
+        LeaseRead::Present { lease } => lease,
+    };
+    let fresh_ms = Timing::millis(timing.lease_fresh);
+    let decision = spawn_decision(
+        Some(lease),
+        session,
+        lease.awaitable_id(),
+        now_unix_ms,
+        fresh_ms,
+    );
+    let same_spawn = fingerprint(lease.awaitable_id()) == expected.awaitable_fingerprint;
+    match decision {
         SpawnDecision::Requeue(reason) => Verdict::Dead(dead_state(Some(reason))),
+        SpawnDecision::Adopt if same_spawn => Verdict::Alive,
+        SpawnDecision::Adopt | SpawnDecision::Spawn => {
+            Verdict::Dead(dead_state(Some(RequeueReason::OtherAwaitable)))
+        }
     }
 }
 
@@ -132,7 +178,7 @@ pub fn expect(
     expected.insert(
         name,
         Expected {
-            awaitable_id: request.awaitable_id,
+            awaitable_fingerprint: request.awaitable_fingerprint,
             since_unix_ms: request.since_unix_ms,
         },
     );
@@ -289,13 +335,17 @@ impl Reconciler {
     async fn status(
         &self,
         shared_context: SharedObjectContext<'_>,
-    ) -> HandlerResult<Json<BTreeMap<String, Expected>>> {
+    ) -> HandlerResult<Json<ReconcilerView>> {
+        let generation = shared_context
+            .get::<u64>(GENERATION_KEY)
+            .await?
+            .unwrap_or(0);
         let expected = shared_context
             .get::<Json<BTreeMap<String, Expected>>>(EXPECTED_KEY)
             .await?
             .map(Json::into_inner)
             .unwrap_or_default();
-        Ok(Json(expected))
+        Ok(Json(ReconcilerView::new(generation, &expected)))
     }
 }
 
@@ -348,9 +398,11 @@ fn conclude(
     };
     let verdict = judge(&session, entry, lease, now_unix_ms, timing);
     report.count(&verdict);
-    if let Verdict::Dead(state) = &verdict {
-        let wire: String = state.clone().into();
-        object_context.reject_awakeable(entry.awaitable_id.as_str(), TerminalError::new(wire));
+    if let Verdict::Dead(state) = verdict {
+        object_context
+            .object_client::<SessionClient>(name)
+            .expire(Json(state))
+            .send();
         expected.remove(name);
     }
 }
@@ -383,7 +435,7 @@ mod tests {
 
     fn expected(since: u64) -> Expected {
         Expected {
-            awaitable_id: awaitable(),
+            awaitable_fingerprint: fingerprint(&awaitable()),
             since_unix_ms: since,
         }
     }
@@ -532,13 +584,32 @@ mod tests {
         let mut all = names(spine::RECONCILER_EXPECTED_MAX_SESSIONS);
         let request = ExpectRequest {
             session: session(),
-            awaitable_id: awaitable(),
+            awaitable_fingerprint: fingerprint(&awaitable()),
             since_unix_ms: 0,
         };
         assert_eq!(expect(&mut all, request.clone()), Err(ExpectError::TooMany));
         all.remove("cf7a.wu000.wrk.claude");
         assert_eq!(expect(&mut all, request.clone()), Ok(()));
         assert_eq!(expect(&mut all, request), Ok(()));
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_hides_the_id() {
+        let print = fingerprint(&awaitable());
+        assert_eq!(print, fingerprint(&awaitable()));
+        assert_eq!(print.len(), 64);
+        assert!(!print.contains("sign_1abc"));
+        assert_ne!(print, fingerprint(&AwaitableId::parse("sign_1x").unwrap()));
+    }
+
+    #[test]
+    fn status_view_carries_no_capability() {
+        let mut all = BTreeMap::new();
+        all.insert(session().to_string(), expected(5));
+        let view = serde_json::to_string(&ReconcilerView::new(3, &all)).unwrap();
+        assert!(!view.contains("sign_1abc"));
+        assert!(!view.contains(&fingerprint(&awaitable())));
+        assert!(view.contains("cf7a.wu03.wrk.claude.a1f3"));
     }
 
     #[test]

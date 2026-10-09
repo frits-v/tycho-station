@@ -74,6 +74,9 @@ pub mod spine {
     pub const STALL_PROGRESS: Duration = Duration::from_secs(15 * 60);
     pub const RETRY_BACKOFF_INITIAL: Duration = Duration::from_secs(10);
     pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
+    /// A spawn, nudge or kill step that keeps failing turns terminal after this many tries,
+    /// so a stuck port cannot hold the session object's exclusive lane.
+    pub const PORT_STEP_ATTEMPTS_MAX: u32 = 12;
     /// The delay before a caller re-sends a reservation that met a full slot.
     pub const SLOT_RETRY_DELAY: Duration = Duration::from_secs(10);
     pub const CONTROL_SLOTS: u16 = 2;

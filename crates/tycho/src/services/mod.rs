@@ -57,14 +57,15 @@ impl Default for Timing {
 }
 
 impl Timing {
-    /// The step retry policy for a spawn: backoff doubling to its cap; agent retries are
-    /// workflow logic and never go through it.
+    /// The step retry policy for port calls: backoff doubling to its cap, bounded in attempts;
+    /// agent retries are workflow logic and never go through it.
     #[must_use]
-    pub fn spawn_retry(&self) -> RunRetryPolicy {
+    pub fn port_retry(&self) -> RunRetryPolicy {
         RunRetryPolicy::new()
             .initial_delay(self.retry_backoff_initial)
             .exponentiation_factor(2.0)
             .max_delay(self.retry_backoff_max)
+            .max_attempts(spine::PORT_STEP_ATTEMPTS_MAX)
     }
 
     #[must_use]

@@ -350,6 +350,7 @@ fn session_and_reconciler_refuse_agents_outside_their_scope() {
         "tick is private"
     );
     wait_until("the reconciler answers status while its chain runs", || {
-        call(&format!("{reconciler}/status"), "", None) == (200, "{}".to_string())
+        call(&format!("{reconciler}/status"), "", None)
+            == (200, r#"{"generation":2,"expected":[]}"#.to_string())
     });
 }
