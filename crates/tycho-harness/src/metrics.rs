@@ -1,7 +1,8 @@
 //! The evaluation metric table from `docs/design.html` section 17.
 //!
 //! Plus the two baselines slice zero introduces (journal size, index build
-//! time), measured by the chaos suite's first-merge test. The
+//! time), measured by the chaos suite's first-merge test, and the suite wall
+//! clock and port collision baselines of the test cores' port offsets. The
 //! zero-work-units-green rule lives here too: a run where nothing passed
 //! verification fails the gate.
 
@@ -25,8 +26,8 @@ const NOT_MEASURED_SLICE_ZERO: MeasuredValue = MeasuredValue::NotYetMeasured {
     reason: "no work unit has run through the merge gate yet",
 };
 
-/// The design's ten metric rows, followed by the two slice-zero baselines.
-pub const METRIC_TABLE: [Metric; 12] = [
+/// The design's ten metric rows, the two slice-zero baselines, and the two port offset baselines.
+pub const METRIC_TABLE: [Metric; 14] = [
     Metric {
         name: "Human interrupts per work unit",
         definition: "inbox items with severity blocks, per merged unit",
@@ -119,6 +120,24 @@ pub const METRIC_TABLE: [Metric; 12] = [
             "252 to 507 ms over five cold builds of the synthetic checkout (5 files, 21 symbols) through the graph port",
         ),
     },
+    Metric {
+        name: "Suite wall clock",
+        definition: "seconds for the spine, kill, launcher and chaos suites alone, and for the four run concurrently from two worktrees",
+        measured_at: "suite runs",
+        target: "baseline; after slice one the port offsets stay only if concurrency shortened review turnaround",
+        measured_value: MeasuredValue::Recorded(
+            "alone with fixed ports: spine 125, kill 45 to 49, launcher 88, chaos 122 s, 384 s in sequence, 768 s for two worktrees; alone with offsets: spine 124, kill 47, launcher 87, chaos 122 s; concurrently from two worktrees: 140 to 146 s per round, median 141 s, over ten rounds",
+        ),
+    },
+    Metric {
+        name: "Port collisions",
+        definition: "test cores that found one of their five ports bound or answering before they started, which fails that suite run naming the address",
+        measured_at: "suite runs",
+        target: "baseline, counted and never retried",
+        measured_value: MeasuredValue::Recorded(
+            "3 in ten concurrent rounds of the four suites from two worktrees (80 suite runs, 580 test cores), each two homes drawing the same of 1800 offsets while both cores ran",
+        ),
+    },
 ];
 
 /// `|` cannot survive into a markdown table cell unescaped.
@@ -183,13 +202,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_table_carries_exactly_the_design_rows_and_the_two_baselines() {
-        assert_eq!(METRIC_TABLE.len(), 12);
+    fn the_table_carries_exactly_the_design_rows_and_the_baselines() {
+        assert_eq!(METRIC_TABLE.len(), 14);
         let names: Vec<&str> = METRIC_TABLE.iter().map(|metric| metric.name).collect();
         assert_eq!(names.first(), Some(&"Human interrupts per work unit"));
         assert_eq!(names.get(9), Some(&"Rule citation ledger"));
         assert_eq!(names.get(10), Some(&"Journal size per unit"));
         assert_eq!(names.get(11), Some(&"Index build time"));
+        assert_eq!(names.get(12), Some(&"Suite wall clock"));
+        assert_eq!(names.get(13), Some(&"Port collisions"));
     }
 
     #[test]
@@ -234,7 +255,12 @@ mod tests {
 
     #[test]
     fn the_baselines_and_restart_recovery_are_recorded() {
-        for name in ["Journal size per unit", "Index build time"] {
+        for name in [
+            "Journal size per unit",
+            "Index build time",
+            "Suite wall clock",
+            "Port collisions",
+        ] {
             assert!(matches!(
                 by_name(name).measured_value,
                 MeasuredValue::Recorded(_)
