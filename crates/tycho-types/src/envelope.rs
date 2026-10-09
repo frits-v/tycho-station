@@ -273,8 +273,19 @@ pub enum EnvelopeError {
         count: usize,
         max: usize,
     },
+    OutOfRange {
+        field: &'static str,
+        value: u64,
+        max: u64,
+    },
     EpicMismatch,
     WorkUnitMismatch,
+    SelfAddressed,
+    Direction {
+        message_type: MessageType,
+        from: Level,
+        to: Level,
+    },
 }
 
 impl fmt::Display for EnvelopeError {
@@ -292,6 +303,9 @@ impl fmt::Display for EnvelopeError {
             Self::TooMany { field, count, max } => {
                 write!(formatter, "{field} has {count} items; maximum is {max}")
             }
+            Self::OutOfRange { field, value, max } => {
+                write!(formatter, "{field} is {value}; expected 1..={max}")
+            }
             Self::EpicMismatch => {
                 write!(
                     formatter,
@@ -301,6 +315,15 @@ impl fmt::Display for EnvelopeError {
             Self::WorkUnitMismatch => write!(
                 formatter,
                 "work_unit_id differs from the unit of from or to, or neither carries one"
+            ),
+            Self::SelfAddressed => write!(formatter, "from and to are the same session"),
+            Self::Direction {
+                message_type,
+                from,
+                to,
+            } => write!(
+                formatter,
+                "a {message_type:?} message cannot go from {from:?} to {to:?}"
             ),
         }
     }
@@ -344,6 +367,37 @@ fn check_payload(payload: &Payload) -> Result<(), EnvelopeError> {
         Payload::Status(status) => check_count("blockers", status.blockers.len(), REFS_MAX_ITEMS),
         Payload::Escalation(escalation) => check_escalation(escalation),
     }
+}
+
+/// Root is the top of the tree; a smaller rank is further up.
+const fn level_rank(level: Level) -> u8 {
+    match level {
+        Level::Root => 0,
+        Level::Control => 1,
+        Level::Worker => 2,
+    }
+}
+
+/// `task_packet` goes down the tree; `result`, `status` and `escalation` go up.
+const fn check_direction(
+    message_type: MessageType,
+    from: Level,
+    to: Level,
+) -> Result<(), EnvelopeError> {
+    let allowed = match message_type {
+        MessageType::TaskPacket => level_rank(to) > level_rank(from),
+        MessageType::Result | MessageType::Status | MessageType::Escalation => {
+            level_rank(to) < level_rank(from)
+        }
+    };
+    if !allowed {
+        return Err(EnvelopeError::Direction {
+            message_type,
+            from,
+            to,
+        });
+    }
+    Ok(())
 }
 
 fn decode_payload(
@@ -403,6 +457,16 @@ impl Envelope {
     }
 
     fn validate(&self) -> Result<(), EnvelopeError> {
+        self.check_routing()?;
+        check_direction(
+            self.payload.message_type(),
+            self.from.level(),
+            self.to.level(),
+        )?;
+        check_payload(&self.payload)
+    }
+
+    fn check_routing(&self) -> Result<(), EnvelopeError> {
         if *self.from.epic() != self.correlation_id || *self.to.epic() != self.correlation_id {
             return Err(EnvelopeError::EpicMismatch);
         }
@@ -415,13 +479,17 @@ impl Envelope {
         if carried == 0 || !agree {
             return Err(EnvelopeError::WorkUnitMismatch);
         }
-        check_payload(&self.payload)
+        if self.from == self.to {
+            return Err(EnvelopeError::SelfAddressed);
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::task_packet::{BUDGET_TOKENS_MAX_COUNT, BUDGET_WALL_CLOCK_MAX_MS, PATHS_MAX_ITEMS};
 
     fn digest(fill: char) -> String {
         format!("sha256:{}", fill.to_string().repeat(64))
@@ -431,6 +499,27 @@ mod tests {
         format!(
             r#"{{"schema_version":1,"id":"01J9Z3K7Q8R2W5X6Y7Z8A9B0C1","type":"{message_type}","work_unit_id":"wu03","from":"cf7a.wu03.wrk.claude.a1f3","to":"cf7a.wu03.ctl.codex","causation_id":null,"correlation_id":"cf7a","created_at_unix_ms":1800000000000,"expires_at_unix_ms":null,"payload":{payload}}}"#
         )
+    }
+
+    /// The same envelope sent from the control session down to the worker.
+    fn downward(message_type: &str, payload: &str) -> String {
+        envelope(message_type, payload)
+            .replace(
+                "\"from\":\"cf7a.wu03.wrk.claude.a1f3\"",
+                "\"from\":\"cf7a.wu03.ctl.codex\"",
+            )
+            .replace(
+                "\"to\":\"cf7a.wu03.ctl.codex\"",
+                "\"to\":\"cf7a.wu03.wrk.claude.a1f3\"",
+            )
+    }
+
+    fn repeated(item: &str, count: usize) -> String {
+        vec![item; count].join(",")
+    }
+
+    fn status_payload() -> String {
+        r#"{"state":"verifying","summary":"tests green","last_progress_unix_ms":1800000000000,"progress":{"head_sha":null,"tests_passing":12},"active_workers":2,"usage":{"input_tokens":0,"output_tokens":0},"blockers":[]}"#.to_string()
     }
 
     fn result_payload() -> String {
@@ -465,8 +554,7 @@ mod tests {
 
     #[test]
     fn status_and_escalation_parse() {
-        let status = r#"{"state":"verifying","summary":"tests green","last_progress_unix_ms":1800000000000,"progress":{"head_sha":null,"tests_passing":12},"active_workers":2,"usage":{"input_tokens":0,"output_tokens":0},"blockers":[]}"#;
-        let parsed = Envelope::parse(envelope("status", status).as_bytes()).unwrap();
+        let parsed = Envelope::parse(envelope("status", &status_payload()).as_bytes()).unwrap();
         assert_eq!(parsed.payload.message_type(), MessageType::Status);
         let parsed =
             Envelope::parse(envelope("escalation", &escalation_payload(2)).as_bytes()).unwrap();
@@ -676,15 +764,7 @@ mod tests {
 
     #[test]
     fn task_packet_round_trips() {
-        let down = envelope("task_packet", &task_packet_payload())
-            .replace(
-                "\"from\":\"cf7a.wu03.wrk.claude.a1f3\"",
-                "\"from\":\"cf7a.wu03.ctl.codex\"",
-            )
-            .replace(
-                "\"to\":\"cf7a.wu03.ctl.codex\"",
-                "\"to\":\"cf7a.wu03.wrk.claude.a1f3\"",
-            );
+        let down = downward("task_packet", &task_packet_payload());
         let parsed = Envelope::parse(down.as_bytes()).unwrap();
         assert_eq!(parsed.payload.message_type(), MessageType::TaskPacket);
         assert_eq!(
@@ -697,22 +777,224 @@ mod tests {
     fn task_packet_rejects_a_missing_rationale_and_too_many_inputs() {
         let missing = task_packet_payload().replace(r#","rationale":"touches the launcher""#, "");
         assert!(matches!(
-            Envelope::parse(envelope("task_packet", &missing).as_bytes()),
+            Envelope::parse(downward("task_packet", &missing).as_bytes()),
             Err(EnvelopeError::Json(_))
         ));
         let empty = task_packet_payload().replace("touches the launcher", "");
-        assert!(Envelope::parse(envelope("task_packet", &empty).as_bytes()).is_err());
+        assert!(matches!(
+            Envelope::parse(downward("task_packet", &empty).as_bytes()),
+            Err(EnvelopeError::Json(_))
+        ));
         let refs = vec![format!("\"{}\"", digest('d')); REFS_MAX_ITEMS.saturating_add(1)].join(",");
         let many = task_packet_payload().replace(
             &format!(r#""inputs":["{}"]"#, digest('f')),
             &format!(r#""inputs":[{refs}]"#),
         );
         assert!(matches!(
-            Envelope::parse(envelope("task_packet", &many).as_bytes()),
+            Envelope::parse(downward("task_packet", &many).as_bytes()),
             Err(EnvelopeError::TooMany {
                 field: "inputs",
                 ..
             })
+        ));
+    }
+
+    fn task_packet_count(field: &str, original: &str, item: &str, count: usize) -> String {
+        let payload = task_packet_payload().replace(
+            &format!(r#""{field}":{original}"#),
+            &format!(r#""{field}":[{}]"#, repeated(item, count)),
+        );
+        downward("task_packet", &payload)
+    }
+
+    fn assert_count_bound(field: &'static str, original: &str, item: &str, max: usize) {
+        let at_max = task_packet_count(field, original, item, max);
+        assert!(Envelope::parse(at_max.as_bytes()).is_ok(), "{field}");
+        let over = task_packet_count(field, original, item, max.saturating_add(1));
+        let rejected = Envelope::parse(over.as_bytes());
+        assert!(
+            matches!(rejected, Err(EnvelopeError::TooMany { field: name, .. }) if name == field),
+            "{field}: {rejected:?}"
+        );
+    }
+
+    #[test]
+    fn task_packet_rejects_too_many_writable_paths() {
+        assert_count_bound(
+            "writable_paths",
+            r#"["crates"]"#,
+            r#""crates""#,
+            PATHS_MAX_ITEMS,
+        );
+    }
+
+    #[test]
+    fn task_packet_rejects_too_many_done_criteria() {
+        assert_count_bound(
+            "done_criteria",
+            r#"[{"kind":"command","command":"cargo test","expected_exit":0},{"kind":"file_absent","path":"TODO.md"}]"#,
+            r#"{"kind":"file_absent","path":"TODO.md"}"#,
+            CRITERIA_MAX_ITEMS,
+        );
+    }
+
+    #[test]
+    fn task_packet_rejects_too_many_forbidden_actions() {
+        assert_count_bound(
+            "forbidden_actions",
+            r#"["push"]"#,
+            r#""push""#,
+            REFS_MAX_ITEMS,
+        );
+    }
+
+    fn with_budget(tokens: u64, wall_clock_ms: u64) -> String {
+        let payload = task_packet_payload().replace(
+            r#""budget":{"tokens_max":200000,"wall_clock_max_ms":3600000}"#,
+            &format!(r#""budget":{{"tokens_max":{tokens},"wall_clock_max_ms":{wall_clock_ms}}}"#),
+        );
+        downward("task_packet", &payload)
+    }
+
+    #[test]
+    fn task_packet_rejects_a_zero_or_oversized_budget() {
+        let hour_ms = 3_600_000;
+        let at_max = with_budget(BUDGET_TOKENS_MAX_COUNT, BUDGET_WALL_CLOCK_MAX_MS);
+        assert!(Envelope::parse(at_max.as_bytes()).is_ok());
+        for (tokens, wall_clock_ms, expected) in [
+            (0, hour_ms, "budget.tokens_max"),
+            (
+                BUDGET_TOKENS_MAX_COUNT.saturating_add(1),
+                hour_ms,
+                "budget.tokens_max",
+            ),
+            (1, 0, "budget.wall_clock_max_ms"),
+            (
+                1,
+                BUDGET_WALL_CLOCK_MAX_MS.saturating_add(1),
+                "budget.wall_clock_max_ms",
+            ),
+        ] {
+            let rejected = Envelope::parse(with_budget(tokens, wall_clock_ms).as_bytes());
+            assert!(
+                matches!(rejected, Err(EnvelopeError::OutOfRange { field, .. }) if field == expected),
+                "{tokens} {wall_clock_ms}: {rejected:?}"
+            );
+        }
+    }
+
+    fn refs(count: usize) -> String {
+        repeated(&format!("\"{}\"", digest('d')), count)
+    }
+
+    #[test]
+    fn status_rejects_too_many_blockers() {
+        let payload = status_payload().replace(
+            r#""blockers":[]"#,
+            &format!(r#""blockers":[{}]"#, refs(REFS_MAX_ITEMS.saturating_add(1))),
+        );
+        assert!(matches!(
+            Envelope::parse(envelope("status", &payload).as_bytes()),
+            Err(EnvelopeError::TooMany {
+                field: "blockers",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn escalation_rejects_too_much_evidence_and_too_many_cases() {
+        let over = REFS_MAX_ITEMS.saturating_add(1);
+        let evidence = escalation_payload(2).replace(
+            r#""evidence":[]"#,
+            &format!(r#""evidence":[{}]"#, refs(over)),
+        );
+        assert!(matches!(
+            Envelope::parse(envelope("escalation", &evidence).as_bytes()),
+            Err(EnvelopeError::TooMany {
+                field: "evidence",
+                ..
+            })
+        ));
+        let cases = escalation_payload(2).replace(
+            r#""cases_consulted":["case-12"]"#,
+            &format!(r#""cases_consulted":[{}]"#, repeated(r#""case-12""#, over)),
+        );
+        assert!(matches!(
+            Envelope::parse(envelope("escalation", &cases).as_bytes()),
+            Err(EnvelopeError::TooMany {
+                field: "cases_consulted",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn state_name_rejects_its_maximum_plus_one() {
+        assert!(StateName::parse(&"s".repeat(STATE_NAME_MAX_BYTES)).is_ok());
+        let over = "s".repeat(STATE_NAME_MAX_BYTES.saturating_add(1));
+        assert!(matches!(
+            StateName::parse(&over),
+            Err(TokenError::TooLong { .. })
+        ));
+        let payload = status_payload().replace("verifying", &over);
+        assert!(matches!(
+            Envelope::parse(envelope("status", &payload).as_bytes()),
+            Err(EnvelopeError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_each_message_type_against_its_direction() {
+        for (message_type, payload) in [
+            ("result", result_payload()),
+            ("status", status_payload()),
+            ("escalation", escalation_payload(2)),
+        ] {
+            let rejected = Envelope::parse(downward(message_type, &payload).as_bytes());
+            assert!(
+                matches!(
+                    rejected,
+                    Err(EnvelopeError::Direction {
+                        from: Level::Control,
+                        to: Level::Worker,
+                        ..
+                    })
+                ),
+                "{message_type}: {rejected:?}"
+            );
+        }
+        let up = envelope("task_packet", &task_packet_payload());
+        assert!(matches!(
+            Envelope::parse(up.as_bytes()),
+            Err(EnvelopeError::Direction {
+                message_type: MessageType::TaskPacket,
+                ..
+            })
+        ));
+        let lateral = routed(
+            "cf7a.wu03.ctl.codex",
+            "cf7a.wu03.ctl.claude",
+            "wu03",
+            "cf7a",
+        );
+        assert!(matches!(
+            Envelope::parse(lateral.as_bytes()),
+            Err(EnvelopeError::Direction { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_message_addressed_to_its_sender() {
+        let echo = routed(
+            "cf7a.wu03.wrk.claude.a1f3",
+            "cf7a.wu03.wrk.claude.a1f3",
+            "wu03",
+            "cf7a",
+        );
+        assert!(matches!(
+            Envelope::parse(echo.as_bytes()),
+            Err(EnvelopeError::SelfAddressed)
         ));
     }
 

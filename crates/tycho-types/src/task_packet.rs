@@ -12,6 +12,8 @@ use crate::token::{check_slug, check_text, checked_string, TokenError};
 pub const PATH_MAX_BYTES: usize = 1024;
 pub const PATHS_MAX_ITEMS: usize = 64;
 pub const ROUTING_NAME_MAX_BYTES: usize = 32;
+pub const BUDGET_TOKENS_MAX_COUNT: u64 = 50_000_000;
+pub const BUDGET_WALL_CLOCK_MAX_MS: u64 = 86_400_000;
 
 fn check_components(value: &str) -> Result<(), TokenError> {
     let bad = value
@@ -34,7 +36,7 @@ fn check_absolute_path(value: &str) -> Result<(), TokenError> {
 
 fn check_relative_path(value: &str) -> Result<(), TokenError> {
     check_text(value, PATH_MAX_BYTES)?;
-    if value.starts_with('/') {
+    if value.starts_with('/') || value.starts_with('-') {
         return Err(TokenError::InvalidCharacter { position: 0 });
     }
     check_components(&format!("/{value}"))
@@ -50,7 +52,7 @@ checked_string!(
     check_absolute_path
 );
 checked_string!(
-    /// A path inside the worktree with no empty, `.` or `..` component.
+    /// A path inside the worktree with no empty, `.` or `..` component, never leading with `-`.
     RelativePath,
     check_relative_path
 );
@@ -126,7 +128,28 @@ pub struct TaskPacketPayload {
     pub result_schema: ContentRef,
 }
 
+const fn check_budget_field(
+    field: &'static str,
+    value: u64,
+    max: u64,
+) -> Result<(), EnvelopeError> {
+    if value == 0 || value > max {
+        return Err(EnvelopeError::OutOfRange { field, value, max });
+    }
+    Ok(())
+}
+
 pub(crate) fn check_task_packet(packet: &TaskPacketPayload) -> Result<(), EnvelopeError> {
+    check_budget_field(
+        "budget.tokens_max",
+        packet.budget.tokens_max,
+        BUDGET_TOKENS_MAX_COUNT,
+    )?;
+    check_budget_field(
+        "budget.wall_clock_max_ms",
+        packet.budget.wall_clock_max_ms,
+        BUDGET_WALL_CLOCK_MAX_MS,
+    )?;
     check_count(
         "done_criteria",
         packet.done_criteria.len(),
@@ -161,11 +184,19 @@ mod tests {
         for bad in ["relative", "/a/../b", "/a//b", "/a/./b", ""] {
             assert!(AbsolutePath::parse(bad).is_err(), "{bad:?}");
         }
-        for bad in ["/abs", "../up", "a/../b", "a//b", "./a", "a/"] {
+        for bad in [
+            "/abs", "../up", "a/../b", "a//b", "./a", "a/", "-rf", "--force",
+        ] {
             assert!(RelativePath::parse(bad).is_err(), "{bad:?}");
         }
+        assert!(RelativePath::parse("a/-b").is_ok());
         let long = format!("/{}", "a".repeat(PATH_MAX_BYTES));
         assert!(AbsolutePath::parse(&long).is_err());
+        let long = "a".repeat(PATH_MAX_BYTES.saturating_add(1));
+        assert!(matches!(
+            RelativePath::parse(&long),
+            Err(TokenError::TooLong { .. })
+        ));
         assert!(RoutingName::parse(&"t".repeat(ROUTING_NAME_MAX_BYTES.saturating_add(1))).is_err());
     }
 

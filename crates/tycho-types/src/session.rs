@@ -334,6 +334,7 @@ mod tests {
     #[test]
     fn rejects_each_defect() {
         let long = format!("cf7a.wu03.wrk.claude.{}", "a".repeat(50));
+        assert!(long.len() > SESSION_NAME_MAX_BYTES);
         assert!(matches!(
             SessionName::parse(&long),
             Err(SessionNameError::TooLong(_))
@@ -370,6 +371,18 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_suffix_over_its_maximum() {
+        let suffix = format!(
+            "cf7a.wu03.wrk.claude.{}",
+            "s".repeat(SUFFIX_MAX_BYTES.saturating_add(1))
+        );
+        assert!(matches!(
+            SessionName::parse(&suffix),
+            Err(SessionNameError::Suffix(TokenError::TooLong { .. }))
+        ));
+    }
+
+    #[test]
     fn longest_name_fits_the_maximum() {
         let epic = EpicId::parse(&"e".repeat(crate::service::ID_MAX_BYTES)).unwrap();
         let unit = WorkUnitId::parse(&"u".repeat(crate::service::ID_MAX_BYTES)).unwrap();
@@ -394,11 +407,19 @@ mod tests {
             short.map(|p| p.display().to_string()),
             Ok("/Users/dev/.zmx/cf7a.wu03.wrk.claude.a1f3".to_string())
         );
-        let deep = format!("/{}", "d".repeat(90));
-        assert!(matches!(
+        let name_length = session.to_string().len();
+        let fits = format!(
+            "/{}",
+            "d".repeat(SOCKET_PATH_MAX_BYTES.saturating_sub(name_length.saturating_add(2)))
+        );
+        assert!(session.socket_path(Path::new(&fits)).is_ok());
+        let deep = format!("{fits}d");
+        assert_eq!(
             session.socket_path(Path::new(&deep)),
-            Err(SessionNameError::SocketPathTooLong(_))
-        ));
+            Err(SessionNameError::SocketPathTooLong(
+                SOCKET_PATH_MAX_BYTES.saturating_add(1)
+            ))
+        );
     }
 
     #[test]

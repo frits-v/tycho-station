@@ -8,6 +8,23 @@ pub const EXIT_RAW_MAX_BYTES: usize = 64;
 /// Wire prefix of an unrecognised state: `unrecognised:<length>[:<raw>]`.
 pub const UNRECOGNISED_PREFIX: &str = "unrecognised:";
 
+/// Raw text of an unrecognised state, built only by `ExitState::from_wire` so it round-trips.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitRaw(String);
+
+impl ExitRaw {
+    fn keep(value: &str) -> Option<Self> {
+        let printable =
+            value.len() <= EXIT_RAW_MAX_BYTES && value.bytes().all(|b| b.is_ascii_graphic());
+        printable.then(|| Self(value.to_string()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(from = "String", into = "String")]
 pub enum ExitState {
@@ -30,7 +47,7 @@ pub enum ExitState {
     /// The session exited without a result or with a failure it reported.
     Failed,
     /// A state no one enumerated; `raw` is kept only when short visible ASCII.
-    Unrecognised { raw: Option<String>, length: usize },
+    Unrecognised { raw: Option<ExitRaw>, length: usize },
 }
 
 /// What the owning workflow does next.
@@ -74,20 +91,15 @@ impl ExitState {
         }
         let length: usize = length.parse().ok()?;
         let raw = match raw {
-            Some(raw) if Self::keeps(raw) => Some(raw.to_string()),
-            Some(_) => return None,
+            Some(raw) => Some(ExitRaw::keep(raw)?),
             None => None,
         };
         Some(Self::Unrecognised { raw, length })
     }
 
-    fn keeps(value: &str) -> bool {
-        value.len() <= EXIT_RAW_MAX_BYTES && value.bytes().all(|b| b.is_ascii_graphic())
-    }
-
     fn unrecognised(value: &str) -> Self {
         Self::Unrecognised {
-            raw: Self::keeps(value).then(|| value.to_string()),
+            raw: ExitRaw::keep(value),
             length: value.len(),
         }
     }
@@ -141,7 +153,7 @@ impl From<ExitState> for String {
             ExitState::Unrecognised {
                 raw: Some(raw),
                 length,
-            } => format!("{UNRECOGNISED_PREFIX}{length}:{raw}"),
+            } => format!("{UNRECOGNISED_PREFIX}{length}:{}", raw.as_str()),
             ExitState::Unrecognised { raw: None, length } => {
                 format!("{UNRECOGNISED_PREFIX}{length}")
             }
@@ -179,13 +191,11 @@ mod tests {
     #[test]
     fn unknown_input_is_unrecognised_and_never_usable() {
         let state = ExitState::from_wire("error_max_turns");
-        assert_eq!(
-            state,
-            ExitState::Unrecognised {
-                raw: Some("error_max_turns".to_string()),
-                length: 15
-            }
-        );
+        let ExitState::Unrecognised { raw, length } = &state else {
+            panic!("expected an unrecognised state");
+        };
+        assert_eq!(raw.as_ref().map(ExitRaw::as_str), Some("error_max_turns"));
+        assert_eq!(*length, 15);
         assert_eq!(state.disposition(), Disposition::Inbox);
         for raw in ["", "Completed", "completed ", "unrecognised"] {
             assert_eq!(
@@ -231,13 +241,39 @@ mod tests {
 
     #[test]
     fn unrecognised_known_name_stays_unrecognised() {
-        let forged = ExitState::Unrecognised {
-            raw: Some("completed".to_string()),
-            length: 9,
-        };
+        let forged = ExitState::from_wire("unrecognised:9:completed");
+        assert!(matches!(
+            &forged,
+            ExitState::Unrecognised { raw: Some(raw), length: 9 } if raw.as_str() == "completed"
+        ));
         let back = round_trip(&forged);
         assert_eq!(back, forged);
         assert_eq!(back.disposition(), Disposition::Inbox);
+    }
+
+    #[test]
+    fn unrecognised_with_whitespace_or_control_characters_round_trips() {
+        let long = "x".repeat(EXIT_RAW_MAX_BYTES.saturating_add(1));
+        for raw in [
+            "a b",
+            "tab\there",
+            "bad\u{1b}[31m",
+            "line\nbreak",
+            "unrecognised:3:a b",
+            "unrecognised:4:a\u{7}bc",
+            long.as_str(),
+        ] {
+            let state = ExitState::from_wire(raw);
+            assert_eq!(
+                state,
+                ExitState::Unrecognised {
+                    raw: None,
+                    length: raw.len()
+                },
+                "{raw:?}"
+            );
+            assert_eq!(round_trip(&state), state, "{raw:?}");
+        }
     }
 
     #[test]

@@ -13,8 +13,9 @@ pub const LEASE_FILE_MAX_BYTES: usize = 4096;
 /// `pid_t` is signed and zero or a negative value addresses a process group.
 pub const PID_MAX: u32 = 0x7fff_ffff;
 
+/// Deserializes only through `LeaseWire` and `validate`, as `parse` does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "LeaseWire")]
 pub struct Lease {
     schema_version: u32,
     session: SessionName,
@@ -22,6 +23,34 @@ pub struct Lease {
     awaitable_id: AwaitableId,
     started_unix_ms: u64,
     heartbeat_unix_ms: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LeaseWire {
+    schema_version: u32,
+    session: SessionName,
+    pid: u32,
+    awaitable_id: AwaitableId,
+    started_unix_ms: u64,
+    heartbeat_unix_ms: u64,
+}
+
+impl TryFrom<LeaseWire> for Lease {
+    type Error = LeaseError;
+
+    fn try_from(wire: LeaseWire) -> Result<Self, Self::Error> {
+        let lease = Self {
+            schema_version: wire.schema_version,
+            session: wire.session,
+            pid: wire.pid,
+            awaitable_id: wire.awaitable_id,
+            started_unix_ms: wire.started_unix_ms,
+            heartbeat_unix_ms: wire.heartbeat_unix_ms,
+        };
+        lease.validate()?;
+        Ok(lease)
+    }
 }
 
 #[derive(Debug)]
@@ -105,9 +134,8 @@ impl Lease {
         if bytes.len() > LEASE_FILE_MAX_BYTES {
             return Err(LeaseError::TooLarge(bytes.len()));
         }
-        let lease: Self = serde_json::from_slice(bytes).map_err(LeaseError::Json)?;
-        lease.validate()?;
-        Ok(lease)
+        let wire: LeaseWire = serde_json::from_slice(bytes).map_err(LeaseError::Json)?;
+        Self::try_from(wire)
     }
 
     const fn validate(&self) -> Result<(), LeaseError> {
@@ -340,6 +368,22 @@ mod tests {
             ),
             SpawnDecision::Requeue(RequeueReason::OtherAwaitable)
         );
+    }
+
+    #[test]
+    fn serde_deserialization_validates_like_parse() {
+        let valid: Lease = serde_json::from_str(&lease_json(4242, NOW_MS)).unwrap();
+        assert_eq!(valid, lease(NOW_MS));
+        for invalid in [
+            lease_json(0, NOW_MS),
+            lease_json(PID_MAX.saturating_add(1), NOW_MS),
+            lease_json(1, NOW_MS.saturating_sub(120_000)),
+            lease_json(1, NOW_MS).replace("\"schema_version\":1", "\"schema_version\":2"),
+            lease_json(1, NOW_MS).replace("\"pid\"", "\"extra\":1,\"pid\""),
+        ] {
+            let decoded: Result<Lease, _> = serde_json::from_str(&invalid);
+            assert!(decoded.is_err(), "{invalid}");
+        }
     }
 
     #[test]

@@ -192,7 +192,11 @@ impl IdempotencyKey {
         if sequence > SEQUENCE_MAX {
             return Err(IdempotencyKeyError::Sequence(sequence));
         }
-        let key = format!("{session}:{sequence}");
+        Self::bounded(format!("{session}:{sequence}"))
+    }
+
+    /// Unreachable from `new` while `SESSION_NAME_MAX_BYTES` and `SEQUENCE_MAX` fit the maximum.
+    fn bounded(key: String) -> Result<Self, IdempotencyKeyError> {
         if key.len() > IDEMPOTENCY_KEY_MAX_BYTES {
             return Err(IdempotencyKeyError::TooLong(key.len()));
         }
@@ -338,5 +342,15 @@ mod tests {
         let longest = SessionName::parse(&longest).unwrap();
         assert!(IdempotencyKey::new(&longest, SEQUENCE_MAX).is_ok());
         assert!(SESSION_NAME_MAX_BYTES.saturating_add(11) <= IDEMPOTENCY_KEY_MAX_BYTES);
+    }
+
+    #[test]
+    fn idempotency_key_rejects_its_maximum_plus_one() {
+        assert!(IdempotencyKey::bounded("k".repeat(IDEMPOTENCY_KEY_MAX_BYTES)).is_ok());
+        let over = IDEMPOTENCY_KEY_MAX_BYTES.saturating_add(1);
+        assert_eq!(
+            IdempotencyKey::bounded("k".repeat(over)),
+            Err(IdempotencyKeyError::TooLong(over))
+        );
     }
 }
