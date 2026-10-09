@@ -1,8 +1,9 @@
 //! The evaluation metric table from `docs/design.html` section 17.
 //!
 //! Plus the two baselines slice zero introduces (journal size, index build
-//! time), not yet measured by this issue. The zero-work-units-green rule
-//! lives here too: a run where nothing passed verification fails the gate.
+//! time), measured by the chaos suite's first-merge test. The
+//! zero-work-units-green rule lives here too: a run where nothing passed
+//! verification fails the gate.
 
 /// A metric's recorded value, or the reason it has none yet; never absent without one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +67,9 @@ pub const METRIC_TABLE: [Metric; 12] = [
         definition: "killed sessions that resumed with no lost state and no duplicate spawn",
         measured_at: "chaos tests",
         target: "100 percent, hard gate",
-        measured_value: NOT_MEASURED_SLICE_ZERO,
+        measured_value: MeasuredValue::NotYetMeasured {
+            reason: "the kill cases that finish through the real launcher never complete: WorkerRun awaits a bare result payload and the launcher resolves with the whole envelope",
+        },
     },
     Metric {
         name: "Gate negative tests",
@@ -103,14 +106,18 @@ pub const METRIC_TABLE: [Metric; 12] = [
         definition: "bytes the journal holds for one merged work unit",
         measured_at: "store",
         target: "baseline, recorded in slice zero",
-        measured_value: NOT_MEASURED_SLICE_ZERO,
+        measured_value: MeasuredValue::Recorded(
+            "15781 bytes over 103 entries for a one-task unit through a fixed gate, summed from sys_journal.raw_length across every invocation but the reconciler's",
+        ),
     },
     Metric {
         name: "Index build time",
         definition: "wall clock to build the semantic graph index for one worktree",
         measured_at: "worktree clone",
         target: "baseline, recorded in slice zero",
-        measured_value: NOT_MEASURED_SLICE_ZERO,
+        measured_value: MeasuredValue::Recorded(
+            "507 ms for the synthetic checkout (5 files, 21 symbols), a cold build through the graph port",
+        ),
     },
 ];
 
@@ -203,6 +210,26 @@ mod tests {
         };
         let rendered = render_markdown(std::slice::from_ref(&metric));
         assert!(rendered.contains("weird \\| name"));
+    }
+
+    #[test]
+    fn the_baselines_are_recorded_and_restart_recovery_says_why_it_is_not() {
+        assert!(matches!(
+            METRIC_TABLE[10].measured_value,
+            MeasuredValue::Recorded(_)
+        ));
+        assert!(matches!(
+            METRIC_TABLE[11].measured_value,
+            MeasuredValue::Recorded(_)
+        ));
+        let recovery = METRIC_TABLE
+            .iter()
+            .find(|metric| metric.name == "Restart recovery")
+            .unwrap();
+        assert!(matches!(
+            recovery.measured_value,
+            MeasuredValue::NotYetMeasured { reason } if reason.contains("envelope")
+        ));
     }
 
     #[test]
