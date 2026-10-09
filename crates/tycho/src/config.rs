@@ -53,6 +53,17 @@ pub const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 pub const WATCHDOG_ITERATIONS_MAX: u32 = 120;
 pub const LIST_SESSIONS_MAX: usize = 256;
 
+pub const ENTIRE_GRAPH_ENV: &str = "TYCHO_ENTIRE_GRAPH";
+pub const GRAPH_INDEX_DIR: &str = "graph";
+/// The graph plugin version the adapter accepts; its command names changed between releases.
+pub const ENTIRE_GRAPH_PINNED_VERSION: &str = "v0.4.0";
+/// A cold build of a 1,573-file repository took 42 seconds when the plugin was probed.
+pub const GRAPH_BUILD_TIMEOUT: Duration = Duration::from_secs(900);
+/// Covers a query that finds no cached index and builds one first.
+pub const GRAPH_QUERY_TIMEOUT: Duration = Duration::from_secs(300);
+pub const GRAPH_DIFF_BUDGET_SECONDS: u64 = 120;
+pub const GRAPH_OUTPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 /// Core session names are `core.<role>`, used only in the core socket directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreRole {
@@ -105,6 +116,7 @@ pub enum ConfigError {
     UnsafePath(PathBuf),
     SocketPathTooLong(usize),
     CurrentExe(std::io::Error),
+    RelativePath(&'static str, PathBuf),
 }
 
 impl fmt::Display for ConfigError {
@@ -141,6 +153,9 @@ impl fmt::Display for ConfigError {
                 "core socket path is {length} bytes; limit is {SOCKET_PATH_MAX_BYTES}"
             ),
             Self::CurrentExe(error) => write!(formatter, "cannot locate the tycho binary: {error}"),
+            Self::RelativePath(variable, path) => {
+                write!(formatter, "{variable}={} is not absolute", path.display())
+            }
         }
     }
 }
@@ -158,11 +173,7 @@ impl CoreConfig {
     /// The home is `.tycho` under the current uid's home from the user database, or
     /// `TYCHO_HOME` when that names a directory under it; tools come from `mise which`.
     pub fn from_environment() -> Result<Self, ConfigError> {
-        let user_home = user_home()?;
-        let home = match env::var_os(HOME_ENV) {
-            Some(home) => checked_home_override(&user_home, PathBuf::from(home))?,
-            None => user_home.join(HOME_DEFAULT_DIR),
-        };
+        let home = core_home()?;
         let zmx = tool_path(ZMX_ENV, "zmx")?;
         let restate_server = tool_path(RESTATE_SERVER_ENV, "restate-server")?;
         let tycho = env::current_exe().map_err(ConfigError::CurrentExe)?;
@@ -260,6 +271,58 @@ impl CoreConfig {
             ),
         }
     }
+}
+
+/// `.tycho` under the current uid's home, or `TYCHO_HOME` when that names a directory under it.
+pub fn core_home() -> Result<PathBuf, ConfigError> {
+    let user_home = user_home()?;
+    let Some(home) = env::var_os(HOME_ENV) else {
+        return Ok(user_home.join(HOME_DEFAULT_DIR));
+    };
+    checked_home_override(&user_home, PathBuf::from(home))
+}
+
+/// The graph plugin binary: `TYCHO_ENTIRE_GRAPH`, else entire's managed plugin directory.
+pub fn entire_graph_path() -> Result<PathBuf, ConfigError> {
+    resolve_entire_graph(&PluginDirs {
+        binary: env::var_os(ENTIRE_GRAPH_ENV).map(PathBuf::from),
+        plugin_dir: env::var_os("ENTIRE_PLUGIN_DIR").map(PathBuf::from),
+        data_home: env::var_os("XDG_DATA_HOME").map(PathBuf::from),
+        user_home: user_home()?,
+    })
+}
+
+/// The inputs to the plugin path, in the precedence `entire plugin --help` lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginDirs {
+    pub binary: Option<PathBuf>,
+    pub plugin_dir: Option<PathBuf>,
+    pub data_home: Option<PathBuf>,
+    pub user_home: PathBuf,
+}
+
+pub fn resolve_entire_graph(dirs: &PluginDirs) -> Result<PathBuf, ConfigError> {
+    let path = match (&dirs.binary, &dirs.plugin_dir, &dirs.data_home) {
+        (Some(binary), _, _) => binary.clone(),
+        (None, Some(dir), _) => absolute("ENTIRE_PLUGIN_DIR", dir)?.join("bin/entire-graph"),
+        (None, None, Some(data_home)) => {
+            absolute("XDG_DATA_HOME", data_home)?.join("entire/plugins/bin/entire-graph")
+        }
+        (None, None, None) => dirs
+            .user_home
+            .join(".local/share/entire/plugins/bin/entire-graph"),
+    };
+    if !path.is_absolute() || !path.exists() {
+        return Err(ConfigError::NotFound(path));
+    }
+    Ok(path)
+}
+
+fn absolute<'a>(variable: &'static str, path: &'a Path) -> Result<&'a Path, ConfigError> {
+    if !path.is_absolute() {
+        return Err(ConfigError::RelativePath(variable, path.to_path_buf()));
+    }
+    Ok(path)
 }
 
 fn user_home() -> Result<PathBuf, ConfigError> {
@@ -422,6 +485,59 @@ mod tests {
              RESTATE_INGRESS__BIND_ADDRESS=127.0.0.1:18080 RESTATE_BIND_ADDRESS=127.0.0.1:15122 \
              RESTATE_LISTEN_MODE=tcp RESTATE_NODE_NAME=tycho RESTATE_DISABLE_TELEMETRY=true \
              /opt/restate-server --base-dir /h/restate"
+        );
+    }
+
+    fn plugin_dirs(
+        binary: Option<&str>,
+        plugin_dir: Option<&str>,
+        data_home: Option<&str>,
+    ) -> PluginDirs {
+        PluginDirs {
+            binary: binary.map(PathBuf::from),
+            plugin_dir: plugin_dir.map(PathBuf::from),
+            data_home: data_home.map(PathBuf::from),
+            user_home: PathBuf::from("/nonexistent-home"),
+        }
+    }
+
+    #[test]
+    fn refuses_a_relative_plugin_dir() {
+        assert!(matches!(
+            resolve_entire_graph(&plugin_dirs(None, Some("plugins"), None)),
+            Err(ConfigError::RelativePath("ENTIRE_PLUGIN_DIR", _))
+        ));
+    }
+
+    #[test]
+    fn refuses_a_relative_data_home() {
+        assert!(matches!(
+            resolve_entire_graph(&plugin_dirs(None, None, Some("share"))),
+            Err(ConfigError::RelativePath("XDG_DATA_HOME", _))
+        ));
+    }
+
+    #[test]
+    fn refuses_a_plugin_binary_that_is_relative_or_missing() {
+        assert!(matches!(
+            resolve_entire_graph(&plugin_dirs(Some("entire-graph"), None, None)),
+            Err(ConfigError::NotFound(_))
+        ));
+        assert!(matches!(
+            resolve_entire_graph(&plugin_dirs(None, Some("/nonexistent"), None)),
+            Err(ConfigError::NotFound(_))
+        ));
+        assert!(matches!(
+            resolve_entire_graph(&plugin_dirs(None, None, None)),
+            Err(ConfigError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_an_existing_absolute_plugin_binary() {
+        assert_eq!(
+            resolve_entire_graph(&plugin_dirs(Some("/bin/sh"), Some("relative"), None)).unwrap(),
+            PathBuf::from("/bin/sh")
         );
     }
 

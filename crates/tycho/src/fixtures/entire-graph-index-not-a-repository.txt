@@ -1,0 +1,1 @@
+resolve committed HEAD for preindex: git rev-parse HEAD: fatal: not a git repository (or any of the parent directories): .git

@@ -1,5 +1,6 @@
 //! Runs an external program with a timeout and a cap on the output it may produce.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read};
 use std::path::Path;
@@ -15,7 +16,7 @@ pub enum CommandError {
     Spawn(String, io::Error),
     Wait(io::Error),
     TimedOut(String, Duration),
-    OutputTooLarge(String),
+    OutputTooLarge(String, usize),
     NotUtf8(String),
     Failed(String, ExitStatus, String),
 }
@@ -28,10 +29,9 @@ impl fmt::Display for CommandError {
             Self::TimedOut(program, limit) => {
                 write!(formatter, "{program} did not finish within {limit:?}")
             }
-            Self::OutputTooLarge(program) => write!(
-                formatter,
-                "{program} wrote more than {COMMAND_OUTPUT_MAX_BYTES} bytes"
-            ),
+            Self::OutputTooLarge(program, limit) => {
+                write!(formatter, "{program} wrote more than {limit} bytes")
+            }
             Self::NotUtf8(program) => write!(formatter, "{program} wrote output that is not UTF-8"),
             Self::Failed(program, status, stderr) => {
                 write!(
@@ -76,8 +76,32 @@ pub fn run_status(
     environment: &[(&str, &str)],
     timeout: Duration,
 ) -> Result<Captured, CommandError> {
+    run_status_capped(
+        program,
+        arguments,
+        environment,
+        &[],
+        timeout,
+        COMMAND_OUTPUT_MAX_BYTES,
+    )
+}
+
+/// `run_status` with inherited variables removed and a caller's cap on each of stdout and
+/// stderr.
+pub fn run_status_capped(
+    program: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+    removed: &[OsString],
+    timeout: Duration,
+    output_max_bytes: usize,
+) -> Result<Captured, CommandError> {
     let name = program.display().to_string();
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    for variable in removed {
+        command.env_remove(variable);
+    }
+    let mut child = command
         .args(arguments)
         .envs(environment.iter().copied())
         .stdin(Stdio::null())
@@ -87,11 +111,18 @@ pub fn run_status(
         .map_err(|error| CommandError::Spawn(name.clone(), error))?;
     let started = Instant::now();
     let deadline = started.checked_add(timeout).unwrap_or(started);
-    let stdout = child.stdout.take().map(bounded_reader);
-    let stderr = child.stderr.take().map(bounded_reader);
+    let stdout = child
+        .stdout
+        .take()
+        .map(|source| bounded_reader(source, output_max_bytes));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|source| bounded_reader(source, output_max_bytes));
     let status = wait_bounded(&mut child, &name, timeout)?;
-    let stdout = collect(stdout, &name, deadline, timeout)?;
-    let stderr = collect(stderr, &name, deadline, timeout)?;
+    let limits = (deadline, timeout, output_max_bytes);
+    let stdout = collect(stdout, &name, limits)?;
+    let stderr = collect(stderr, &name, limits)?;
     Ok(Captured {
         status,
         stdout,
@@ -139,11 +170,11 @@ type Reader = mpsc::Receiver<io::Result<Vec<u8>>>;
 
 /// The reader thread is detached: a grandchild that inherited the pipe can hold it open
 /// past the deadline, and the caller must not wait for it.
-fn bounded_reader(source: impl Read + Send + 'static) -> Reader {
+fn bounded_reader(source: impl Read + Send + 'static, output_max_bytes: usize) -> Reader {
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
         let mut bytes = Vec::new();
-        let limit = u64::try_from(COMMAND_OUTPUT_MAX_BYTES).unwrap_or(u64::MAX);
+        let limit = u64::try_from(output_max_bytes).unwrap_or(u64::MAX);
         let read = source
             .take(limit.saturating_add(1))
             .read_to_end(&mut bytes)
@@ -157,8 +188,7 @@ fn bounded_reader(source: impl Read + Send + 'static) -> Reader {
 fn collect(
     reader: Option<Reader>,
     name: &str,
-    deadline: Instant,
-    timeout: Duration,
+    (deadline, timeout, output_max_bytes): (Instant, Duration, usize),
 ) -> Result<String, CommandError> {
     let Some(reader) = reader else {
         return Ok(String::new());
@@ -175,8 +205,11 @@ fn collect(
             )))
         }
     };
-    if bytes.len() > COMMAND_OUTPUT_MAX_BYTES {
-        return Err(CommandError::OutputTooLarge(name.to_string()));
+    if bytes.len() > output_max_bytes {
+        return Err(CommandError::OutputTooLarge(
+            name.to_string(),
+            output_max_bytes,
+        ));
     }
     String::from_utf8(bytes).map_err(|_| CommandError::NotUtf8(name.to_string()))
 }
@@ -230,6 +263,55 @@ mod tests {
             &[],
             Duration::from_secs(5),
         );
-        assert!(matches!(result, Err(CommandError::OutputTooLarge(_))));
+        assert!(matches!(
+            result,
+            Err(CommandError::OutputTooLarge(_, COMMAND_OUTPUT_MAX_BYTES))
+        ));
+    }
+
+    #[test]
+    fn a_caller_cap_rejects_output_the_default_cap_allows() {
+        let result = run_status_capped(
+            Path::new("/usr/bin/head"),
+            &["-c", "65", "/dev/zero"],
+            &[],
+            &[],
+            Duration::from_secs(5),
+            64,
+        );
+        assert!(matches!(result, Err(CommandError::OutputTooLarge(_, 64))));
+    }
+
+    #[test]
+    fn a_caller_cap_admits_output_over_the_default_cap() {
+        let count = (COMMAND_OUTPUT_MAX_BYTES + 1).to_string();
+        let captured = run_status_capped(
+            Path::new("/usr/bin/head"),
+            &["-c", &count, "/dev/zero"],
+            &[],
+            &[],
+            Duration::from_secs(5),
+            COMMAND_OUTPUT_MAX_BYTES * 2,
+        )
+        .unwrap();
+        assert_eq!(captured.stdout.len(), COMMAND_OUTPUT_MAX_BYTES + 1);
+    }
+
+    #[test]
+    fn removes_an_inherited_variable_and_keeps_a_set_one() {
+        let captured = run_status_capped(
+            Path::new("/usr/bin/env"),
+            &[],
+            &[("TYCHO_COMMAND_SET", "kept")],
+            &[OsString::from("HOME")],
+            Duration::from_secs(5),
+            COMMAND_OUTPUT_MAX_BYTES,
+        )
+        .unwrap();
+        assert!(captured.stdout.contains("TYCHO_COMMAND_SET=kept"));
+        assert!(!captured
+            .stdout
+            .lines()
+            .any(|line| line.starts_with("HOME=")));
     }
 }
