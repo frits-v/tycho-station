@@ -215,9 +215,12 @@ pub fn stop(supervisor: &Supervisor) -> StopReport {
             .map_err(|error| error.to_string())
             .and_then(|entries| match presence(&entries, role.session_name()) {
                 Presence::Absent => Ok("not running".to_string()),
-                Presence::Running { pid, .. } | Presence::Ended { pid } => supervisor
+                Presence::Running { pid, .. } => supervisor
                     .stop(role, pid, "-TERM")
                     .map(|()| format!("stopped pid {pid}")),
+                Presence::Ended { pid } => supervisor
+                    .remove(role)
+                    .map(|()| format!("removed the ended entry (pid {pid} not signalled)")),
                 Presence::Unrecognised => Err("zmx list is unrecognised".to_string()),
             });
         stopped.push((role, result));

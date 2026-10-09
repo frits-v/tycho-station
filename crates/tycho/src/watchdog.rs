@@ -25,6 +25,9 @@ pub enum Action {
     KillThenRun {
         pid: u32,
     },
+    /// The session's program has ended, so its listed pid may belong to another process by
+    /// now: the entry is removed by name and never signalled.
+    RemoveThenRun,
     /// The state is one the watchdog must not act on.
     Refuse,
 }
@@ -45,7 +48,7 @@ pub const fn decide(presence: Presence, health: &Health, now_unix_seconds: u64) 
                 Action::KillThenRun { pid }
             }
         }
-        Presence::Ended { pid } => Action::KillThenRun { pid },
+        Presence::Ended { .. } => Action::RemoveThenRun,
         Presence::Absent if health.is_healthy() => Action::Refuse,
         Presence::Absent => Action::Run,
         Presence::Unrecognised => Action::Refuse,
@@ -189,6 +192,11 @@ impl Supervisor {
                 self.start(role)
                     .map(|started| format!("killed pid {pid}; {started}"))
             }
+            Action::RemoveThenRun => {
+                self.remove(role)?;
+                self.start(role)
+                    .map(|started| format!("removed the ended entry; {started}"))
+            }
         }
     }
 
@@ -222,6 +230,13 @@ impl Supervisor {
         if self.wait_for_absent(name).is_ok() {
             return Ok(());
         }
+        self.zmx.kill(name).map_err(|error| error.to_string())?;
+        self.wait_for_absent(name)
+    }
+
+    /// Removes an ended session by name; its pid is never signalled.
+    pub fn remove(&self, role: CoreRole) -> Result<(), String> {
+        let name = role.session_name();
         self.zmx.kill(name).map_err(|error| error.to_string())?;
         self.wait_for_absent(name)
     }
@@ -325,10 +340,16 @@ mod tests {
             decide(running(0), &dead(), NOW),
             Action::KillThenRun { pid: 42 }
         );
-        assert_eq!(
-            decide(Presence::Ended { pid: 7 }, &Health::Healthy, NOW),
-            Action::KillThenRun { pid: 7 }
-        );
+    }
+
+    #[test]
+    fn an_ended_session_is_removed_by_name_and_its_pid_never_signalled() {
+        for health in [Health::Healthy, dead()] {
+            assert_eq!(
+                decide(Presence::Ended { pid: 7 }, &health, NOW),
+                Action::RemoveThenRun
+            );
+        }
     }
 
     #[test]
