@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["xtask"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
