@@ -23,8 +23,10 @@ pub const HOME_ENV: &str = "TYCHO_HOME";
 pub const ZMX_ENV: &str = "TYCHO_ZMX";
 pub const RESTATE_SERVER_ENV: &str = "TYCHO_RESTATE_SERVER";
 pub const HOME_DEFAULT_DIR: &str = ".tycho";
-/// Short, because zmx names each socket after its session under this directory.
-pub const CORE_SOCKET_DIR: &str = "zc";
+/// Developer-owned, mode 0700, apart from the agents' group-shared directory, because zmx
+/// does not check who connects to a socket.
+pub const CORE_SOCKET_DIR: &str = "/Users/Shared/tycho-core-zmx";
+pub const CORE_SOCKET_DIR_MODE: u32 = 0o700;
 pub const RESTATE_DATA_DIR: &str = "restate";
 pub const LOG_DIR: &str = "logs";
 pub const STOP_FILE: &str = "watchdog.stop";
@@ -120,6 +122,7 @@ impl fmt::Display for ConfigError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreConfig {
     pub home: PathBuf,
+    pub socket_dir: PathBuf,
     pub zmx: PathBuf,
     pub restate_server: PathBuf,
     pub tycho: PathBuf,
@@ -136,23 +139,31 @@ impl CoreConfig {
         let zmx = tool_path(ZMX_ENV, "zmx")?;
         let restate_server = tool_path(RESTATE_SERVER_ENV, "restate-server")?;
         let tycho = env::current_exe().map_err(ConfigError::CurrentExe)?;
-        Self::new(home, zmx, restate_server, tycho)
+        Self::new(
+            home,
+            PathBuf::from(CORE_SOCKET_DIR),
+            zmx,
+            restate_server,
+            tycho,
+        )
     }
 
     /// Every path is typed into a shell by zmx, so each must be shell-safe text.
     pub fn new(
         home: PathBuf,
+        socket_dir: PathBuf,
         zmx: PathBuf,
         restate_server: PathBuf,
         tycho: PathBuf,
     ) -> Result<Self, ConfigError> {
-        for path in [&home, &zmx, &restate_server, &tycho] {
+        for path in [&home, &socket_dir, &zmx, &restate_server, &tycho] {
             if !is_shell_safe(path) {
                 return Err(ConfigError::UnsafePath(path.clone()));
             }
         }
         let config = Self {
             home,
+            socket_dir,
             zmx,
             restate_server,
             tycho,
@@ -161,7 +172,7 @@ impl CoreConfig {
             .iter()
             .map(|role| {
                 config
-                    .socket_dir()
+                    .socket_dir
                     .join(role.session_name())
                     .as_os_str()
                     .len()
@@ -172,11 +183,6 @@ impl CoreConfig {
             return Err(ConfigError::SocketPathTooLong(longest));
         }
         Ok(config)
-    }
-
-    #[must_use]
-    pub fn socket_dir(&self) -> PathBuf {
-        self.home.join(CORE_SOCKET_DIR)
     }
 
     #[must_use]
@@ -245,8 +251,13 @@ mod tests {
     use super::*;
 
     fn config(home: &str) -> Result<CoreConfig, ConfigError> {
+        with_socket_dir(home, CORE_SOCKET_DIR)
+    }
+
+    fn with_socket_dir(home: &str, socket_dir: &str) -> Result<CoreConfig, ConfigError> {
         CoreConfig::new(
             PathBuf::from(home),
+            PathBuf::from(socket_dir),
             PathBuf::from("/opt/zmx"),
             PathBuf::from("/opt/restate-server"),
             PathBuf::from("/opt/tycho"),
@@ -254,11 +265,11 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_short_home() {
+    fn accepts_the_shared_core_socket_dir() {
         let config = config("/Users/someone/.tycho").unwrap();
         assert_eq!(
-            config.socket_dir(),
-            PathBuf::from("/Users/someone/.tycho/zc")
+            config.socket_dir,
+            PathBuf::from("/Users/Shared/tycho-core-zmx")
         );
     }
 
@@ -271,10 +282,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_a_home_past_the_socket_bound() {
-        let home = format!("/{}", "a".repeat(90));
+    fn rejects_a_socket_dir_past_the_socket_bound() {
+        let socket_dir = format!("/{}", "a".repeat(90));
         assert!(matches!(
-            config(&home),
+            with_socket_dir("/h", &socket_dir),
             Err(ConfigError::SocketPathTooLong(_))
         ));
     }

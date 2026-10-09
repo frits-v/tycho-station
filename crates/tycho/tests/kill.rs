@@ -20,7 +20,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tycho::config::{
-    CoreConfig, CoreRole, HOME_ENV, RESTATE_INGRESS_PORT, RESTATE_SERVER_ENV, ZMX_ENV,
+    CoreConfig, CoreRole, CORE_SOCKET_DIR, HOME_ENV, RESTATE_INGRESS_PORT, RESTATE_SERVER_ENV,
+    ZMX_ENV,
 };
 use tycho::health::{self, Health};
 use tycho::http::Http;
@@ -47,6 +48,7 @@ impl Core {
         let restate_server = mise_which("restate-server");
         let config = CoreConfig::new(
             home.clone(),
+            PathBuf::from(CORE_SOCKET_DIR),
             zmx.clone(),
             restate_server.clone(),
             PathBuf::from(TYCHO),
@@ -92,7 +94,7 @@ impl Core {
     }
 
     fn zmx(&self) -> Zmx {
-        Zmx::new(&self.config.zmx, &self.config.socket_dir())
+        Zmx::new(&self.config.zmx, &self.config.socket_dir)
     }
 
     fn pid(&self, role: CoreRole) -> u32 {

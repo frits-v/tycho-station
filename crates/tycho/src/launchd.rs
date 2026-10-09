@@ -256,6 +256,7 @@ mod tests {
     fn renders_the_plist() {
         let config = CoreConfig::new(
             PathBuf::from("/Users/someone/.tycho"),
+            PathBuf::from(crate::config::CORE_SOCKET_DIR),
             PathBuf::from("/opt/zmx/0.8.1/zmx"),
             PathBuf::from("/opt/restate-server/1.7.13/restate-server"),
             PathBuf::from("/opt/bin/tycho"),
