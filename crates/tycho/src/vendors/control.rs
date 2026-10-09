@@ -123,7 +123,7 @@ pub enum Delivery {
     Denied {
         socket: String,
     },
-    /// The write failed with nothing written.
+    /// Nothing was written before the write failed.
     WriteFailed {
         socket: String,
         reason: String,

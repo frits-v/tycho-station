@@ -113,9 +113,9 @@ pub fn decode_line(line: &str) -> MessageLine {
     }
 }
 
-/// Decodes every line with the exit: 0 with no diagnostic is clean, 0 or 101 with
-/// diagnostics is a finding, anything else is unrecognised. A diagnostic reported for more
-/// than one target is counted once.
+/// Decodes every line with the exit: 0 with no diagnostic over at least one artifact is
+/// clean, 0 or 101 with diagnostics is a finding, anything else (zero artifacts included)
+/// is unrecognised. A diagnostic reported for more than one target is counted once.
 pub fn decode(exit: &Exit, output: &str) -> ClippyOutcome {
     let mut artifacts = 0_usize;
     let mut finished = None;
@@ -144,7 +144,7 @@ pub fn decode(exit: &Exit, output: &str) -> ClippyOutcome {
         }
     }
     match (exit, finished, findings.is_empty()) {
-        (Exit::Code(0), Some(true), true) => ClippyOutcome::Clean { artifacts },
+        (Exit::Code(0), Some(true), true) if artifacts > 0 => ClippyOutcome::Clean { artifacts },
         (Exit::Code(0 | 101), Some(_), false) => ClippyOutcome::Findings { findings, rendered },
         (exit, finished, _) => ClippyOutcome::Unrecognised(format!(
             "clippy ended {exit:?}, build finished {finished:?}, {} findings",
@@ -249,6 +249,10 @@ mod tests {
         ));
         assert!(matches!(
             decode(&Exit::Code(0), &lines(&[ARTIFACT])),
+            ClippyOutcome::Unrecognised(_)
+        ));
+        assert!(matches!(
+            decode(&Exit::Code(0), FINISHED_OK),
             ClippyOutcome::Unrecognised(_)
         ));
         assert!(matches!(
