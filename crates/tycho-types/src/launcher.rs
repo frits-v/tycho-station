@@ -252,6 +252,22 @@ mod tests {
     }
 
     #[test]
+    fn rejects_overlong_secrets() {
+        let mut long = environment();
+        long.insert(
+            ENV_SESSION_SECRET.to_string(),
+            "s".repeat(SESSION_SECRET_MAX_BYTES.saturating_add(1)),
+        );
+        assert!(matches!(
+            LauncherEnv::from_map(&long),
+            Err(EnvError::Invalid {
+                name: ENV_SESSION_SECRET,
+                reason: TokenError::TooLong { .. },
+            })
+        ));
+    }
+
+    #[test]
     fn secret_never_prints() {
         let env = LauncherEnv::from_map(&environment()).unwrap();
         let printed = format!("{env:?}");

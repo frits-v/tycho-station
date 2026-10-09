@@ -512,6 +512,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_too_many_criteria() {
+        let criterion = r#"{"criterion":0,"passed":true,"evidence":[]}"#;
+        let criteria = vec![criterion; CRITERIA_MAX_ITEMS.saturating_add(1)].join(",");
+        let payload = result_payload().replace(
+            &format!(
+                r#"[{{"criterion":0,"passed":true,"evidence":["{}"]}}]"#,
+                digest('b')
+            ),
+            &format!("[{criteria}]"),
+        );
+        assert!(matches!(
+            Envelope::parse(envelope("result", &payload).as_bytes()),
+            Err(EnvelopeError::TooMany {
+                field: "criteria",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn strings_reject_lengths_over_their_maximum() {
+        let over = |max: usize| "a".repeat(max.saturating_add(1));
+        assert!(RecordId::parse(&over(RECORD_ID_MAX_BYTES)).is_err());
+        assert!(ShortText::parse(&over(TEXT_MAX_BYTES)).is_err());
+        assert!(BranchName::parse(&over(BRANCH_MAX_BYTES)).is_err());
+        assert!(RecordId::parse(&"a".repeat(RECORD_ID_MAX_BYTES)).is_ok());
+    }
+
+    #[test]
     fn references_and_branches_are_checked() {
         assert!(ContentRef::parse(&digest('e')).is_ok());
         assert!(ContentRef::parse("md5:abc").is_err());

@@ -111,9 +111,14 @@ impl From<String> for ExitState {
     }
 }
 
+/// An unrecognised state keeps its raw text on the wire, so the inbox can show
+/// what the vendor actually said after the state crosses the reject path.
 impl From<ExitState> for String {
     fn from(value: ExitState) -> Self {
-        value.as_wire().to_string()
+        match value {
+            ExitState::Unrecognised { raw: Some(raw), .. } => raw,
+            known => known.as_wire().to_string(),
+        }
     }
 }
 
@@ -177,6 +182,15 @@ mod tests {
             ExitState::from_wire("bad\u{1b}"),
             ExitState::Unrecognised { raw: None, .. }
         ));
+    }
+
+    #[test]
+    fn unrecognised_raw_survives_serialization() {
+        let state = ExitState::from_wire("error_max_turns");
+        let json = serde_json::to_string(&state).unwrap();
+        assert_eq!(json, "\"error_max_turns\"");
+        let back: ExitState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, state);
     }
 
     #[test]
