@@ -10,7 +10,7 @@ mandate: #Mandate & {
 			pending: false
 		}
 		ci: {
-			what:    "xtask ci in the ci workflow: formatting, clippy with the workspace lints, tests, zizmor, actionlint, and the xtask checks. check-names, check-comments and check-rules count the files they examined and fail at zero; a file that cannot be read still counts as examined. check-pr-title passes when no title is available."
+			what:    "xtask ci in the ci workflow: formatting, clippy with the workspace lints, tests, zizmor, actionlint, and the xtask checks. check-names, check-comments, check-rules and check-config count the files they examined and fail at zero; a file that cannot be read still counts as examined. check-config also fails when an export under config/export differs from a fresh export of its CUE. check-pr-title passes when no title is available."
 			runs:    "every pull request and push to the default branch"
 			record:  "forge"
 			pending: false
@@ -22,7 +22,7 @@ mandate: #Mandate & {
 			pending: false
 		}
 		post_edit_hook: {
-			what:    ".claude/settings.json runs xtask hook post-tool-use after Edit and Write: formatting, clippy, check-names, check-comments, check-rules. Advisory; it always exits zero."
+			what:    ".claude/settings.json runs xtask hook post-tool-use after Edit and Write: formatting, clippy, check-names, check-comments, check-rules, and check-config after a CUE edit. Advisory; it always exits zero."
 			runs:    "each edit in an agent session on this repository"
 			record:  "not_recorded"
 			pending: false
@@ -393,7 +393,7 @@ mandate: #Mandate & {
 		"15.4": {
 			requires: "A mechanism without recorded firings does not count; a check that examines nothing and reports success has failed."
 			mechanisms: ["ci"]
-			coverage: "ci: check-names, check-comments and check-rules fail at zero files examined"
+			coverage: "ci: check-names, check-comments, check-rules and check-config fail at zero files examined"
 			partial:  true
 			slices: ["zero", "one"]
 		}
