@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tycho::agent_files::current_uid;
 use tycho::config::AgentDirs;
-use tycho::kill::{kill_session, KillRequest};
-use tycho::launcher::HeartbeatTarget;
+use tycho::kill::{kill_session, reap, KillRequest, KillVerdict};
+use tycho::launcher::{HeartbeatTarget, VendorTerminal};
 use tycho::launcher::{SessionFiles, VendorRecord};
 use tycho::process::{process_facts, send, ProcessFacts};
 use tycho::services::spawner::{LeaseRead, SpawnSpec, Spawner, SpawnerError};
@@ -47,7 +47,8 @@ pub struct LauncherLog {
     /// Every spawn call with what `spawn_session` answered.
     pub spawned: Vec<(String, String)>,
     pub killed: Vec<(String, String)>,
-    pub reaped: Vec<String>,
+    /// Every reap with the verdict on the session's recorded vendor.
+    pub reaped: Vec<(String, Option<KillVerdict>)>,
 }
 
 struct Inner {
@@ -174,6 +175,8 @@ impl LauncherSpawner {
             vendor: &vendor,
             agent_uid: current_uid(),
             tier,
+            terminal: VendorTerminal::Files,
+            vendor_dir: None,
         })
     }
 
@@ -290,20 +293,20 @@ impl Spawner for LauncherSpawner {
             log.killed
                 .push((session.to_string(), format!("{report:?}")));
         });
-        Ok(())
+        report.zmx_kill.map_err(SpawnerError::Transient)
     }
 
     fn kill_by_name(&self, session: &SessionName) -> Result<(), SpawnerError> {
         let name = session.to_string();
-        self.record(|log| log.reaped.push(name.clone()));
         let listed = self
             .inner
             .zmx
             .list()
             .map(|entries| presence(&entries, &name));
-        let outcome = tycho::kill::kill_by_name(&self.inner.zmx, session);
-        println!("evidence: port reap({name}) with the session {listed:?} -> {outcome:?}");
-        outcome
+        let report = reap(&self.inner.zmx, &self.inner.dirs, session, current_uid());
+        println!("evidence: port reap({name}) with the session {listed:?} -> {report:?}");
+        self.record(|log| log.reaped.push((name, report.vendor.clone())));
+        report.zmx_kill
     }
 
     fn save_scrollback(&self, session: &SessionName) -> Result<ShortText, SpawnerError> {

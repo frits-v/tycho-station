@@ -68,7 +68,7 @@ pub const METRIC_TABLE: [Metric; 12] = [
         measured_at: "chaos tests",
         target: "100 percent, hard gate",
         measured_value: MeasuredValue::Recorded(
-            "100 percent: 4 of 4 kill cases (terminal app, Restate before the resolve, endpoint between tasks, launcher before its trap) ended done in the unit attempt they started in, with one session per worker attempt",
+            "4 of 4 cases held on state and one session per attempt; the launcher case leaves attempt 1's vendor running (issue 66)",
         ),
     },
     Metric {
@@ -185,10 +185,11 @@ mod tests {
     #[test]
     fn the_table_carries_exactly_the_design_rows_and_the_two_baselines() {
         assert_eq!(METRIC_TABLE.len(), 12);
-        assert_eq!(METRIC_TABLE[0].name, "Human interrupts per work unit");
-        assert_eq!(METRIC_TABLE[9].name, "Rule citation ledger");
-        assert_eq!(METRIC_TABLE[10].name, "Journal size per unit");
-        assert_eq!(METRIC_TABLE[11].name, "Index build time");
+        let names: Vec<&str> = METRIC_TABLE.iter().map(|metric| metric.name).collect();
+        assert_eq!(names.first(), Some(&"Human interrupts per work unit"));
+        assert_eq!(names.get(9), Some(&"Rule citation ledger"));
+        assert_eq!(names.get(10), Some(&"Journal size per unit"));
+        assert_eq!(names.get(11), Some(&"Index build time"));
     }
 
     #[test]
@@ -212,24 +213,42 @@ mod tests {
         assert!(rendered.contains("weird \\| name"));
     }
 
+    fn by_name(name: &str) -> &'static Metric {
+        METRIC_TABLE
+            .iter()
+            .find(|metric| metric.name == name)
+            .unwrap()
+    }
+
+    /// The step 4 kill cases the chaos catalogue names as runnable.
+    fn kill_cases() -> usize {
+        let step_four = crate::chaos::SLICE_ZERO_EXIT_TESTS
+            .iter()
+            .find(|test| test.name == "kill tests (step 4)")
+            .unwrap();
+        match step_four.readiness {
+            crate::chaos::Readiness::Runnable { test } => test.split(", ").count(),
+            crate::chaos::Readiness::NotYetRunnable { .. } => 0,
+        }
+    }
+
     #[test]
     fn the_baselines_and_restart_recovery_are_recorded() {
-        assert!(matches!(
-            METRIC_TABLE[10].measured_value,
-            MeasuredValue::Recorded(_)
-        ));
-        assert!(matches!(
-            METRIC_TABLE[11].measured_value,
-            MeasuredValue::Recorded(_)
-        ));
-        let recovery = METRIC_TABLE
-            .iter()
-            .find(|metric| metric.name == "Restart recovery")
-            .unwrap();
-        assert!(matches!(
-            recovery.measured_value,
-            MeasuredValue::Recorded(value) if value.starts_with("100 percent")
-        ));
+        for name in ["Journal size per unit", "Index build time"] {
+            assert!(matches!(
+                by_name(name).measured_value,
+                MeasuredValue::Recorded(_)
+            ));
+        }
+        let cases = kill_cases();
+        assert_eq!(cases, 4);
+        let MeasuredValue::Recorded(value) = by_name("Restart recovery").measured_value else {
+            panic!("restart recovery is not recorded");
+        };
+        assert!(
+            value.starts_with(&format!("{cases} of {cases} cases")),
+            "{value}"
+        );
     }
 
     #[test]

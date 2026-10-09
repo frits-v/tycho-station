@@ -21,16 +21,17 @@ use tycho_types::envelope::CommitSha;
 use tycho_types::service::WorkUnitId;
 
 use crate::launcher_spawner::result_envelope;
+use crate::support::running_before_the_kill;
 use crate::support::{
     admin_query, attach, await_unit_end, client, dispatch, lifecycle_and_attempt, session_status,
-    start_core, unit_status, wait_until, worker_run_status, DoublesEndpoint,
+    start_core, wait_until, worker_run_status, DoublesEndpoint,
 };
 
 const DEFAULT_SHA: &str = "2222222222222222222222222222222222222222";
 const HEAD_SHA: &str = "1111111111111111111111111111111111111111";
 
-/// Statuses Restate answered to the double's resolves, in arrival order.
-type Acks = Arc<Mutex<Vec<u16>>>;
+/// When each of the double's resolves was answered, and Restate's status, in arrival order.
+type Acks = Arc<Mutex<Vec<(Instant, u16)>>>;
 
 /// The wire bytes a launcher resolves with, checked the way the launcher checks its spool.
 fn result_json(spec: &SpawnSpec, head: &str) -> String {
@@ -53,7 +54,7 @@ fn resolve_later(awaitable: String, delay: Duration, body: String, acks: Acks) {
         println!("evidence: launcher double resolve -> {status}");
         acks.lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(status);
+            .push((Instant::now(), status));
     });
 }
 
@@ -101,8 +102,9 @@ fn endpoint_killed_between_tasks_replays_without_dispatching_twice() {
     wait_until("task 1 session recorded", || {
         session_status(&first)["phase"] == "running"
     });
-    let before = lifecycle_and_attempt(&unit_status());
+    let before = running_before_the_kill();
     drop(endpoint);
+    let dropped = Instant::now();
     println!("evidence: endpoint killed with task 1 awaiting its result, unit {before:?}");
     wait_until("task 1 resolved while the endpoint is down", || {
         !acks
@@ -110,10 +112,18 @@ fn endpoint_killed_between_tasks_replays_without_dispatching_twice() {
             .unwrap_or_else(PoisonError::into_inner)
             .is_empty()
     });
-    let acknowledged = acks.lock().unwrap_or_else(PoisonError::into_inner)[0];
+    let (answered, acknowledged) = acks.lock().unwrap_or_else(PoisonError::into_inner)[0];
     assert!(
         (200..300).contains(&acknowledged),
         "resolve -> {acknowledged}"
+    );
+    assert!(
+        answered > dropped,
+        "task 1 resolved before the endpoint was killed"
+    );
+    println!(
+        "evidence: task 1 resolve answered {:.1}s after the endpoint was killed",
+        answered.duration_since(dropped).as_secs_f64()
     );
     assert_eq!(
         spawner.log().spawned.len(),

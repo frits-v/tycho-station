@@ -68,7 +68,7 @@ pub const CHAOS_CATALOGUE: [ChaosTest; 4] = [
 ];
 
 /// Slice zero's exit tests (`docs/slices.md`).
-pub const SLICE_ZERO_EXIT_TESTS: [SliceZeroExitTest; 4] = [
+pub const SLICE_ZERO_EXIT_TESTS: [SliceZeroExitTest; 5] = [
     SliceZeroExitTest {
         name: "kill tests (step 4)",
         pass_condition: "killing the terminal app, the Restate server between worker exit and resolve, the endpoint, and the launcher before its exit trap each leaves nothing lost and spawns no duplicate session",
@@ -91,8 +91,15 @@ pub const SLICE_ZERO_EXIT_TESTS: [SliceZeroExitTest; 4] = [
         },
     },
     SliceZeroExitTest {
-        name: "first merge and baselines",
-        pass_condition: "a work unit merges end to end; journal size per unit and index build time are recorded as the first baselines",
+        name: "first merge",
+        pass_condition: "a work unit merges end to end through the local merge gate's verify and fast-forward",
+        readiness: Readiness::NotYetRunnable {
+            reason: "waits on the local merge gate's fast-forward (issue 15)",
+        },
+    },
+    SliceZeroExitTest {
+        name: "first baselines",
+        pass_condition: "journal size per unit and index build time are recorded as the first baselines",
         readiness: Readiness::Runnable {
             test: "a_unit_merges_end_to_end_and_records_the_baselines",
         },
@@ -168,22 +175,19 @@ mod tests {
             assert!(reason.starts_with("waits on"), "{reason}");
             examined = examined.saturating_add(1);
         }
-        assert_eq!(examined, 5);
+        assert_eq!(examined, 6);
     }
 
     #[test]
-    fn slice_zero_steps_four_and_the_first_merge_name_tests_that_exist() {
-        assert_eq!(SLICE_ZERO_EXIT_TESTS.len(), 4);
+    fn slice_zero_step_four_and_the_baselines_name_tests_that_exist() {
+        assert_eq!(SLICE_ZERO_EXIT_TESTS.len(), 5);
         let sources = suite_tests();
         let runnable: Vec<&str> = SLICE_ZERO_EXIT_TESTS
             .iter()
             .filter(|test| matches!(test.readiness, Readiness::Runnable { .. }))
             .map(|test| test.name)
             .collect();
-        assert_eq!(
-            runnable,
-            ["kill tests (step 4)", "first merge and baselines"]
-        );
+        assert_eq!(runnable, ["kill tests (step 4)", "first baselines"]);
         let names: Vec<&str> = SLICE_ZERO_EXIT_TESTS
             .iter()
             .flat_map(|test| runnable_names(test.readiness))

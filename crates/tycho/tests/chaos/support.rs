@@ -20,6 +20,7 @@ use tycho::http::Http;
 use tycho::services::merge_gate::MergeGate;
 use tycho::services::spawner::Spawner;
 use tycho::services::{Ports, Timing};
+use tycho::vendors::control::NoVendor;
 use tycho::zmx::{ListEntry, Zmx};
 
 pub const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
@@ -283,6 +284,17 @@ pub fn lifecycle_and_attempt(view: &serde_json::Value) -> (String, u64) {
     )
 }
 
+/// Every kill lands on a unit running its first attempt; anything else is a broken setup.
+pub fn running_before_the_kill() -> (String, u64) {
+    let before = lifecycle_and_attempt(&unit_status());
+    assert_eq!(
+        before,
+        ("running".to_string(), 1),
+        "the unit before the kill"
+    );
+    before
+}
+
 fn register_doubles() {
     let body = format!("{{\"uri\":\"http://{}\"}}", loopback(DOUBLES_PORT));
     let response = client()
@@ -348,6 +360,7 @@ pub fn start_endpoint(
 ) -> (DoublesEndpoint, Ports) {
     let ports = Ports {
         spawner,
+        vendor: Arc::new(NoVendor),
         merge_gate,
         timing: test_timing(),
         config: Arc::new(test_config()),

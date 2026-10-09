@@ -11,20 +11,24 @@ use std::time::{Duration, Instant};
 
 use tycho::config::{CoreRole, AGENT_USER_ENV};
 use tycho::health::{self, Health};
+use tycho::kill::{KillRefusal, KillVerdict};
 use tycho::launcher::HEARTBEAT_INTERVAL;
 use tycho::process::now_unix_ms;
+use tycho::process::{process_facts, ProcessFacts};
 use tycho::services::doubles::FixedGate;
 use tycho::services::merge_gate::GateVerdict;
 use tycho::services::spawner::LeaseRead;
 use tycho::spawn::SpawnOutcome;
 use tycho::spool::ACKNOWLEDGED_SUFFIX;
+use tycho::zmx::SESSION_ENV;
 use tycho::zmx::{count_named, presence, Presence};
 use tycho_types::envelope::CommitSha;
 
 use crate::launcher_spawner::{running_vendor, AgentGuard, LauncherSpawner, VendorPlan, VendorRun};
+use crate::support::running_before_the_kill;
 use crate::support::{
     attach, await_unit_end, dispatch, http, lifecycle_and_attempt, session_status, start_endpoint,
-    start_with_retries, unit_status, wait_until, worker_run_status, Core, DoublesEndpoint, TYCHO,
+    start_with_retries, wait_until, worker_run_status, Core, DoublesEndpoint, TYCHO,
 };
 
 const DEFAULT_SHA: &str = "2222222222222222222222222222222222222222";
@@ -143,44 +147,115 @@ fn lease_heartbeat(spawner: &LauncherSpawner, name: &str) -> u64 {
     }
 }
 
-/// A process group the case started; whatever is left of it is killed when the case ends.
-struct Group(Child);
+/// A program under `script`, the way a terminal tab runs one: `script` holds the pty master
+/// and its child leads the session on the pty. Whatever is left is killed when the case ends.
+struct Pty {
+    script: Child,
+    child: u32,
+}
 
-impl Drop for Group {
-    fn drop(&mut self) {
-        if matches!(self.0.try_wait(), Ok(None)) {
-            drop(
-                Command::new("/bin/kill")
-                    .args(["-KILL", "--", &format!("-{}", self.0.id())])
-                    .status(),
-            );
-            drop(self.0.wait());
+/// How long a pty's child gets to end after its master is gone.
+const HANGUP_LIMIT: Duration = Duration::from_secs(10);
+
+fn kill_group_of(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn child_of(parent: u32) -> Option<u32> {
+    let listing = Command::new("/bin/ps")
+        .args(["-ax", "-o", "pid=,ppid="])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some((fields.next()?.parse().ok()?, fields.next()?.parse().ok()?))
+        })
+        .find(|(_, ppid): &(u32, u32)| *ppid == parent)
+        .map(|(pid, _)| pid)
+}
+
+impl Pty {
+    /// Runs `program` with `arguments` under `script` in its own process group.
+    fn spawn(program: &str, arguments: &[&str], environment: &[(&str, String)]) -> Self {
+        let mut command = Command::new("/usr/bin/script");
+        command.args(["-q", "/dev/null", program]).args(arguments);
+        for (key, value) in environment {
+            command.env(key, value);
         }
+        let script = command
+            .env_remove(SESSION_ENV)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = 0;
+        wait_until("the program under script started", || {
+            child_of(script.id()).is_some_and(|pid| {
+                child = pid;
+                true
+            })
+        });
+        Self { script, child }
+    }
+
+    /// SIGKILL to `script`'s group closes the pty master; the child should end on the hangup.
+    fn hang_up(&mut self, what: &str) {
+        assert!(kill_group_of(self.script.id()), "kill of the {what} group");
+        assert!(self.script.wait().is_ok());
+        println!(
+            "evidence: SIGKILL to the {what}'s script process group {}",
+            self.script.id()
+        );
+        let started = Instant::now();
+        while started.elapsed() < HANGUP_LIMIT
+            && !matches!(process_facts(self.child), ProcessFacts::Gone)
+        {
+            thread::sleep(Duration::from_millis(100));
+        }
+        match process_facts(self.child) {
+            ProcessFacts::Gone => println!(
+                "evidence: the {what} (pid {}) ended on the pty hangup after {:.1}s",
+                self.child,
+                started.elapsed().as_secs_f64()
+            ),
+            other => println!(
+                "evidence: the {what} (pid {}) outlived the hangup: {other:?}",
+                self.child
+            ),
+        }
+        let signalled = kill_group_of(self.child);
+        println!(
+            "evidence: SIGKILL to the {what}'s own group {}: {}",
+            self.child,
+            if signalled {
+                "delivered"
+            } else {
+                "no such group"
+            }
+        );
     }
 }
 
-fn kill_group(group: &mut Group, what: &str) {
-    let child = &mut group.0;
-    let status = Command::new("/bin/kill")
-        .args(["-KILL", "--", &format!("-{}", child.id())])
-        .status()
-        .unwrap();
-    assert!(status.success(), "kill of the {what} group failed");
-    assert!(child.wait().is_ok(), "the {what} did not end");
-    println!(
-        "evidence: SIGKILL to the {what} process group {}",
-        child.id()
-    );
+impl Drop for Pty {
+    fn drop(&mut self) {
+        if matches!(self.script.try_wait(), Ok(None)) {
+            kill_group_of(self.script.id());
+            drop(self.script.wait());
+        }
+        kill_group_of(self.child);
+    }
 }
 
 /// The `clients=` count `zmx list` shows for the session; zmx's own field, not a decoded entry.
 fn attached_clients(spawner: &LauncherSpawner, name: &str) -> String {
-    let listing = Command::new(crate::support::mise_which("zmx"))
-        .arg("list")
-        .env("ZMX_DIR", spawner.zmx().socket_dir())
-        .env_remove("ZMX_SESSION")
-        .output()
-        .unwrap();
+    let listing = spawner.zmx().command(&["list"]).output().unwrap();
     let prefix = format!("name={name}\t");
     String::from_utf8_lossy(&listing.stdout)
         .lines()
@@ -191,51 +266,45 @@ fn attached_clients(spawner: &LauncherSpawner, name: &str) -> String {
 }
 
 /// A pty client attached to the session, the way a Ghostty tab attaches.
-fn attach_client(spawner: &LauncherSpawner, name: &str) -> Group {
-    // zmx refuses to attach from inside a session, and this test may itself run inside one.
-    let child = Command::new("/usr/bin/script")
-        .args(["-q", "/dev/null"])
-        .arg(crate::support::mise_which("zmx"))
-        .args(["attach", name])
-        .env("ZMX_DIR", spawner.zmx().socket_dir())
-        .env_remove("ZMX_SESSION")
-        .process_group(0)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let child = Group(child);
+fn attach_client(spawner: &LauncherSpawner, name: &str) -> Pty {
+    let zmx = spawner.zmx().binary().display().to_string();
+    let environment = [("ZMX_DIR", spawner.zmx().socket_dir().to_string())];
+    let client = Pty::spawn(&zmx, &["attach", name], &environment);
     wait_until("zmx lists one attached client", || {
         attached_clients(spawner, name) == "clients=1"
     });
-    child
+    client
 }
 
 /// The shell a terminal tab runs `tycho core start` from, left running as the tab would be.
-fn core_from_shell(core: &Core) -> Group {
+fn core_from_shell(core: &Core) -> Pty {
     start_with_retries(core, shell_running_core_start)
 }
 
-fn shell_running_core_start(core: &Core) -> Option<Group> {
+fn shell_running_core_start(core: &Core) -> Option<Pty> {
     let report = core.config.home.with_extension("start-report");
-    let child = Command::new("/bin/sh")
-        .args(["-c", "\"$0\" core start > \"$1\" 2>&1; exec /bin/sleep 600"])
-        .arg(TYCHO)
-        .arg(&report)
-        .envs(core.envs())
-        .process_group(0)
-        .stdin(Stdio::null())
-        .spawn()
-        .unwrap();
-    let child = Group(child);
+    let report_path = report.display().to_string();
+    let environment: Vec<(&str, String)> = core
+        .envs()
+        .map(|(key, value)| (key, value.to_string()))
+        .collect();
+    let shell = Pty::spawn(
+        "/bin/sh",
+        &[
+            "-c",
+            "\"$0\" core start > \"$1\" 2>&1; exec /bin/sleep 600",
+            TYCHO,
+            &report_path,
+        ],
+        &environment,
+    );
     wait_until("core start from the shell reported", || {
         fs::read_to_string(&report).is_ok_and(|text| text.contains("core home:"))
     });
     let text = fs::read_to_string(&report).unwrap();
     drop(fs::remove_file(&report));
     println!("evidence: {text}");
-    text.contains("reconciler: generation").then_some(child)
+    text.contains("reconciler: generation").then_some(shell)
 }
 
 fn core_sessions_listed_once(core: &Core) {
@@ -261,10 +330,10 @@ fn terminal_app_killed_leaves_the_session_core_and_unit_running() {
     let name = spawned(&rig, 0);
     wait_for_heartbeat(&name);
     let mut client = attach_client(&rig.spawner, &name);
-    let before = lifecycle_and_attempt(&unit_status());
+    let before = running_before_the_kill();
     let killed_at = now_unix_ms();
-    kill_group(&mut client, "attach client");
-    kill_group(&mut shell, "core start shell");
+    client.hang_up("attach client");
+    shell.hang_up("core start shell");
     wait_until("zmx lists no attached client", || {
         attached_clients(&rig.spawner, &name) == "clients=0"
     });
@@ -315,7 +384,7 @@ fn restate_killed_between_worker_exit_and_resolve_resolves_on_the_same_attempt()
     let invocation = dispatch(&rig.core, &["wu01-t1"]);
     let name = spawned(&rig, 0);
     wait_for_heartbeat(&name);
-    let before = lifecycle_and_attempt(&unit_status());
+    let before = running_before_the_kill();
     kill_restate(&rig.core);
     let files = rig.spawner.files(&name);
     wait_until("the result spooled while restate is down", || {
@@ -375,6 +444,37 @@ fn kill_launcher(spawner: &LauncherSpawner, name: &str) {
     );
 }
 
+/// The reap judged the recorded vendor and, with the agent user being the core's own user
+/// in this rig, refused to signal it, so the vendor is still running.
+fn assert_reap_refused_and_vendor_running(spawner: &LauncherSpawner, name: &str) {
+    let verdicts: Vec<Option<KillVerdict>> = spawner
+        .log()
+        .reaped
+        .into_iter()
+        .filter(|(reaped, _)| reaped == name)
+        .map(|(_, verdict)| verdict)
+        .collect();
+    println!("evidence: reap verdicts on the attempt 1 vendor {verdicts:?}");
+    assert!(!verdicts.is_empty(), "attempt 1 was never reaped");
+    for verdict in &verdicts {
+        assert!(
+            matches!(
+                verdict,
+                None | Some(KillVerdict::Refused(KillRefusal::CoreUid))
+            ),
+            "{verdict:?}"
+        );
+    }
+    let orphan = running_vendor(&spawner.files(name));
+    println!("evidence: attempt 1 vendor after the reap: {orphan:?}");
+    // The known gap: the production reap kills by zmx name only, so nothing signals the
+    // vendor of a launcher killed before its trap.
+    assert!(
+        orphan.is_some(),
+        "the orphaned vendor stopped; the known gap of issue 66 closed, update this case"
+    );
+}
+
 /// Nothing resolved, no spool, and a replay of the absent spool is refused.
 fn assert_nothing_spooled(rig: &Rig, name: &str) {
     let files = rig.spawner.files(name);
@@ -404,7 +504,7 @@ fn launcher_killed_before_its_trap_requeues_as_attempt_two() {
     let invocation = dispatch(&rig.core, &["wu01-t1"]);
     let first = spawned(&rig, 0);
     wait_for_heartbeat(&first);
-    let before = lifecycle_and_attempt(&unit_status());
+    let before = running_before_the_kill();
     kill_launcher(&rig.spawner, &first);
     assert_lease_frozen(&rig.spawner, &first);
     assert_nothing_spooled(&rig, &first);
@@ -412,18 +512,14 @@ fn launcher_killed_before_its_trap_requeues_as_attempt_two() {
     println!("evidence: attempt 2 spawned as {second}");
     assert!(first.ends_with("a1") && second.ends_with("a2") && first != second);
     wait_until("attempt 1 reaped by name", || {
-        rig.spawner.log().reaped.contains(&first)
+        rig.spawner
+            .log()
+            .reaped
+            .iter()
+            .any(|(name, _)| *name == first)
     });
     assert_eq!(rig.spawner.listed(&first), 0, "attempt 1 is gone from zmx");
-    let orphan = running_vendor(&rig.spawner.files(&first));
-    println!("evidence: attempt 1 vendor after the reap by name: {orphan:?}");
-    // Known gap: the reap goes by zmx name, and the vendor of a launcher killed before its
-    // trap runs in its own session, so nothing stops it. This flips once the reap signals
-    // the vendor recorded in the spool directory.
-    assert!(
-        orphan.is_some(),
-        "the orphaned vendor stopped; the known gap closed"
-    );
+    assert_reap_refused_and_vendor_running(&rig.spawner, &first);
     assert_eq!(session_status(&first)["phase"], "lost");
     assert_completed(
         &rig,
