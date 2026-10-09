@@ -27,6 +27,14 @@ const STYLE_PATH: &str = "docs/style.md";
 /// The style document's row for this rule names the markers it bans; only that row is exempt.
 const STYLE_ROW_PREFIX: &str =
     "| No personal access tokens; a credential is the shortest-lived and narrowest";
+const MANDATE_PATH: &str = "docs/mandate.md";
+/// Mandate clause 7.4 states the rule in its own words; only these three consecutive lines,
+/// exactly as written, are exempt.
+const MANDATE_CLAUSE: [&str; 3] = [
+    "7.4 Where options differ in security, the station takes the most secure one that does the",
+    "work and names the trade-off. No personal access token is used; a credential is the",
+    "shortest-lived and narrowest the task allows, issued to the station's own identity.",
+];
 const LISTED_FILES_MAX: usize = 4096;
 const SCANNED_FILE_MAX_BYTES: u64 = 4 << 20;
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -93,14 +101,32 @@ fn normalized(text: &str) -> (String, Vec<usize>) {
     (kept, lines)
 }
 
+/// The one-based line numbers of every place `passage` appears as consecutive whole lines.
+fn passage_lines(text: &str, passage: &[&str]) -> Vec<usize> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut exempt = Vec::new();
+    for (start, window) in lines.windows(passage.len()).enumerate() {
+        if window == passage {
+            exempt.extend((1..=passage.len()).map(|offset| start.saturating_add(offset)));
+        }
+    }
+    exempt
+}
+
 fn credential_defects(path: &Path, text: &str) -> Vec<String> {
     let style = path == Path::new(STYLE_PATH);
+    let mandate_exempt = if path == Path::new(MANDATE_PATH) {
+        passage_lines(text, &MANDATE_CLAUSE)
+    } else {
+        Vec::new()
+    };
     let exempt_line = |line: usize| {
-        style
+        let style_row = style
             && text
                 .lines()
                 .nth(line.saturating_sub(1))
-                .is_some_and(|row| row.starts_with(STYLE_ROW_PREFIX))
+                .is_some_and(|row| row.starts_with(STYLE_ROW_PREFIX));
+        style_row || mandate_exempt.contains(&line)
     };
     let (kept, lines) = normalized(text);
     let mut defects = Vec::new();
@@ -216,6 +242,26 @@ mod tests {
         let defects = markers_found(STYLE_PATH, &text);
         assert_eq!(defects, ["docs/style.md:2: `personal access token`"]);
         assert_eq!(markers_found("docs/process.md", &text).len(), 2);
+    }
+
+    #[test]
+    fn exempts_only_the_exact_mandate_clause() {
+        let clause = MANDATE_CLAUSE.join("\n");
+        let mandate =
+            format!("7.3 Nothing leaves the agent domain.\n\n{clause}\n\n## 8. Case law\n");
+        assert_eq!(markers_found(MANDATE_PATH, &mandate), Vec::<String>::new());
+        let elsewhere = format!(
+            "{mandate}\n8.9 No personal access token is used; a credential is the shortest-lived.\n"
+        );
+        assert_eq!(
+            markers_found(MANDATE_PATH, &elsewhere),
+            ["docs/mandate.md:9: `personal access token`"]
+        );
+        let middle_line_alone = format!("{}\n", MANDATE_CLAUSE[1]);
+        assert_eq!(markers_found(MANDATE_PATH, &middle_line_alone).len(), 1);
+        let reworded = clause.replace("is used", "is ever used");
+        assert_eq!(markers_found(MANDATE_PATH, &reworded).len(), 1);
+        assert_eq!(markers_found("docs/process.md", &mandate).len(), 1);
     }
 
     fn repository_root() -> &'static Path {
