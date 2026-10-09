@@ -1082,14 +1082,15 @@ impl WorkUnit {
         let Some(workers) = &self.workers else {
             return Ok(());
         };
-        let graph = Arc::clone(&workers.graph);
+        let ports = Arc::clone(workers);
         let (unit_key, worktree) = (unit_id.clone(), worktree.to_path_buf());
         let record = unit
             .workflow_context
             .run(|| {
                 blocking(move || {
                     Ok(Json(index(
-                        graph.as_ref(),
+                        ports.graph.as_ref(),
+                        &ports.repositories,
                         kind,
                         &key,
                         &unit_key,

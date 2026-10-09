@@ -425,6 +425,8 @@ impl CoreConfig {
     }
 }
 
+// The agent worktree root must be on this directory's filesystem: a worktree is cloned in the
+// core home's staging directory and renamed into place, and a rename cannot cross filesystems.
 /// `.tycho` under the current uid's home, or `TYCHO_HOME` when that names a directory under it.
 pub fn core_home() -> Result<PathBuf, ConfigError> {
     let user_home = user_home()?;
@@ -553,6 +555,10 @@ pub fn is_shell_safe(path: &Path) -> bool {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 mod tests {
     use super::*;
 

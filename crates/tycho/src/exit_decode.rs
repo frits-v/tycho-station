@@ -12,7 +12,7 @@ use tycho_types::envelope::{
 use tycho_types::exit::ExitState;
 use tycho_types::session::SessionName;
 
-use crate::agent_files::{current_uid, read_checked};
+use crate::agent_files::{current_uid, read_checked, read_checked_modified};
 use crate::spool::{check_result_envelope, escalation_rejection};
 
 pub const PROGRESS_FILE_MAX_BYTES: usize = 4096;
@@ -50,15 +50,14 @@ pub enum Progress {
 
 #[must_use]
 pub fn read_progress(path: &Path) -> Progress {
-    let bytes = match read_checked(path, PROGRESS_FILE_MAX_BYTES, Some(current_uid())) {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => return Progress::Absent,
-        Err(error) => return Progress::Invalid(error.to_string()),
-    };
-    let modified_unix_ms = std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok()
-        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+    let (bytes, modified) =
+        match read_checked_modified(path, PROGRESS_FILE_MAX_BYTES, Some(current_uid())) {
+            Ok(Some(read)) => read,
+            Ok(None) => return Progress::Absent,
+            Err(error) => return Progress::Invalid(error.to_string()),
+        };
+    let modified_unix_ms = modified
+        .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| {
             u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
         });
@@ -235,6 +234,10 @@ fn decode_report(report: ResultReport, end: ChildEnd, session: &SessionName) -> 
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 pub mod tests {
     use super::*;
     use tycho_types::exit::Disposition;
@@ -387,6 +390,31 @@ pub mod tests {
             ),
             unrecognised(RAW_RESULT_FILE_INVALID)
         );
+    }
+
+    #[test]
+    fn a_symlinked_or_fifo_result_or_progress_file_is_refused() {
+        let dir = std::env::temp_dir().join(format!("tycho-exit-links-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real_result = dir.join("real-result.json");
+        std::fs::write(&real_result, r#"{"state":"failed","envelope":null}"#).unwrap();
+        let real_progress = dir.join("real-progress.json");
+        std::fs::write(&real_progress, r#"{"tests_passing":1}"#).unwrap();
+        assert!(matches!(
+            read_progress(&real_progress),
+            Progress::Read { modified_unix_ms, .. } if modified_unix_ms > 0
+        ));
+        let result = dir.join("result.json");
+        std::os::unix::fs::symlink(&real_result, &result).unwrap();
+        assert!(matches!(read_result_file(&result), ResultFile::Invalid(_)));
+        let progress = dir.join("progress.json");
+        std::os::unix::fs::symlink(&real_progress, &progress).unwrap();
+        assert!(matches!(read_progress(&progress), Progress::Invalid(_)));
+        let fifo = dir.join("fifo.json");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        assert!(matches!(read_progress(&fifo), Progress::Invalid(_)));
+        assert!(matches!(read_result_file(&fifo), ResultFile::Invalid(_)));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -393,6 +393,10 @@ pub fn send_line(zmx: &Zmx, session: &SessionName, text: &ShortText) -> Result<(
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 mod tests {
     use super::*;
     use crate::agent_files::{current_uid, write_durable};

@@ -2,6 +2,10 @@
 //! rebuilds it after a commit, queries it, and records the index build time. Needs the
 //! pinned plugin installed; run by `mise run graph-tests`.
 #![allow(
+    clippy::disallowed_methods,
+    reason = "fixtures live in throwaway directories no other user can write"
+)]
+#![allow(
     clippy::print_stdout,
     reason = "the evidence lines are the test's report for the pull request"
 )]

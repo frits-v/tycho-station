@@ -163,6 +163,10 @@ fn render() -> Result<Vec<Export>, String> {
     Ok(exports)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "exports are written inside the developer's checkout"
+)]
 fn write_all(root: &Path, exports: &[Export]) -> Result<(), String> {
     for export in exports {
         let path = root.join(&export.relative);

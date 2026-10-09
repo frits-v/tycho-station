@@ -150,6 +150,10 @@ fn checked_git(dir: &Path, author_date: &str, args: &[&str]) -> Result<Output, R
     })
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the synthetic repository is built in a directory of the test"
+)]
 fn apply_commit(target_dir: &Path, commit: &CommitSpec) -> Result<(), RepositoryError> {
     for (relative, bytes) in commit.files {
         let path = target_dir.join(relative);

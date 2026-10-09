@@ -3,6 +3,10 @@
 //! a throwaway core. macOS only, run by `mise run control-tests`; uses the developer's Claude
 //! login, so each case is one short haiku turn.
 #![allow(
+    clippy::disallowed_methods,
+    reason = "fixtures live in throwaway directories no other user can write"
+)]
+#![allow(
     clippy::print_stdout,
     clippy::print_stderr,
     reason = "the evidence lines are the test's report for the pull request"

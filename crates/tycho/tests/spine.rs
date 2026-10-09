@@ -3,6 +3,10 @@
 //! and the services are driven through Restate's ingress. macOS only, run by
 //! `mise run spine-tests`.
 #![allow(
+    clippy::disallowed_methods,
+    reason = "fixtures live in throwaway directories no other user can write"
+)]
+#![allow(
     clippy::print_stdout,
     clippy::print_stderr,
     reason = "the evidence lines are the test's report for the pull request"

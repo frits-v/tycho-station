@@ -10,6 +10,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use nix::fcntl::OFlag;
 use nix::unistd::Uid;
@@ -137,6 +138,15 @@ pub fn read_checked(
     max_bytes: usize,
     owner: Option<u32>,
 ) -> io::Result<Option<Vec<u8>>> {
+    Ok(read_checked_modified(path, max_bytes, owner)?.map(|(bytes, _)| bytes))
+}
+
+/// `read_checked` with the modification time, both from the one opened descriptor.
+pub fn read_checked_modified(
+    path: &Path,
+    max_bytes: usize,
+    owner: Option<u32>,
+) -> io::Result<Option<(Vec<u8>, SystemTime)>> {
     // O_NONBLOCK keeps a planted FIFO from blocking the open; fstat then refuses it.
     let file = match OpenOptions::new()
         .read(true)
@@ -166,7 +176,7 @@ pub fn read_checked(
     if bytes.len() > max_bytes {
         return Err(too_large(path, max_bytes));
     }
-    Ok(Some(bytes))
+    Ok(Some((bytes, metadata.modified()?)))
 }
 
 /// Overwrites an existing regular file of this user with zeros, then removes it; best effort.
@@ -205,6 +215,10 @@ pub fn current_uid() -> u32 {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;

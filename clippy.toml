@@ -4,3 +4,8 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
+disallowed-methods = [
+    { path = "std::fs::remove_dir_all", reason = "follows symlinked ancestors; remove under an agent-writable root with agent_tree::remove_dir" },
+    { path = "std::fs::create_dir_all", reason = "follows symlinked ancestors; create under an agent-writable root with agent_tree::ensure_dirs" },
+    { path = "std::fs::canonicalize", reason = "a resolved path is for comparison only, never an operation target" },
+]

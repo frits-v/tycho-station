@@ -671,6 +671,10 @@ impl<I: Ingress> Run<'_, I> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 mod tests {
     use super::*;
     use crate::launch_spec::tests::{environment, NAME, SECRET};

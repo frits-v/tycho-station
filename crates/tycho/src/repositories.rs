@@ -2,12 +2,15 @@
 //! attempt clones from one, and the pin refs that keep a worker's commit.
 //!
 //! Every git call runs through `command` with a timeout, an output cap, and the host's global
-//! and system configuration shut out.
+//! and system configuration shut out. git never runs on a path under the agent worktree root:
+//! a worktree is cloned and configured in a staging directory of the core and renamed into place.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -16,12 +19,16 @@ use tycho_types::service::{Attempt, EpicId, WorkUnitId};
 use tycho_types::session::SessionName;
 use tycho_types::token::check_slug;
 
+use crate::agent_files::current_uid;
+use crate::agent_tree::{self, Bounds, Owners, TreeError, TreeRefusal};
 use crate::command::{run_status_capped, Captured};
 use crate::config::COMMAND_OUTPUT_MAX_BYTES;
 use crate::private_dir;
 
 pub const REPOSITORIES_DIR: &str = "repositories";
 pub const BRIEFS_DIR: &str = "briefs";
+/// Under the core home: where a worktree is cloned before it is renamed under the agent root.
+pub const STAGING_DIR: &str = "staging";
 pub const PIN_REF_PREFIX: &str = "refs/factory/checkpoints";
 pub const PROJECT_NAME_MAX_BYTES: usize = 64;
 /// A clone or fetch of a large repository over the local file system.
@@ -31,6 +38,15 @@ pub const WORKER_NAME: &str = "Tycho Worker";
 pub const WORKER_EMAIL: &str = "worker@tycho.invalid";
 /// A worktree's `origin` push URL: a path that cannot exist, so a push from the worktree fails.
 pub const PUSH_DISABLED: &str = "/dev/null/push-disabled";
+/// Levels below a worktree a removal enters; each level holds one descriptor open.
+pub const WORKTREE_DEPTH_MAX: usize = 64;
+/// Entries a removal deletes: a large checkout with its `.git` and build output fits.
+pub const WORKTREE_ENTRIES_MAX: usize = 2_000_000;
+const WORKTREE_BOUNDS: Bounds = Bounds {
+    depth: WORKTREE_DEPTH_MAX,
+    entries: WORKTREE_ENTRIES_MAX,
+};
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 const GIT_ENVIRONMENT: [(&str, &str); 3] = [
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ("GIT_CONFIG_NOSYSTEM", "1"),
@@ -47,6 +63,8 @@ const GIT_REMOVED: [&str; 4] = [
 pub enum RepositoryError {
     Input(String),
     Io(String),
+    /// A path under the worktree root is a symlink, a stranger's, or past a bound.
+    Refused(String, TreeRefusal),
     /// git could not start, timed out or overran its output cap: worth a retry.
     CouldNotRun(String),
     /// git ran and refused: the command and its report.
@@ -62,7 +80,11 @@ impl RepositoryError {
     pub const fn is_transient(&self) -> bool {
         match self {
             Self::Io(_) | Self::CouldNotRun(_) => true,
-            Self::Input(_) | Self::Git(_) | Self::NotFetched(_) | Self::Unrecognised(_) => false,
+            Self::Input(_)
+            | Self::Refused(..)
+            | Self::Git(_)
+            | Self::NotFetched(_)
+            | Self::Unrecognised(_) => false,
         }
     }
 }
@@ -72,6 +94,7 @@ impl fmt::Display for RepositoryError {
         match self {
             Self::Input(reason) => write!(formatter, "repository input: {reason}"),
             Self::Io(reason) => write!(formatter, "repository file system: {reason}"),
+            Self::Refused(path, refusal) => write!(formatter, "refused: {path} {refusal}"),
             Self::CouldNotRun(reason) => write!(formatter, "git could not run: {reason}"),
             Self::Git(reason) => write!(formatter, "git {reason}"),
             Self::NotFetched(reason) => write!(formatter, "not from the fetched branch: {reason}"),
@@ -81,6 +104,15 @@ impl fmt::Display for RepositoryError {
 }
 
 impl std::error::Error for RepositoryError {}
+
+impl From<TreeError> for RepositoryError {
+    fn from(error: TreeError) -> Self {
+        match error {
+            TreeError::Refused(path, refusal) => Self::Refused(text(&path), refusal),
+            TreeError::Io(path, reason) => Self::Io(format!("{}: {reason}", path.display())),
+        }
+    }
+}
 
 /// A project's name: the canonical repository is `<name>.git`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,19 +216,44 @@ fn text(path: &Path) -> String {
     path.display().to_string()
 }
 
+/// A clone in the staging directory, named relative to that directory's descriptor.
+struct Staged {
+    directory: OwnedFd,
+    root: PathBuf,
+    name: OsString,
+    owners: Owners,
+}
+
+impl Staged {
+    /// Removes a clone that will not be placed; the caller reports the error that stopped it.
+    fn discard(&self) {
+        let _left_behind = agent_tree::remove_dir(
+            self.directory.as_fd(),
+            &self.root,
+            &self.name,
+            self.owners,
+            WORKTREE_BOUNDS,
+        )
+        .is_err();
+    }
+}
+
 /// The canonical repositories and the directory worktrees are cloned into.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repositories {
     git: PathBuf,
     core_home: PathBuf,
     worktree_root: PathBuf,
+    owners: Owners,
 }
 
 impl Repositories {
+    /// Directories under the worktree root may belong to the core or to `agent_uid`.
     pub fn new(
         git: PathBuf,
         core_home: PathBuf,
         worktree_root: PathBuf,
+        agent_uid: u32,
     ) -> Result<Self, RepositoryError> {
         absolute("core home", &core_home)?;
         absolute("worktree root", &worktree_root)?;
@@ -204,6 +261,10 @@ impl Repositories {
             git,
             core_home,
             worktree_root,
+            owners: Owners {
+                core: current_uid(),
+                agent: agent_uid,
+            },
         })
     }
 
@@ -234,6 +295,52 @@ impl Repositories {
         self.worktree_root
             .join(BRIEFS_DIR)
             .join(format!("{session}.md"))
+    }
+
+    /// Writes the session's brief through the briefs directory's descriptor; returns its path.
+    pub fn write_brief(
+        &self,
+        session: &SessionName,
+        brief: &[u8],
+    ) -> Result<PathBuf, RepositoryError> {
+        let dir = self.worktree_root.join(BRIEFS_DIR);
+        let directory = agent_tree::ensure_dirs(&self.worktree_root, &dir, self.owners)?;
+        agent_tree::replace_file(&directory, &dir, &format!("{session}.md"), brief)?;
+        Ok(self.brief_path(session))
+    }
+
+    /// Opens every level from the root down to the worktree without following a symlink.
+    pub fn check_worktree(&self, path: &Path) -> Result<(), RepositoryError> {
+        let relative = self.relative_to_root(path)?;
+        if relative.as_os_str().is_empty() {
+            return Err(RepositoryError::Refused(
+                text(path),
+                TreeRefusal::OutsideRoot,
+            ));
+        }
+        drop(agent_tree::open_dirs(
+            &self.worktree_root,
+            &self.worktree_root.join(relative),
+            self.owners,
+        )?);
+        Ok(())
+    }
+
+    /// The names below the configured root or below its resolved form.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the resolved root is compared with, never operated on"
+    )]
+    fn relative_to_root<'a>(&self, path: &'a Path) -> Result<&'a Path, RepositoryError> {
+        // `clone_worktree` reports a worktree under the resolved root.
+        if let Ok(relative) = path.strip_prefix(&self.worktree_root) {
+            return Ok(relative);
+        }
+        let root = fs::canonicalize(&self.worktree_root).map_err(|error| {
+            RepositoryError::Io(format!("{}: {error}", text(&self.worktree_root)))
+        })?;
+        path.strip_prefix(root)
+            .map_err(|_| RepositoryError::Refused(text(path), TreeRefusal::OutsideRoot))
     }
 
     /// Runs git and returns whatever exit status it ends with.
@@ -325,6 +432,12 @@ impl Repositories {
         branch: &BranchName,
     ) -> Result<Worktree, RepositoryError> {
         absolute("worktree", path)?;
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Err(RepositoryError::Input(format!(
+                "{} has no parent",
+                text(path)
+            )));
+        };
         if !path.starts_with(&self.worktree_root) || path == self.worktree_root {
             return Err(RepositoryError::Input(format!(
                 "{} is outside {}",
@@ -332,7 +445,93 @@ impl Repositories {
                 self.worktree_root.display()
             )));
         }
-        prepare_clone_target(path)?;
+        let target = self.prepare_clone_target(parent, name)?;
+        let (staged, base) = self.stage(project, branch)?;
+        let placed = agent_tree::move_dir(
+            staged.directory.as_fd(),
+            &staged.name,
+            target.as_fd(),
+            parent,
+            name,
+        );
+        if let Err(error) = placed {
+            staged.discard();
+            return Err(error.into());
+        }
+        Ok(Worktree {
+            path: self.resolved_inside_root(path)?,
+            branch: branch.clone(),
+            base,
+        })
+    }
+
+    /// Ensures the levels down to `parent`, clears a leftover `name`, returns the parent.
+    fn prepare_clone_target(
+        &self,
+        parent: &Path,
+        name: &OsStr,
+    ) -> Result<OwnedFd, RepositoryError> {
+        let directory = agent_tree::ensure_dirs(&self.worktree_root, parent, self.owners)?;
+        agent_tree::remove_dir(
+            directory.as_fd(),
+            parent,
+            name,
+            self.owners,
+            WORKTREE_BOUNDS,
+        )?;
+        Ok(directory)
+    }
+
+    /// The staging directory, private to the core, and the owners admitted in it.
+    fn staging_root(&self) -> Result<(PathBuf, OwnedFd, Owners), RepositoryError> {
+        let root = self.core_home.join(STAGING_DIR);
+        private_dir::ensure(&[self.core_home.clone(), root.clone()])
+            .map_err(|error| RepositoryError::Io(error.to_string()))?;
+        let core_only = Owners {
+            core: self.owners.core,
+            agent: self.owners.core,
+        };
+        let directory = agent_tree::open_dirs(&root, &root, core_only)?;
+        Ok((root, directory, core_only))
+    }
+
+    /// Clones and configures the worktree under a fresh name in the staging directory.
+    fn stage(
+        &self,
+        project: &ProjectName,
+        branch: &BranchName,
+    ) -> Result<(Staged, CommitSha), RepositoryError> {
+        let (root, directory, owners) = self.staging_root()?;
+        let count = STAGING_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let name = OsString::from(format!(
+            "{}-{}-{count}",
+            project.as_str(),
+            std::process::id()
+        ));
+        // A name reused from an earlier process with the same pid may still hold its clone.
+        agent_tree::remove_dir(directory.as_fd(), &root, &name, owners, WORKTREE_BOUNDS)?;
+        let staged = Staged {
+            directory,
+            root,
+            name,
+            owners,
+        };
+        match self.configure_clone(project, &staged.root.join(&staged.name), branch) {
+            Ok(base) => Ok((staged, base)),
+            Err(error) => {
+                staged.discard();
+                Err(error)
+            }
+        }
+    }
+
+    /// Clones into `path` and configures it; returns the checked-out commit.
+    fn configure_clone(
+        &self,
+        project: &ProjectName,
+        path: &Path,
+        branch: &BranchName,
+    ) -> Result<CommitSha, RepositoryError> {
         let canonical = self.canonical(project);
         self.git(&[
             "clone",
@@ -355,14 +554,26 @@ impl Repositories {
             words.extend(arguments.iter().filter(|word| !word.is_empty()));
             self.git(&words)?;
         }
-        let path =
-            fs::canonicalize(path).map_err(|error| RepositoryError::Io(error.to_string()))?;
-        let base = self.rev_parse(&path, "HEAD")?;
-        Ok(Worktree {
-            path,
-            branch: branch.clone(),
-            base,
-        })
+        self.rev_parse(path, "HEAD")
+    }
+
+    /// The resolved `path`, which must be the resolved root joined with the same names.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "both resolved paths are compared, and the stored path names what was checked"
+    )]
+    fn resolved_inside_root(&self, path: &Path) -> Result<PathBuf, RepositoryError> {
+        let io =
+            |error: std::io::Error| RepositoryError::Io(format!("{}: {error}", path.display()));
+        let root = fs::canonicalize(&self.worktree_root).map_err(io)?;
+        let relative = path
+            .strip_prefix(&self.worktree_root)
+            .map_err(|_| RepositoryError::Refused(text(path), TreeRefusal::OutsideRoot))?;
+        let expected = root.join(relative);
+        if fs::canonicalize(path).map_err(io)? != expected {
+            return Err(RepositoryError::Refused(text(path), TreeRefusal::Symlink));
+        }
+        Ok(expected)
     }
 
     /// Fetches the worktree's branch into the canonical repository and points `pin` at
@@ -374,6 +585,7 @@ impl Repositories {
         head: &CommitSha,
         pin: &str,
     ) -> Result<(), RepositoryError> {
+        self.check_worktree(&worktree.path)?;
         let canonical = text(&self.canonical(project));
         let refspec = format!("refs/heads/{}", worktree.branch);
         self.git(&[
@@ -427,26 +639,11 @@ impl Repositories {
     }
 }
 
-fn prepare_clone_target(path: &Path) -> Result<(), RepositoryError> {
-    let io = |error: std::io::Error| RepositoryError::Io(format!("{}: {error}", path.display()));
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path).map_err(io)?,
-        Ok(_) => {
-            return Err(RepositoryError::Input(format!(
-                "{} exists and is not a directory",
-                path.display()
-            )))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(io(error)),
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| RepositoryError::Input(format!("{} has no parent", path.display())))?;
-    fs::create_dir_all(parent).map_err(io)
-}
-
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 pub(crate) mod tests {
     use super::*;
     use std::process::Command;
@@ -503,6 +700,7 @@ pub(crate) mod tests {
             PathBuf::from("git"),
             scratch.0.join("home"),
             scratch.0.join("worktrees"),
+            current_uid(),
         )
         .unwrap();
         let project = ProjectName::parse("widget").unwrap();
@@ -538,7 +736,7 @@ pub(crate) mod tests {
         let attempt = Attempt::new(2).unwrap();
         assert_eq!(unit_branch(&unit(), attempt).unwrap().as_str(), "wu01/a2");
         let repositories =
-            Repositories::new(PathBuf::from("git"), "/core".into(), "/agent/wt".into()).unwrap();
+            Repositories::new(PathBuf::from("git"), "/core".into(), "/agent/wt".into(), 0).unwrap();
         let epic = EpicId::parse("cf7a").unwrap();
         assert_eq!(
             repositories.worktree_path(&epic, &unit(), attempt),
@@ -556,7 +754,7 @@ pub(crate) mod tests {
         );
         assert!(ProjectName::parse("Widget").is_err());
         assert!(ProjectName::parse("../x").is_err());
-        assert!(Repositories::new(PathBuf::from("git"), "core".into(), "/w".into()).is_err());
+        assert!(Repositories::new(PathBuf::from("git"), "core".into(), "/w".into(), 0).is_err());
     }
 
     #[test]
@@ -621,6 +819,189 @@ pub(crate) mod tests {
         assert!(repositories
             .create_canonical(&project, Path::new("/nonexistent"))
             .is_ok());
+    }
+
+    #[test]
+    fn a_symlinked_worktree_directory_is_refused_and_its_target_survives() {
+        let scratch = Scratch::new("linked-worktree");
+        let (repositories, project) = fixture(&scratch);
+        let victim = scratch.0.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep"), "untouched").unwrap();
+        fs::create_dir_all(scratch.0.join("worktrees/cf7a/wu01")).unwrap();
+        let path = scratch.0.join("worktrees/cf7a/wu01/a1");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        let branch = unit_branch(&unit(), Attempt::FIRST).unwrap();
+        let refused = repositories.clone_worktree(&project, &path, &branch);
+        assert_eq!(
+            refused,
+            Err(RepositoryError::Refused(text(&path), TreeRefusal::Symlink))
+        );
+        assert!(!refused.unwrap_err().is_transient());
+        assert_eq!(
+            fs::read_to_string(victim.join("keep")).unwrap(),
+            "untouched"
+        );
+    }
+
+    #[test]
+    fn a_symlinked_ancestor_is_refused_on_create() {
+        let scratch = Scratch::new("linked-ancestor");
+        let (repositories, project) = fixture(&scratch);
+        let elsewhere = scratch.0.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::create_dir_all(scratch.0.join("worktrees")).unwrap();
+        let epic = scratch.0.join("worktrees/cf7a");
+        std::os::unix::fs::symlink(&elsewhere, &epic).unwrap();
+        let branch = unit_branch(&unit(), Attempt::FIRST).unwrap();
+        assert_eq!(
+            repositories.clone_worktree(&project, &epic.join("wu01/a1"), &branch),
+            Err(RepositoryError::Refused(text(&epic), TreeRefusal::Symlink))
+        );
+        assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+        fs::remove_file(&epic).unwrap();
+        let briefs = scratch.0.join("worktrees/briefs");
+        std::os::unix::fs::symlink(&elsewhere, &briefs).unwrap();
+        assert_eq!(
+            repositories.write_brief(
+                &SessionName::parse("cf7a.wu01.wrk.claude.a1f3").unwrap(),
+                b"x"
+            ),
+            Err(RepositoryError::Refused(
+                text(&briefs),
+                TreeRefusal::Symlink
+            ))
+        );
+    }
+
+    #[test]
+    fn a_symlink_inside_a_worktree_is_removed_without_following_it() {
+        let scratch = Scratch::new("inner-link");
+        let (repositories, project) = fixture(&scratch);
+        let path = scratch.0.join("worktrees/cf7a/wu01/a1");
+        let branch = unit_branch(&unit(), Attempt::FIRST).unwrap();
+        let first = repositories
+            .clone_worktree(&project, &path, &branch)
+            .unwrap();
+        let victim = scratch.0.join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep"), "untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, path.join("escape")).unwrap();
+        std::os::unix::fs::symlink(victim.join("keep"), path.join(".git/escape")).unwrap();
+        let again = repositories
+            .clone_worktree(&project, &path, &branch)
+            .unwrap();
+        assert_eq!(again, first);
+        assert!(fs::symlink_metadata(path.join("escape")).is_err());
+        assert_eq!(
+            fs::read_to_string(victim.join("keep")).unwrap(),
+            "untouched"
+        );
+        assert_eq!(fs::read_dir(&victim).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_worktree_under_a_root_reached_through_a_symlinked_ancestor_checks() {
+        let scratch = Scratch::new("aliased-root");
+        let (_, project) = fixture(&scratch);
+        let alias = scratch.0.join("alias");
+        std::os::unix::fs::symlink(&scratch.0, &alias).unwrap();
+        let repositories = Repositories::new(
+            PathBuf::from("git"),
+            alias.join("home"),
+            alias.join("worktrees"),
+            current_uid(),
+        )
+        .unwrap();
+        let branch = unit_branch(&unit(), Attempt::FIRST).unwrap();
+        let worktree = repositories
+            .clone_worktree(&project, &alias.join("worktrees/cf7a/wu01/a1"), &branch)
+            .unwrap();
+        assert_eq!(worktree.path, scratch.0.join("worktrees/cf7a/wu01/a1"));
+        assert_eq!(repositories.check_worktree(&worktree.path), Ok(()));
+        let root = scratch.0.join("worktrees");
+        assert_eq!(
+            repositories.check_worktree(&root),
+            Err(RepositoryError::Refused(
+                text(&root),
+                TreeRefusal::OutsideRoot
+            ))
+        );
+        let outside = scratch.0.join("home");
+        assert_eq!(
+            repositories.check_worktree(&outside),
+            Err(RepositoryError::Refused(
+                text(&outside),
+                TreeRefusal::OutsideRoot
+            ))
+        );
+        let epic = scratch.0.join("worktrees/cf7a");
+        let moved = scratch.0.join("moved");
+        fs::rename(&epic, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &epic).unwrap();
+        assert_eq!(
+            repositories.check_worktree(&worktree.path),
+            Err(RepositoryError::Refused(
+                text(&alias.join("worktrees/cf7a")),
+                TreeRefusal::Symlink
+            ))
+        );
+    }
+
+    /// A repository with one commit, and the bytes of its `HEAD` and `config`.
+    fn victim_repository(path: &Path) -> (Vec<u8>, Vec<u8>) {
+        fs::create_dir_all(path).unwrap();
+        git(path, &["init", "-q", "-b", "trunk"]);
+        fs::write(path.join("keep"), "untouched\n").unwrap();
+        git(path, &["add", "keep"]);
+        git(path, &["commit", "-q", "-m", "victim"]);
+        (
+            fs::read(path.join(".git/HEAD")).unwrap(),
+            fs::read(path.join(".git/config")).unwrap(),
+        )
+    }
+
+    #[test]
+    fn git_never_runs_under_the_agent_root_and_a_linked_parent_leaves_its_target_untouched() {
+        let scratch = Scratch::new("staged-clone");
+        let (repositories, project) = fixture(&scratch);
+        let victim = scratch.0.join("victim");
+        let (head, config) = victim_repository(&victim);
+        fs::create_dir_all(scratch.0.join("worktrees/cf7a")).unwrap();
+        let parent = scratch.0.join("worktrees/cf7a/wu01");
+        std::os::unix::fs::symlink(&victim, &parent).unwrap();
+        let branch = unit_branch(&unit(), Attempt::FIRST).unwrap();
+        assert_eq!(
+            repositories.clone_worktree(&project, &parent.join("a1"), &branch),
+            Err(RepositoryError::Refused(
+                text(&parent),
+                TreeRefusal::Symlink
+            ))
+        );
+        fs::remove_file(&parent).unwrap();
+        let path = parent.join("a1");
+        let worktree = repositories
+            .clone_worktree(&project, &path, &branch)
+            .unwrap();
+        assert_eq!(worktree.path, path);
+        assert_eq!(
+            git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+            "wu01/a1"
+        );
+        let staging = scratch.0.join("home").join(STAGING_DIR);
+        assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
+        let missing = ProjectName::parse("missing").unwrap();
+        assert!(repositories
+            .clone_worktree(&missing, &scratch.0.join("worktrees/cf7a/wu02/a1"), &branch)
+            .is_err());
+        assert_eq!(
+            fs::read_dir(&staging).unwrap().count(),
+            0,
+            "a failed clone is discarded"
+        );
+        assert_eq!(fs::read(victim.join(".git/HEAD")).unwrap(), head);
+        assert_eq!(fs::read(victim.join(".git/config")).unwrap(), config);
+        assert_eq!(git(&victim, &["status", "--porcelain"]), "");
     }
 
     #[test]

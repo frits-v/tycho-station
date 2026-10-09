@@ -107,6 +107,10 @@ impl StepKey {
 pub struct Checkout(PathBuf);
 
 impl Checkout {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the resolved path is compared; only a path already in its resolved spelling is kept"
+    )]
     pub fn parse(path: &Path) -> Result<Self, InputError> {
         let text = path
             .to_str()
@@ -553,6 +557,10 @@ pub trait CodeGraph: Send + Sync {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
 mod tests {
     use super::*;
 
