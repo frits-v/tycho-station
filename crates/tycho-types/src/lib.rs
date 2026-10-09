@@ -6,6 +6,7 @@
     reason = "each error type is an enumerated decoder; its variants are the documentation"
 )]
 
+pub mod agent_call;
 pub mod envelope;
 pub mod exit;
 pub mod launcher;

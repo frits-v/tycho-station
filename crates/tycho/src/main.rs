@@ -7,12 +7,17 @@
 
 use std::env;
 use std::fmt::Display;
+use std::path::PathBuf;
 use std::process;
+use std::sync::Arc;
 use std::thread;
 
 use tycho::config::{self, CoreConfig, ENDPOINT_PORT, PROBE_TIMEOUT, WATCHDOG_INTERVAL};
+use tycho::epic_command::{self, OperatorAnswer};
 use tycho::http::Http;
 use tycho::launchd::Agent;
+use tycho::services::spawner::NoLauncher;
+use tycho::services::{Ports, Timing};
 use tycho::watchdog::{self, LoopEnd, Supervisor};
 use tycho::{core, endpoint};
 
@@ -25,7 +30,9 @@ const USAGE: &str = "usage: tycho <command>
   watchdog install|uninstall  the launchd user agent that runs `watchdog run`
   graph build <checkout> <work-unit>   build the semantic graph index of a checkout
   graph query <checkout> definitions|callers <symbol>
-  graph query <checkout> impact <path>   entities changed under the path since HEAD~1";
+  graph query <checkout> impact <path>   entities changed under the path since HEAD~1
+  epic start <id> <goal>      start an epic through the operator service
+  epic add-unit <id> <unit>   add a work unit to an epic through the operator service";
 
 fn main() {
     let arguments: Vec<String> = env::args().skip(1).collect();
@@ -33,7 +40,7 @@ fn main() {
     let code = match words.as_slice() {
         ["endpoint"] => serve_endpoint(),
         ["core", "start"] => with_config(|config, supervisor| {
-            let report = core::start(supervisor);
+            let report = core::start(supervisor, config);
             finish(&report, report.succeeded(), config)
         }),
         ["core", "stop"] => with_config(|config, supervisor| {
@@ -49,6 +56,12 @@ fn main() {
             finish(&report, report.succeeded(), config)
         }),
         ["watchdog", "run"] => with_config(run_watchdog),
+        ["epic", "start", epic, goal] => with_config(|config, _| {
+            operator_call(|http| epic_command::start(config, http, epic, goal))
+        }),
+        ["epic", "add-unit", epic, unit] => with_config(|config, _| {
+            operator_call(|http| epic_command::add_unit(config, http, epic, unit))
+        }),
         ["watchdog", "install"] => with_config(|config, _| {
             report_result(
                 Agent::for_default_label()
@@ -74,7 +87,13 @@ fn main() {
 }
 
 fn serve_endpoint() -> i32 {
-    match endpoint::serve(config::loopback(ENDPOINT_PORT)) {
+    let ports = Ports {
+        spawner: Arc::new(NoLauncher),
+        timing: Timing::default(),
+        operator_secret: env::var_os(config::HOME_ENV)
+            .map(|home| PathBuf::from(home).join(config::OPERATOR_SECRET_FILE)),
+    };
+    match endpoint::serve(config::loopback(ENDPOINT_PORT), &ports) {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("tycho: endpoint: {error}");
@@ -131,6 +150,26 @@ fn run_watchdog(config: &CoreConfig, supervisor: &Supervisor) -> i32 {
     match end {
         LoopEnd::StopFile(_) => 0,
         LoopEnd::IterationsExhausted(_) => EXIT_TICKS_EXHAUSTED,
+    }
+}
+
+fn operator_call(action: impl FnOnce(&Http) -> Result<OperatorAnswer, String>) -> i32 {
+    let answer = Http::new(config::COMMAND_TIMEOUT)
+        .map_err(|error| format!("cannot build the HTTP client: {error}"))
+        .and_then(|http| action(&http));
+    match answer {
+        Ok(OperatorAnswer::Done(body)) => {
+            println!("{body}");
+            0
+        }
+        Ok(other) => {
+            eprintln!("tycho: {other}");
+            1
+        }
+        Err(error) => {
+            eprintln!("tycho: {error}");
+            2
+        }
     }
 }
 

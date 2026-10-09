@@ -2,15 +2,83 @@
 
 use std::fmt;
 
-use crate::config::CoreRole;
+use tycho_types::service::{handler, Service, RECONCILER_KEY};
+
+use crate::config::{ingress_url, CoreConfig, CoreRole};
 use crate::health::{self, Health};
+use crate::http::{Http, Outcome};
+use crate::services::operator;
 use crate::watchdog::{OnceReport, Supervisor};
 use crate::zmx::{presence, Presence};
 
-/// Starts whatever is missing and registers the endpoint; the watchdog's own pass.
+/// The watchdog's pass, then the operator secret and the reconciler's tick chain.
+#[derive(Debug)]
+pub struct StartReport {
+    pub once: OnceReport,
+    pub operator_secret: Result<String, String>,
+    pub reconciler: Result<String, String>,
+}
+
+impl StartReport {
+    #[must_use]
+    pub fn succeeded(&self) -> bool {
+        self.once.succeeded() && self.operator_secret.is_ok() && self.reconciler.is_ok()
+    }
+}
+
+impl fmt::Display for StartReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.once)?;
+        for (label, result) in [
+            ("operator secret", &self.operator_secret),
+            ("reconciler", &self.reconciler),
+        ] {
+            match result {
+                Ok(done) => writeln!(formatter, "  {label}: {done}")?,
+                Err(error) => writeln!(formatter, "  {label}: failed: {error}")?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Starts whatever is missing, registers the endpoint, writes the operator secret if absent,
+/// and starts a reconciler tick chain, which ends any older chain.
 #[must_use]
-pub fn start(supervisor: &Supervisor) -> OnceReport {
-    supervisor.once()
+pub fn start(supervisor: &Supervisor, config: &CoreConfig) -> StartReport {
+    let once = supervisor.once();
+    let operator_secret =
+        operator::ensure_secret_file(&config.operator_secret_file()).map(|created| {
+            if created {
+                "created".to_string()
+            } else {
+                "present".to_string()
+            }
+        });
+    let reconciler = if once.succeeded() {
+        start_reconciler(supervisor.http())
+    } else {
+        Err("not attempted: the core did not come up".to_string())
+    };
+    StartReport {
+        once,
+        operator_secret,
+        reconciler,
+    }
+}
+
+fn start_reconciler(http: &Http) -> Result<String, String> {
+    let path = format!(
+        "/{}/{RECONCILER_KEY}/{}",
+        Service::Reconciler.name(),
+        handler::RECONCILER_START
+    );
+    match http.post_empty(&ingress_url(&path)) {
+        Outcome::Response { status: 200, body } => Ok(format!("generation {}", body.trim())),
+        Outcome::Response { status, body } => Err(format!("status {status}: {body}")),
+        Outcome::Unreachable(reason) => Err(format!("ingress unreachable: {reason}")),
+        Outcome::BodyTooLarge => Err("body over the limit".to_string()),
+    }
 }
 
 #[derive(Debug)]

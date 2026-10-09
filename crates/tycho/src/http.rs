@@ -45,6 +45,12 @@ impl Http {
         read(self.http2.get(url).send())
     }
 
+    /// A POST with no body and no content type, as Restate wants for a handler without input.
+    #[must_use]
+    pub fn post_empty(&self, url: &str) -> Outcome {
+        read(self.http1.post(url).send())
+    }
+
     #[must_use]
     pub fn post_json(&self, url: &str, body: String) -> Outcome {
         read(

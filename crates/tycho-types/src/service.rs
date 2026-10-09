@@ -74,7 +74,16 @@ pub mod handler {
     pub const SESSION_NUDGE: &str = "nudge";
     pub const SESSION_HANDOFF: &str = "handoff";
     pub const SESSION_KILL: &str = "kill";
+    pub const SESSION_EXPIRE: &str = "expire";
+    pub const SESSION_REAP: &str = "reap";
+    pub const SESSION_STATUS: &str = "status";
+    pub const RECONCILER_START: &str = "start";
+    pub const RECONCILER_EXPECT: &str = "expect";
+    pub const RECONCILER_FORGET: &str = "forget";
     pub const RECONCILER_TICK: &str = "tick";
+    pub const RECONCILER_STATUS: &str = "status";
+    pub const OPERATOR_START_EPIC: &str = "start_epic";
+    pub const OPERATOR_ADD_UNIT: &str = "add_unit";
     pub const WORKER_RUN_RUN: &str = "run";
 }
 

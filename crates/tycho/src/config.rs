@@ -32,6 +32,7 @@ pub const CORE_SOCKET_DIR: &str = "zmx";
 pub const RESTATE_DATA_DIR: &str = "restate";
 pub const LOG_DIR: &str = "logs";
 pub const STOP_FILE: &str = "watchdog.stop";
+pub const OPERATOR_SECRET_FILE: &str = "operator.secret";
 
 pub const LAUNCHD_LABEL: &str = "dev.tycho.watchdog";
 pub const LAUNCHD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -63,6 +64,39 @@ pub const GRAPH_BUILD_TIMEOUT: Duration = Duration::from_secs(900);
 pub const GRAPH_QUERY_TIMEOUT: Duration = Duration::from_secs(300);
 pub const GRAPH_DIFF_BUDGET_SECONDS: u64 = 120;
 pub const GRAPH_OUTPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Spine numbers: placeholders until the harness measures them.
+pub mod spine {
+    use std::time::Duration;
+
+    /// T1: silence before a nudge.
+    pub const STALL_SILENCE: Duration = Duration::from_secs(5 * 60);
+    /// T2: an unchanged progress marker before kill and re-queue.
+    pub const STALL_PROGRESS: Duration = Duration::from_secs(15 * 60);
+    pub const RETRY_BACKOFF_INITIAL: Duration = Duration::from_secs(10);
+    pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
+    /// Tries per port step; with the backoff above, about 35 minutes before it turns terminal.
+    pub const PORT_STEP_ATTEMPTS_MAX: u32 = 12;
+    /// The delay before a caller re-sends a reservation that met a full slot.
+    pub const SLOT_RETRY_DELAY: Duration = Duration::from_secs(10);
+    pub const CONTROL_SLOTS: u16 = 2;
+    pub const WORKER_SLOTS: u16 = 2;
+    /// Attempts per task class before the run gives up; one tier up per failed attempt.
+    pub const ATTEMPT_CAP_DEFAULT: u16 = 3;
+    /// A heartbeat older than this makes a lease stale.
+    pub const LEASE_FRESH: Duration = Duration::from_secs(30);
+    /// A session with no lease file younger than this is still starting.
+    pub const SPAWN_GRACE: Duration = Duration::from_secs(60);
+    pub const RECONCILER_INTERVAL: Duration = Duration::from_secs(30);
+    pub const RECONCILER_SESSIONS_MAX_PER_TICK: usize = 32;
+    pub const RECONCILER_EXPECTED_MAX_SESSIONS: usize = 256;
+    pub const EPIC_UNITS_MAX: usize = 64;
+    pub const EPIC_RESERVATIONS_MAX: usize = 64;
+    pub const SPAWN_ARGV_MAX_ITEMS: usize = 64;
+    /// Ledger limits `tycho epic start` gives a new epic: seat tokens and metered micro-dollars.
+    pub const EPIC_SEAT_LIMIT_DEFAULT: u64 = 50_000_000;
+    pub const EPIC_METERED_LIMIT_DEFAULT: u64 = 0;
+}
 
 /// Core session names are `core.<role>`, used only in the core socket directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +131,11 @@ pub const fn loopback(port: u16) -> SocketAddr {
 #[must_use]
 pub fn admin_url(path: &str) -> String {
     format!("http://{}{path}", loopback(RESTATE_ADMIN_PORT))
+}
+
+#[must_use]
+pub fn ingress_url(path: &str) -> String {
+    format!("http://{}{path}", loopback(RESTATE_INGRESS_PORT))
 }
 
 #[must_use]
@@ -246,6 +285,11 @@ impl CoreConfig {
         self.home.join(STOP_FILE)
     }
 
+    #[must_use]
+    pub fn operator_secret_file(&self) -> PathBuf {
+        self.home.join(OPERATOR_SECRET_FILE)
+    }
+
     /// The command line typed into the role's zmx session; `exec` makes the session end
     /// with the program and makes the listed pid the program's pid.
     #[must_use]
@@ -265,9 +309,9 @@ impl CoreConfig {
                 data = self.restate_data_dir().display(),
             ),
             CoreRole::Endpoint => format!(
-                "exec /usr/bin/env -i HOME={} PATH={CORE_PROCESS_PATH} {} endpoint",
-                self.home.display(),
-                self.tycho.display()
+                "exec /usr/bin/env -i HOME={home} PATH={CORE_PROCESS_PATH} {HOME_ENV}={home} {} endpoint",
+                self.tycho.display(),
+                home = self.home.display(),
             ),
         }
     }
@@ -471,7 +515,7 @@ mod tests {
         let config = config("/h").unwrap();
         assert_eq!(
             config.session_command(CoreRole::Endpoint),
-            "exec /usr/bin/env -i HOME=/h PATH=/usr/bin:/bin /opt/tycho endpoint"
+            "exec /usr/bin/env -i HOME=/h PATH=/usr/bin:/bin TYCHO_HOME=/h /opt/tycho endpoint"
         );
     }
 
