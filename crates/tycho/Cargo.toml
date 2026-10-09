@@ -16,6 +16,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "time"]
 sha2 = "=0.10.9"
 tycho-types = { path = "../tycho-types" }
 
+[dev-dependencies]
+tycho-harness = { path = "../tycho-harness" }
+
 [lints]
 workspace = true
 

@@ -353,7 +353,7 @@ fn check_result(payload: &ResultPayload) -> Result<(), EnvelopeError> {
     Ok(())
 }
 
-fn check_escalation(payload: &EscalationPayload) -> Result<(), EnvelopeError> {
+pub(crate) fn check_escalation(payload: &EscalationPayload) -> Result<(), EnvelopeError> {
     check_count("options", payload.options.len(), OPTIONS_MAX_ITEMS)?;
     check_count("evidence", payload.evidence.len(), REFS_MAX_ITEMS)?;
     check_count(

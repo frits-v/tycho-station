@@ -34,6 +34,11 @@ pub const RESTATE_DATA_DIR: &str = "restate";
 pub const LOG_DIR: &str = "logs";
 pub const STOP_FILE: &str = "watchdog.stop";
 pub const OPERATOR_SECRET_FILE: &str = "operator.secret";
+/// Decision packets and the verdict files typed beside them, one directory per epic.
+pub const PACKET_DIR: &str = "packets";
+/// Passes one `tycho verdicts run` makes before it exits for launchd to restart it.
+pub const VERDICT_ITERATIONS_MAX: u32 = 720;
+pub const VERDICT_INTERVAL: Duration = Duration::from_secs(5);
 
 pub const LAUNCHD_LABEL: &str = "dev.tycho.watchdog";
 pub const LAUNCHD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -379,6 +384,11 @@ impl CoreConfig {
     #[must_use]
     pub fn operator_secret_file(&self) -> PathBuf {
         self.home.join(OPERATOR_SECRET_FILE)
+    }
+
+    #[must_use]
+    pub fn packet_dir(&self) -> PathBuf {
+        self.home.join(PACKET_DIR)
     }
 
     /// The command line typed into the role's zmx session; `exec` makes the session end

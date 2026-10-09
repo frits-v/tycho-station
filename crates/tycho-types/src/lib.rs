@@ -11,6 +11,7 @@ pub mod envelope;
 pub mod exit;
 pub mod launcher;
 pub mod lease;
+pub mod rejection;
 pub mod service;
 pub mod session;
 pub mod task_packet;

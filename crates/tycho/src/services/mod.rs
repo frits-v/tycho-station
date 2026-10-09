@@ -107,6 +107,8 @@ pub struct Ports {
     pub config: Arc<FactoryConfig>,
     /// The operator secret file; `None` refuses every operator call.
     pub operator_secret: Option<std::path::PathBuf>,
+    /// Where decision packets go; `None` abandons a unit that escalates, since no one would see it.
+    pub packet_dir: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for Ports {
@@ -118,6 +120,7 @@ impl std::fmt::Debug for Ports {
             .field("timing", &self.timing)
             .field("config", &self.config.hashes())
             .field("operator_secret", &self.operator_secret)
+            .field("packet_dir", &self.packet_dir)
             .finish()
     }
 }

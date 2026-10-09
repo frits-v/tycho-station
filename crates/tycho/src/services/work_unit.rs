@@ -2,17 +2,20 @@
 //! with the run handler as the only writer of lifecycle state.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tycho_types::envelope::{CommitSha, EscalationPayload, ResultPayload, ShortText};
+use tycho_types::rejection::Question;
 use tycho_types::service::{Attempt, EpicId, Phase, PromiseName, TaskId, WorkUnitId};
 use tycho_types::session::{SessionKind, SessionName, Vendor};
 
 use crate::config::spine;
 use crate::config_store::{FactoryConfig, UnitConfig};
+use crate::packets::{self, Blocker, PacketContext, PacketError};
 use crate::services::epic::EpicClient;
 use crate::services::merge_gate::{Claim, GateError, GateVerdict, MergeGate, VerifyRequest};
 use crate::services::worker_run::{
@@ -162,6 +165,9 @@ pub struct WorkUnitView {
     /// The configuration the unit started with, journaled once; the run uses these values.
     #[serde(default)]
     pub config: UnitConfig,
+    /// The decision packet of the current escalation, once written.
+    #[serde(default)]
+    pub packet: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,7 +216,12 @@ impl<T: fmt::Debug> fmt::Debug for ControlCall<T> {
 pub enum ControlError {
     Secret,
     Attempt(u16),
-    NotCurrent { attempt: u16, current: Option<u16> },
+    NotCurrent {
+        attempt: u16,
+        current: Option<u16>,
+    },
+    /// A ruling reaches only an escalated unit, so it never waits ahead of the escalation.
+    NotEscalated(Option<Lifecycle>),
 }
 
 impl fmt::Display for ControlError {
@@ -224,6 +235,9 @@ impl fmt::Display for ControlError {
                     "attempt {attempt} is not the current attempt {current:?}"
                 )
             }
+            Self::NotEscalated(lifecycle) => {
+                write!(formatter, "the unit is {lifecycle:?}, not escalated")
+            }
         }
     }
 }
@@ -233,7 +247,7 @@ impl ControlError {
         match self {
             Self::Secret => CODE_FORBIDDEN,
             Self::Attempt(_) => CODE_BAD_REQUEST,
-            Self::NotCurrent { .. } => CODE_CONFLICT,
+            Self::NotCurrent { .. } | Self::NotEscalated(_) => CODE_CONFLICT,
         }
     }
 }
@@ -249,6 +263,18 @@ pub fn current_promise(
         return Err(ControlError::NotCurrent { attempt, current });
     }
     Ok(PromiseName::new(phase, checked))
+}
+
+/// `ruling.<attempt>`, only while the unit is escalated in that attempt.
+pub fn ruling_promise(
+    view: Option<&WorkUnitView>,
+    attempt: u16,
+) -> Result<PromiseName, ControlError> {
+    let name = current_promise(Phase::Ruling, attempt, view.map(|view| view.attempt))?;
+    match view.map(|view| view.lifecycle) {
+        Some(Lifecycle::Escalated) => Ok(name),
+        other => Err(ControlError::NotEscalated(other)),
+    }
 }
 
 /// The same, after the control session's secret checks out.
@@ -292,13 +318,48 @@ enum AttemptEnd {
     CriteriaFailed(Vec<String>),
     /// A worker run ended without a result; the unit is retry queued.
     GaveUp(Vec<String>),
-    Escalated,
+    Escalated(Blocker),
 }
 
 /// What follows an attempt that did not merge.
 enum After {
     Retry,
-    Escalate,
+    Escalate(Blocker),
+}
+
+/// The blocker a worker run outcome other than completed hands the unit.
+fn worker_blocker(task: &TaskId, outcome: WorkerRunOutcome) -> Blocker {
+    let reason = match outcome {
+        WorkerRunOutcome::Escalated {
+            question: Question::Certified { payload },
+            ..
+        } => return Blocker::Certified(payload),
+        WorkerRunOutcome::Escalated {
+            question: Question::Absent,
+            ..
+        } => format!("task {task} escalated without a certified question"),
+        WorkerRunOutcome::Escalated {
+            question: Question::Malformed { reason },
+            ..
+        } => format!("task {task} sent a certified question that did not decode: {reason}"),
+        WorkerRunOutcome::Replan { .. } => {
+            format!("task {task} came back too large and needs re-planning")
+        }
+        WorkerRunOutcome::Inbox { state, .. } => {
+            format!("task {task} ended in a state nobody enumerated: {state}")
+        }
+        other @ (WorkerRunOutcome::Completed { .. }
+        | WorkerRunOutcome::Stopped { .. }
+        | WorkerRunOutcome::Exhausted { .. }) => format!("task {task} ended as {other:?}"),
+    };
+    Blocker::Uncertified { reason }
+}
+
+fn packet_failure(error: PacketError) -> HandlerError {
+    match error {
+        PacketError::Io(..) => HandlerError::from(error),
+        PacketError::TooLarge { .. } => refuse(CODE_INTERNAL, error.to_string()),
+    }
 }
 
 fn failure(code: u16, message: impl Into<String>) -> TerminalError {
@@ -309,6 +370,7 @@ pub struct WorkUnit {
     merge_gate: Arc<dyn MergeGate>,
     timing: Timing,
     config: Arc<FactoryConfig>,
+    packet_dir: Option<PathBuf>,
 }
 
 impl WorkUnit {
@@ -318,6 +380,7 @@ impl WorkUnit {
             merge_gate: Arc::clone(&ports.merge_gate),
             timing: ports.timing,
             config: Arc::clone(&ports.config),
+            packet_dir: ports.packet_dir.clone(),
         }
     }
 }
@@ -329,6 +392,7 @@ impl fmt::Debug for WorkUnit {
             .field("merge_gate", &self.merge_gate.describe())
             .field("timing", &self.timing)
             .field("config", &self.config.hashes())
+            .field("packet_dir", &self.packet_dir)
             .finish()
     }
 }
@@ -443,8 +507,8 @@ impl WorkUnit {
         call: Json<RuleCall>,
     ) -> HandlerResult<()> {
         let call = call.into_inner();
-        let current = current_attempt(&shared_context).await?;
-        let name = current_promise(Phase::Ruling, call.attempt, current)
+        let view = shared_context.get::<Json<WorkUnitView>>(VIEW_KEY).await?;
+        let name = ruling_promise(view.map(Json::into_inner).as_ref(), call.attempt)
             .map_err(|error| refuse(error.code(), error.to_string()))?;
         shared_context.resolve_promise(&name.to_string(), Json(call.ruling));
         Ok(())
@@ -521,6 +585,7 @@ impl WorkUnit {
                 findings: Vec::new(),
                 reason: None,
                 config: start.config,
+                packet: None,
             },
             timing: start.timing,
         };
@@ -556,10 +621,14 @@ impl WorkUnit {
                     unit.view.findings = findings;
                     self.after_give_up(unit, attempt, cap).await?
                 }
-                AttemptEnd::Escalated => After::Escalate,
+                AttemptEnd::Escalated(blocker) => After::Escalate(blocker),
             };
-            if matches!(after, After::Escalate) && !self.ruling(unit, attempt).await? {
-                return Ok(());
+            if let After::Escalate(blocker) = after {
+                self.packet(unit, unit_id, request, attempt, blocker)
+                    .await?;
+                if !self.ruling(unit, attempt).await? {
+                    return Ok(());
+                }
             }
             attempt = attempt
                 .next()
@@ -577,7 +646,9 @@ impl WorkUnit {
             return Ok(After::Retry);
         }
         unit.step(Event::GiveUpRuleHit)?;
-        Ok(After::Escalate)
+        Ok(After::Escalate(Blocker::Uncertified {
+            reason: "the done criteria failed on the last attempt the cap allows".to_string(),
+        }))
     }
 
     async fn after_give_up(
@@ -588,7 +659,9 @@ impl WorkUnit {
     ) -> Result<After, TerminalError> {
         if attempt >= cap {
             unit.step(Event::AttemptOverMax)?;
-            return Ok(After::Escalate);
+            return Ok(After::Escalate(Blocker::Uncertified {
+                reason: "the worker runs gave up on the last attempt the cap allows".to_string(),
+            }));
         }
         unit.workflow_context
             .sleep(backoff(&unit.timing, attempt))
@@ -609,6 +682,8 @@ impl WorkUnit {
             .into_inner();
         match ruling.verdict {
             RulingVerdict::Continue => {
+                unit.view.findings = vec![format!("verdict: {}", ruling.reason)];
+                unit.view.packet = None;
                 unit.step(Event::Verdict)?;
                 Ok(true)
             }
@@ -618,6 +693,46 @@ impl WorkUnit {
                 Ok(false)
             }
         }
+    }
+
+    /// Writes the decision packet in a journaled step and records its path on the view.
+    async fn packet(
+        &self,
+        unit: &mut Unit<'_>,
+        unit_id: &WorkUnitId,
+        request: &WorkUnitRequest,
+        attempt: Attempt,
+        blocker: Blocker,
+    ) -> Result<(), TerminalError> {
+        let packet_dir = self.packet_dir.clone().ok_or_else(|| {
+            failure(
+                CODE_INTERNAL,
+                "no packet directory is configured, so the escalation would reach no one",
+            )
+        })?;
+        let context = PacketContext {
+            epic: request.epic.clone(),
+            unit: unit_id.clone(),
+            attempt,
+            head_sha: unit.view.head_sha.clone(),
+            checkpoint: None,
+            findings: unit.view.findings.clone(),
+        };
+        let path = unit
+            .workflow_context
+            .run(|| {
+                blocking(move || {
+                    packets::write(&packet_dir, &blocker, &context)
+                        .map(|path| path.display().to_string())
+                        .map_err(packet_failure)
+                })
+            })
+            .name("packet")
+            .retry_policy(unit.timing.port_retry())
+            .await?;
+        unit.view.packet = Some(path);
+        unit.save();
+        Ok(())
     }
 
     /// Dispatches the plan's tasks in order, then verifies every claim.
@@ -650,7 +765,10 @@ impl WorkUnit {
                 | WorkerRunOutcome::Replan { .. }
                 | WorkerRunOutcome::Inbox { .. } => {
                     unit.step(Event::GiveUpRuleHit)?;
-                    return Ok(AttemptEnd::Escalated);
+                    return Ok(AttemptEnd::Escalated(worker_blocker(
+                        &planned.task,
+                        outcome,
+                    )));
                 }
                 WorkerRunOutcome::Stopped { .. } | WorkerRunOutcome::Exhausted { .. } => {
                     unit.step(Event::WorkerGaveUp)?;
@@ -909,5 +1027,82 @@ mod tests {
             payload: 7_u32,
         };
         assert!(!format!("{call:?}").contains(&"s".repeat(40)));
+    }
+
+    fn view(lifecycle: Lifecycle, attempt: u16) -> WorkUnitView {
+        WorkUnitView {
+            lifecycle,
+            attempt,
+            head_sha: None,
+            control_session: "cf7a.wu01.ctl.codex".to_string(),
+            findings: Vec::new(),
+            reason: None,
+            config: UnitConfig::default(),
+            packet: None,
+        }
+    }
+
+    #[test]
+    fn a_ruling_reaches_only_an_escalated_unit_in_its_current_attempt() {
+        let escalated = view(Lifecycle::Escalated, 2);
+        assert_eq!(
+            ruling_promise(Some(&escalated), 2).unwrap().to_string(),
+            "ruling.2"
+        );
+        let stale = ruling_promise(Some(&escalated), 1);
+        assert_eq!(
+            stale,
+            Err(ControlError::NotCurrent {
+                attempt: 1,
+                current: Some(2)
+            })
+        );
+        let running = ruling_promise(Some(&view(Lifecycle::Running, 2)), 2);
+        assert_eq!(
+            running,
+            Err(ControlError::NotEscalated(Some(Lifecycle::Running)))
+        );
+        assert_eq!(running.unwrap_err().code(), CODE_CONFLICT);
+        assert!(ruling_promise(None, 1).is_err());
+    }
+
+    #[test]
+    fn every_worker_outcome_that_escalates_names_its_blocker() {
+        let task = TaskId::parse("t1").unwrap();
+        let reason = |outcome| match worker_blocker(&task, outcome) {
+            Blocker::Uncertified { reason } => reason,
+            Blocker::Certified(payload) => panic!("{payload:?}"),
+        };
+        assert!(reason(WorkerRunOutcome::Escalated {
+            attempt: 1,
+            question: Question::Absent
+        })
+        .contains("without a certified question"));
+        assert!(reason(WorkerRunOutcome::Escalated {
+            attempt: 1,
+            question: Question::Malformed {
+                reason: "Syntax error".to_string()
+            }
+        })
+        .contains("did not decode: Syntax error"));
+        assert!(reason(WorkerRunOutcome::Replan { attempt: 1 }).contains("re-planning"));
+        assert!(reason(WorkerRunOutcome::Inbox {
+            attempt: 1,
+            state: "unrecognised:3:boo".to_string()
+        })
+        .contains("nobody enumerated"));
+    }
+
+    #[test]
+    fn a_journaled_escalated_outcome_without_a_question_still_decodes() {
+        let outcome: WorkerRunOutcome =
+            serde_json::from_str(r#"{"outcome":"escalated","attempt":3}"#).unwrap();
+        assert_eq!(
+            outcome,
+            WorkerRunOutcome::Escalated {
+                attempt: 3,
+                question: Question::Absent
+            }
+        );
     }
 }

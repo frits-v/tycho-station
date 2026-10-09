@@ -12,17 +12,21 @@ use std::process;
 use std::sync::Arc;
 use std::thread;
 
-use tycho::config::{self, CoreConfig, ENDPOINT_PORT, PROBE_TIMEOUT, WATCHDOG_INTERVAL};
+use tycho::config::{
+    self, CoreConfig, ENDPOINT_PORT, PROBE_TIMEOUT, VERDICT_INTERVAL, VERDICT_ITERATIONS_MAX,
+    WATCHDOG_INTERVAL,
+};
 use tycho::config_store::{self, FactoryConfig, CONFIG_DIR_ENV};
 use tycho::epic_command::{self, OperatorAnswer};
 use tycho::http::Http;
 use tycho::launchd::Agent;
 use tycho::launcher;
 use tycho::services::merge_gate::NoGate;
+use tycho::services::operator::read_secret_file;
 use tycho::services::spawner::NoLauncher;
 use tycho::services::{Ports, Timing};
 use tycho::watchdog::{self, LoopEnd, Supervisor};
-use tycho::{core, endpoint};
+use tycho::{agent_files, core, endpoint, verdicts};
 
 mod graph;
 
@@ -31,6 +35,7 @@ const USAGE: &str = "usage: tycho <command>
   core start|stop|status      the restate-server and endpoint zmx sessions
   watchdog once|run           probe both sessions and restart what is missing
   watchdog install|uninstall  the launchd user agent that runs `watchdog run`
+  verdicts once|run           apply the verdict files typed beside decision packets
   graph build <checkout> <work-unit>   build the semantic graph index of a checkout
   graph query <checkout> definitions|callers <symbol>
   graph query <checkout> impact <path>   entities changed under the path since HEAD~1
@@ -66,6 +71,7 @@ fn main() {
             finish(&report, report.succeeded(), config)
         }),
         ["watchdog", "run"] => with_config(run_watchdog),
+        ["verdicts", mode @ ("once" | "run")] => with_config(|config, _| verdicts(config, mode)),
         ["epic", "start", epic, goal] => with_config(|config, _| {
             operator_call(|http| epic_command::start(config, http, epic, goal))
         }),
@@ -192,7 +198,10 @@ fn serve_endpoint() -> i32 {
         merge_gate: Arc::new(NoGate),
         timing: Timing::from_thresholds(&factory.thresholds.value),
         config: Arc::new(factory),
-        operator_secret: home.map(|home| home.join(config::OPERATOR_SECRET_FILE)),
+        operator_secret: home
+            .as_ref()
+            .map(|home| home.join(config::OPERATOR_SECRET_FILE)),
+        packet_dir: home.map(|home| home.join(config::PACKET_DIR)),
     };
     match endpoint::serve(config::loopback(ENDPOINT_PORT), &ports) {
         Ok(()) => 0,
@@ -248,6 +257,57 @@ fn run_watchdog(config: &CoreConfig, supervisor: &Supervisor) -> i32 {
         thread::sleep,
     );
     println!("watchdog run ended: {end:?}");
+    match end {
+        LoopEnd::StopFile(_) => 0,
+        LoopEnd::IterationsExhausted(_) => EXIT_TICKS_EXHAUSTED,
+    }
+}
+
+fn verdicts(config: &CoreConfig, mode: &str) -> i32 {
+    if mode == "run" {
+        run_verdicts(config)
+    } else {
+        verdicts_once(config)
+    }
+}
+
+/// One pass; a pass that could not run, or that the operator refused, exits non-zero.
+fn verdicts_once(config: &CoreConfig) -> i32 {
+    let secret = match read_secret_file(&config.operator_secret_file()) {
+        Ok(secret) => secret,
+        Err(error) => {
+            eprintln!("tycho: verdicts: {error}");
+            return 2;
+        }
+    };
+    let http = match Http::new(config::COMMAND_TIMEOUT) {
+        Ok(http) => http,
+        Err(error) => {
+            eprintln!("tycho: verdicts: cannot build the HTTP client: {error}");
+            return 2;
+        }
+    };
+    let report = verdicts::pass(
+        &config.packet_dir(),
+        agent_files::current_uid(),
+        &mut |request| verdicts::rule_through_operator(&http, secret.expose(), request),
+    );
+    print!("{report}");
+    i32::from(!report.succeeded())
+}
+
+fn run_verdicts(config: &CoreConfig) -> i32 {
+    let stop_file = config.stop_file();
+    let end = watchdog::run_bounded(
+        VERDICT_ITERATIONS_MAX,
+        VERDICT_INTERVAL,
+        || stop_file.exists(),
+        |_| {
+            verdicts_once(config);
+        },
+        thread::sleep,
+    );
+    println!("verdicts run ended: {end:?}");
     match end {
         LoopEnd::StopFile(_) => 0,
         LoopEnd::IterationsExhausted(_) => EXIT_TICKS_EXHAUSTED,

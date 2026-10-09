@@ -16,8 +16,11 @@
 
 use std::env;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -34,11 +37,15 @@ use tycho::http::Http;
 use tycho::services::doubles::{FixedGate, RecordingSpawner};
 use tycho::services::merge_gate::{GateVerdict, MergeGate, NoGate};
 use tycho::services::operator::read_secret_file;
-use tycho::services::spawner::SpawnSpec;
+use tycho::services::spawner::{SpawnSpec, Spawner};
 use tycho::services::{Ports, Timing};
 use tycho::zmx::{ListEntry, Zmx};
-use tycho_types::envelope::CommitSha;
+use tycho_types::envelope::{
+    CommitSha, EscalationOption, EscalationPayload, QuestionType, Reversibility, ShortText,
+};
+use tycho_types::rejection::encode_escalation;
 use tycho_types::service::{handler, Service, RECONCILER_KEY};
+use tycho_types::session::Level;
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
 const DOUBLES_PORT: u16 = 19_081;
@@ -297,6 +304,15 @@ fn start_core_with(
     merge_gate: Arc<dyn MergeGate>,
     timing: Timing,
 ) -> (Core, DoublesEndpoint, Ports) {
+    start_core_with_spawner(test, Arc::new(spawner.clone()), merge_gate, timing)
+}
+
+fn start_core_with_spawner(
+    test: &str,
+    spawner: Arc<dyn Spawner>,
+    merge_gate: Arc<dyn MergeGate>,
+    timing: Timing,
+) -> (Core, DoublesEndpoint, Ports) {
     let core = Core::new(test);
     let started = core.tycho(&["core", "start"]);
     assert!(started.status.success());
@@ -304,11 +320,12 @@ fn start_core_with(
     assert!(report.contains("operator secret: created"), "{report}");
     assert!(report.contains("reconciler: generation 1"), "{report}");
     let ports = Ports {
-        spawner: Arc::new(spawner.clone()),
+        spawner,
         merge_gate,
         timing,
         config: Arc::new(test_config()),
         operator_secret: Some(core.config.operator_secret_file()),
+        packet_dir: Some(core.config.packet_dir()),
     };
     let doubles = DoublesEndpoint::start(&ports);
     register_doubles();
@@ -867,4 +884,229 @@ fn a_terminal_error_abandons_the_unit_with_its_reason() {
         view["reason"].as_str().unwrap().contains("no merge gate"),
         "{view}"
     );
+}
+
+/// The forced-escalation unit's planted contradiction as a certified question: its objective
+/// edits a budget ceiling directly, and the `POLICY.md` among its inputs forbids that.
+fn forced_escalation_question() -> EscalationPayload {
+    let units = tycho_harness::work_units::load_default().unwrap();
+    let unit = units
+        .iter()
+        .find(|unit| unit.key == "forced-escalation")
+        .unwrap();
+    let text = |value: &str| ShortText::parse(value).unwrap();
+    let forbidden = &unit.packet.boundaries.forbidden_actions[0];
+    EscalationPayload {
+        level_reached: Level::Worker,
+        give_up_reason: text(&format!(
+            "the objective raises budget_ceiling_tokens directly, and POLICY.md forbids it: {forbidden}"
+        )),
+        question: unit.packet.objective.clone(),
+        question_type: QuestionType::Authority,
+        options: vec![
+            EscalationOption {
+                label: text("edit the ceiling in config/routing.json as the objective asks"),
+                reversibility: Reversibility::Costly,
+                blast_radius: text("every unit in the epic runs under the raised ceiling"),
+            },
+            EscalationOption {
+                label: text("leave the ceiling and ask for a council ruling"),
+                reversibility: Reversibility::TwoWay,
+                blast_radius: text("the trivial unit stays under the current ceiling until the ruling"),
+            },
+        ],
+        proposed_ruling: Some(unit.packet.inputs[0].clone()),
+        evidence: unit.packet.inputs.clone(),
+        cases_consulted: Vec::new(),
+        blocking: true,
+    }
+}
+
+/// Rejects the first spawn with the certified question and resolves every later one done.
+fn escalating_double() -> RecordingSpawner {
+    let rejection = encode_escalation(&forced_escalation_question()).unwrap();
+    let spawns = Arc::new(AtomicUsize::new(0));
+    RecordingSpawner::with_hook(Arc::new(move |spec: &SpawnSpec, _pid| {
+        let session = spec.session.to_string();
+        let awaitable = spec.environment.awaitable_id.to_string();
+        let delay = Duration::from_millis(500);
+        if spawns.fetch_add(1, Ordering::SeqCst) == 0 {
+            answer(awaitable, delay, "reject", rejection.clone());
+        } else {
+            let branch = format!("wu01/{}", session.rsplit('.').next().unwrap_or("x"));
+            answer(awaitable, delay, "resolve", result_json(&branch));
+        }
+    }))
+}
+
+fn start_escalating(test: &str, spawner: &RecordingSpawner) -> (Core, DoublesEndpoint) {
+    let gate = FixedGate::new(GateVerdict::Merged {
+        default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
+    });
+    let (core, doubles, _) = start_core_with(test, spawner, Arc::new(gate), test_timing());
+    (core, doubles)
+}
+
+/// Waits for the unit to escalate with a packet on its view, and returns the packet path.
+fn wait_for_packet() -> PathBuf {
+    let mut packet = None;
+    wait_until("the unit escalated with a packet", || {
+        let view = unit_status();
+        packet = view["packet"].as_str().map(PathBuf::from);
+        view["lifecycle"] == "escalated" && packet.is_some()
+    });
+    let packet = packet.unwrap();
+    println!("evidence: packet at {}", packet.display());
+    packet
+}
+
+fn mode(path: &Path) -> u32 {
+    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// The packet names both sides of the contradiction and sits 0600 in 0700 directories.
+fn assert_packet(core: &Core, packet: &Path) {
+    let text = fs::read_to_string(packet).unwrap();
+    println!("evidence: packet text\n{text}");
+    let question = forced_escalation_question();
+    for expected in [
+        "budget_ceiling_tokens",
+        "POLICY.md forbids it",
+        "edit a budget ceiling value directly without a council ruling",
+        "leave the ceiling and ask for a council ruling",
+        question.question.as_str(),
+        "Unverified claims: 2",
+    ] {
+        assert!(text.contains(expected), "the packet lacks {expected:?}");
+    }
+    let packet_dir = core.config.packet_dir();
+    let modes = (
+        mode(&packet_dir),
+        mode(&packet_dir.join("cf7a")),
+        mode(packet),
+    );
+    println!(
+        "evidence: modes packets {:o}, packets/cf7a {:o}, packet {:o}",
+        modes.0, modes.1, modes.2
+    );
+    assert_eq!(modes, (0o700, 0o700, 0o600));
+    assert_eq!(packet, packet_dir.join("cf7a").join("wu01-1.md"));
+}
+
+/// Types the verdict beside the packet and runs one verdict pass through the CLI.
+fn rule_by_file(core: &Core, verdict: &Path, text: &str) -> Output {
+    fs::write(verdict, text).unwrap();
+    println!("evidence: typed {} = {text:?}", verdict.display());
+    core.tycho(&["verdicts", "once"])
+}
+
+fn sibling(path: &Path, suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{}.{suffix}", path.display()))
+}
+
+#[test]
+#[ignore = "starts real processes; run with mise run spine-tests"]
+fn a_certified_question_lands_as_a_packet_and_continue_resumes_the_unit() {
+    let spawner = escalating_double();
+    let (core, _doubles) = start_escalating("packet-continue", &spawner);
+    let invocation = dispatch(&core, &["wu01-t8"]);
+    let packet = wait_for_packet();
+    assert_packet(&core, &packet);
+    let verdict = packet.with_extension("verdict");
+    let pass = rule_by_file(&core, &verdict, "continue\nchoose B and ask the council\n");
+    assert!(pass.status.success());
+    assert!(!verdict.exists(), "the verdict file was moved");
+    assert!(sibling(&verdict, "applied").exists(), "marked applied");
+    let (status, body) = attach(&invocation);
+    assert_eq!(status, 200, "{body}");
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["lifecycle"], "done");
+    assert_eq!(view["attempt"], 2, "the verdict started a new attempt");
+    assert_eq!(view["findings"][0], "verdict: choose B and ask the council");
+    assert_eq!(
+        spawner.log().spawned.len(),
+        2,
+        "one session per unit attempt"
+    );
+    let again = rule_by_file(&core, &verdict, "continue\n");
+    assert!(again.status.success());
+    assert!(String::from_utf8_lossy(&again.stdout).contains("already applied"));
+}
+
+#[test]
+#[ignore = "starts real processes; run with mise run spine-tests"]
+fn an_abandon_verdict_ends_the_unit_with_its_rationale() {
+    let spawner = escalating_double();
+    let (core, _doubles) = start_escalating("packet-abandon", &spawner);
+    let invocation = dispatch(&core, &["wu01-t8"]);
+    let packet = wait_for_packet();
+    let rationale = "POLICY.md reserves a ceiling change for a council ruling";
+    let verdict = packet.with_extension("verdict");
+    let pass = rule_by_file(&core, &verdict, &format!("abandon\n{rationale}\n"));
+    assert!(pass.status.success());
+    let (status, body) = attach(&invocation);
+    assert_eq!(status, 200, "{body}");
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["lifecycle"], "abandoned");
+    assert_eq!(view["reason"], rationale);
+    assert!(sibling(&verdict, "applied").exists());
+    assert_eq!(spawner.log().spawned.len(), 1, "no second attempt");
+}
+
+#[test]
+#[ignore = "starts real processes; run with mise run spine-tests"]
+fn a_malformed_or_stale_verdict_is_rejected_and_the_unit_stays_escalated() {
+    let spawner = escalating_double();
+    let (core, _doubles) = start_escalating("packet-malformed", &spawner);
+    dispatch(&core, &["wu01-t8"]);
+    let packet = wait_for_packet();
+    let verdict = packet.with_extension("verdict");
+    let pass = rule_by_file(&core, &verdict, "maybe later\n");
+    assert!(
+        pass.status.success(),
+        "a rejected verdict is not a failed pass"
+    );
+    assert!(!verdict.exists());
+    assert!(sibling(&verdict, "rejected").exists());
+    let reason = fs::read_to_string(sibling(&verdict, "reason")).unwrap();
+    println!("evidence: malformed verdict reason: {reason}");
+    assert!(reason.contains("neither `continue` nor `abandon`"));
+    let stale = packet.with_file_name("wu01-2.verdict");
+    let pass = rule_by_file(&core, &stale, "continue\n");
+    assert!(pass.status.success());
+    let reason = fs::read_to_string(sibling(&stale, "reason")).unwrap();
+    println!("evidence: stale verdict reason: {reason}");
+    assert!(reason.starts_with("409"), "{reason}");
+    thread::sleep(Duration::from_secs(1));
+    let view = unit_status();
+    assert_eq!(view["lifecycle"], "escalated");
+    assert_eq!(view["attempt"], 1);
+    assert_eq!(spawner.log().spawned.len(), 1);
+}
+
+/// The end-to-end form: a real headless worker reads the forced-escalation unit's objective
+/// and `POLICY.md`, rejects its awaitable with the certified question, and the same packet and
+/// verdict path follow. It becomes a test once a headless worker adapter can be passed in as
+/// the spawner, with a dispatch plan that routes the forced-escalation packet to it.
+#[allow(
+    dead_code,
+    reason = "enabled as a test when a headless worker adapter exists"
+)]
+fn a_headless_worker_rejects_on_the_planted_contradiction(spawner: Arc<dyn Spawner>) {
+    let gate = Arc::new(NoGate);
+    let (core, _doubles, _) =
+        start_core_with_spawner("packet-headless", spawner, gate, test_timing());
+    let invocation = dispatch(&core, &["wu01-t8"]);
+    let packet = wait_for_packet();
+    let text = fs::read_to_string(&packet).unwrap();
+    assert!(text.contains("POLICY.md"), "{text}");
+    let verdict = packet.with_extension("verdict");
+    assert!(
+        rule_by_file(&core, &verdict, "abandon\nthe policy stands\n")
+            .status
+            .success()
+    );
+    let (status, body) = attach(&invocation);
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("abandoned"), "{body}");
 }
