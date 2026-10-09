@@ -1,8 +1,8 @@
-//! Child processes run with a deadline, stdin closed, stderr inherited and stdout captured up
-//! to a cap.
+//! Child processes run with a deadline, stdin closed, stdout captured up to a cap, and stderr
+//! inherited or captured up to the same cap.
 
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -26,15 +26,33 @@ pub enum Exit {
 pub struct Captured {
     pub exit: Exit,
     pub stdout: String,
+    /// Empty unless the command ran through `run_bounded_capturing_stderr`.
+    pub stderr: String,
 }
 
 /// Runs a command with stdin closed, stderr inherited and stdout captured up to the cap.
 pub fn run_bounded(command: &mut Command, timeout: Duration) -> Captured {
+    run_with(command, timeout, false)
+}
+
+/// Runs a command with stdin closed and both stdout and stderr captured up to the cap.
+pub fn run_bounded_capturing_stderr(command: &mut Command, timeout: Duration) -> Captured {
+    run_with(command, timeout, true)
+}
+
+type ReaderResult = mpsc::Receiver<(Vec<u8>, Option<Exit>)>;
+
+fn run_with(command: &mut Command, timeout: Duration, capture_stderr: bool) -> Captured {
     println!("xtask: {}", describe(command));
+    let stderr_mode = if capture_stderr {
+        Stdio::piped()
+    } else {
+        Stdio::inherit()
+    };
     let spawned = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(stderr_mode)
         .spawn();
     let mut child = match spawned {
         Ok(child) => child,
@@ -42,45 +60,77 @@ pub fn run_bounded(command: &mut Command, timeout: Duration) -> Captured {
             return Captured {
                 exit: Exit::NotStarted(error.to_string()),
                 stdout: String::new(),
+                stderr: String::new(),
             }
         }
     };
-    let (sender, receiver) = mpsc::channel();
-    if let Some(pipe) = child.stdout.take() {
-        thread::spawn(move || {
-            let mut kept = Vec::new();
-            let mut limited = pipe.take(OUTPUT_MAX_BYTES.saturating_add(1));
-            let read = limited.read_to_end(&mut kept);
-            let mut rest = limited.into_inner();
-            // Draining past the cap keeps the child from blocking on a full pipe.
-            let drained = std::io::copy(&mut rest, &mut std::io::sink());
-            let state = if read.is_err() || drained.is_err() {
-                Some(Exit::OutputUnreadable)
-            } else if u64::try_from(kept.len()).map_or(true, |n| n > OUTPUT_MAX_BYTES) {
-                Some(Exit::OutputTooLarge)
-            } else {
-                None
-            };
-            if sender.send((kept, state)).is_err() {
-                eprintln!("xtask: stdout arrived after the reader deadline");
-            }
-        });
-    }
+    let stdout_reader = child.stdout.take().map(Pipe::Out).map(read_capped);
+    let stderr_reader = child.stderr.take().map(Pipe::Err).map(read_capped);
     let exit = wait_with_deadline(&mut child, timeout);
-    let Ok((kept, reader_state)) = receiver.recv_timeout(READER_JOIN_TIMEOUT) else {
+    let (stdout, exit) = collect(stdout_reader, exit);
+    let (stderr, exit) = match stderr_reader {
+        Some(reader) => collect(Some(reader), exit),
+        None => (String::new(), exit),
+    };
+    Captured {
+        exit,
+        stdout,
+        stderr,
+    }
+}
+
+enum Pipe {
+    Out(ChildStdout),
+    Err(ChildStderr),
+}
+
+impl Read for Pipe {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Out(pipe) => pipe.read(buffer),
+            Self::Err(pipe) => pipe.read(buffer),
+        }
+    }
+}
+
+fn read_capped(pipe: Pipe) -> ReaderResult {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut limited = pipe.take(OUTPUT_MAX_BYTES.saturating_add(1));
+        let read = limited.read_to_end(&mut kept);
+        let mut rest = limited.into_inner();
+        // Draining past the cap keeps the child from blocking on a full pipe.
+        let drained = std::io::copy(&mut rest, &mut std::io::sink());
+        let state = if read.is_err() || drained.is_err() {
+            Some(Exit::OutputUnreadable)
+        } else if u64::try_from(kept.len()).map_or(true, |n| n > OUTPUT_MAX_BYTES) {
+            Some(Exit::OutputTooLarge)
+        } else {
+            None
+        };
+        if sender.send((kept, state)).is_err() {
+            eprintln!("xtask: output arrived after the reader deadline");
+        }
+    });
+    receiver
+}
+
+/// The text a reader kept and the exit to report: a reader's own failure overrides a clean
+/// exit, and a reader that never answered turns a clean exit into `OutputUnreadable`.
+fn collect(reader: Option<ReaderResult>, exit: Exit) -> (String, Exit) {
+    let Some(Ok((kept, reader_state))) =
+        reader.map(|receiver| receiver.recv_timeout(READER_JOIN_TIMEOUT))
+    else {
         let exit = if exit == Exit::Code(0) {
             Exit::OutputUnreadable
         } else {
             exit
         };
-        return Captured {
-            exit,
-            stdout: String::new(),
-        };
+        return (String::new(), exit);
     };
-    let stdout = String::from_utf8_lossy(&kept).into_owned();
-    let exit = reader_state.unwrap_or(exit);
-    Captured { exit, stdout }
+    let text = String::from_utf8_lossy(&kept).into_owned();
+    (text, reader_state.unwrap_or(exit))
 }
 
 fn wait_with_deadline(child: &mut std::process::Child, timeout: Duration) -> Exit {
@@ -150,5 +200,28 @@ mod tests {
         assert_eq!(large.exit, Exit::OutputTooLarge);
         let missing = run_bounded(&mut Command::new("no-such-program-xtask"), QUICK_TIMEOUT);
         assert!(matches!(missing.exit, Exit::NotStarted(_)));
+    }
+
+    #[test]
+    fn capturing_run_keeps_stderr_apart_and_bounds_it() {
+        let both = run_bounded_capturing_stderr(
+            Command::new("sh").args(["-c", "echo out; echo err >&2"]),
+            QUICK_TIMEOUT,
+        );
+        assert_eq!(both.exit, Exit::Code(0));
+        assert_eq!(both.stdout.trim(), "out");
+        assert_eq!(both.stderr.trim(), "err");
+        let flood = format!(
+            "head -c {} /dev/zero >&2",
+            OUTPUT_MAX_BYTES.saturating_add(10)
+        );
+        let large =
+            run_bounded_capturing_stderr(Command::new("sh").args(["-c", &flood]), QUICK_TIMEOUT);
+        assert_eq!(large.exit, Exit::OutputTooLarge);
+        let inherited = run_bounded(
+            Command::new("sh").args(["-c", "echo err >&2"]),
+            QUICK_TIMEOUT,
+        );
+        assert!(inherited.stderr.is_empty());
     }
 }

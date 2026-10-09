@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output};
 
 mod app_token;
+mod clippy;
+mod code_scanning;
 mod config;
 mod credentials;
 mod figures;
@@ -21,6 +23,9 @@ mod process;
 mod release;
 mod sarif;
 mod setup;
+mod workflows;
+
+use sarif::{Finding, Rule};
 
 const TYPES: [&str; 11] = [
     "feat", "fix", "docs", "chore", "refactor", "test", "build", "ci", "perf", "style", "revert",
@@ -34,14 +39,22 @@ const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
 const DOC_DIRS: [&str; 1] = ["docs"];
 const RULES_DIR: &str = ".claude/rules";
 const RULE_MAX_LINES: usize = 24;
-const COMMANDS: [(&str, &str); 17] = [
+const COMMANDS: [(&str, &str); 19] = [
     (
         "ci",
-        "format check, clippy, tests, the repository checks, workflow lints, PR title",
+        "every check below that ci runs, then sarif-upload when in GitHub Actions",
     ),
     (
         "opengrep",
         "the opengrep rules against their fixtures, then over the Rust sources",
+    ),
+    (
+        "workflows",
+        "zizmor and jactionlint over the workflows at pedantic, online",
+    ),
+    (
+        "sarif-upload",
+        "upload target/sarif/*.sarif to GitHub code scanning",
     ),
     (
         "check-commit-msg <file>",
@@ -117,6 +130,30 @@ const NARRATION_MARKERS: [&str; 10] = [
 /// Markers that opengrep's `rust-history-trace-comment` rule covers in Rust comments; this
 /// check still applies them to documents.
 const MARKERS_IN_OPENGREP: [&str; 3] = ["previously", "used to ", "now does"];
+const NAMES_RULES: [Rule<'static>; 1] = [Rule {
+    id: "check-names/abbreviation",
+    description: "An identifier is an abbreviation (tmp, ctx, obj, arr, cfg) no framework imposes",
+}];
+const COMMENTS_RULES: [Rule<'static>; 2] = [
+    Rule {
+        id: "check-comments/narration",
+        description: "A comment or document narrates history or process",
+    },
+    Rule {
+        id: "check-comments/ticket-reference",
+        description: "A Rust comment names a ticket or issue number",
+    },
+];
+const RULES_RULES: [Rule<'static>; 2] = [
+    Rule {
+        id: "check-rules/frontmatter",
+        description: "A rule file has no `paths` frontmatter",
+    },
+    Rule {
+        id: "check-rules/length",
+        description: "A rule file is longer than the limit",
+    },
+];
 
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
@@ -245,48 +282,71 @@ fn run(program: &str, args: &[&str]) -> ExitStatus {
         })
 }
 
-/// A cargo build started here finds rustup's cargo on `PATH`, not the mise wrapper that
-/// routes it through the mbx cache, so builds start `mbx` with the cargo subcommand.
+fn step_passed(name: &str, outcome: Result<String, String>) -> bool {
+    match outcome {
+        Ok(summary) => {
+            println!("xtask {summary}");
+            true
+        }
+        Err(reason) => {
+            eprintln!("xtask {name}: {reason}");
+            false
+        }
+    }
+}
+
+type Check = fn() -> i32;
+
+/// Runs every step even after one fails, so one run reports and uploads all findings. A
+/// cargo build started here finds rustup's cargo on `PATH`, not the mise wrapper that routes
+/// it through the mbx cache, so builds start `mbx` with the cargo subcommand.
 fn ci() -> i32 {
-    let steps: [(&str, &[&str]); 5] = [
-        ("cargo", &["fmt", "--all", "--", "--check"]),
+    if let Err(reason) = sarif::clear() {
+        eprintln!("xtask ci: {reason}");
+        return 1;
+    }
+    let mut steps: Vec<(&str, bool)> = vec![
         (
-            "mbx",
-            &[
-                "clippy",
-                "--workspace",
-                "--all-targets",
-                "--",
-                "-D",
-                "warnings",
-            ],
+            "fmt",
+            run("cargo", &["fmt", "--all", "--", "--check"]).success(),
         ),
-        ("mbx", &["test", "--workspace"]),
-        (
-            "zizmor",
-            &["--pedantic", "--no-progress", ".github/workflows"],
-        ),
-        ("actionlint", &[]),
+        ("clippy", step_passed("clippy", clippy::clippy())),
+        ("test", run("mbx", &["test", "--workspace"]).success()),
+        ("workflows", workflows::workflows() == 0),
+        ("opengrep", opengrep::opengrep() == 0),
     ];
-    for (program, args) in steps {
-        if !run(program, args).success() {
-            return 1;
-        }
+    let checks: [(&str, Check); 6] = [
+        ("check-names", check_names),
+        ("check-comments", check_comments),
+        ("check-rules", check_rules),
+        ("check-credentials", credentials::check_credentials),
+        ("check-figures", figures::check_figures),
+        ("check-config", config::check_config),
+    ];
+    for (name, check) in checks {
+        steps.push((name, check() == 0));
     }
-    for check in [
-        opengrep::opengrep,
-        check_names,
-        check_comments,
-        check_rules,
-        credentials::check_credentials,
-        figures::check_figures,
-        config::check_config,
-    ] {
-        if check() != 0 {
-            return 1;
-        }
+    steps.push(("check-pr-title", check_pr_title(pr_title_from_event()) == 0));
+    if env::var("GITHUB_ACTIONS").is_ok_and(|value| value == "true") {
+        steps.push(("sarif-upload", code_scanning::sarif_upload() == 0));
     }
-    check_pr_title(pr_title_from_event())
+    let failed: Vec<&str> = steps
+        .iter()
+        .filter(|(_, passed)| !passed)
+        .map(|(name, _)| *name)
+        .collect();
+    if failed.is_empty() {
+        println!("xtask ci: {} steps passed", steps.len());
+        0
+    } else {
+        eprintln!(
+            "xtask ci: {} of {} steps failed: {}",
+            failed.len(),
+            steps.len(),
+            failed.join(", ")
+        );
+        1
+    }
 }
 
 fn walk(dirs: &[&str], extension: &str) -> Vec<PathBuf> {
@@ -326,28 +386,43 @@ fn outside_strings(line: &str) -> String {
     kept
 }
 
-fn identifiers(line: &str) -> Vec<String> {
-    outside_strings(line)
-        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .filter(|token| !token.is_empty())
-        .map(str::to_string)
-        .collect()
+/// Each identifier outside string literals with its one-based character column.
+fn identifiers(line: &str) -> Vec<(usize, String)> {
+    let mut found = Vec::new();
+    let mut current = String::new();
+    let mut start = 0_usize;
+    for (index, character) in outside_strings(line).chars().enumerate() {
+        if character.is_ascii_alphanumeric() || character == '_' {
+            if current.is_empty() {
+                start = index.saturating_add(1);
+            }
+            current.push(character);
+        } else if !current.is_empty() {
+            found.push((start, std::mem::take(&mut current)));
+        }
+    }
+    if !current.is_empty() {
+        found.push((start, current));
+    }
+    found
 }
 
-fn abbreviation_defects(path: &Path, text: &str) -> Vec<String> {
+fn abbreviation_defects(path: &Path, text: &str) -> Vec<Finding> {
     let mut defects = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let trimmed = line.trim_start();
         if trimmed.starts_with("//") || trimmed.starts_with("#[") {
             continue;
         }
-        for token in identifiers(line) {
+        for (column, token) in identifiers(line) {
             let framework = token == "cfg" && (line.contains("cfg(") || line.contains("cfg!"));
             if ABBREVIATIONS.contains(&token.as_str()) && !framework {
-                defects.push(format!(
-                    "{}:{}: identifier `{token}`",
-                    path.display(),
-                    index.saturating_add(1)
+                defects.push(Finding::at(
+                    path,
+                    index.saturating_add(1),
+                    column,
+                    "check-names/abbreviation",
+                    format!("identifier `{token}`"),
                 ));
             }
         }
@@ -408,7 +483,7 @@ fn comment_text(line: &str) -> Option<&str> {
 }
 
 /// In Rust sources (`comments_only`) the markers opengrep covers are left to it.
-fn narration_defects(path: &Path, text: &str, comments_only: bool) -> Vec<String> {
+fn narration_defects(path: &Path, text: &str, comments_only: bool) -> Vec<Finding> {
     let mut defects = Vec::new();
     for (index, line) in text.lines().enumerate() {
         let scanned = if comments_only {
@@ -419,41 +494,56 @@ fn narration_defects(path: &Path, text: &str, comments_only: bool) -> Vec<String
         } else {
             line
         };
+        let offset = line.len().saturating_sub(scanned.len());
         let lower = scanned.to_ascii_lowercase();
+        let line_number = index.saturating_add(1);
         for marker in NARRATION_MARKERS {
             if comments_only && MARKERS_IN_OPENGREP.contains(&marker) {
                 continue;
             }
-            if lower.contains(marker) {
-                defects.push(format!(
-                    "{}:{}: `{marker}`",
-                    path.display(),
-                    index.saturating_add(1)
+            if let Some(found) = lower.find(marker) {
+                defects.push(Finding::at(
+                    path,
+                    line_number,
+                    offset.saturating_add(found).saturating_add(1),
+                    "check-comments/narration",
+                    format!("`{marker}`"),
                 ));
             }
         }
         if comments_only && has_ticket_reference(&lower) {
-            defects.push(format!(
-                "{}:{}: ticket reference",
-                path.display(),
-                index.saturating_add(1)
+            defects.push(Finding::at(
+                path,
+                line_number,
+                offset.saturating_add(1),
+                "check-comments/ticket-reference",
+                "ticket reference".to_string(),
             ));
         }
     }
     defects
 }
 
-fn rule_defects(path: &Path, text: &str) -> Vec<String> {
+fn rule_defects(path: &Path, text: &str) -> Vec<Finding> {
     let mut defects = Vec::new();
     let has_paths = text.starts_with("---\n") && text.contains("\npaths:");
     if !has_paths {
-        defects.push(format!("{}: missing `paths` frontmatter", path.display()));
+        defects.push(Finding::at(
+            path,
+            1,
+            1,
+            "check-rules/frontmatter",
+            "missing `paths` frontmatter".to_string(),
+        ));
     }
     let lines = text.lines().count();
     if lines > RULE_MAX_LINES {
-        defects.push(format!(
-            "{}: {lines} lines; limit is {RULE_MAX_LINES}",
-            path.display()
+        defects.push(Finding::at(
+            path,
+            RULE_MAX_LINES.saturating_add(1),
+            1,
+            "check-rules/length",
+            format!("{lines} lines; limit is {RULE_MAX_LINES}"),
         ));
     }
     defects
@@ -483,9 +573,27 @@ fn finish_with_note(name: &str, examined: usize, note: &str, defects: &[String])
     1
 }
 
+/// Writes a file-and-line check's findings to `target/sarif/xtask-<name>.sarif`, one
+/// category per check, then reports them as `finish_with_note` does.
+fn finish_findings(
+    name: &str,
+    rules: &[Rule<'_>],
+    examined: usize,
+    note: &str,
+    findings: &[Finding],
+) -> i32 {
+    let document = sarif::document("xtask", &format!("xtask-{name}"), rules, findings);
+    if let Err(reason) = sarif::write(&format!("xtask-{name}"), &document) {
+        eprintln!("xtask {name}: {reason}");
+        return 1;
+    }
+    let defects: Vec<String> = findings.iter().map(ToString::to_string).collect();
+    finish_with_note(name, examined, note, &defects)
+}
+
 fn check_names() -> i32 {
     let files = walk(&SOURCE_DIRS, "rs");
-    let defects: Vec<String> = files
+    let defects: Vec<Finding> = files
         .iter()
         .filter_map(|p| {
             fs::read_to_string(p)
@@ -494,7 +602,7 @@ fn check_names() -> i32 {
         })
         .flatten()
         .collect();
-    finish("check-names", files.len(), &defects)
+    finish_findings("check-names", &NAMES_RULES, files.len(), "", &defects)
 }
 
 fn check_comments() -> i32 {
@@ -511,21 +619,23 @@ fn check_comments() -> i32 {
             defects.extend(narration_defects(path, &text, false));
         }
     }
-    finish(
+    finish_findings(
         "check-comments",
+        &COMMENTS_RULES,
         sources.len().saturating_add(docs.len()),
+        "",
         &defects,
     )
 }
 
 fn check_rules() -> i32 {
     let files = walk(&[RULES_DIR], "md");
-    let defects: Vec<String> = files
+    let defects: Vec<Finding> = files
         .iter()
         .filter_map(|p| fs::read_to_string(p).ok().map(|t| rule_defects(p, &t)))
         .flatten()
         .collect();
-    finish("check-rules", files.len(), &defects)
+    finish_findings("check-rules", &RULES_RULES, files.len(), "", &defects)
 }
 
 fn capture(program: &str, args: &[&str]) -> Option<Output> {
@@ -622,6 +732,8 @@ fn main() {
         Some("check-pr-title") => check_pr_title(args.get(1).cloned().or_else(pr_title_from_event)),
         Some("ci") => ci(),
         Some("opengrep") => opengrep::opengrep(),
+        Some("workflows") => workflows::workflows(),
+        Some("sarif-upload") => code_scanning::sarif_upload(),
         Some("check-names") => check_names(),
         Some("check-comments") => check_comments(),
         Some("check-rules") => check_rules(),
@@ -703,7 +815,9 @@ mod tests {
         let text = "let tmp = 1;\n#[cfg(test)]\nif cfg!(unix) {}\nlet s = \"tmp ctx\";\n";
         let defects = abbreviation_defects(Path::new("a.rs"), text);
         assert_eq!(defects.len(), 1);
-        assert!(defects.first().is_some_and(|d| d.contains("`tmp`")));
+        assert!(defects.first().is_some_and(
+            |d| d.to_string() == "a.rs:1:5: check-names/abbreviation: identifier `tmp`"
+        ));
     }
 
     #[test]
@@ -740,7 +854,7 @@ mod tests {
         assert_eq!(defects.len(), 1, "{defects:?}");
         assert!(defects
             .first()
-            .is_some_and(|defect| defect.contains("a.rs:1:")));
+            .is_some_and(|defect| defect.to_string().starts_with("a.rs:1:16:")));
     }
 
     #[test]
