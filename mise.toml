@@ -26,3 +26,11 @@ run = "lefthook install"
 [tasks.kill-tests]
 description = "Kill the restate server, the endpoint and the watchdog in turn and watch each return (macOS)"
 run = "cargo test -p tycho --test kill -- --ignored --test-threads=1 --nocapture"
+
+[tasks.graph-plugin]
+description = "Install the entire semantic graph plugin at the pinned version"
+run = "entire plugin install graph --pin v0.4.0 --yes"
+
+[tasks.graph-tests]
+description = "Build, rebuild and query the semantic graph index of a copy of this repository and record the index build time"
+run = "cargo test -p tycho --test graph -- --ignored --test-threads=1 --nocapture"

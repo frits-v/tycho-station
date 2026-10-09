@@ -16,11 +16,16 @@ use tycho::launchd::Agent;
 use tycho::watchdog::{self, LoopEnd, Supervisor};
 use tycho::{core, endpoint};
 
+mod graph;
+
 const USAGE: &str = "usage: tycho <command>
   endpoint                    serve the Restate services on the loopback port
   core start|stop|status      the restate-server and endpoint zmx sessions
   watchdog once|run           probe both sessions and restart what is missing
-  watchdog install|uninstall  the launchd user agent that runs `watchdog run`";
+  watchdog install|uninstall  the launchd user agent that runs `watchdog run`
+  graph build <checkout>      build the semantic graph index of a checkout
+  graph query <checkout> definitions|callers <symbol>
+  graph query <checkout> impact <path>   entities changed under the path since HEAD~1";
 
 fn main() {
     let arguments: Vec<String> = env::args().skip(1).collect();
@@ -56,6 +61,10 @@ fn main() {
                 .and_then(|agent| agent.uninstall())
                 .map_err(|error| error.to_string()),
         ),
+        ["graph", "build", checkout] => report_result(graph::build(checkout)),
+        ["graph", "query", checkout, kind, argument] => {
+            report_result(graph::query(checkout, kind, argument))
+        }
         _ => {
             eprintln!("{USAGE}");
             2

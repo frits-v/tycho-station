@@ -53,6 +53,17 @@ pub const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 pub const WATCHDOG_ITERATIONS_MAX: u32 = 120;
 pub const LIST_SESSIONS_MAX: usize = 256;
 
+pub const ENTIRE_GRAPH_ENV: &str = "TYCHO_ENTIRE_GRAPH";
+pub const GRAPH_INDEX_DIR: &str = "graph";
+/// The graph plugin version the adapter accepts; its command names changed between releases.
+pub const ENTIRE_GRAPH_PINNED_VERSION: &str = "v0.4.0";
+/// A cold build of a 1,573-file repository took 42 seconds when the plugin was probed.
+pub const GRAPH_BUILD_TIMEOUT: Duration = Duration::from_secs(900);
+/// Covers a query that finds no cached index and builds one first.
+pub const GRAPH_QUERY_TIMEOUT: Duration = Duration::from_secs(300);
+pub const GRAPH_DIFF_BUDGET_SECONDS: u64 = 120;
+pub const GRAPH_OUTPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
+
 /// Core session names are `core.<role>`, used only in the core socket directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreRole {
@@ -158,11 +169,7 @@ impl CoreConfig {
     /// The home is `.tycho` under the current uid's home from the user database, or
     /// `TYCHO_HOME` when that names a directory under it; tools come from `mise which`.
     pub fn from_environment() -> Result<Self, ConfigError> {
-        let user_home = user_home()?;
-        let home = match env::var_os(HOME_ENV) {
-            Some(home) => checked_home_override(&user_home, PathBuf::from(home))?,
-            None => user_home.join(HOME_DEFAULT_DIR),
-        };
+        let home = core_home()?;
         let zmx = tool_path(ZMX_ENV, "zmx")?;
         let restate_server = tool_path(RESTATE_SERVER_ENV, "restate-server")?;
         let tycho = env::current_exe().map_err(ConfigError::CurrentExe)?;
@@ -260,6 +267,32 @@ impl CoreConfig {
             ),
         }
     }
+}
+
+/// `.tycho` under the current uid's home, or `TYCHO_HOME` when that names a directory under it.
+pub fn core_home() -> Result<PathBuf, ConfigError> {
+    let user_home = user_home()?;
+    let Some(home) = env::var_os(HOME_ENV) else {
+        return Ok(user_home.join(HOME_DEFAULT_DIR));
+    };
+    checked_home_override(&user_home, PathBuf::from(home))
+}
+
+/// Where entire installs the graph plugin, in the precedence its `plugin --help` lists;
+/// `TYCHO_ENTIRE_GRAPH` names the binary directly. Existence is the version gate's question.
+pub fn entire_graph_path() -> Result<PathBuf, ConfigError> {
+    if let Some(path) = env::var_os(ENTIRE_GRAPH_ENV) {
+        return Ok(PathBuf::from(path));
+    }
+    let plugin_dir = match (
+        env::var_os("ENTIRE_PLUGIN_DIR"),
+        env::var_os("XDG_DATA_HOME"),
+    ) {
+        (Some(dir), _) => PathBuf::from(dir),
+        (None, Some(data_home)) => PathBuf::from(data_home).join("entire/plugins"),
+        (None, None) => user_home()?.join(".local/share/entire/plugins"),
+    };
+    Ok(plugin_dir.join("bin/entire-graph"))
 }
 
 fn user_home() -> Result<PathBuf, ConfigError> {

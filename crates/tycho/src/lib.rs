@@ -4,10 +4,12 @@
     reason = "each error type is an enumerated state; its variants are the documentation"
 )]
 
+pub mod code_graph;
 pub mod command;
 pub mod config;
 pub mod core;
 pub mod endpoint;
+pub mod entire_graph;
 pub mod health;
 pub mod http;
 pub mod launchd;

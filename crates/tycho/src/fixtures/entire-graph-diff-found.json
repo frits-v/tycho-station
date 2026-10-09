@@ -1,0 +1,149 @@
+{
+  "base": "HEAD~3",
+  "head": "HEAD",
+  "files": [
+    {
+      "path": "crates/tycho/src/command.rs",
+      "status": "A",
+      "language": "Rust",
+      "changes": [
+        {
+          "type": "added",
+          "kind": "enum",
+          "name": "CommandError",
+          "new_signature": "pub enum CommandError",
+          "after_start_line": 14,
+          "dependents_count": 11
+        },
+        {
+          "type": "added",
+          "kind": "method",
+          "name": "CommandError.fmt",
+          "new_signature": "fn fmt(\u0026self, formatter: \u0026mut fmt::Formatter\u003c'_\u003e) -\u003e fmt::Result",
+          "after_start_line": 24,
+          "dependents_count": 2
+        },
+        {
+          "type": "added",
+          "kind": "struct",
+          "name": "Captured",
+          "new_signature": "pub struct Captured",
+          "after_start_line": 48,
+          "dependents_count": 2
+        },
+        {
+          "type": "added",
+          "kind": "field",
+          "name": "Captured.status",
+          "new_signature": "status ExitStatus",
+          "after_start_line": 49,
+          "dependents_count": 39
+        },
+        {
+          "type": "added",
+          "kind": "field",
+          "name": "Captured.stdout",
+          "new_signature": "stdout String",
+          "after_start_line": 50,
+          "dependents_count": 13
+        },
+        {
+          "type": "added",
+          "kind": "field",
+          "name": "Captured.stderr",
+          "new_signature": "stderr String",
+          "after_start_line": 51,
+          "dependents_count": 10
+        },
+        {
+          "type": "added",
+          "kind": "function",
+          "name": "run_captured",
+          "new_signature": "pub fn run_captured( program: \u0026Path, arguments: \u0026[\u0026str], environment: \u0026[(\u0026str, \u0026str)], timeout: Duration, ) -\u003e Result\u003cCaptured, CommandError\u003e",
+          "after_start_line": 55,
+          "dependents_count": 8
+        },
+        {
+          "type": "added",
+          "kind": "function",
+          "name": "run_status",
+          "new_signature": "pub fn run_status( program: \u0026Path, arguments: \u0026[\u0026str], environment: \u0026[(\u0026str, \u0026str)], timeout: Duration, ) -\u003e Result\u003cCaptured, CommandError\u003e",
+          "after_start_line": 73,
+          "dependents_count": 4
+        },
+        {
+          "type": "added",
+          "kind": "function",
+          "name": "run_detached",
+          "new_signature": "pub fn run_detached( program: \u0026Path, arguments: \u0026[\u0026str], environment: \u0026[(\u0026str, \u0026str)], timeout: Duration, ) -\u003e Result\u003cExitStatus, CommandError\u003e",
+          "after_start_line": 103,
+          "dependents_count": 1
+        },
+        {
+          "type": "added",
+          "kind": "function",
+          "name": "wait_bounded",
+          "new_signature": "fn wait_bounded( child: \u0026mut Child, name: \u0026str, timeout: Duration, ) -\u003e Result\u003cExitStatus, CommandError\u003e",
+          "after_start_line": 121,
+          "dependents_count": 2
+        },
+        {
+          "type": "added",
+          "kind": "block",
+          "name": "receiver",
+          "new_signature": "{ let (sender, receiver) = mpsc::sync_channel(1); thread::spawn(move || { let mut bytes = Vec::new(); let limit = u64::try_from(COMMAND_OUTPUT_MAX_BYTES).unwrap_or(u64::MAX); let read = source .take(limit.saturating_add(1)) .read_to_end(\u0026mut bytes) .map(|_| bytes); // The receiver is gone when the caller gave up at its deadline. drop(sender.send(read)); }); receiver }",
+          "after_start_line": 142,
+          "dependents_count": 1
+        },
+        {
+          "type": "added",
+          "kind": "function",
+          "name": "bounded_reader",
+          "new_signature": "fn bounded_reader(source: impl Read + Send + 'static) -\u003e Reader",
+          "after_start_line": 142,
+          "dependents_count": 2
+        },
+        {
+          "type": "added",
+          "kind": "function",
+          "name": "collect",
+          "new_signature": "fn collect( reader: Option\u003cReader\u003e, name: \u0026str, deadline: Instant, timeout: Duration, ) -\u003e Result\u003cString, CommandError\u003e",
+          "after_start_line": 157,
+          "dependents_count": 14
+        },
+        {
+          "type": "added",
+          "kind": "function",
+          "name": "captures_stdout",
+          "new_signature": "fn captures_stdout()",
+          "after_start_line": 189,
+          "dependents_count": 0
+        },
+        {
+          "type": "added",
+          "kind": "function",
+          "name": "times_out_a_slow_program",
+          "new_signature": "fn times_out_a_slow_program()",
+          "after_start_line": 201,
+          "dependents_count": 0
+        },
+        {
+          "type": "added",
+          "kind": "function",
+          "name": "a_grandchild_holding_stdout_times_out",
+          "new_signature": "fn a_grandchild_holding_stdout_times_out()",
+          "after_start_line": 212,
+          "dependents_count": 0
+        },
+        {
+          "type": "added",
+          "kind": "function",
+          "name": "rejects_output_over_the_cap",
+          "new_signature": "fn rejects_output_over_the_cap()",
+          "after_start_line": 225,
+          "dependents_count": 0
+        }
+      ]
+    }
+  ]
+}
