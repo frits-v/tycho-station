@@ -9,7 +9,7 @@ use std::time::Duration;
 use restate_sdk::context::DurableFuture;
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
-use tycho_types::envelope::{Outcome, ResultPayload, ShortText, Usage};
+use tycho_types::envelope::{Envelope, Outcome, Payload, ResultPayload, ShortText, Usage};
 use tycho_types::exit::{Disposition, ExitState};
 use tycho_types::rejection::{decode_rejection, Question};
 use tycho_types::service::{Attempt, EpicId, TaskId, WorkUnitId, RECONCILER_KEY};
@@ -393,7 +393,7 @@ fn model_for(
 }
 
 enum Wake {
-    Result(Result<Json<ResultPayload>, TerminalError>),
+    Result(Result<Json<serde_json::Value>, TerminalError>),
     Timer,
 }
 
@@ -658,7 +658,7 @@ impl WorkerRun {
             })
             .name("session secret")
             .await?;
-        let (awaitable_id, awaitable) = workflow_context.awakeable::<Json<ResultPayload>>();
+        let (awaitable_id, awaitable) = workflow_context.awakeable::<Json<serde_json::Value>>();
         let spawn = SpawnRequest {
             argv,
             awaitable_id: tycho_types::launcher::AwaitableId::parse(&awaitable_id)
@@ -769,7 +769,10 @@ impl WorkerRun {
             if let Wake::Result(completion) = woke {
                 forget(workflow_context, session);
                 return Ok(match completion {
-                    Ok(result) => completed(result.into_inner()),
+                    Ok(value) => result_from_envelope(&value.into_inner(), session).map_or_else(
+                        |_| AttemptEnd::exit(ExitState::from_wire(RAW_RESULT_INVALID), true),
+                        completed,
+                    ),
                     Err(rejected) => rejection(rejected.message()),
                 });
             }
@@ -852,6 +855,27 @@ fn rejection(message: &str) -> AttemptEnd {
     AttemptEnd {
         question,
         ..AttemptEnd::exit(exit, true)
+    }
+}
+
+/// Wire text of the state a resolved awaitable takes when its value is not this attempt's
+/// result envelope; it decodes as unrecognised and blocks in the inbox.
+pub const RAW_RESULT_INVALID: &str = "result_envelope_invalid";
+
+/// The launcher resolves with the result envelope; only a result from this attempt's
+/// session counts.
+pub fn result_from_envelope(
+    value: &serde_json::Value,
+    session: &SessionName,
+) -> Result<ResultPayload, String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    let envelope = Envelope::parse(&bytes).map_err(|error| error.to_string())?;
+    if envelope.from != *session {
+        return Err(format!("envelope from {} not {session}", envelope.from));
+    }
+    match envelope.payload {
+        Payload::Result(result) => Ok(result),
+        _ => Err("envelope payload is not a result".to_string()),
     }
 }
 
@@ -975,6 +999,21 @@ mod tests {
 
     const T1: u64 = 300_000;
     const T2: u64 = 900_000;
+
+    #[test]
+    fn only_a_result_envelope_from_the_attempts_session_resolves() {
+        let session = SessionName::parse(crate::exit_decode::tests::SESSION).unwrap();
+        let envelope = crate::exit_decode::tests::envelope(crate::exit_decode::tests::SESSION);
+        let result = result_from_envelope(&envelope, &session).unwrap();
+        assert_eq!(result.outcome, Outcome::Done);
+        let other = SessionName::parse("cf7a.wu03.wrk.claude.b2c4").unwrap();
+        assert!(result_from_envelope(&envelope, &other).is_err());
+        assert!(result_from_envelope(&envelope["payload"], &session).is_err());
+        assert_eq!(
+            ExitState::from_wire(RAW_RESULT_INVALID).disposition(),
+            Disposition::Inbox
+        );
+    }
 
     #[test]
     fn evidence_is_attached_only_to_a_completed_outcome() {

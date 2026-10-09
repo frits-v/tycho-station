@@ -598,7 +598,7 @@ fn a_worker_over_its_turn_cap_returns_as_too_large() {
     assert_eq!(unit["index"][0]["kind"], "build", "{unit}");
     let secret = read_secret_file(&core.config.operator_secret_file()).unwrap();
     let rule = format!(
-        r#"{{"secret":"{}","unit":"{UNIT}","rule":{{"attempt":1,"ruling":{{"verdict":"abandon","reason":"re-plan smaller"}}}}}}"#,
+        r#"{{"secret":"{}","unit":"{UNIT}","rule":{{"epic":"cf7a","attempt":1,"ruling":{{"verdict":"abandon","reason":"re-plan smaller"}}}}}}"#,
         secret.expose()
     );
     let (ruled, body) = post(&format!("/Operator/{}", handler::OPERATOR_RULE_UNIT), &rule);

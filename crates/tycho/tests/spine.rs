@@ -457,9 +457,10 @@ fn session_and_reconciler_refuse_agents_outside_their_scope() {
 const HEAD_SHA: &str = "1111111111111111111111111111111111111111";
 const DEFAULT_SHA: &str = "2222222222222222222222222222222222222222";
 
-fn result_json(branch: &str) -> String {
+/// The result envelope a launcher resolves with, from the worker session to its control session.
+fn result_json(session: &str, branch: &str) -> String {
     format!(
-        r#"{{"outcome":"done","branch":"{branch}","head_sha":"{HEAD_SHA}","criteria":[],"usage":{{"input_tokens":1200,"output_tokens":300,"cost_micro_dollars":42000}}}}"#
+        r#"{{"schema_version":1,"id":"01J9Z3K7Q8R2W5X6Y7Z8A9B0C1","type":"result","work_unit_id":"wu01","from":"{session}","to":"cf7a.wu01.ctl.codex","causation_id":null,"correlation_id":"cf7a","created_at_unix_ms":1,"expires_at_unix_ms":null,"payload":{{"outcome":"done","branch":"{branch}","head_sha":"{HEAD_SHA}","criteria":[],"usage":{{"input_tokens":1200,"output_tokens":300,"cost_micro_dollars":42000}}}}}}"#
     )
 }
 
@@ -483,7 +484,7 @@ fn launcher_double(launcher: Launcher) -> RecordingSpawner {
         match launcher {
             Launcher::Resolve(suffix, delay) if session.ends_with(suffix) => {
                 let branch = format!("wu01/{}", session.rsplit('.').next().unwrap_or("x"));
-                answer(awaitable, delay, "resolve", result_json(&branch));
+                answer(awaitable, delay, "resolve", result_json(&session, &branch));
             }
             Launcher::Reject(state, delay) => {
                 answer(awaitable, delay, "reject", state.to_string());
@@ -949,7 +950,7 @@ fn escalating_double() -> RecordingSpawner {
             answer(awaitable, delay, "reject", rejection.clone());
         } else {
             let branch = format!("wu01/{}", session.rsplit('.').next().unwrap_or("x"));
-            answer(awaitable, delay, "resolve", result_json(&branch));
+            answer(awaitable, delay, "resolve", result_json(&session, &branch));
         }
     }))
 }
