@@ -112,7 +112,7 @@ fn wait_for_heartbeat(name: &str) {
 }
 
 /// Polls until the unit reaches a terminal lifecycle; on the deadline, reports what is retrying.
-fn await_unit_end(why: &str) -> serde_json::Value {
+fn await_unit_end(why: &str, before: &(String, u64)) -> serde_json::Value {
     let started = Instant::now();
     while started.elapsed() < WAIT_TIMEOUT {
         let view = unit_status();
@@ -125,6 +125,7 @@ fn await_unit_end(why: &str) -> serde_json::Value {
             return view;
         }
         if let Some(looping) = looping_invocation() {
+            print_failed_pair(before, &view);
             panic!("{why}: an invocation of the unit is looping; view {view}; {looping}");
         }
         thread::sleep(Duration::from_millis(500));
@@ -134,9 +135,15 @@ fn await_unit_end(why: &str) -> serde_json::Value {
         println!("evidence: still retrying: {line}");
     }
     let view = unit_status();
+    print_failed_pair(before, &view);
     panic!(
         "{why}: the unit did not end within {WAIT_TIMEOUT:?}; view {view}; retrying {retrying:?}"
     );
+}
+
+fn print_failed_pair(before: &(String, u64), view: &serde_json::Value) {
+    let after = lifecycle_and_attempt(view);
+    println!("evidence: lifecycle before the kill {before:?}, at failure {after:?}");
 }
 
 /// An invocation Restate has retried this often will not end on its own; the case fails now.
@@ -149,9 +156,10 @@ fn looping_invocation() -> Option<String> {
         .map(|(_, line)| line)
 }
 
-/// The unit ended done in the attempt it ran before the kill, and the attach agrees.
-fn assert_completed(invocation: &str, before: &(String, u64), why: &str) {
-    let view = await_unit_end(why);
+/// No duplicate session so far, then the unit ended done in the attempt it ran before the kill.
+fn assert_completed(rig: &Rig, invocation: &str, before: &(String, u64), why: &str) {
+    sessions_per_attempt(&rig.spawner);
+    let view = await_unit_end(why, before);
     let (status, body) = attach(invocation);
     assert_eq!(status, 200, "{body}");
     let after = lifecycle_and_attempt(&view);
@@ -317,7 +325,7 @@ fn terminal_app_killed_leaves_the_session_core_and_unit_running() {
         lease_heartbeat(&rig.spawner, &name) > killed_at
     });
     assert_eq!(session_status(&name)["phase"], "running");
-    assert_completed(&invocation, &before, "terminal app killed");
+    assert_completed(&rig, &invocation, &before, "terminal app killed");
     assert_eq!(rig.spawner.spawned_names(), std::slice::from_ref(&name));
     sessions_per_attempt(&rig.spawner);
     wait_until("the session ended itself", || {
@@ -367,7 +375,12 @@ fn restate_killed_between_worker_exit_and_resolve_resolves_on_the_same_attempt()
     wait_until("the spooled result acknowledged after the restart", || {
         files.spool.with_extension(ACKNOWLEDGED_SUFFIX).exists()
     });
-    assert_completed(&invocation, &before, "restate killed before the resolve");
+    assert_completed(
+        &rig,
+        &invocation,
+        &before,
+        "restate killed before the resolve",
+    );
     let run = worker_run_status("wu01-t1");
     println!("evidence: worker run {run}");
     assert_eq!(run["outcome"]["attempt"], 1, "the same attempt");
@@ -452,7 +465,12 @@ fn launcher_killed_before_its_trap_requeues_as_attempt_two() {
     let orphan = running_vendor(&rig.spawner.files(&first));
     println!("evidence: attempt 1 vendor after the reap by name: {orphan:?}");
     assert_eq!(session_status(&first)["phase"], "lost");
-    assert_completed(&invocation, &before, "launcher killed before its trap");
+    assert_completed(
+        &rig,
+        &invocation,
+        &before,
+        "launcher killed before its trap",
+    );
     let run = worker_run_status("wu01-t1");
     println!("evidence: worker run {run}");
     assert_eq!(run["outcome"]["attempt"], 2);
