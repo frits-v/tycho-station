@@ -460,17 +460,17 @@ fn run_bounded(mut command: Command) -> Capture {
         Err(error) => return Capture::Unreachable(format!("failed to start {program}: {error}")),
     };
     let pid = child.id();
-    let stdout_rx = spawn_reader(child.stdout.take());
-    let stderr_rx = spawn_reader(child.stderr.take());
-    let (wait_sender, wait_rx) = mpsc::channel();
+    let stdout_receiver = spawn_reader(child.stdout.take());
+    let stderr_receiver = spawn_reader(child.stderr.take());
+    let (wait_sender, wait_receiver) = mpsc::channel();
     thread::spawn(move || drop(wait_sender.send(child.wait())));
 
     let deadline = Instant::now()
         .checked_add(PROBE_TIMEOUT)
         .unwrap_or_else(Instant::now);
-    let stdout = recv_by(&stdout_rx, deadline);
-    let stderr = recv_by(&stderr_rx, deadline);
-    let status = recv_by(&wait_rx, deadline);
+    let stdout = recv_by(&stdout_receiver, deadline);
+    let stderr = recv_by(&stderr_receiver, deadline);
+    let status = recv_by(&wait_receiver, deadline);
     let (
         Some((stdout_bytes, stdout_overflow)),
         Some((stderr_bytes, stderr_overflow)),
