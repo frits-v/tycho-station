@@ -1,0 +1,15 @@
+//! The contract shared by the launcher, the Restate services, the vendor
+//! adapters and the xtask: service keys, session names, the lease file, the
+//! launcher's environment, and the message envelope with its decoder states.
+#![allow(
+    clippy::missing_errors_doc,
+    reason = "each error type is an enumerated decoder; its variants are the documentation"
+)]
+
+pub mod envelope;
+pub mod exit;
+pub mod launcher;
+pub mod lease;
+pub mod service;
+pub mod session;
+pub mod token;

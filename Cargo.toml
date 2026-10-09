@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["xtask"]
+members = ["crates/tycho-types", "xtask"]
 
 [workspace.package]
 edition = "2021"
