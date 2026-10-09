@@ -51,14 +51,7 @@ fn main() {
     let words: Vec<&str> = arguments.iter().map(String::as_str).collect();
     let code = match words.as_slice() {
         ["endpoint"] => serve_endpoint(),
-        ["core", "start"] => with_config(|config, supervisor| {
-            if let Err(error) = factory_config(Some(&config.home)) {
-                eprintln!("tycho: refusing to start: {error}");
-                return 2;
-            }
-            let report = core::start(supervisor, config);
-            finish(&report, report.succeeded(), config)
-        }),
+        ["core", "start"] => with_config(start_core),
         ["core", "stop"] => with_config(|config, supervisor| {
             let report = core::stop(supervisor);
             finish(&report, report.succeeded(), config)
@@ -225,6 +218,15 @@ fn serve_endpoint() -> i32 {
             1
         }
     }
+}
+
+fn start_core(config: &CoreConfig, supervisor: &Supervisor) -> i32 {
+    if let Err(error) = factory_config(Some(&config.home)) {
+        eprintln!("tycho: refusing to start: {error}");
+        return 2;
+    }
+    let report = core::start(supervisor, config);
+    finish(&report, report.succeeded(), config)
 }
 
 fn with_config(action: impl FnOnce(&CoreConfig, &Supervisor) -> i32) -> i32 {
