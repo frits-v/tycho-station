@@ -1480,7 +1480,7 @@ mod tests {
                     .unwrap(),
             ),
         };
-        let claude = ClaudeControl::new("/c".into(), "/h".into());
+        let claude = ClaudeControl::new("/c".into(), "/h".into(), 501);
         let refused = check_plan(&request, &NoVendor).unwrap_err();
         assert!(refused.contains("no vendor"), "{refused}");
         assert!(

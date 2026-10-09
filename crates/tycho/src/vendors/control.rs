@@ -132,6 +132,10 @@ pub enum Delivery {
     RelayFailed {
         reason: String,
     },
+    /// The socket's path, owner or listener failed a check; nothing was written.
+    Untrusted {
+        reason: String,
+    },
     Unrecognised {
         reason: String,
     },
@@ -154,6 +158,7 @@ impl Delivery {
             | Self::Denied { .. }
             | Self::WriteFailed { .. }
             | Self::RelayFailed { .. }
+            | Self::Untrusted { .. }
             | Self::Unrecognised { .. } => false,
         }
     }
@@ -312,6 +317,9 @@ mod tests {
                 reason: "broken pipe".to_string(),
             },
             Delivery::RelayFailed {
+                reason: "r".to_string(),
+            },
+            Delivery::Untrusted {
                 reason: "r".to_string(),
             },
             Delivery::Unrecognised {

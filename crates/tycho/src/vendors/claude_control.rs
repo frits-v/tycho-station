@@ -5,13 +5,15 @@
 //! session has a new one. An instruction is one JSON line on that socket; the vendor never
 //! answers on it, so delivery is confirmed only by observing the session.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use nix::errno::Errno;
+use nix::fcntl::OFlag;
 use nix::sys::signal;
 use nix::unistd::Pid;
 use serde::Deserialize;
@@ -21,7 +23,7 @@ use tycho_types::lease::PID_MAX;
 use tycho_types::session::{SessionName, Vendor};
 use tycho_types::task_packet::Effort;
 
-use crate::agent_files::read_checked;
+use crate::agent_files::{current_uid, read_checked};
 use crate::config::AgentDirs;
 use crate::launch_spec::VendorTerminal;
 use crate::relay::{remove_relay_dir, write_instruction};
@@ -36,6 +38,11 @@ pub const INSTRUCTION_MAX_BYTES: usize = TEXT_MAX_BYTES;
 pub const AUTO_COMPACT_WINDOW_MAX: u64 = 1_000_000;
 pub const REGISTRY_FILES_MAX: usize = 1024;
 pub const REGISTRY_FILE_MAX_BYTES: usize = 16 * 1024;
+/// The shared inbox socket directory; the vendor defines it and the fallbacks, not the adapter.
+pub const SOCKETS_DIR: &str = "/tmp/cc-socks";
+/// The vendor's socket directory under `$XDG_RUNTIME_DIR` when that is set.
+pub const SOCKETS_DIR_NAME: &str = "cc-socks";
+pub const XDG_RUNTIME_DIR_ENV: &str = "XDG_RUNTIME_DIR";
 pub const REPLY_MAX_BYTES: usize = 4096;
 /// The transcript window read for the last turn's usage.
 pub const TRANSCRIPT_TAIL_MAX_BYTES: u64 = 512 * 1024;
@@ -59,6 +66,10 @@ pub struct ClaudeControl {
     pub config_dir: PathBuf,
     pub relay_dirs: Option<AgentDirs>,
     pub relay_mode: RelayMode,
+    /// Where the vendor may bind inbox sockets; a registry path elsewhere is refused.
+    pub sockets_dirs: Vec<PathBuf>,
+    /// The uid that must own the inbox socket and the transcript.
+    pub agent_uid: u32,
 }
 
 /// One registry file; only pid and session id are required, as other versions share the files.
@@ -72,6 +83,45 @@ pub struct RegistryEntry {
     pub status: Option<String>,
     pub waiting_for: Option<String>,
     pub messaging_socket_path: Option<String>,
+}
+
+/// The file type `symlink_metadata` or `fstat` reports, never through a link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    Socket,
+    Symlink,
+    Regular,
+    Directory,
+    Other,
+}
+
+/// The type and owner the socket and transcript checks read from a path's metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathFacts {
+    pub kind: PathKind,
+    pub uid: u32,
+}
+
+impl PathFacts {
+    #[must_use]
+    pub fn of(metadata: &fs::Metadata) -> Self {
+        let file_type = metadata.file_type();
+        let kind = if file_type.is_symlink() {
+            PathKind::Symlink
+        } else if file_type.is_socket() {
+            PathKind::Socket
+        } else if file_type.is_file() {
+            PathKind::Regular
+        } else if file_type.is_dir() {
+            PathKind::Directory
+        } else {
+            PathKind::Other
+        };
+        Self {
+            kind,
+            uid: metadata.uid(),
+        }
+    }
 }
 
 /// Where a session id stands in the registry.
@@ -332,14 +382,45 @@ pub fn post_on(channel: &mut impl Channel, label: String, line: &str) -> Deliver
     }
 }
 
-/// Connects and posts the line within the timeouts.
+/// The effective uid of the process that bound the connected socket.
+#[cfg(target_os = "macos")]
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    nix::unistd::getpeereid(stream)
+        .map(|(uid, _)| uid.as_raw())
+        .map_err(io::Error::from)
+}
+
+/// The effective uid of the process that bound the connected socket.
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+        .map(|credentials| credentials.uid())
+        .map_err(io::Error::from)
+}
+
+/// Connects, checks the listener runs as `listener_uid`, and posts the line within the timeouts.
 #[must_use]
-pub fn post(socket: &Path, line: &str) -> Delivery {
+pub fn post(socket: &Path, line: &str, listener_uid: u32) -> Delivery {
     let mut stream = match UnixStream::connect(socket) {
         Ok(stream) => stream,
         Err(error) => return connect_failure(socket, &error),
     };
     let label = socket.display().to_string();
+    match peer_uid(&stream) {
+        Ok(uid) if uid == listener_uid => {}
+        Ok(uid) => {
+            return Delivery::Untrusted {
+                reason: format!(
+                    "{label}: the listener runs as uid {uid}, expected uid {listener_uid}"
+                ),
+            }
+        }
+        Err(error) => {
+            return Delivery::Untrusted {
+                reason: bounded(&format!("{label}: peer credentials: {error}")),
+            }
+        }
+    }
     let timeouts = stream
         .set_write_timeout(Some(IO_TIMEOUT))
         .and_then(|()| stream.set_read_timeout(Some(IO_TIMEOUT)));
@@ -352,8 +433,144 @@ pub fn post(socket: &Path, line: &str) -> Delivery {
     post_on(&mut stream, label, line)
 }
 
-/// The socket of the vendor process `pid` from its registry file, for the launcher.
+/// The vendor's socket directories for `uid`: under `$XDG_RUNTIME_DIR`, shared, per-user.
+#[must_use]
+pub fn sockets_dirs(xdg_runtime_dir: Option<&Path>, uid: u32) -> Vec<PathBuf> {
+    xdg_runtime_dir
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(SOCKETS_DIR_NAME))
+        .into_iter()
+        .chain([
+            PathBuf::from(SOCKETS_DIR),
+            PathBuf::from(format!("{SOCKETS_DIR}-{uid}")),
+        ])
+        .collect()
+}
+
+/// `sockets_dirs` for this process's environment and `uid`.
+#[must_use]
+pub fn sockets_dirs_from_environment(uid: u32) -> Vec<PathBuf> {
+    let xdg = std::env::var_os(XDG_RUNTIME_DIR_ENV).map(PathBuf::from);
+    sockets_dirs(xdg.as_deref(), uid)
+}
+
+/// The registry's socket when it is absolute, without `..`, and `<dir>/<pid>.sock` in the set.
+pub fn socket_shape(raw: &str, pid: u32, sockets_dirs: &[PathBuf]) -> Result<PathBuf, String> {
+    let path = PathBuf::from(raw);
+    let shown = bounded(raw);
+    if !path.is_absolute() {
+        return Err(format!("socket {shown:?} is not absolute"));
+    }
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
+        return Err(format!("socket {shown:?} holds a parent component"));
+    }
+    if !path
+        .parent()
+        .is_some_and(|parent| sockets_dirs.iter().any(|dir| dir.as_path() == parent))
+    {
+        return Err(format!(
+            "socket {shown:?} is not in one of the vendor's socket directories"
+        ));
+    }
+    let expected = format!("{pid}.sock");
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected.as_str()) {
+        return Err(format!("socket {shown:?} is not named {expected}"));
+    }
+    Ok(path)
+}
+
+/// A socket, not a link or a regular file, owned by the agent user.
+pub fn check_socket_facts(facts: PathFacts, agent_uid: u32) -> Result<(), String> {
+    if facts.kind != PathKind::Socket {
+        return Err(format!("a {:?}, not a socket", facts.kind));
+    }
+    if facts.uid != agent_uid {
+        return Err(format!(
+            "owned by uid {}, expected uid {agent_uid}",
+            facts.uid
+        ));
+    }
+    Ok(())
+}
+
+/// Where a directory on a vendor path stands.
+#[derive(Debug)]
+pub enum DirState {
+    Real,
+    Missing,
+    /// Present but a link, not a directory, or another user's.
+    Refused(String),
+    Unreadable(io::Error),
+}
+
+/// Whether `dir` is a real directory of `agent_uid`, never through a link.
+#[must_use]
+pub fn real_dir(dir: &Path, agent_uid: u32) -> DirState {
+    let metadata = match fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return DirState::Missing,
+        Err(error) => return DirState::Unreadable(error),
+    };
+    let facts = PathFacts::of(&metadata);
+    if facts.kind == PathKind::Directory && facts.uid == agent_uid {
+        return DirState::Real;
+    }
+    DirState::Refused(bounded(&format!(
+        "{}: a {:?} of uid {}, expected a directory of uid {agent_uid}",
+        dir.display(),
+        facts.kind,
+        facts.uid
+    )))
+}
+
+/// A shaped socket's directory, type and owner; a stat error decodes as a connect error would.
+pub fn check_socket(path: &Path, agent_uid: u32) -> Result<(), Delivery> {
+    let parent = path.parent().unwrap_or(path);
+    match real_dir(parent, agent_uid) {
+        DirState::Real => {}
+        DirState::Missing => {
+            return Err(Delivery::NoSocket {
+                socket: path.display().to_string(),
+            })
+        }
+        DirState::Refused(reason) => return Err(Delivery::Untrusted { reason }),
+        DirState::Unreadable(error) => return Err(connect_failure(path, &error)),
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|error| connect_failure(path, &error))?;
+    check_socket_facts(PathFacts::of(&metadata), agent_uid).map_err(|reason| Delivery::Untrusted {
+        reason: bounded(&format!("{}: {reason}", path.display())),
+    })
+}
+
+/// The registry's socket once its shape, directory, type and owner pass.
+pub fn trusted_socket(
+    raw: &str,
+    pid: u32,
+    sockets_dirs: &[PathBuf],
+    agent_uid: u32,
+) -> Result<PathBuf, Delivery> {
+    let path =
+        socket_shape(raw, pid, sockets_dirs).map_err(|reason| Delivery::Untrusted { reason })?;
+    check_socket(&path, agent_uid)?;
+    Ok(path)
+}
+
+/// The launcher's checked socket for its vendor `pid`, against its own environment and uid.
 pub fn socket_of_pid(config_dir: &Path, pid: u32) -> Result<Option<PathBuf>, String> {
+    let uid = current_uid();
+    socket_in_registry(config_dir, pid, &sockets_dirs_from_environment(uid), uid)
+}
+
+/// The checked socket the registry file of `pid` names; a socket not bound yet is handed on.
+pub fn socket_in_registry(
+    config_dir: &Path,
+    pid: u32,
+    sockets_dirs: &[PathBuf],
+    agent_uid: u32,
+) -> Result<Option<PathBuf>, String> {
     let path = config_dir.join("sessions").join(format!("{pid}.json"));
     let bytes = read_checked(&path, REGISTRY_FILE_MAX_BYTES, None)
         .map_err(|error| bounded(&error.to_string()))?;
@@ -361,7 +578,65 @@ pub fn socket_of_pid(config_dir: &Path, pid: u32) -> Result<Option<PathBuf>, Str
         return Ok(None);
     };
     let entry = decode_registry(&bytes)?;
-    Ok(entry.messaging_socket_path.map(PathBuf::from))
+    if entry.pid != pid {
+        return Err(format!("{} names pid {}", path.display(), entry.pid));
+    }
+    let Some(raw) = entry.messaging_socket_path else {
+        return Ok(None);
+    };
+    let socket = socket_shape(&raw, pid, sockets_dirs)?;
+    match check_socket(&socket, agent_uid) {
+        // Not bound yet: the post finds no socket and marks the instruction failed.
+        Ok(()) | Err(Delivery::NoSocket { .. }) => Ok(Some(socket)),
+        Err(refusal) => Err(bounded(&format!("{refusal:?}"))),
+    }
+}
+
+fn unreadable_at(path: &Path, error: &io::Error) -> ContextReport {
+    ContextReport::Unreadable {
+        reason: bounded(&format!("{}: {error}", path.display())),
+    }
+}
+
+/// The transcript's last bytes from a regular file of `agent_uid`; missing is `None`.
+fn read_tail(path: &Path, agent_uid: u32) -> Result<Option<String>, ContextReport> {
+    // O_NONBLOCK keeps a planted FIFO from blocking the open; the descriptor check refuses it.
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits())
+        .open(path);
+    let mut file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(Errno::ELOOP as i32) => {
+            return Err(ContextReport::Unrecognised {
+                reason: bounded(&format!("{}: a link, not a transcript", path.display())),
+            })
+        }
+        Err(error) => return Err(unreadable_at(path, &error)),
+    };
+    let metadata = file
+        .metadata()
+        .map_err(|error| unreadable_at(path, &error))?;
+    let facts = PathFacts::of(&metadata);
+    if facts.kind != PathKind::Regular || facts.uid != agent_uid {
+        return Err(ContextReport::Unrecognised {
+            reason: bounded(&format!(
+                "{}: a {:?} of uid {}, expected a regular file of uid {agent_uid}",
+                path.display(),
+                facts.kind,
+                facts.uid
+            )),
+        });
+    }
+    let start = metadata.len().saturating_sub(TRANSCRIPT_TAIL_MAX_BYTES);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| unreadable_at(path, &error))?;
+    let mut tail = Vec::new();
+    file.take(TRANSCRIPT_TAIL_MAX_BYTES)
+        .read_to_end(&mut tail)
+        .map_err(|error| unreadable_at(path, &error))?;
+    Ok(Some(String::from_utf8_lossy(&tail).into_owned()))
 }
 
 /// Whether a pid names a live process; another user's process counts as live.
@@ -375,14 +650,31 @@ fn alive(pid: u32) -> bool {
 }
 
 impl ClaudeControl {
+    /// The socket directories come from this process's environment for `agent_uid`.
     #[must_use]
-    pub const fn new(binary: PathBuf, config_dir: PathBuf) -> Self {
+    pub fn new(binary: PathBuf, config_dir: PathBuf, agent_uid: u32) -> Self {
         Self {
             binary,
             config_dir,
             relay_dirs: None,
             relay_mode: RelayMode::OnRefusal,
+            sockets_dirs: sockets_dirs_from_environment(agent_uid),
+            agent_uid,
         }
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn with_sockets_dirs(mut self, sockets_dirs: Vec<PathBuf>) -> Self {
+        self.sockets_dirs = sockets_dirs;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub const fn with_agent_uid(mut self, agent_uid: u32) -> Self {
+        self.agent_uid = agent_uid;
+        self
     }
 
     #[must_use]
@@ -464,30 +756,63 @@ impl ClaudeControl {
         Ok((entry.session_id == session.as_str() && alive(entry.pid)).then_some(entry))
     }
 
-    fn transcript_tail(&self, entry: &RegistryEntry) -> Result<Option<String>, String> {
+    /// The transcript path once `projects` and the project under it are real directories.
+    fn transcript_path(&self, entry: &RegistryEntry) -> Result<Option<PathBuf>, ContextReport> {
         let cwd = entry
             .cwd
             .as_deref()
-            .ok_or_else(|| "the registry entry names no working directory".to_string())?;
-        let path = self
-            .config_dir
-            .join("projects")
-            .join(project_slug(cwd))
-            .join(format!("{}.jsonl", entry.session_id));
-        let mut file = match fs::File::open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(bounded(&format!("{}: {error}", path.display()))),
+            .ok_or_else(|| ContextReport::Unreadable {
+                reason: "the registry entry names no working directory".to_string(),
+            })?;
+        let slug = project_slug(cwd);
+        if slug.is_empty() {
+            return Err(ContextReport::Unrecognised {
+                reason: "the registry entry's working directory is empty".to_string(),
+            });
+        }
+        let projects = self.config_dir.join("projects");
+        let project = projects.join(slug);
+        // The slug holds only alphanumerics and `-`, so it cannot leave the projects directory.
+        for dir in [&projects, &project] {
+            match real_dir(dir, self.agent_uid) {
+                DirState::Real => {}
+                DirState::Missing => return Ok(None),
+                DirState::Refused(reason) => return Err(ContextReport::Unrecognised { reason }),
+                DirState::Unreadable(error) => return Err(unreadable_at(dir, &error)),
+            }
+        }
+        Ok(Some(project.join(format!("{}.jsonl", entry.session_id))))
+    }
+
+    fn transcript_tail(&self, entry: &RegistryEntry) -> Result<Option<String>, ContextReport> {
+        self.transcript_path(entry)?
+            .map_or(Ok(None), |path| read_tail(&path, self.agent_uid))
+    }
+
+    /// Posts to the entry's checked socket; a socket refusing the core goes to the relay.
+    fn deliver(
+        &self,
+        target: &AddressTarget,
+        key: &ShortText,
+        entry: &RegistryEntry,
+        line: &str,
+    ) -> Delivery {
+        let Some(raw) = entry.messaging_socket_path.as_deref() else {
+            return Delivery::Unrecognised {
+                reason: "the registry entry names no inbox socket".to_string(),
+            };
         };
-        let length = file.metadata().map_err(|error| error.to_string())?.len();
-        let start = length.saturating_sub(TRANSCRIPT_TAIL_MAX_BYTES);
-        file.seek(SeekFrom::Start(start))
-            .map_err(|error| error.to_string())?;
-        let mut tail = Vec::new();
-        file.take(TRANSCRIPT_TAIL_MAX_BYTES)
-            .read_to_end(&mut tail)
-            .map_err(|error| error.to_string())?;
-        Ok(Some(String::from_utf8_lossy(&tail).into_owned()))
+        let delivery = match trusted_socket(raw, entry.pid, &self.sockets_dirs, self.agent_uid) {
+            // Between the check and the connect a socket can be swapped; the peer uid is checked
+            // before any byte, so what remains is a connect to a socket of the agent uid, or a
+            // foreign listener seeing a connection that closes with no payload.
+            Ok(socket) => post(&socket, line, self.agent_uid),
+            Err(refusal) => refusal,
+        };
+        match delivery {
+            Delivery::Denied { .. } => self.relay(target, key, line),
+            delivery => delivery,
+        }
     }
 }
 
@@ -542,15 +867,7 @@ impl SessionVendor for ClaudeControl {
             return self.relay(target, key, &line);
         }
         match self.locate(&target.vendor_session) {
-            Located::Found(entry) => entry.messaging_socket_path.map_or_else(
-                || Delivery::Unrecognised {
-                    reason: "the registry entry names no inbox socket".to_string(),
-                },
-                |socket| match post(Path::new(&socket), &line) {
-                    Delivery::Denied { .. } => self.relay(target, key, &line),
-                    delivery => delivery,
-                },
-            ),
+            Located::Found(entry) => self.deliver(target, key, &entry, &line),
             Located::Denied(_) => self.relay(target, key, &line),
             Located::Absent => Delivery::NoSession,
             Located::Unreadable(reason) => Delivery::Unreadable { reason },
@@ -593,7 +910,7 @@ impl SessionVendor for ClaudeControl {
         match self.transcript_tail(&entry) {
             Ok(Some(tail)) => context_of(&tail),
             Ok(None) => ContextReport::NoTurnYet,
-            Err(reason) => ContextReport::Unreadable { reason },
+            Err(report) => report,
         }
     }
 

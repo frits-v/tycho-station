@@ -324,7 +324,7 @@ pub fn relay_once(
     let mut outcomes = Vec::new();
     for path in pending(dir)?.into_iter().take(RELAY_POSTS_PER_POLL_MAX) {
         let delivery = match read_instruction(&path, core_uid, session) {
-            Ok(line) => post(socket, &line),
+            Ok(line) => post(socket, &line, current_uid()),
             Err(reason) => Delivery::Unrecognised { reason },
         };
         let suffix = if delivery.written() {
