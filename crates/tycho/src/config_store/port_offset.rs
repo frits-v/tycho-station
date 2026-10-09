@@ -11,13 +11,13 @@ use sha2::{Digest, Sha256};
 pub const PORT_OFFSET_ENV: &str = "TYCHO_PORT_OFFSET";
 /// No two production ports differ by a multiple of the stride, so cores whose offsets differ
 /// by one never share a port; `config` tests it over the whole range.
-pub const PORT_OFFSET_STRIDE: u16 = 32;
+pub const PORT_OFFSET_STRIDE: u16 = 16;
 /// The lowest test offset, a multiple of the stride.
 pub const PORT_OFFSET_BASE: u16 = 1024;
-pub const PORT_OFFSET_SLOTS: u16 = 900;
-/// `PORT_OFFSET_BASE` plus 899 strides; the highest shifted port stays below 49152, where the
+pub const PORT_OFFSET_SLOTS: u16 = 1800;
+/// `PORT_OFFSET_BASE` plus 1799 strides; the highest shifted port stays below 49152, where the
 /// macOS ephemeral range starts.
-pub const PORT_OFFSET_MAX: u16 = 29_792;
+pub const PORT_OFFSET_MAX: u16 = 29_808;
 /// Five decimal digits hold every `u16`.
 pub const PORT_OFFSET_TEXT_MAX_BYTES: usize = 5;
 
@@ -201,15 +201,15 @@ mod tests {
             Ok(PORT_OFFSET_BASE)
         );
         assert_eq!(
-            PortOffset::parse("29792").map(PortOffset::get),
+            PortOffset::parse("29808").map(PortOffset::get),
             Ok(PORT_OFFSET_MAX)
         );
-        assert_eq!(PortOffset::parse("1056").map(PortOffset::get), Ok(1056));
+        assert_eq!(PortOffset::parse("1040").map(PortOffset::get), Ok(1040));
     }
 
     #[test]
     fn refuses_an_offset_that_leaves_the_range() {
-        for value in ["0", "992", "1023", "29793", "29824", "65535", "99999"] {
+        for value in ["0", "992", "1023", "29809", "29824", "65535", "99999"] {
             assert!(
                 matches!(
                     PortOffset::parse(value),
@@ -226,7 +226,7 @@ mod tests {
 
     #[test]
     fn refuses_an_offset_off_the_stride() {
-        for value in ["1025", "1055", "29791"] {
+        for value in ["1025", "1039", "29807"] {
             assert!(
                 matches!(PortOffset::parse(value), Err(PortOffsetError::OffStride(_))),
                 "{value}"
@@ -271,6 +271,6 @@ mod tests {
     fn shifting_the_highest_port_by_the_max_does_not_saturate() {
         let max = PortOffset::new(u32::from(PORT_OFFSET_MAX)).unwrap();
         assert!(u32::from(u16::MAX) > u32::from(19_081_u16) + u32::from(PORT_OFFSET_MAX));
-        assert_eq!(max.shift(19_081), 48_873);
+        assert_eq!(max.shift(19_081), 48_889);
     }
 }

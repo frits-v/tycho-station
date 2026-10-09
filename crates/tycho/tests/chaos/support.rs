@@ -73,11 +73,11 @@ impl Core {
         )
         .unwrap()
         .with_port_offset(PortOffset::for_test_home(&home));
+        let offset = config.ports.offset;
+        println!("evidence: {} at port offset {offset}", home.display());
         if let Some(taken) = config.ports.first_taken() {
             panic!("port collision: {taken}");
         }
-        let offset = config.ports.offset;
-        println!("evidence: {} at port offset {offset}", home.display());
         let environment = vec![
             (HOME_ENV, home.display().to_string()),
             (ZMX_ENV, zmx.display().to_string()),

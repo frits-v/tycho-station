@@ -69,11 +69,11 @@ impl Core {
         .into_iter()
         .chain(config.port_offset_pair())
         .collect();
+        let offset = config.ports.offset;
+        println!("evidence: {} at port offset {offset}", home.display());
         if let Some(taken) = config.ports.first_taken() {
             panic!("port collision: {taken}");
         }
-        let offset = config.ports.offset;
-        println!("evidence: {} at port offset {offset}", home.display());
         Self {
             config,
             environment,

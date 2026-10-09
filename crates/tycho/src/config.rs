@@ -801,8 +801,8 @@ mod tests {
                 );
             }
         }
-        assert_eq!(cores, 901);
-        assert_eq!(seen.len(), 901 * 5);
+        assert_eq!(cores, 1801);
+        assert_eq!(seen.len(), 1801 * 5);
     }
 
     #[test]

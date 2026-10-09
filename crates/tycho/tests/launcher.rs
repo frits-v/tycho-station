@@ -107,11 +107,11 @@ impl Harness {
         )
         .unwrap()
         .with_port_offset(PortOffset::for_test_home(&home));
+        let offset = config.ports.offset;
+        println!("evidence: {} at port offset {offset}", home.display());
         if let Some(taken) = config.ports.first_taken() {
             panic!("port collision: {taken}");
         }
-        let offset = config.ports.offset;
-        println!("evidence: {} at port offset {offset}", home.display());
         let dirs = AgentDirs::new(agent.clone()).unwrap();
         let mut harness = Self {
             probe_endpoint: None,
