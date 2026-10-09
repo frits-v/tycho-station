@@ -76,7 +76,8 @@ jobs:
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           cache: false
-          install_args: rust release-plz
+          install_args: rust release-plz gh
       - run: mise run release-pr
         env:
-          RELEASE_PLZ_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          TYCHO_RELEASE_APP_ID: ${{ vars.TYCHO_RELEASE_APP_ID }}
+          TYCHO_RELEASE_APP_PRIVATE_KEY: ${{ secrets.TYCHO_RELEASE_APP_PRIVATE_KEY }}

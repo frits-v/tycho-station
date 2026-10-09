@@ -67,13 +67,33 @@ The `release` workflow runs on every push to the default branch, through the xta
 release-plz writes the release pull request's commit through the GitHub API, so GitHub
 signs it. The pull request still needs `ci`, a required check. A pull request opened with
 the workflow's own `GITHUB_TOKEN` waits for a writer to approve its workflow runs on every
-update, and release-plz updates it on every push, so the job uses a separate token:
+update, and release-plz updates it on every push, so the `release-pr` job opens it with a
+GitHub App installation token that the xtask mints for each run:
 
-- `RELEASE_PLZ_TOKEN`: a fine-grained personal access token for this repository only,
-  with Contents and Pull requests read and write, stored as a repository secret. Without
-  it the `release-pr` job fails and names the secret.
-- Rotation: create the replacement before the expiry date, then
-  `gh secret set RELEASE_PLZ_TOKEN -R frits-v/tycho-station`, then revoke the old token.
-- A GitHub App installation token is the intended replacement: a bot author and
-  short-lived tokens. It needs the token minted in the xtask, since no marketplace action
-  beyond checkout and mise setup is used.
+- The xtask signs an RS256 JWT with the App's private key (`iat` sixty seconds in the
+  past, `exp` ten minutes after `iat`), looks up the App's installation on this
+  repository, and requests an installation token limited to this repository and to
+  Contents and Pull requests write. It refuses a token whose grant is wider. The token
+  reaches release-plz as `GIT_TOKEN` in its environment and is revoked when release-plz
+  exits; the key, the JWT and the token never appear in arguments, output or errors.
+- The release pull request's author is the App's bot account (`<app-name>[bot]`), not a
+  person. The merge gate and any ruleset that names authors or bypass actors see that
+  identity.
+- Setup, once: create a GitHub App owned by the operator's account with webhooks off,
+  repository permissions Contents and Pull requests set to read and write and nothing
+  else, installable only on this account. Install it on this repository only. Generate a
+  private key, then store the App id and the key and delete the downloaded file:
+
+  ```sh
+  gh variable set TYCHO_RELEASE_APP_ID -R frits-v/tycho-station --body <app-id>
+  gh secret set TYCHO_RELEASE_APP_PRIVATE_KEY -R frits-v/tycho-station < key.pem
+  rm key.pem
+  ```
+
+- Rotation: generate a new private key in the App settings, store it with the same
+  `gh secret set` command, delete the local file, then delete the old key in the App
+  settings. The next `release-pr` run uses the new key.
+- Until the variable and the secret exist, the `release-pr` job fails with a message
+  naming both and this section; the `release` and `binaries` jobs use the workflow's own
+  `GITHUB_TOKEN` and are unaffected. A key that does not belong to the App id, or an App
+  not installed on this repository, fails the installation lookup with GitHub's message.

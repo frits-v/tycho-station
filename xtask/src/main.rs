@@ -12,6 +12,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output};
 
+mod app_token;
 mod config;
 mod figures;
 mod process;
