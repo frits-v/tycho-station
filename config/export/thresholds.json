@@ -12,7 +12,8 @@
         "backoff_max_seconds": 300,
         "backoff_factor": 2,
         "port_step_attempts_max": 12,
-        "slot_retry_delay_seconds": 10
+        "slot_retry_delay_seconds": 10,
+        "unit_attempt_cap": 3
     },
     "session": {
         "heartbeat_interval_seconds": 10,

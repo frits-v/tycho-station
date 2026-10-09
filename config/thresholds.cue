@@ -17,6 +17,7 @@ thresholds: #Thresholds & {
 		// With the backoff above, about 35 minutes before a port step turns terminal.
 		port_step_attempts_max:   12
 		slot_retry_delay_seconds: 10
+		unit_attempt_cap:         3
 	}
 	session: {
 		heartbeat_interval_seconds:  10

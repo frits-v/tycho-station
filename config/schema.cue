@@ -34,6 +34,8 @@ import (
 		struct.MinFields(1) & struct.MaxFields(32)
 	tiers!: {[#Name]: #Tier & {fallback: null | or(_tier_names)}} &
 		struct.MinFields(1) & struct.MaxFields(8)
+	// The attempt cap of a class the table does not list.
+	attempt_cap_default!: int & >=1 & <=99
 	_tier_names: [for name, _ in tiers {name}]
 }
 
@@ -54,6 +56,8 @@ import (
 		backoff_factor!:           2
 		port_step_attempts_max!:   int & >=1 & <=100
 		slot_retry_delay_seconds!: #Seconds
+		// Attempts one work unit makes before it is abandoned.
+		unit_attempt_cap!: int & >=1 & <=99
 	}
 	session!: {
 		heartbeat_interval_seconds!:  #Seconds

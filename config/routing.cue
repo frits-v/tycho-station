@@ -11,6 +11,7 @@ routing: #Routing & {
 		plan: {minimum_tier: "strong", effort: "high", attempt_cap: 3}
 		judge: {minimum_tier: "strong", effort: "high", attempt_cap: 3}
 	}
+	attempt_cap_default: 3
 	tiers: {
 		light: {models: {claude: "haiku", codex: "gpt-5-codex-mini"}, fallback: "standard"}
 		standard: {models: {claude: "sonnet", codex: "gpt-5-codex"}, fallback: "strong"}

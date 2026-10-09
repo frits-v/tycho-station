@@ -26,6 +26,7 @@
             "attempt_cap": 3
         }
     },
+    "attempt_cap_default": 3,
     "tiers": {
         "light": {
             "models": {
