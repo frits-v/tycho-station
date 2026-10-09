@@ -10,7 +10,10 @@ use tycho_types::envelope::{RecordId, ShortText};
 use tycho_types::service::{Attempt, TaskId, WorkUnitId};
 
 use crate::config::spine;
-use crate::services::{refuse, CODE_BAD_REQUEST, CODE_CONFLICT, CODE_INTERNAL, CODE_NOT_FOUND};
+use crate::config_store::SlotCounts;
+use crate::services::{
+    refuse, Ports, CODE_BAD_REQUEST, CODE_CONFLICT, CODE_INTERNAL, CODE_NOT_FOUND,
+};
 
 const STATE_KEY: &str = "epic";
 
@@ -185,7 +188,11 @@ fn reservation_key(task: &TaskId, attempt: u16) -> Result<String, EpicError> {
 }
 
 /// A started epic, or the same epic again when the goal matches.
-pub fn start(current: Option<EpicState>, request: StartRequest) -> Result<EpicState, EpicError> {
+pub fn start(
+    current: Option<EpicState>,
+    request: StartRequest,
+    slots: SlotCounts,
+) -> Result<EpicState, EpicError> {
     if let Some(state) = current {
         if state.goal != request.goal {
             return Err(EpicError::GoalMismatch);
@@ -198,11 +205,11 @@ pub fn start(current: Option<EpicState>, request: StartRequest) -> Result<EpicSt
         seat: Ledger::new(request.seat_limit),
         metered: Ledger::new(request.metered_limit),
         control_slots: Slots {
-            limit: spine::CONTROL_SLOTS,
+            limit: slots.control,
             used: 0,
         },
         worker_slots: Slots {
-            limit: spine::WORKER_SLOTS,
+            limit: slots.worker,
             used: 0,
         },
         cases_in_force: Vec::new(),
@@ -308,8 +315,20 @@ fn terminal(error: &EpicError) -> HandlerError {
     refuse(error.code(), error.to_string())
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Epic;
+/// Holds the slot counts a newly started epic gets.
+#[derive(Debug, Clone, Copy)]
+pub struct Epic {
+    slots: SlotCounts,
+}
+
+impl Epic {
+    #[must_use]
+    pub fn new(ports: &Ports) -> Self {
+        Self {
+            slots: ports.config.thresholds.value.slots,
+        }
+    }
+}
 
 #[restate_sdk::object]
 impl Epic {
@@ -320,8 +339,12 @@ impl Epic {
         request: Json<StartRequest>,
     ) -> HandlerResult<Json<EpicState>> {
         let current = object_context.get::<Json<EpicState>>(STATE_KEY).await?;
-        let state = start(current.map(Json::into_inner), request.into_inner())
-            .map_err(|error| terminal(&error))?;
+        let state = start(
+            current.map(Json::into_inner),
+            request.into_inner(),
+            self.slots,
+        )
+        .map_err(|error| terminal(&error))?;
         object_context.set(STATE_KEY, Json(state.clone()));
         Ok(Json(state))
     }
@@ -385,6 +408,11 @@ async fn load(object_context: &ObjectContext<'_>) -> Result<EpicState, HandlerEr
 mod tests {
     use super::*;
 
+    const SLOTS: SlotCounts = SlotCounts {
+        control: 2,
+        worker: 2,
+    };
+
     fn started(seat: u64, metered: u64) -> EpicState {
         start(
             None,
@@ -393,6 +421,7 @@ mod tests {
                 seat_limit: seat,
                 metered_limit: metered,
             },
+            SLOTS,
         )
         .unwrap()
     }
@@ -426,7 +455,8 @@ mod tests {
                     goal: state.goal.clone(),
                     seat_limit: 1,
                     metered_limit: 1
-                }
+                },
+                SLOTS
             ),
             Ok(state.clone())
         );
@@ -435,7 +465,10 @@ mod tests {
             seat_limit: 1,
             metered_limit: 1,
         };
-        assert_eq!(start(Some(state), other), Err(EpicError::GoalMismatch));
+        assert_eq!(
+            start(Some(state), other, SLOTS),
+            Err(EpicError::GoalMismatch)
+        );
     }
 
     #[test]
@@ -470,7 +503,7 @@ mod tests {
             reserve(&mut state, &request("t3", SlotLevel::Worker, 10)),
             Ok(ReserveAnswer::RetryLater)
         );
-        assert_eq!(state.worker_slots.used, spine::WORKER_SLOTS);
+        assert_eq!(state.worker_slots.used, SLOTS.worker);
         assert_eq!(state.seat.reserved, 20);
         assert_eq!(
             reserve(&mut state, &request("t3", SlotLevel::Control, 10)),

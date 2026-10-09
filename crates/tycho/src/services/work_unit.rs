@@ -12,6 +12,7 @@ use tycho_types::service::{Attempt, EpicId, Phase, PromiseName, TaskId, WorkUnit
 use tycho_types::session::{SessionKind, SessionName, Vendor};
 
 use crate::config::spine;
+use crate::config_store::{ConfigHashes, FactoryConfig};
 use crate::services::epic::EpicClient;
 use crate::services::merge_gate::{Claim, GateError, GateVerdict, MergeGate, VerifyRequest};
 use crate::services::worker_run::{
@@ -158,6 +159,9 @@ pub struct WorkUnitView {
     pub findings: Vec<String>,
     /// Why the unit was abandoned, when it was.
     pub reason: Option<String>,
+    /// The configuration the unit started with, recorded once in a journaled step.
+    #[serde(default)]
+    pub config: ConfigHashes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +308,7 @@ fn failure(code: u16, message: impl Into<String>) -> TerminalError {
 pub struct WorkUnit {
     merge_gate: Arc<dyn MergeGate>,
     timing: Timing,
+    config: Arc<FactoryConfig>,
 }
 
 impl WorkUnit {
@@ -312,6 +317,7 @@ impl WorkUnit {
         Self {
             merge_gate: Arc::clone(&ports.merge_gate),
             timing: ports.timing,
+            config: Arc::clone(&ports.config),
         }
     }
 }
@@ -322,6 +328,7 @@ impl fmt::Debug for WorkUnit {
             .debug_struct("WorkUnit")
             .field("merge_gate", &self.merge_gate.describe())
             .field("timing", &self.timing)
+            .field("config", &self.config.hashes())
             .finish()
     }
 }
@@ -486,6 +493,12 @@ impl WorkUnit {
             .name("control secret")
             .await?;
         workflow_context.set(SECRET_KEY, control_secret);
+        let hashes = self.config.hashes();
+        let config = workflow_context
+            .run(|| async move { Ok(Json(hashes)) })
+            .name("config hashes")
+            .await?
+            .into_inner();
         let unit = Unit {
             workflow_context,
             view: WorkUnitView {
@@ -495,6 +508,7 @@ impl WorkUnit {
                 control_session: control.to_string(),
                 findings: Vec::new(),
                 reason: None,
+                config,
             },
         };
         unit.save();
@@ -507,7 +521,8 @@ impl WorkUnit {
         unit_id: &WorkUnitId,
         request: &WorkUnitRequest,
     ) -> Result<(), TerminalError> {
-        let cap = Attempt::new(spine::ATTEMPT_CAP_DEFAULT).unwrap_or(Attempt::FIRST);
+        let cap = Attempt::new(self.config.thresholds.value.retry.unit_attempt_cap)
+            .unwrap_or(Attempt::FIRST);
         let mut attempt = Attempt::FIRST;
         unit.step(Event::ChildClaimsLease)?;
         unit.step(Event::FirstStatus)?;

@@ -8,6 +8,7 @@ pub mod agent_files;
 pub mod code_graph;
 pub mod command;
 pub mod config;
+pub mod config_store;
 pub mod core;
 pub mod endpoint;
 pub mod entire_graph;

@@ -19,7 +19,7 @@ use crate::services::Ports;
 pub fn build(ports: &Ports) -> Endpoint {
     Endpoint::builder()
         .bind(Probe)
-        .bind(Epic)
+        .bind(Epic::new(ports))
         .bind(Session::new(ports))
         .bind(Reconciler::new(ports))
         .bind(Operator::new(ports.operator_secret.clone()))
@@ -56,6 +56,7 @@ mod tests {
             spawner: Arc::new(NoLauncher),
             merge_gate: Arc::new(NoGate),
             timing: Timing::default(),
+            config: Arc::new(crate::config_store::FactoryConfig::embedded().unwrap()),
             operator_secret: None,
         };
         let runtime = tokio::runtime::Builder::new_multi_thread()

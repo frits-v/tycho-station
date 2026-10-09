@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use restate_sdk::context::DurableFuture;
@@ -15,6 +16,7 @@ use tycho_types::session::{SessionKind, SessionName, Suffix, Vendor};
 use tycho_types::task_packet::{Routing, RoutingName};
 
 use crate::config::spine;
+use crate::config_store::FactoryConfig;
 use crate::services::epic::{
     EpicClient, LedgerKind, ReserveAnswer, ReserveRequest, SettleRequest, SlotLevel,
 };
@@ -108,10 +110,10 @@ pub fn after_attempt(
     }
 }
 
-/// The attempt cap for a task class; every class takes the default until routing tables land.
+/// The routing table's attempt cap for a task class, clamped to the attempt range.
 #[must_use]
-pub fn attempt_cap(_class: &RoutingName) -> Attempt {
-    Attempt::new(spine::ATTEMPT_CAP_DEFAULT).unwrap_or(Attempt::FIRST)
+pub fn attempt_cap(config: &FactoryConfig, class: &RoutingName) -> Attempt {
+    Attempt::new(config.attempt_cap(class)).unwrap_or(Attempt::FIRST)
 }
 
 #[must_use]
@@ -307,13 +309,15 @@ impl AttemptEnd {
 
 pub struct WorkerRun {
     timing: Timing,
+    config: Arc<FactoryConfig>,
 }
 
 impl WorkerRun {
     #[must_use]
-    pub const fn new(ports: &Ports) -> Self {
+    pub fn new(ports: &Ports) -> Self {
         Self {
             timing: ports.timing,
+            config: Arc::clone(&ports.config),
         }
     }
 }
@@ -323,6 +327,7 @@ impl fmt::Debug for WorkerRun {
         formatter
             .debug_struct("WorkerRun")
             .field("timing", &self.timing)
+            .field("config", &self.config.hashes())
             .finish()
     }
 }
@@ -340,7 +345,7 @@ impl WorkerRun {
         let (task, _) = parse_worker_key(&key)
             .map_err(|error| refuse(CODE_BAD_REQUEST, RequestError::Key(error).to_string()))?;
         check_request(&request).map_err(|error| refuse(CODE_BAD_REQUEST, error.to_string()))?;
-        let cap = attempt_cap(&request.routing.class);
+        let cap = attempt_cap(&self.config, &request.routing.class);
         let mut tier = request.routing.tier.clone();
         let mut attempt = Attempt::FIRST;
         let run = Run {

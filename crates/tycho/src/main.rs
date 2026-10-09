@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::thread;
 
 use tycho::config::{self, CoreConfig, ENDPOINT_PORT, PROBE_TIMEOUT, WATCHDOG_INTERVAL};
+use tycho::config_store::{self, FactoryConfig, CONFIG_DIR_ENV};
 use tycho::epic_command::{self, OperatorAnswer};
 use tycho::http::Http;
 use tycho::launchd::Agent;
@@ -45,6 +46,10 @@ fn main() {
     let code = match words.as_slice() {
         ["endpoint"] => serve_endpoint(),
         ["core", "start"] => with_config(|config, supervisor| {
+            if let Err(error) = factory_config(Some(&config.home)) {
+                eprintln!("tycho: refusing to start: {error}");
+                return 2;
+            }
             let report = core::start(supervisor, config);
             finish(&report, report.succeeded(), config)
         }),
@@ -160,13 +165,34 @@ fn replay(spool: &str) -> i32 {
     }
 }
 
+/// Loads the configuration from `TYCHO_CONFIG_DIR`, `<home>/config` or the embedded export.
+fn factory_config(home: Option<&Path>) -> Result<FactoryConfig, String> {
+    let source = config_store::resolve_source(env::var_os(CONFIG_DIR_ENV), home)
+        .map_err(|error| error.to_string())?;
+    let loaded = config_store::load(&source).map_err(|error| error.to_string())?;
+    let hashes = loaded.hashes();
+    println!(
+        "configuration: {source} (routing {}, thresholds {})",
+        hashes.routing, hashes.thresholds
+    );
+    Ok(loaded)
+}
+
 fn serve_endpoint() -> i32 {
+    let home = env::var_os(config::HOME_ENV).map(PathBuf::from);
+    let factory = match factory_config(home.as_deref()) {
+        Ok(factory) => factory,
+        Err(error) => {
+            eprintln!("tycho: endpoint: {error}");
+            return 1;
+        }
+    };
     let ports = Ports {
         spawner: Arc::new(NoLauncher),
         merge_gate: Arc::new(NoGate),
-        timing: Timing::default(),
-        operator_secret: env::var_os(config::HOME_ENV)
-            .map(|home| PathBuf::from(home).join(config::OPERATOR_SECRET_FILE)),
+        timing: Timing::from_thresholds(&factory.thresholds.value),
+        config: Arc::new(factory),
+        operator_secret: home.map(|home| home.join(config::OPERATOR_SECRET_FILE)),
     };
     match endpoint::serve(config::loopback(ENDPOINT_PORT), &ports) {
         Ok(()) => 0,

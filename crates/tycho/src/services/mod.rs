@@ -16,7 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use restate_sdk::prelude::{HandlerError, RunRetryPolicy, TerminalError};
 
-use crate::config::spine;
+use crate::config_store::{FactoryConfig, Thresholds};
 use spawner::Spawner;
 
 /// HTTP-style codes on terminal errors, so a caller can tell a refusal from a defect.
@@ -33,7 +33,7 @@ pub fn refuse(code: u16, message: impl Into<String>) -> HandlerError {
     TerminalError::new_with_code(code, message).into()
 }
 
-/// The durations every service reads; tests shorten them.
+/// The durations and retry bound every service reads; tests shorten them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timing {
     pub stall_silence: Duration,
@@ -44,24 +44,35 @@ pub struct Timing {
     pub lease_fresh: Duration,
     pub spawn_grace: Duration,
     pub reconciler_interval: Duration,
+    /// Tries per port step before it turns terminal.
+    pub port_step_attempts_max: u32,
 }
 
+#[cfg(test)]
 impl Default for Timing {
     fn default() -> Self {
-        Self {
-            stall_silence: spine::STALL_SILENCE,
-            stall_progress: spine::STALL_PROGRESS,
-            retry_backoff_initial: spine::RETRY_BACKOFF_INITIAL,
-            retry_backoff_max: spine::RETRY_BACKOFF_MAX,
-            slot_retry_delay: spine::SLOT_RETRY_DELAY,
-            lease_fresh: spine::LEASE_FRESH,
-            spawn_grace: spine::SPAWN_GRACE,
-            reconciler_interval: spine::RECONCILER_INTERVAL,
-        }
+        Self::from_thresholds(&FactoryConfig::embedded().unwrap().thresholds.value)
     }
 }
 
 impl Timing {
+    #[must_use]
+    pub const fn from_thresholds(thresholds: &Thresholds) -> Self {
+        Self {
+            stall_silence: Duration::from_secs(thresholds.stall.silence_seconds),
+            stall_progress: Duration::from_secs(thresholds.stall.progress_seconds),
+            retry_backoff_initial: Duration::from_secs(thresholds.retry.backoff_initial_seconds),
+            retry_backoff_max: Duration::from_secs(thresholds.retry.backoff_max_seconds),
+            slot_retry_delay: Duration::from_secs(thresholds.retry.slot_retry_delay_seconds),
+            lease_fresh: Duration::from_secs(thresholds.session.lease_fresh_seconds),
+            spawn_grace: Duration::from_secs(thresholds.session.spawn_grace_seconds),
+            reconciler_interval: Duration::from_secs(
+                thresholds.session.reconciler_interval_seconds,
+            ),
+            port_step_attempts_max: thresholds.retry.port_step_attempts_max,
+        }
+    }
+
     /// Retry policy for port steps; agent retries are workflow logic and never use it.
     #[must_use]
     pub fn port_retry(&self) -> RunRetryPolicy {
@@ -69,7 +80,7 @@ impl Timing {
             .initial_delay(self.retry_backoff_initial)
             .exponentiation_factor(2.0)
             .max_delay(self.retry_backoff_max)
-            .max_attempts(spine::PORT_STEP_ATTEMPTS_MAX)
+            .max_attempts(self.port_step_attempts_max)
     }
 
     /// A nudge is best-effort: three tries, two seconds apart.
@@ -92,6 +103,8 @@ pub struct Ports {
     pub spawner: Arc<dyn Spawner>,
     pub merge_gate: Arc<dyn merge_gate::MergeGate>,
     pub timing: Timing,
+    /// Routing tables and thresholds, with the content hashes a unit records at its start.
+    pub config: Arc<FactoryConfig>,
     /// The operator secret file; `None` refuses every operator call.
     pub operator_secret: Option<std::path::PathBuf>,
 }
@@ -103,6 +116,7 @@ impl std::fmt::Debug for Ports {
             .field("spawner", &self.spawner.describe())
             .field("merge_gate", &self.merge_gate.describe())
             .field("timing", &self.timing)
+            .field("config", &self.config.hashes())
             .field("operator_secret", &self.operator_secret)
             .finish()
     }
@@ -143,7 +157,10 @@ mod tests {
     #[test]
     fn port_retry_is_bounded_in_attempts() {
         let policy = format!("{:?}", Timing::default().port_retry());
-        let bound = format!("max_attempts: Some({})", spine::PORT_STEP_ATTEMPTS_MAX);
+        let bound = format!(
+            "max_attempts: Some({})",
+            Timing::default().port_step_attempts_max
+        );
         assert!(policy.contains(&bound), "{policy}");
         assert!(policy.contains("factor: 2.0"), "{policy}");
     }

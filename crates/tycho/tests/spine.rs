@@ -27,6 +27,7 @@ use tycho::config::{
     admin_url, ingress_url, loopback, CoreConfig, CoreRole, HOME_ENV, MISE_NO_INSTALL,
     RESTATE_INGRESS_PORT, RESTATE_SERVER_ENV, ZMX_ENV,
 };
+use tycho::config_store::FactoryConfig;
 use tycho::endpoint;
 use tycho::health;
 use tycho::http::Http;
@@ -277,7 +278,7 @@ fn start_core_with_doubles(test: &str, spawner: &RecordingSpawner) -> (Core, Dou
 fn test_timing() -> Timing {
     Timing {
         reconciler_interval: Duration::from_secs(1),
-        ..Timing::default()
+        ..Timing::from_thresholds(&FactoryConfig::embedded().unwrap().thresholds.value)
     }
 }
 
@@ -297,6 +298,7 @@ fn start_core_with(
         spawner: Arc::new(spawner.clone()),
         merge_gate,
         timing,
+        config: Arc::new(FactoryConfig::embedded().unwrap()),
         operator_secret: Some(core.config.operator_secret_file()),
     };
     let doubles = DoublesEndpoint::start(&ports);
@@ -553,6 +555,17 @@ fn operator_secret(core: &Core) -> String {
         .to_string()
 }
 
+/// The unit's view carries the hashes of the configuration it started with.
+fn assert_started_with_the_embedded_config(view: &serde_json::Value) {
+    let hashes = FactoryConfig::embedded().unwrap().hashes();
+    assert_eq!(view["config"]["routing"], hashes.routing.as_str());
+    assert_eq!(view["config"]["thresholds"], hashes.thresholds.as_str());
+    println!(
+        "evidence: unit started with configuration {}",
+        view["config"]
+    );
+}
+
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
@@ -585,6 +598,7 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(view["lifecycle"], "done");
     assert_eq!(view["head_sha"], DEFAULT_SHA);
+    assert_started_with_the_embedded_config(&view);
     let requests = gate.requests();
     assert_eq!(requests.len(), 1, "one verify");
     let tasks: Vec<&str> = requests[0]
