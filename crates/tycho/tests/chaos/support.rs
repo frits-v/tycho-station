@@ -58,8 +58,8 @@ pub fn test_claim(test: &str) -> PortClaim {
     claim_ports(&test_home(test))
 }
 
-/// Claims a port slot for the home, held until the core is stopped; a port another process
-/// holds fails the test as a port collision.
+/// Claims a port slot for the home, held until the core is stopped; a slot whose ports
+/// another process holds is skipped and named, and the test fails only when no slot is left.
 pub fn claim_ports(home: &Path) -> PortClaim {
     let claim = CorePorts::claim(home).unwrap_or_else(|error| panic!("{error}"));
     println!("evidence: {claim}");

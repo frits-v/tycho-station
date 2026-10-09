@@ -1056,8 +1056,8 @@ fn a_killed_session_resumes_under_its_id_with_the_settings_passed_again() {
     harness.kill(&resumed);
 }
 
-/// Claims a port slot for the home, held until the core is stopped; a port another process
-/// holds fails the test as a port collision.
+/// Claims a port slot for the home, held until the core is stopped; a slot whose ports
+/// another process holds is skipped and named, and the test fails only when no slot is left.
 fn claim_ports(home: &Path) -> PortClaim {
     let claim = CorePorts::claim(home).unwrap_or_else(|error| panic!("{error}"));
     println!("evidence: {claim}");

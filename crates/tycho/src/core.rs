@@ -110,7 +110,7 @@ fn start_again(start: &mut dyn FnMut() -> Outcome, reason: &str) -> Result<Strin
     match decode_start(start()) {
         StartAnswer::Started(done) => Ok(format!("{done}, after a start that {reason}")),
         StartAnswer::TimedOut(again) | StartAnswer::Failed(again) => Err(format!(
-            "the start {reason}, the view showed no generation, and the second start: {again}"
+            "the start {reason}, the view showed no newer generation, and the second start: {again}"
         )),
     }
 }
@@ -143,6 +143,16 @@ pub fn decode_start(outcome: Outcome) -> StartAnswer {
     }
 }
 
+/// The generation before a start: zero for a reconciler that never started, `None` when the
+/// view did not answer, so a timed-out start is never judged against an unknown baseline.
+#[must_use]
+pub fn view_baseline(outcome: &Outcome) -> Option<u64> {
+    match outcome {
+        Outcome::Response { status: 200, body } if body.trim() == "null" => Some(0),
+        _ => view_generation(outcome),
+    }
+}
+
 /// The generation in the reconciler's view, when the view answered with one.
 #[must_use]
 pub fn view_generation(outcome: &Outcome) -> Option<u64> {
@@ -156,26 +166,26 @@ pub fn view_generation(outcome: &Outcome) -> Option<u64> {
     }
 }
 
-/// Starts the reconciler's tick chain, reading the view when the start timed out.
+/// Starts the reconciler's tick chain, judging a timed-out start against the view before it.
 ///
-/// A timed-out start may have been accepted, so the view decides: a generation means the
-/// chain runs, and none gets one more start. A second start after an accepted one is
-/// harmless, since the older chain ends at its next tick.
+/// The generation survives restarts, so a generation alone does not show that this start
+/// landed: only one above the generation read before the start does. Any other answer after
+/// a timeout gets one more start, which is harmless after an accepted one, since the older
+/// chain ends at its next tick.
 pub fn kick_reconciler(
     start: &mut dyn FnMut() -> Outcome,
     view: &mut dyn FnMut() -> Outcome,
 ) -> Result<String, String> {
+    let before = view_baseline(&view());
     match decode_start(start()) {
         StartAnswer::Started(done) => Ok(done),
         StartAnswer::Failed(reason) => Err(reason),
-        StartAnswer::TimedOut(reason) => view_generation(&view()).map_or_else(
-            || start_again(start, &reason),
-            |generation| {
-                Ok(format!(
-                    "generation {generation}, read from the view after the start {reason}"
-                ))
-            },
-        ),
+        StartAnswer::TimedOut(reason) => match (before, view_generation(&view())) {
+            (Some(before), Some(after)) if after > before => Ok(format!(
+                "generation {after}, read from the view after the start {reason}"
+            )),
+            _ => start_again(start, &reason),
+        },
     }
 }
 
@@ -333,54 +343,102 @@ mod tests {
         }
     }
 
+    /// Answers the view with `before` on its first read and `after` on later ones.
+    fn views(before: &'static str, after: &'static str) -> impl FnMut() -> Outcome {
+        let mut reads: u32 = 0;
+        move || {
+            reads = reads.saturating_add(1);
+            answered(if reads == 1 { before } else { after })
+        }
+    }
+
+    fn counted_timeouts(starts: &mut u32) -> impl FnMut() -> Outcome + '_ {
+        move || {
+            *starts = starts.saturating_add(1);
+            timed_out()
+        }
+    }
+
     #[test]
-    fn a_timed_out_start_that_landed_is_read_from_the_view_and_not_repeated() {
+    fn a_timed_out_start_that_raised_the_generation_is_not_repeated() {
         let mut starts = 0;
         let kicked = kick_reconciler(
-            &mut || {
-                starts += 1;
-                timed_out()
-            },
-            &mut || answered(r#"{"generation":1,"expected":[]}"#),
+            &mut counted_timeouts(&mut starts),
+            &mut views(
+                r#"{"generation":4,"expected":[]}"#,
+                r#"{"generation":5,"expected":[]}"#,
+            ),
         );
         assert_eq!(starts, 1);
         assert!(kicked
             .unwrap()
-            .starts_with("generation 1, read from the view"));
+            .starts_with("generation 5, read from the view"));
+        let mut fresh = 0;
+        let first = kick_reconciler(
+            &mut counted_timeouts(&mut fresh),
+            &mut views("null", r#"{"generation":1,"expected":[]}"#),
+        );
+        assert_eq!(fresh, 1);
+        assert!(first.is_ok());
     }
 
     #[test]
-    fn a_timed_out_start_the_view_does_not_show_is_tried_once_more() {
-        let mut answers = vec![answered("1"), timed_out()];
-        let kicked = kick_reconciler(&mut || answers.pop().unwrap(), &mut || answered("null"));
+    fn a_timed_out_start_judged_only_by_a_generation_from_an_earlier_lifetime_is_repeated() {
+        let mut answers = vec![answered("5"), timed_out()];
+        let kicked = kick_reconciler(
+            &mut || answers.pop().unwrap(),
+            &mut views(
+                r#"{"generation":4,"expected":[]}"#,
+                r#"{"generation":4,"expected":[]}"#,
+            ),
+        );
         assert!(kicked
             .unwrap()
-            .starts_with("generation 1, after a start that"));
+            .starts_with("generation 5, after a start that"));
         assert!(answers.is_empty());
-        let mut starts = 0;
-        let refused = kick_reconciler(
-            &mut || {
-                starts += 1;
-                timed_out()
-            },
-            &mut || answered("null"),
-        );
-        assert_eq!(starts, 2);
-        assert!(refused.is_err());
     }
 
     #[test]
-    fn a_refused_connect_fails_the_start_without_reading_the_view() {
-        let mut views = 0;
+    fn a_timed_out_start_with_no_baseline_or_no_newer_generation_is_tried_once_more() {
+        for (before, after) in [
+            ("{", r#"{"generation":4}"#),
+            ("null", "null"),
+            (r#"{"generation":4}"#, r#"{"generation":3}"#),
+        ] {
+            let mut starts = 0;
+            let refused = kick_reconciler(
+                &mut counted_timeouts(&mut starts),
+                &mut views(before, after),
+            );
+            assert_eq!(starts, 2, "{before} then {after}");
+            assert!(refused.is_err());
+        }
+    }
+
+    #[test]
+    fn a_refused_connect_fails_the_start_without_a_second_view_or_start() {
+        let mut views_read = 0;
+        let mut starts = 0;
         let kicked = kick_reconciler(
-            &mut || Outcome::Unreachable("connect failed: refused".to_string()),
             &mut || {
-                views += 1;
+                starts += 1;
+                Outcome::Unreachable("connect failed: refused".to_string())
+            },
+            &mut || {
+                views_read += 1;
                 answered("null")
             },
         );
-        assert_eq!(views, 0);
+        assert_eq!((views_read, starts), (1, 1));
         assert!(kicked.unwrap_err().starts_with("ingress unreachable"));
+    }
+
+    #[test]
+    fn a_reconciler_that_never_started_is_baseline_zero_and_an_unread_view_has_none() {
+        assert_eq!(view_baseline(&answered("null")), Some(0));
+        assert_eq!(view_baseline(&answered(r#"{"generation":4}"#)), Some(4));
+        assert_eq!(view_baseline(&answered("{")), None);
+        assert_eq!(view_baseline(&timed_out()), None);
     }
 
     #[test]

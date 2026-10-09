@@ -319,29 +319,57 @@ impl Zmx {
     pub fn clear(&self, programs: &[String]) -> Result<ClearReport, ZmxError> {
         let mut lines = Vec::new();
         for entry in self.list()? {
-            let line = match entry {
-                ListEntry::Running { name, pid, .. } => {
-                    let signalled = expected_program(&process::process_facts(pid), programs)
-                        .and_then(|()| process::send(pid, false, Signal::SIGKILL));
-                    let verdict = match signalled {
-                        Ok(()) => "killed".to_string(),
-                        Err(reason) => format!("not signalled: {reason}"),
-                    };
-                    format!(
-                        "{name} running as pid {pid}, {verdict}; zmx kill: {:?}",
-                        self.kill(&name)
-                    )
-                }
-                ListEntry::Ended { name, pid, .. } => format!(
-                    "{name} ended (pid {pid} not signalled); zmx kill: {:?}",
+            let line = match clear_action(&entry, &process::process_facts, programs) {
+                ClearAction::SignalThenRemove { name, pid } => format!(
+                    "{name} running as pid {pid}, signal: {:?}; zmx kill: {:?}",
+                    process::send(pid, false, Signal::SIGKILL),
                     self.kill(&name)
                 ),
-                ListEntry::Unrecognised(text) => format!("unrecognised entry {text:?}"),
+                ClearAction::RemoveByName { name, why } => {
+                    format!("{name} {why}; zmx kill: {:?}", self.kill(&name))
+                }
+                ClearAction::Leave(text) => format!("unrecognised entry {text:?}"),
             };
             lines.push(line);
         }
         let remaining = self.list()?.len();
         Ok(ClearReport { lines, remaining })
+    }
+}
+
+/// What `Zmx::clear` does with one listed entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClearAction {
+    /// A running session whose pid `ps` shows running an expected program.
+    SignalThenRemove { name: String, pid: u32 },
+    /// Removed by name only, with the reason its pid is not signalled.
+    RemoveByName { name: String, why: String },
+    /// An entry the decoder did not recognise is left and counts as remaining.
+    Leave(String),
+}
+
+/// An ended entry's pid may belong to another process by now, so `ps` is not even asked.
+pub fn clear_action(
+    entry: &ListEntry,
+    facts: &dyn Fn(u32) -> ProcessFacts,
+    programs: &[String],
+) -> ClearAction {
+    match entry {
+        ListEntry::Running { name, pid, .. } => match expected_program(&facts(*pid), programs) {
+            Ok(()) => ClearAction::SignalThenRemove {
+                name: name.clone(),
+                pid: *pid,
+            },
+            Err(reason) => ClearAction::RemoveByName {
+                name: name.clone(),
+                why: format!("running as pid {pid}, not signalled: {reason}"),
+            },
+        },
+        ListEntry::Ended { name, pid, .. } => ClearAction::RemoveByName {
+            name: name.clone(),
+            why: format!("ended (pid {pid} not signalled)"),
+        },
+        ListEntry::Unrecognised(text) => ClearAction::Leave(text.clone()),
     }
 }
 
@@ -389,6 +417,66 @@ mod tests {
             started_unix_seconds: 0,
             command: command.to_string(),
         })
+    }
+
+    #[test]
+    fn an_ended_entry_is_removed_by_name_without_asking_ps_or_signalling() {
+        let programs = vec!["/opt/restate-server".to_string()];
+        let asked = std::cell::Cell::new(0_u32);
+        let facts = |_pid: u32| {
+            asked.set(asked.get().saturating_add(1));
+            running("/opt/restate-server --base-dir /h")
+        };
+        let ended = ListEntry::Ended {
+            name: "core.restate".to_string(),
+            pid: 60267,
+            exit_code: 137,
+        };
+        assert_eq!(
+            clear_action(&ended, &facts, &programs),
+            ClearAction::RemoveByName {
+                name: "core.restate".to_string(),
+                why: "ended (pid 60267 not signalled)".to_string(),
+            }
+        );
+        assert_eq!(asked.get(), 0);
+    }
+
+    #[test]
+    fn a_running_entry_is_signalled_only_while_it_runs_an_expected_program() {
+        let programs = vec!["/opt/restate-server".to_string()];
+        let entry = ListEntry::Running {
+            name: "core.restate".to_string(),
+            pid: 60889,
+            created_unix_seconds: 0,
+        };
+        assert_eq!(
+            clear_action(
+                &entry,
+                &|_| running("/opt/restate-server --base-dir /h"),
+                &programs
+            ),
+            ClearAction::SignalThenRemove {
+                name: "core.restate".to_string(),
+                pid: 60889,
+            }
+        );
+        assert!(matches!(
+            clear_action(&entry, &|_| running("/bin/zsh -l"), &programs),
+            ClearAction::RemoveByName { .. }
+        ));
+        assert!(matches!(
+            clear_action(&entry, &|_| ProcessFacts::Gone, &programs),
+            ClearAction::RemoveByName { .. }
+        ));
+        assert_eq!(
+            clear_action(
+                &ListEntry::Unrecognised("x".to_string()),
+                &|_| ProcessFacts::Gone,
+                &programs
+            ),
+            ClearAction::Leave("x".to_string())
+        );
     }
 
     #[test]
