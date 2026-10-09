@@ -15,10 +15,12 @@ use tycho::entire_graph::EntireGraph;
 use tycho::services::doubles::{FixedGate, RecordingSpawner};
 use tycho::services::merge_gate::GateVerdict;
 use tycho::services::spawner::SpawnSpec;
+use tycho::spool::check_result_envelope;
 use tycho_harness::verify::{unit_passed, verify_unit, VerifyOptions};
 use tycho_types::envelope::CommitSha;
 use tycho_types::service::WorkUnitId;
 
+use crate::launcher_spawner::result_envelope;
 use crate::support::{
     admin_query, attach, await_unit_end, client, dispatch, lifecycle_and_attempt, session_status,
     start_core, unit_status, wait_until, worker_run_status, DoublesEndpoint,
@@ -30,10 +32,10 @@ const HEAD_SHA: &str = "1111111111111111111111111111111111111111";
 /// Statuses Restate answered to the double's resolves, in arrival order.
 type Acks = Arc<Mutex<Vec<u16>>>;
 
-fn result_json(branch: &str, head: &str) -> String {
-    format!(
-        r#"{{"outcome":"done","branch":"{branch}","head_sha":"{head}","criteria":[],"usage":{{"input_tokens":1200,"output_tokens":300,"cost_micro_dollars":42000}}}}"#
-    )
+/// The wire bytes a launcher resolves with, checked the way the launcher checks its spool.
+fn result_json(spec: &SpawnSpec, head: &str) -> String {
+    let envelope = result_envelope(&spec.session, &branch_of(spec), head);
+    check_result_envelope(&envelope, &spec.session).unwrap()
 }
 
 /// Resolves the awaitable through ingress after a delay, as a launcher's exit trap would.
@@ -71,7 +73,7 @@ fn first_task_late(acks: &Acks) -> RecordingSpawner {
             Duration::from_millis(500)
         };
         let awaitable = spec.environment.awaitable_id.to_string();
-        let body = result_json(&branch_of(spec), HEAD_SHA);
+        let body = result_json(spec, HEAD_SHA);
         resolve_later(awaitable, delay, body, Arc::clone(&acks));
     }))
 }
@@ -201,7 +203,7 @@ fn committing_worker(repository: PathBuf, checkout: PathBuf, acks: &Acks) -> Rec
         let head = work_in_clone(&repository, &checkout, &branch);
         println!("evidence: worker double committed {head} on {branch}");
         let awaitable = spec.environment.awaitable_id.to_string();
-        let body = result_json(&branch, &head);
+        let body = result_json(spec, &head);
         resolve_later(
             awaitable,
             Duration::from_millis(500),

@@ -417,6 +417,13 @@ fn launcher_killed_before_its_trap_requeues_as_attempt_two() {
     assert_eq!(rig.spawner.listed(&first), 0, "attempt 1 is gone from zmx");
     let orphan = running_vendor(&rig.spawner.files(&first));
     println!("evidence: attempt 1 vendor after the reap by name: {orphan:?}");
+    // Known gap: the reap goes by zmx name, and the vendor of a launcher killed before its
+    // trap runs in its own session, so nothing stops it. This flips once the reap signals
+    // the vendor recorded in the spool directory.
+    assert!(
+        orphan.is_some(),
+        "the orphaned vendor stopped; the known gap closed"
+    );
     assert_eq!(session_status(&first)["phase"], "lost");
     assert_completed(
         &rig,

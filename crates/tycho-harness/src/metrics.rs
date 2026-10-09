@@ -67,9 +67,9 @@ pub const METRIC_TABLE: [Metric; 12] = [
         definition: "killed sessions that resumed with no lost state and no duplicate spawn",
         measured_at: "chaos tests",
         target: "100 percent, hard gate",
-        measured_value: MeasuredValue::NotYetMeasured {
-            reason: "the kill cases that finish through the real launcher never complete: WorkerRun awaits a bare result payload and the launcher resolves with the whole envelope",
-        },
+        measured_value: MeasuredValue::Recorded(
+            "100 percent: 4 of 4 kill cases (terminal app, Restate before the resolve, endpoint between tasks, launcher before its trap) ended done in the unit attempt they started in, with one session per worker attempt",
+        ),
     },
     Metric {
         name: "Gate negative tests",
@@ -107,7 +107,7 @@ pub const METRIC_TABLE: [Metric; 12] = [
         measured_at: "store",
         target: "baseline, recorded in slice zero",
         measured_value: MeasuredValue::Recorded(
-            "14721 bytes over 97 entries for a one-task unit through a fixed gate, summed from sys_journal.raw_length across every invocation but the reconciler's and status reads",
+            "16041 bytes over 100 entries for a one-task unit through a fixed gate, summed from sys_journal.raw_length across every invocation but the reconciler's and status reads",
         ),
     },
     Metric {
@@ -116,7 +116,7 @@ pub const METRIC_TABLE: [Metric; 12] = [
         measured_at: "worktree clone",
         target: "baseline, recorded in slice zero",
         measured_value: MeasuredValue::Recorded(
-            "252 to 507 ms over three cold builds of the synthetic checkout (5 files, 21 symbols) through the graph port",
+            "252 to 507 ms over four cold builds of the synthetic checkout (5 files, 21 symbols) through the graph port",
         ),
     },
 ];
@@ -213,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn the_baselines_are_recorded_and_restart_recovery_says_why_it_is_not() {
+    fn the_baselines_and_restart_recovery_are_recorded() {
         assert!(matches!(
             METRIC_TABLE[10].measured_value,
             MeasuredValue::Recorded(_)
@@ -228,7 +228,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             recovery.measured_value,
-            MeasuredValue::NotYetMeasured { reason } if reason.contains("envelope")
+            MeasuredValue::Recorded(value) if value.starts_with("100 percent")
         ));
     }
 

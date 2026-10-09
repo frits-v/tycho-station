@@ -17,7 +17,7 @@ use tycho::services::spawner::{LeaseRead, SpawnSpec, Spawner, SpawnerError};
 use tycho::spawn::{
     read_lease, save_scrollback, spawn_session, split_tier, SpawnOutcome, SpawnRequest,
 };
-use tycho::zmx::{count_named, presence, Presence, Zmx};
+use tycho::zmx::{count_named, presence, Zmx};
 use tycho_types::envelope::ShortText;
 use tycho_types::launcher::LauncherEnv;
 use tycho_types::session::SessionName;
@@ -221,32 +221,34 @@ pub fn kill_orphan_vendor(files: &SessionFiles) -> bool {
 
 /// The result envelope the fixture vendor writes, addressed from the session itself.
 pub fn result_json(session: &SessionName) -> String {
-    let epic = session.epic();
     let name = session.to_string();
     let suffix = name.rsplit('.').next().unwrap_or("x");
+    let envelope = result_envelope(session, &format!("wu01/{suffix}"), HEAD_SHA);
+    serde_json::json!({ "state": "completed", "envelope": envelope }).to_string()
+}
+
+/// A done result from `session`, in the envelope the launcher resolves its awaitable with.
+pub fn result_envelope(session: &SessionName, branch: &str, head: &str) -> serde_json::Value {
+    let epic = session.epic();
     serde_json::json!({
-        "state": "completed",
-        "envelope": {
-            "schema_version": 1,
-            "id": "01J9Z3K7Q8R2W5X6Y7Z8A9B0C1",
-            "type": "result",
-            "work_unit_id": "wu01",
-            "from": session.to_string(),
-            "to": format!("{epic}.wu01.ctl.claude"),
-            "causation_id": null,
-            "correlation_id": epic.to_string(),
-            "created_at_unix_ms": 1,
-            "expires_at_unix_ms": null,
-            "payload": {
-                "outcome": "done",
-                "branch": format!("wu01/{suffix}"),
-                "head_sha": HEAD_SHA,
-                "criteria": [],
-                "usage": {"input_tokens": 1200, "output_tokens": 300}
-            }
+        "schema_version": 1,
+        "id": "01J9Z3K7Q8R2W5X6Y7Z8A9B0C1",
+        "type": "result",
+        "work_unit_id": "wu01",
+        "from": session.to_string(),
+        "to": format!("{epic}.wu01.ctl.claude"),
+        "causation_id": null,
+        "correlation_id": epic.to_string(),
+        "created_at_unix_ms": 1,
+        "expires_at_unix_ms": null,
+        "payload": {
+            "outcome": "done",
+            "branch": branch,
+            "head_sha": head,
+            "criteria": [],
+            "usage": {"input_tokens": 1200, "output_tokens": 300}
         }
     })
-    .to_string()
 }
 
 impl Spawner for LauncherSpawner {
@@ -294,17 +296,14 @@ impl Spawner for LauncherSpawner {
     fn kill_by_name(&self, session: &SessionName) -> Result<(), SpawnerError> {
         let name = session.to_string();
         self.record(|log| log.reaped.push(name.clone()));
-        let entries = self
+        let listed = self
             .inner
             .zmx
             .list()
-            .map_err(|error| SpawnerError::Transient(error.to_string()))?;
-        let listed = presence(&entries, &name);
-        println!("evidence: port reap({name}) with the session {listed:?}");
-        if listed == Presence::Absent {
-            return Ok(());
-        }
-        tycho::kill::kill_by_name(&self.inner.zmx, session)
+            .map(|entries| presence(&entries, &name));
+        let outcome = tycho::kill::kill_by_name(&self.inner.zmx, session);
+        println!("evidence: port reap({name}) with the session {listed:?} -> {outcome:?}");
+        outcome
     }
 
     fn save_scrollback(&self, session: &SessionName) -> Result<ShortText, SpawnerError> {
