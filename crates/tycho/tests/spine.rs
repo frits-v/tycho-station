@@ -256,7 +256,11 @@ fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
 
 fn start_core_with_doubles(test: &str, spawner: &RecordingSpawner) -> (Core, DoublesEndpoint) {
     let core = Core::new(test);
-    assert!(core.tycho(&["core", "start"]).status.success());
+    let started = core.tycho(&["core", "start"]);
+    assert!(started.status.success());
+    let report = String::from_utf8_lossy(&started.stdout).to_string();
+    assert!(report.contains("operator secret: created"), "{report}");
+    assert!(report.contains("reconciler: generation 1"), "{report}");
     let timing = Timing {
         reconciler_interval: Duration::from_secs(1),
         ..Timing::default()
@@ -264,54 +268,83 @@ fn start_core_with_doubles(test: &str, spawner: &RecordingSpawner) -> (Core, Dou
     let ports = Ports {
         spawner: Arc::new(spawner.clone()),
         timing,
+        operator_secret: Some(core.config.operator_secret_file()),
     };
     let doubles = DoublesEndpoint::start(&ports);
     register_doubles();
     (core, doubles)
 }
 
-#[test]
-#[ignore = "starts real processes; run with mise run spine-tests"]
-fn epic_starts_and_adds_units_with_authority_handlers_private() {
-    let spawner = RecordingSpawner::new();
-    let (_core, _doubles) = start_core_with_doubles("epic", &spawner);
-    let epic = format!("/{}/cf7a", Service::Epic.name());
-    let start = r#"{"goal":"split the orders table","seat_limit":1000000,"metered_limit":0}"#;
-    assert_eq!(
-        call(&format!("{epic}/{}", handler::EPIC_START), start, None).0,
-        200
-    );
-    let add = format!("{epic}/{}", handler::EPIC_ADD_UNIT);
-    assert_eq!(call(&add, "\"wu01\"", None), (200, "\"added\"".to_string()));
-    assert_eq!(
-        call(&add, "\"wu01\"", None),
-        (200, "\"already_present\"".to_string())
-    );
-    let (status, body) = call(&format!("{epic}/{}", handler::EPIC_STATUS), "", None);
-    assert_eq!(status, 200);
-    let state: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(state["units"], serde_json::json!(["wu01"]));
-    assert_eq!(state["worker_slots"]["limit"], 2);
-    let other_goal = r#"{"goal":"another goal","seat_limit":1,"metered_limit":0}"#;
-    let (status, _) = call(&format!("{epic}/{}", handler::EPIC_START), other_goal, None);
-    assert_eq!(
-        status, 409,
-        "a second start with another goal must conflict"
-    );
-    let reserve = r#"{"task":"wu01-t1","attempt":1,"level":"worker","ledger":"seat","amount":1}"#;
-    for private in [handler::EPIC_RESERVE, handler::EPIC_SETTLE] {
-        let metadata = handler_metadata(Service::Epic.name(), private);
+fn assert_private(service: Service, handlers: &[&str], key: &str) {
+    for private in handlers {
+        let metadata = handler_metadata(service.name(), private);
         println!(
-            "evidence: {private} metadata public = {}",
+            "evidence: {}/{private} public = {}",
+            service.name(),
             metadata["public"]
         );
-        assert_eq!(metadata["public"], serde_json::json!(false));
-        let (status, _) = call(&format!("{epic}/{private}"), reserve, None);
+        assert_eq!(metadata["public"], serde_json::json!(false), "{private}");
+        let (status, _) = call(&format!("/{}/{key}/{private}", service.name()), "{}", None);
         assert!(
             (400..500).contains(&status),
             "{private} must be refused at ingress"
         );
     }
+}
+
+fn epic_status() -> serde_json::Value {
+    let path = format!("/{}/cf7a/{}", Service::Epic.name(), handler::EPIC_STATUS);
+    let (status, body) = call(&path, "", None);
+    assert_eq!(status, 200);
+    serde_json::from_str(&body).unwrap()
+}
+
+#[test]
+#[ignore = "starts real processes; run with mise run spine-tests"]
+fn epic_starts_and_adds_units_only_through_the_operator() {
+    let spawner = RecordingSpawner::new();
+    let (core, _doubles) = start_core_with_doubles("epic", &spawner);
+    let handlers = [
+        handler::EPIC_START,
+        handler::EPIC_ADD_UNIT,
+        handler::EPIC_RESERVE,
+        handler::EPIC_SETTLE,
+    ];
+    assert_private(Service::Epic, &handlers, "cf7a");
+    let wrong = format!(
+        r#"{{"secret":"{}","epic":"cf7a","goal":"split the orders table","seat_limit":1,"metered_limit":0}}"#,
+        "x".repeat(64)
+    );
+    let start_epic = format!("/Operator/{}", handler::OPERATOR_START_EPIC);
+    assert_eq!(call(&start_epic, &wrong, None).0, 401, "a wrong secret");
+    let empty = wrong.replace(&"x".repeat(64), "");
+    assert_eq!(call(&start_epic, &empty, None).0, 401, "an empty secret");
+    assert_eq!(
+        epic_status(),
+        serde_json::Value::Null,
+        "no state after refusals"
+    );
+    assert!(core
+        .tycho(&["epic", "start", "cf7a", "split the orders table"])
+        .status
+        .success());
+    let added = core.tycho(&["epic", "add-unit", "cf7a", "wu01"]);
+    assert_eq!(String::from_utf8_lossy(&added.stdout).trim(), "\"added\"");
+    let again = core.tycho(&["epic", "add-unit", "cf7a", "wu01"]);
+    assert_eq!(
+        String::from_utf8_lossy(&again.stdout).trim(),
+        "\"already_present\""
+    );
+    let state = epic_status();
+    assert_eq!(state["units"], serde_json::json!(["wu01"]));
+    assert_eq!(state["worker_slots"]["limit"], 2);
+    let conflict = core.tycho(&["epic", "start", "cf7a", "another goal"]);
+    assert_eq!(
+        conflict.status.code(),
+        Some(1),
+        "another goal must conflict"
+    );
+    assert!(String::from_utf8_lossy(&conflict.stderr).contains("409"));
 }
 
 #[test]
@@ -320,16 +353,21 @@ fn session_and_reconciler_refuse_agents_outside_their_scope() {
     let spawner = RecordingSpawner::new();
     let (_core, _doubles) = start_core_with_doubles("session", &spawner);
     let name = "cf7a.wu01.wrk.claude.a1";
-    let session = format!("/{}/{name}", Service::Session.name());
-    for private in [
+    let session_handlers = [
         handler::SESSION_SPAWN,
         handler::SESSION_KILL,
         handler::SESSION_NUDGE,
-    ] {
-        let metadata = handler_metadata(Service::Session.name(), private);
-        assert_eq!(metadata["public"], serde_json::json!(false), "{private}");
-        assert!((400..500).contains(&call(&format!("{session}/{private}"), "{}", None).0));
-    }
+        handler::SESSION_EXPIRE,
+        handler::SESSION_REAP,
+    ];
+    assert_private(Service::Session, &session_handlers, name);
+    let reconciler_handlers = [
+        handler::RECONCILER_EXPECT,
+        handler::RECONCILER_FORGET,
+        handler::RECONCILER_TICK,
+    ];
+    assert_private(Service::Reconciler, &reconciler_handlers, RECONCILER_KEY);
+    let session = format!("/{}/{name}", Service::Session.name());
     let beat = format!(
         r#"{{"secret":"{}","sequence":1,"status":{{"state":null,"summary":"s","last_progress_unix_ms":0,"progress":{{"head_sha":null,"tests_passing":0}},"active_workers":0,"usage":{{"input_tokens":0,"output_tokens":0}},"blockers":[]}},"context_tokens":0}}"#,
         "s".repeat(40)
@@ -337,20 +375,14 @@ fn session_and_reconciler_refuse_agents_outside_their_scope() {
     let heartbeat = format!("{session}/{}", handler::SESSION_HEARTBEAT);
     let (status, _) = call(&heartbeat, &beat, Some(&format!("{name}:1")));
     assert_eq!(status, 404, "no session was spawned under this key");
+    let status_path = format!("{session}/{}", handler::SESSION_STATUS);
+    assert_eq!(call(&status_path, "", None), (200, "null".to_string()));
     let reconciler = format!("/{}/{RECONCILER_KEY}", Service::Reconciler.name());
-    let (status, generation) = call(&format!("{reconciler}/start"), "", None);
-    assert_eq!((status, generation.as_str()), (200, "1"));
-    assert_eq!(
-        call(&format!("{reconciler}/start"), "", None),
-        (200, "2".to_string())
-    );
-    let tick = format!("{reconciler}/{}", handler::RECONCILER_TICK);
-    assert!(
-        (400..500).contains(&call(&tick, "2", None).0),
-        "tick is private"
-    );
+    let start = format!("{reconciler}/{}", handler::RECONCILER_START);
+    assert_eq!(call(&start, "", None), (200, "2".to_string()));
+    assert_eq!(call(&start, "", None), (200, "3".to_string()));
+    let status_path = format!("{reconciler}/{}", handler::RECONCILER_STATUS);
     wait_until("the reconciler answers status while its chain runs", || {
-        call(&format!("{reconciler}/status"), "", None)
-            == (200, r#"{"generation":2,"expected":[]}"#.to_string())
+        call(&status_path, "", None) == (200, r#"{"generation":3,"expected":[]}"#.to_string())
     });
 }

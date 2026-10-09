@@ -52,6 +52,8 @@ pub trait Spawner: Send + Sync + 'static {
     fn spawn(&self, spec: &SpawnSpec) -> Result<u32, SpawnerError>;
     /// Kills by the recorded pid, never by session name alone.
     fn kill(&self, session: &SessionName, pid: u32) -> Result<(), SpawnerError>;
+    /// Kills a lost session by its zmx name; a lost session's pid is never trusted.
+    fn kill_by_name(&self, session: &SessionName) -> Result<(), SpawnerError>;
     /// Saves the session's scrollback as evidence and returns where it went.
     fn save_scrollback(&self, session: &SessionName) -> Result<ShortText, SpawnerError>;
     /// Types one line into the session's stdin, for a nudge.
@@ -76,6 +78,10 @@ impl Spawner for NoLauncher {
     }
 
     fn kill(&self, _session: &SessionName, _pid: u32) -> Result<(), SpawnerError> {
+        Err(SpawnerError::Refused(NO_LAUNCHER.to_string()))
+    }
+
+    fn kill_by_name(&self, _session: &SessionName) -> Result<(), SpawnerError> {
         Err(SpawnerError::Refused(NO_LAUNCHER.to_string()))
     }
 

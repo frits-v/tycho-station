@@ -307,7 +307,7 @@ pub struct Epic;
 
 #[restate_sdk::object]
 impl Epic {
-    #[handler]
+    #[handler(ingress_private)]
     async fn start(
         &self,
         object_context: ObjectContext<'_>,
@@ -320,7 +320,7 @@ impl Epic {
         Ok(Json(state))
     }
 
-    #[handler]
+    #[handler(ingress_private)]
     async fn add_unit(
         &self,
         object_context: ObjectContext<'_>,

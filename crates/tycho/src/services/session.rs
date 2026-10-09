@@ -54,6 +54,8 @@ pub struct SessionState {
     pub inbox_socket: Option<AbsolutePath>,
     pub handoff: Option<HandoffNote>,
     pub scrollback: Option<ShortText>,
+    /// A lost session's zmx name still needs killing by name; its pid is never trusted.
+    pub awaiting_reap: bool,
 }
 
 /// What `status` answers: no secret and no capability, so no awaitable id and no note content.
@@ -61,7 +63,6 @@ pub struct SessionState {
 pub struct SessionView {
     pub phase: SessionPhase,
     pub vendor: Vendor,
-    pub control: bool,
     pub pid: u32,
     pub spawned_unix_ms: u64,
     pub heartbeat_unix_ms: Option<u64>,
@@ -72,6 +73,7 @@ pub struct SessionView {
     pub inbox_socket: Option<AbsolutePath>,
     pub handoff_present: bool,
     pub scrollback: Option<ShortText>,
+    pub awaiting_reap: bool,
 }
 
 impl From<&SessionState> for SessionView {
@@ -79,7 +81,6 @@ impl From<&SessionState> for SessionView {
         Self {
             phase: state.phase,
             vendor: state.vendor,
-            control: state.control,
             pid: state.pid,
             spawned_unix_ms: state.spawned_unix_ms,
             heartbeat_unix_ms: state.heartbeat_unix_ms,
@@ -90,6 +91,7 @@ impl From<&SessionState> for SessionView {
             inbox_socket: state.inbox_socket.clone(),
             handoff_present: state.handoff.is_some(),
             scrollback: state.scrollback.clone(),
+            awaiting_reap: state.awaiting_reap,
         }
     }
 }
@@ -102,6 +104,18 @@ pub fn expire(state: &SessionState) -> Option<SessionState> {
     }
     let mut next = state.clone();
     next.phase = SessionPhase::Lost;
+    next.awaiting_reap = true;
+    Some(next)
+}
+
+/// A lost session awaiting its reap stops awaiting it; any other state stays as it is.
+#[must_use]
+pub fn reaped(state: &SessionState) -> Option<SessionState> {
+    if state.phase != SessionPhase::Lost || !state.awaiting_reap {
+        return None;
+    }
+    let mut next = state.clone();
+    next.awaiting_reap = false;
     Some(next)
 }
 
@@ -211,9 +225,7 @@ fn terminal(error: &SessionError) -> HandlerError {
     refuse(error.code(), error.to_string())
 }
 
-/// Records a beat; `None` for a sequence at or below the last one recorded.
-///
-/// A marker equal to the last one moves the heartbeat time and never the progress time.
+/// Records a beat, `None` for an old sequence; only a changed marker moves the progress time.
 pub fn apply_heartbeat(
     state: &SessionState,
     stored_secret: &str,
@@ -256,6 +268,9 @@ pub fn apply_handoff(
 ) -> Result<(SessionState, usize), SessionError> {
     if !secret::matches(stored_secret, &call.secret) {
         return Err(SessionError::Secret);
+    }
+    if state.phase != SessionPhase::Running {
+        return Err(SessionError::Ended);
     }
     let length = call
         .note
@@ -350,13 +365,11 @@ impl Session {
                 return Ok(Json(SpawnOutcome::Requeue { reason }))
             }
         };
-        record_spawn(
-            &object_context,
-            &name,
-            request,
-            pid,
-            observation.now_unix_ms,
-        );
+        let spawned_unix_ms = object_context
+            .run(|| async { Ok(wall_clock_unix_ms()) })
+            .name("clock after spawn")
+            .await?;
+        record_spawn(&object_context, &name, request, pid, spawned_unix_ms);
         Ok(Json(outcome))
     }
 
@@ -465,6 +478,30 @@ impl Session {
         let wire: String = exit.into_inner().into();
         object_context.reject_awakeable(state.awaitable_id.as_str(), TerminalError::new(wire));
         object_context.set(STATE_KEY, Json(next));
+        object_context
+            .object_client::<SessionClient>(object_context.key())
+            .reap()
+            .send();
+        Ok(true)
+    }
+
+    /// Kills a lost session by its zmx name through the port, once.
+    #[handler(ingress_private)]
+    async fn reap(&self, object_context: ObjectContext<'_>) -> HandlerResult<bool> {
+        let name = parse_key(object_context.key()).map_err(|error| terminal(&error))?;
+        let Some(state) = object_context.get::<Json<SessionState>>(STATE_KEY).await? else {
+            return Ok(false);
+        };
+        let Some(next) = reaped(&state.into_inner()) else {
+            return Ok(false);
+        };
+        let spawner = Arc::clone(&self.spawner);
+        object_context
+            .run(|| blocking(move || spawner.kill_by_name(&name).map_err(spawner_failure)))
+            .name("reap")
+            .retry_policy(self.timing.port_retry())
+            .await?;
+        object_context.set(STATE_KEY, Json(next));
         Ok(true)
     }
 
@@ -498,6 +535,7 @@ impl Session {
                 })
             })
             .name("observe lease")
+            .retry_policy(self.timing.port_retry())
             .await?;
         Ok(observation.into_inner())
     }
@@ -551,39 +589,53 @@ impl Session {
     }
 }
 
-fn record_spawn(
-    object_context: &ObjectContext<'_>,
+/// The state and expectation a spawn records; `spawned_unix_ms` is read after the spawn step.
+#[must_use]
+pub fn spawn_record(
     name: &SessionName,
-    request: SpawnRequest,
+    request: &SpawnRequest,
     pid: u32,
-    now_unix_ms: u64,
-) {
+    spawned_unix_ms: u64,
+) -> (SessionState, ExpectRequest) {
     let state = SessionState {
         phase: SessionPhase::Running,
         vendor: name.vendor(),
         control: name.level() != tycho_types::session::Level::Worker,
         pid,
         awaitable_id: request.awaitable_id.clone(),
-        spawned_unix_ms: now_unix_ms,
+        spawned_unix_ms,
         heartbeat_unix_ms: None,
         heartbeat_sequence: None,
         progress: None,
-        progress_changed_unix_ms: now_unix_ms,
+        progress_changed_unix_ms: spawned_unix_ms,
         context_tokens: 0,
-        resume_handle: request.resume_handle,
-        inbox_socket: request.inbox_socket,
+        resume_handle: request.resume_handle.clone(),
+        inbox_socket: request.inbox_socket.clone(),
         handoff: None,
         scrollback: None,
+        awaiting_reap: false,
     };
+    let expectation = ExpectRequest {
+        session: name.clone(),
+        awaitable_fingerprint: fingerprint(&request.awaitable_id),
+        since_unix_ms: spawned_unix_ms,
+    };
+    (state, expectation)
+}
+
+fn record_spawn(
+    object_context: &ObjectContext<'_>,
+    name: &SessionName,
+    request: SpawnRequest,
+    pid: u32,
+    spawned_unix_ms: u64,
+) {
+    let (state, expectation) = spawn_record(name, &request, pid, spawned_unix_ms);
     object_context.set(STATE_KEY, Json(state));
     object_context.set(SECRET_KEY, request.secret);
     object_context
         .object_client::<ReconcilerClient>(RECONCILER_KEY)
-        .expect(Json(ExpectRequest {
-            session: name.clone(),
-            awaitable_fingerprint: fingerprint(&request.awaitable_id),
-            since_unix_ms: now_unix_ms,
-        }))
+        .expect(Json(expectation))
         .send();
 }
 
@@ -622,6 +674,7 @@ mod tests {
             inbox_socket: None,
             handoff: None,
             scrollback: None,
+            awaiting_reap: false,
         }
     }
 
@@ -816,6 +869,64 @@ mod tests {
             assert!(!view.contains(hidden), "{hidden} in {view}");
         }
         assert!(view.contains("\"handoff_present\":true"));
+    }
+
+    #[test]
+    fn spawn_time_is_read_after_the_spawn_step() {
+        use crate::services::reconciler::{judge, Expected, Verdict};
+        use crate::services::spawner::LeaseRead;
+        let timing = Timing::default();
+        let observed_unix_ms = 1_800_000_000_000_u64;
+        let three_retries_ms = 10_000 + 20_000 + 40_000;
+        let spawned = observed_unix_ms.saturating_add(three_retries_ms);
+        let name = SessionName::parse("cf7a.wu03.wrk.claude.a1f3").unwrap();
+        let (state, expectation) = spawn_record(&name, &spawn_request(1), 7, spawned);
+        assert_eq!(state.spawned_unix_ms, spawned);
+        assert_eq!(expectation.since_unix_ms, spawned);
+        let expected = Expected {
+            awaitable_fingerprint: expectation.awaitable_fingerprint,
+            since_unix_ms: expectation.since_unix_ms,
+        };
+        let now = spawned.saturating_add(1_000);
+        assert_eq!(
+            judge(&name, &expected, &LeaseRead::Absent, now, &timing),
+            Verdict::Starting
+        );
+        let from_observation = Expected {
+            since_unix_ms: observed_unix_ms,
+            ..expected
+        };
+        assert!(matches!(
+            judge(&name, &from_observation, &LeaseRead::Absent, now, &timing),
+            Verdict::Dead(_)
+        ));
+    }
+
+    #[test]
+    fn handoff_rejects_an_ended_session() {
+        for phase in [SessionPhase::Killed, SessionPhase::Lost] {
+            let mut state = running();
+            state.phase = phase;
+            let call = HandoffCall {
+                secret: the_secret(),
+                note: note(0, 1),
+            };
+            assert_eq!(
+                apply_handoff(&state, &the_secret(), call),
+                Err(SessionError::Ended)
+            );
+        }
+    }
+
+    #[test]
+    fn a_lost_session_is_reaped_once() {
+        let lost = expire(&running()).unwrap();
+        assert!(lost.awaiting_reap);
+        let done = reaped(&lost).unwrap();
+        assert!(!done.awaiting_reap);
+        assert_eq!(done.phase, SessionPhase::Lost);
+        assert_eq!(reaped(&done), None);
+        assert_eq!(reaped(&running()), None);
     }
 
     #[test]

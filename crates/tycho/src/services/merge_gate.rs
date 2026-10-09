@@ -25,6 +25,21 @@ pub enum GateVerdict {
     Failed { findings: Vec<ShortText> },
 }
 
+impl GateVerdict {
+    /// Refuses a verdict whose findings exceed `FINDINGS_MAX_ITEMS`.
+    pub fn validate(&self) -> Result<(), GateError> {
+        match self {
+            Self::Failed { findings } if findings.len() > FINDINGS_MAX_ITEMS => {
+                Err(GateError::Refused(format!(
+                    "{} findings; maximum is {FINDINGS_MAX_ITEMS}",
+                    findings.len()
+                )))
+            }
+            Self::Merged { .. } | Self::Failed { .. } => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateError {
     Transient(String),
@@ -61,5 +76,33 @@ impl MergeGate for NoGate {
         Err(GateError::Refused(
             "no merge gate is installed in this endpoint".to_string(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed(count: usize) -> GateVerdict {
+        GateVerdict::Failed {
+            findings: vec![ShortText::parse("criterion 2 failed").unwrap(); count],
+        }
+    }
+
+    #[test]
+    fn accepts_findings_up_to_the_maximum() {
+        assert_eq!(failed(FINDINGS_MAX_ITEMS).validate(), Ok(()));
+        let merged = GateVerdict::Merged {
+            default_sha: CommitSha::parse(&"a".repeat(40)).unwrap(),
+        };
+        assert_eq!(merged.validate(), Ok(()));
+    }
+
+    #[test]
+    fn rejects_findings_over_the_maximum() {
+        assert!(matches!(
+            failed(FINDINGS_MAX_ITEMS.saturating_add(1)).validate(),
+            Err(GateError::Refused(_))
+        ));
     }
 }

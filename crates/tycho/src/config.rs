@@ -32,6 +32,7 @@ pub const CORE_SOCKET_DIR: &str = "zmx";
 pub const RESTATE_DATA_DIR: &str = "restate";
 pub const LOG_DIR: &str = "logs";
 pub const STOP_FILE: &str = "watchdog.stop";
+pub const OPERATOR_SECRET_FILE: &str = "operator.secret";
 
 pub const LAUNCHD_LABEL: &str = "dev.tycho.watchdog";
 pub const LAUNCHD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -74,8 +75,7 @@ pub mod spine {
     pub const STALL_PROGRESS: Duration = Duration::from_secs(15 * 60);
     pub const RETRY_BACKOFF_INITIAL: Duration = Duration::from_secs(10);
     pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
-    /// A spawn, nudge or kill step that keeps failing turns terminal after this many tries,
-    /// so a stuck port cannot hold the session object's exclusive lane.
+    /// Tries per port step; with the backoff above, about 35 minutes before it turns terminal.
     pub const PORT_STEP_ATTEMPTS_MAX: u32 = 12;
     /// The delay before a caller re-sends a reservation that met a full slot.
     pub const SLOT_RETRY_DELAY: Duration = Duration::from_secs(10);
@@ -93,6 +93,9 @@ pub mod spine {
     pub const EPIC_UNITS_MAX: usize = 64;
     pub const EPIC_RESERVATIONS_MAX: usize = 64;
     pub const SPAWN_ARGV_MAX_ITEMS: usize = 64;
+    /// Ledger limits `tycho epic start` gives a new epic: seat tokens and metered micro-dollars.
+    pub const EPIC_SEAT_LIMIT_DEFAULT: u64 = 50_000_000;
+    pub const EPIC_METERED_LIMIT_DEFAULT: u64 = 0;
 }
 
 /// Core session names are `core.<role>`, used only in the core socket directory.
@@ -128,6 +131,11 @@ pub const fn loopback(port: u16) -> SocketAddr {
 #[must_use]
 pub fn admin_url(path: &str) -> String {
     format!("http://{}{path}", loopback(RESTATE_ADMIN_PORT))
+}
+
+#[must_use]
+pub fn ingress_url(path: &str) -> String {
+    format!("http://{}{path}", loopback(RESTATE_INGRESS_PORT))
 }
 
 #[must_use]
@@ -277,6 +285,11 @@ impl CoreConfig {
         self.home.join(STOP_FILE)
     }
 
+    #[must_use]
+    pub fn operator_secret_file(&self) -> PathBuf {
+        self.home.join(OPERATOR_SECRET_FILE)
+    }
+
     /// The command line typed into the role's zmx session; `exec` makes the session end
     /// with the program and makes the listed pid the program's pid.
     #[must_use]
@@ -296,9 +309,9 @@ impl CoreConfig {
                 data = self.restate_data_dir().display(),
             ),
             CoreRole::Endpoint => format!(
-                "exec /usr/bin/env -i HOME={} PATH={CORE_PROCESS_PATH} {} endpoint",
-                self.home.display(),
-                self.tycho.display()
+                "exec /usr/bin/env -i HOME={home} PATH={CORE_PROCESS_PATH} {HOME_ENV}={home} {} endpoint",
+                self.tycho.display(),
+                home = self.home.display(),
             ),
         }
     }
@@ -502,7 +515,7 @@ mod tests {
         let config = config("/h").unwrap();
         assert_eq!(
             config.session_command(CoreRole::Endpoint),
-            "exec /usr/bin/env -i HOME=/h PATH=/usr/bin:/bin /opt/tycho endpoint"
+            "exec /usr/bin/env -i HOME=/h PATH=/usr/bin:/bin TYCHO_HOME=/h /opt/tycho endpoint"
         );
     }
 

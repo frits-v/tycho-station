@@ -15,10 +15,7 @@ pub const HANDOFF_ITEMS_MAX: usize = 32;
 /// Above any vendor's context window; a larger report is a defect, not a measurement.
 pub const CONTEXT_TOKENS_MAX: u64 = 10_000_000;
 
-/// The exclusive heartbeat: the status payload plus the context size from per-turn usage.
-///
-/// `sequence` is the one in the call's idempotency key; the handler ignores any sequence at
-/// or below the last one it recorded, since Restate does not hand the key to the handler.
+/// The heartbeat; `sequence` repeats the idempotency key's, which Restate keeps from handlers.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HeartbeatCall {
@@ -47,11 +44,22 @@ pub struct DecisionTaken {
     pub reason: ShortText,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The awaitable id is a capability, so `Debug` hides it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkerInFlight {
     pub task: TaskId,
     pub awaitable_id: AwaitableId,
+}
+
+impl fmt::Debug for WorkerInFlight {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkerInFlight")
+            .field("task", &self.task)
+            .field("awaitable_id", &"redacted")
+            .finish()
+    }
 }
 
 /// A control session's last act before rollover; structured, never a transcript summary.
@@ -188,6 +196,21 @@ mod tests {
             secret: "s".repeat(40),
             note: note(0, 1),
         };
+        assert!(!format!("{call:?}").contains(&"s".repeat(40)));
+    }
+
+    #[test]
+    fn note_debug_never_prints_a_worker_awaitable_id() {
+        assert!(!format!("{:?}", note(0, 1)).contains("sign_1abc"));
+    }
+
+    #[test]
+    fn heartbeat_debug_never_prints_the_secret() {
+        let json = format!(
+            r#"{{"secret":"{}","sequence":1,"status":{{"state":null,"summary":"s","last_progress_unix_ms":0,"progress":{{"head_sha":null,"tests_passing":0}},"active_workers":0,"usage":{{"input_tokens":0,"output_tokens":0}},"blockers":[]}},"context_tokens":0}}"#,
+            "s".repeat(40)
+        );
+        let call: HeartbeatCall = serde_json::from_str(&json).unwrap();
         assert!(!format!("{call:?}").contains(&"s".repeat(40)));
     }
 

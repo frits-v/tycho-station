@@ -10,6 +10,7 @@ pub mod config;
 pub mod core;
 pub mod endpoint;
 pub mod entire_graph;
+pub mod epic_command;
 pub mod health;
 pub mod http;
 pub mod launchd;

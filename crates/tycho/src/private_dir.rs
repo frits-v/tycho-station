@@ -2,14 +2,15 @@
 //! can reach.
 
 use std::fmt;
-use std::fs::{self, DirBuilder};
-use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use nix::unistd::Uid;
 
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
+pub const PRIVATE_FILE_MODE: u32 = 0o600;
 const GROUP_AND_OTHER_BITS: u32 = 0o077;
 const GROUP_AND_OTHER_WRITE_BITS: u32 = 0o022;
 
@@ -25,8 +26,10 @@ pub enum Policy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     NotADirectory,
+    NotARegularFile,
     OwnedBy(u32),
     OpenToOthers(u32),
+    TooLarge(usize),
 }
 
 #[derive(Debug)]
@@ -51,6 +54,16 @@ impl fmt::Display for DirError {
                     "{} is not a real directory (a symlink or a file)",
                     path.display()
                 )
+            }
+            Self::Refused(path, Refusal::NotARegularFile) => {
+                write!(
+                    formatter,
+                    "{} is not a regular file (a symlink or a directory)",
+                    path.display()
+                )
+            }
+            Self::Refused(path, Refusal::TooLarge(length)) => {
+                write!(formatter, "{} is {length} bytes; too large", path.display())
             }
             Self::Refused(path, Refusal::OwnedBy(uid)) => {
                 write!(
@@ -132,6 +145,55 @@ fn ensure_one(dir: &Path, current_uid: u32, policy: Policy) -> Result<(), DirErr
         current_uid,
     )
     .map_err(|refusal| DirError::Refused(dir.to_path_buf(), refusal))
+}
+
+/// Creates the file 0600 with the given contents unless it exists; never follows a symlink.
+pub fn create_private_file(path: &Path, contents: &[u8]) -> Result<bool, DirError> {
+    let opened = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(PRIVATE_FILE_MODE)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(path);
+    match opened {
+        Ok(mut file) => {
+            file.write_all(contents)
+                .map_err(|error| DirError::Create(path.to_path_buf(), error))?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(DirError::Create(path.to_path_buf(), error)),
+    }
+}
+
+/// Reads a regular file the current user owns with no group or other bits, up to `max` bytes.
+pub fn read_private_file(path: &Path, max: usize) -> Result<Vec<u8>, DirError> {
+    let inspect = |error| DirError::Inspect(path.to_path_buf(), error);
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(path)
+        .map_err(inspect)?;
+    let metadata = file.metadata().map_err(inspect)?;
+    let refuse = |refusal| DirError::Refused(path.to_path_buf(), refusal);
+    if !metadata.file_type().is_file() {
+        return Err(refuse(Refusal::NotARegularFile));
+    }
+    if metadata.uid() != Uid::current().as_raw() {
+        return Err(refuse(Refusal::OwnedBy(metadata.uid())));
+    }
+    if metadata.mode() & GROUP_AND_OTHER_BITS != 0 {
+        return Err(refuse(Refusal::OpenToOthers(metadata.mode() & 0o777)));
+    }
+    let limit = u64::try_from(max).unwrap_or(u64::MAX);
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(inspect)?;
+    if bytes.len() > max {
+        return Err(refuse(Refusal::TooLarge(bytes.len())));
+    }
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -223,5 +285,54 @@ mod tests {
             judge(Policy::Private, true, ME, 0o41777, ME),
             Err(Refusal::OpenToOthers(0o777))
         );
+    }
+
+    #[test]
+    fn creates_a_private_file_once_and_reads_it_back() {
+        let base = scratch("file");
+        let path = base.join("operator.secret");
+        let first = create_private_file(&path, b"abc");
+        let second = create_private_file(&path, b"other");
+        let mode = fs::symlink_metadata(&path).unwrap().mode() & 0o777;
+        let read = read_private_file(&path, 16);
+        fs::remove_dir_all(&base).unwrap();
+        assert!(matches!(first, Ok(true)));
+        assert!(matches!(second, Ok(false)));
+        assert_eq!(mode, PRIVATE_FILE_MODE);
+        assert_eq!(read.unwrap(), b"abc");
+    }
+
+    #[test]
+    fn refuses_a_file_open_to_others_or_over_its_maximum() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("open-file");
+        let path = base.join("operator.secret");
+        create_private_file(&path, b"abcdef").unwrap();
+        let too_large = read_private_file(&path, 3);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let open = read_private_file(&path, 16);
+        fs::remove_dir_all(&base).unwrap();
+        assert!(matches!(
+            too_large,
+            Err(DirError::Refused(_, Refusal::TooLarge(_)))
+        ));
+        assert!(matches!(
+            open,
+            Err(DirError::Refused(_, Refusal::OpenToOthers(0o644)))
+        ));
+    }
+
+    #[test]
+    fn refuses_a_symlinked_file() {
+        let base = scratch("link-file");
+        let target = base.join("target");
+        create_private_file(&target, b"abc").unwrap();
+        let link = base.join("operator.secret");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let read = read_private_file(&link, 16);
+        let created = create_private_file(&link, b"x");
+        fs::remove_dir_all(&base).unwrap();
+        assert!(read.is_err());
+        assert!(created.is_err() || matches!(created, Ok(false)));
     }
 }

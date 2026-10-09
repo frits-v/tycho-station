@@ -3,6 +3,7 @@
 pub mod doubles;
 pub mod epic;
 pub mod merge_gate;
+pub mod operator;
 pub mod reconciler;
 pub mod secret;
 pub mod session;
@@ -57,8 +58,7 @@ impl Default for Timing {
 }
 
 impl Timing {
-    /// The step retry policy for port calls: backoff doubling to its cap, bounded in attempts;
-    /// agent retries are workflow logic and never go through it.
+    /// Retry policy for port steps; agent retries are workflow logic and never use it.
     #[must_use]
     pub fn port_retry(&self) -> RunRetryPolicy {
         RunRetryPolicy::new()
@@ -79,6 +79,8 @@ impl Timing {
 pub struct Ports {
     pub spawner: Arc<dyn Spawner>,
     pub timing: Timing,
+    /// The operator secret file; `None` refuses every operator call.
+    pub operator_secret: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for Ports {
@@ -87,6 +89,7 @@ impl std::fmt::Debug for Ports {
             .debug_struct("Ports")
             .field("spawner", &self.spawner.describe())
             .field("timing", &self.timing)
+            .field("operator_secret", &self.operator_secret)
             .finish()
     }
 }
@@ -117,4 +120,17 @@ where
     tokio::task::spawn_blocking(work)
         .await
         .map_err(|error| HandlerError::from(std::io::Error::other(error.to_string())))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn port_retry_is_bounded_in_attempts() {
+        let policy = format!("{:?}", Timing::default().port_retry());
+        let bound = format!("max_attempts: Some({})", spine::PORT_STEP_ATTEMPTS_MAX);
+        assert!(policy.contains(&bound), "{policy}");
+        assert!(policy.contains("factor: 2.0"), "{policy}");
+    }
 }

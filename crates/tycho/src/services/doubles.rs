@@ -16,6 +16,7 @@ pub type SpawnHook = Arc<dyn Fn(&SpawnSpec, u32) + Send + Sync>;
 pub struct SpawnerLog {
     pub spawned: Vec<(String, u32)>,
     pub killed: Vec<(String, u32)>,
+    pub reaped: Vec<String>,
     pub sent: Vec<(String, String)>,
     pub scrollbacks: Vec<String>,
 }
@@ -93,6 +94,11 @@ impl Spawner for RecordingSpawner {
 
     fn kill(&self, session: &SessionName, pid: u32) -> Result<(), SpawnerError> {
         self.with(|inner| inner.log.killed.push((session.to_string(), pid)));
+        Ok(())
+    }
+
+    fn kill_by_name(&self, session: &SessionName) -> Result<(), SpawnerError> {
+        self.with(|inner| inner.log.reaped.push(session.to_string()));
         Ok(())
     }
 

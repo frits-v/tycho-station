@@ -152,6 +152,12 @@ pub fn batch(expected: &BTreeMap<String, Expected>, cursor: Option<&str>) -> Vec
         .collect()
 }
 
+/// Only a tick of the latest generation runs and re-sends itself; an older chain ends there.
+#[must_use]
+pub const fn tick_is_current(generation: u64, current: u64) -> bool {
+    generation == current && current != 0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpectError {
     TooMany,
@@ -294,7 +300,7 @@ impl Reconciler {
             .get::<u64>(GENERATION_KEY)
             .await?
             .unwrap_or(0);
-        if generation != current {
+        if !tick_is_current(generation, current) {
             return Ok(Json(TickReport {
                 generation,
                 stale_generation: true,
@@ -379,6 +385,7 @@ impl Reconciler {
                 })
             })
             .name("observe leases")
+            .retry_policy(self.timing.port_retry())
             .await?;
         Ok(observed.into_inner())
     }
@@ -610,6 +617,14 @@ mod tests {
         assert!(!view.contains("sign_1abc"));
         assert!(!view.contains(&fingerprint(&awaitable())));
         assert!(view.contains("cf7a.wu03.wrk.claude.a1f3"));
+    }
+
+    #[test]
+    fn only_the_latest_generation_ticks() {
+        assert!(tick_is_current(2, 2));
+        assert!(!tick_is_current(1, 2));
+        assert!(!tick_is_current(3, 2));
+        assert!(!tick_is_current(0, 0));
     }
 
     #[test]
