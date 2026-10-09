@@ -85,7 +85,7 @@ takes them.
 
 - A repository without code scanning answers 403 "Code scanning is not enabled". The
   upload prints `sarif-upload: code scanning is not enabled for this repository; N files
-  not uploaded` and does not fail ci, since each check already fails ci on a finding. Any
+  not uploaded` with GitHub's message and does not fail ci, since each check already fails ci on a finding. Any
   other refusal fails ci.
 - For code scanning to accept the files, the operator enables GitHub Code Security for the
   repository (Settings, Advanced Security) where the account's plan offers it, or moves the

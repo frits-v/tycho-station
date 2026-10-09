@@ -32,8 +32,8 @@ pub enum UploadOutcome {
     Accepted {
         id: String,
     },
-    /// Code scanning (GitHub Code Security) is off for the repository.
-    NotEnabled,
+    /// Code scanning (GitHub Code Security) is off for the repository; GitHub's message.
+    NotEnabled(String),
     Forbidden(String),
     NotFound,
     TooLarge,
@@ -88,7 +88,7 @@ pub fn decode_response(exit: &Exit, response: &str) -> UploadOutcome {
                 .iter()
                 .any(|marker| lower.contains(marker))
             {
-                UploadOutcome::NotEnabled
+                UploadOutcome::NotEnabled(message)
             } else {
                 UploadOutcome::Forbidden(message)
             }
@@ -240,6 +240,7 @@ fn upload_all() -> Result<String, String> {
     }
     let mut accepted = 0_usize;
     let mut not_enabled = 0_usize;
+    let mut not_enabled_message = String::new();
     let mut failures = Vec::new();
     for path in &files {
         match upload(&target, path)? {
@@ -247,7 +248,10 @@ fn upload_all() -> Result<String, String> {
                 println!("xtask sarif-upload: {} accepted as {id}", path.display());
                 accepted = accepted.saturating_add(1);
             }
-            UploadOutcome::NotEnabled => not_enabled = not_enabled.saturating_add(1),
+            UploadOutcome::NotEnabled(message) => {
+                not_enabled = not_enabled.saturating_add(1);
+                not_enabled_message = message;
+            }
             other => failures.push(format!("{}: {other:?}", path.display())),
         }
     }
@@ -256,7 +260,7 @@ fn upload_all() -> Result<String, String> {
     }
     if not_enabled > 0 {
         println!(
-            "sarif-upload: code scanning is not enabled for this repository; {not_enabled} files not uploaded"
+            "sarif-upload: code scanning is not enabled for this repository; {not_enabled} files not uploaded (GitHub: {not_enabled_message})"
         );
     }
     Ok(format!(
@@ -312,7 +316,9 @@ mod tests {
                     "403 Forbidden",
                     r#"{"message":"Code scanning is not enabled for this repository. Please enable code scanning in the repository settings."}"#,
                 ),
-                UploadOutcome::NotEnabled,
+                UploadOutcome::NotEnabled(
+                    "Code scanning is not enabled for this repository. Please enable code scanning in the repository settings.".to_string(),
+                ),
             ),
             (
                 Exit::Code(1),
@@ -320,7 +326,9 @@ mod tests {
                     "403 Forbidden",
                     r#"{"message":"Advanced Security must be enabled for this repository to use code scanning."}"#,
                 ),
-                UploadOutcome::NotEnabled,
+                UploadOutcome::NotEnabled(
+                    "Advanced Security must be enabled for this repository to use code scanning.".to_string(),
+                ),
             ),
             (
                 Exit::Code(1),
