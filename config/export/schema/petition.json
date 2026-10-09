@@ -1,0 +1,145 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+        "ContentRef": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "PetitionArticle": {
+            "type": "string",
+            "description": "The article number of the clause the petition would amend, or \"new\" for a new article.",
+            "pattern": "^([1-9][0-9]?|new)$"
+        },
+        "PetitionCounter": {
+            "enum": [
+                "repeated_ruling",
+                "convention_hold",
+                "void_finding",
+                "dormancy",
+                "early"
+            ]
+        },
+        "PetitionState": {
+            "enum": [
+                "open",
+                "amend",
+                "reject"
+            ]
+        },
+        "RecordId": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "ShortText": {
+            "type": "string",
+            "$ref": "#/$defs/Text",
+            "maxLength": 512
+        },
+        "Text": {
+            "type": "string",
+            "description": "No control characters (Unicode category Cc), so text cannot carry terminal escapes.",
+            "pattern": "^[^\\x00-\\x1f\\x7f-\\x9f]+$"
+        },
+        "U32": {
+            "allOf": [
+                {
+                    "type": "number"
+                },
+                {
+                    "type": "integer",
+                    "maximum": 4294967295,
+                    "minimum": 0
+                }
+            ]
+        }
+    },
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+        "article": {
+            "$ref": "#/$defs/PetitionArticle"
+        },
+        "cases": {
+            "type": "array",
+            "items": {
+                "$ref": "#/$defs/RecordId"
+            },
+            "maxItems": 16
+        },
+        "cases_total": {
+            "$ref": "#/$defs/U32"
+        },
+        "counter": {
+            "$ref": "#/$defs/PetitionCounter"
+        },
+        "evidence": {
+            "description": "The counter's evidence value when the petition was raised.",
+            "$ref": "#/$defs/U32"
+        },
+        "fingerprint": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+        },
+        "key": {
+            "description": "The counter key: question fingerprint and ruling digest, case id, article, clause or\nmechanism id, or escalation id.",
+            "$ref": "#/$defs/ShortText"
+        },
+        "sequence": {
+            "allOf": [
+                {
+                    "type": "number"
+                },
+                {
+                    "type": "integer",
+                    "maximum": 9999,
+                    "minimum": 1
+                }
+            ]
+        },
+        "state": {
+            "$ref": "#/$defs/PetitionState"
+        },
+        "supersedes": {
+            "description": "The silent-by-design case this petition overcomes with new evidence.",
+            "$ref": "#/$defs/RecordId"
+        },
+        "thresholds": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "convention_hold_days": {
+                    "$ref": "#/$defs/U32"
+                },
+                "digest": {
+                    "description": "Digest of config/export/petitions.json, so the reader can match the values.",
+                    "$ref": "#/$defs/ContentRef"
+                },
+                "repeated_ruling_count": {
+                    "$ref": "#/$defs/U32"
+                },
+                "review_period_days": {
+                    "$ref": "#/$defs/U32"
+                }
+            },
+            "required": [
+                "convention_hold_days",
+                "digest",
+                "repeated_ruling_count",
+                "review_period_days"
+            ]
+        }
+    },
+    "required": [
+        "article",
+        "cases",
+        "cases_total",
+        "counter",
+        "evidence",
+        "fingerprint",
+        "key",
+        "sequence",
+        "state",
+        "thresholds"
+    ]
+}

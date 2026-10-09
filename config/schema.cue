@@ -74,6 +74,23 @@ import (
 	}
 }
 
+// Article 14.4 and 15.3 thresholds of the petition mechanism (design section 11), reported
+// with every petition. Each key is bounded, so no value the operator sets is unbounded.
+#Petitions: {
+	// Consecutive human rulings with one ruling on one question fingerprint.
+	repeated_ruling_count!: int & >=2 & <=50
+	// Days a convention holds without a failed citation.
+	convention_hold_days!: int & >=7 & <=730
+	// Days without a citation or a firing before a rule is listed as dormant.
+	review_period_days!: int & >=7 & <=730
+	// Petitions open at once; a crossing past it waits for a later pass.
+	open_max!: int & >=1 & <=8
+	// Seconds between passes of the Petitions tick.
+	evaluation_interval_seconds!: #Seconds & >=60
+	// Motivating cases a packet lists; the rest are counted.
+	cases_listed_max!: int & >=1 & <=16
+}
+
 #Adapter: {
 	session_vendor!: "claude" | "codex" | "antigravity" | "amp" | "opencode"
 	pane_host!:      "zmx"

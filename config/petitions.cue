@@ -1,0 +1,12 @@
+// Petition thresholds of design section 11. Set by the operator only; every petition reports
+// these values with the export's digest.
+package config
+
+petitions: #Petitions & {
+	repeated_ruling_count:       3
+	convention_hold_days:        90
+	review_period_days:          90
+	open_max:                    3
+	evaluation_interval_seconds: 3600
+	cases_listed_max:            8
+}
