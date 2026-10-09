@@ -9,6 +9,11 @@ use tycho_types::lease::PID_MAX;
 use crate::command::{self, CommandError};
 use crate::config::{COMMAND_TIMEOUT, LIST_SESSIONS_MAX};
 
+/// The core directory is private: zmx does not check who connects to a socket.
+const CORE_DIR_MODE: &str = "0700";
+/// The agent user and the developer share the group; others get nothing.
+const AGENT_ZMX_DIR_MODE: &str = "0770";
+
 /// One line of `zmx list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListEntry {
@@ -170,6 +175,7 @@ impl std::fmt::Display for ZmxError {
 pub struct Zmx {
     binary: PathBuf,
     socket_dir: String,
+    dir_mode: &'static str,
 }
 
 impl Zmx {
@@ -178,14 +184,24 @@ impl Zmx {
         Self {
             binary: binary.to_path_buf(),
             socket_dir: socket_dir.display().to_string(),
+            dir_mode: CORE_DIR_MODE,
         }
     }
 
-    /// The core directory is private: zmx does not check who connects to a socket.
+    /// zmx bound to the agent socket directory, which the developer's group shares.
+    #[must_use]
+    pub fn agent(binary: &Path, socket_dir: &Path) -> Self {
+        Self {
+            binary: binary.to_path_buf(),
+            socket_dir: socket_dir.display().to_string(),
+            dir_mode: AGENT_ZMX_DIR_MODE,
+        }
+    }
+
     const fn environment(&self) -> [(&str, &str); 2] {
         [
             ("ZMX_DIR", self.socket_dir.as_str()),
-            ("ZMX_DIR_MODE", "0700"),
+            ("ZMX_DIR_MODE", self.dir_mode),
         ]
     }
 

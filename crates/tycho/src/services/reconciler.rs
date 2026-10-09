@@ -8,10 +8,9 @@ use std::sync::Arc;
 
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tycho_types::exit::ExitState;
-use tycho_types::launcher::AwaitableId;
-use tycho_types::lease::{spawn_decision, RequeueReason, SpawnDecision};
+use tycho_types::launcher::{AwaitableDigest, AwaitableId};
+use tycho_types::lease::{Freshness, RequeueReason};
 use tycho_types::service::RECONCILER_KEY;
 use tycho_types::session::SessionName;
 
@@ -70,11 +69,7 @@ impl ReconcilerView {
 
 #[must_use]
 pub fn fingerprint(awaitable_id: &AwaitableId) -> String {
-    Sha256::digest(awaitable_id.as_str().as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<Vec<_>>()
-        .concat()
+    AwaitableDigest::of(awaitable_id).as_str().to_string()
 }
 
 /// What one tick concludes about one expected session.
@@ -121,21 +116,20 @@ pub fn judge(
         }
         LeaseRead::Present { lease } => lease,
     };
-    let fresh_ms = Timing::millis(timing.lease_fresh);
-    let decision = spawn_decision(
-        Some(lease),
-        session,
-        lease.awaitable_id(),
-        now_unix_ms,
-        fresh_ms,
-    );
-    let same_spawn = fingerprint(lease.awaitable_id()) == expected.awaitable_fingerprint;
-    match decision {
-        SpawnDecision::Requeue(reason) => Verdict::Dead(dead_state(Some(reason))),
-        SpawnDecision::Adopt if same_spawn => Verdict::Alive,
-        SpawnDecision::Adopt | SpawnDecision::Spawn => {
-            Verdict::Dead(dead_state(Some(RequeueReason::OtherAwaitable)))
-        }
+    if lease.awaitable_sha256().as_str() != expected.awaitable_fingerprint {
+        return Verdict::Dead(dead_state(Some(RequeueReason::OtherAwaitable)));
+    }
+    if lease.session() != session {
+        return Verdict::Dead(dead_state(Some(RequeueReason::OtherSession)));
+    }
+    // An ended lease means Restate acknowledged the launcher's result: nothing to reap.
+    if lease.ended_unix_ms().is_some() {
+        return Verdict::Alive;
+    }
+    match lease.freshness(now_unix_ms, Timing::millis(timing.lease_fresh)) {
+        Freshness::Fresh => Verdict::Alive,
+        Freshness::Stale => Verdict::Dead(dead_state(Some(RequeueReason::Stale))),
+        Freshness::Ahead => Verdict::Dead(dead_state(Some(RequeueReason::Ahead))),
     }
 }
 
@@ -447,12 +441,12 @@ mod tests {
         }
     }
 
-    fn present(session: SessionName, awaitable_id: AwaitableId, heartbeat: u64) -> LeaseRead {
+    fn present(session: SessionName, awaitable_id: &AwaitableId, heartbeat: u64) -> LeaseRead {
         LeaseRead::Present {
             lease: Lease::new(
                 session,
                 77,
-                awaitable_id,
+                AwaitableDigest::of(awaitable_id),
                 NOW_MS.saturating_sub(600_000),
                 heartbeat,
             )
@@ -473,7 +467,7 @@ mod tests {
     #[test]
     fn a_fresh_lease_is_alive() {
         assert_eq!(
-            verdict(&present(session(), awaitable(), NOW_MS), NOW_MS),
+            verdict(&present(session(), &awaitable(), NOW_MS), NOW_MS),
             Verdict::Alive
         );
     }
@@ -504,10 +498,23 @@ mod tests {
         let fresh = Timing::millis(Timing::default().lease_fresh);
         let stale = present(
             session(),
-            awaitable(),
+            &awaitable(),
             NOW_MS.saturating_sub(fresh).saturating_sub(1),
         );
         assert_eq!(verdict(&stale, NOW_MS), Verdict::Dead(ExitState::Killed));
+    }
+
+    #[test]
+    fn an_ended_lease_of_this_spawn_is_never_reaped() {
+        let fresh = Timing::millis(Timing::default().lease_fresh);
+        let old = NOW_MS.saturating_sub(fresh).saturating_sub(60_000);
+        let LeaseRead::Present { lease } = present(session(), &awaitable(), old) else {
+            panic!("no lease");
+        };
+        let ended = LeaseRead::Present {
+            lease: lease.ended(old).unwrap(),
+        };
+        assert_eq!(verdict(&ended, NOW_MS), Verdict::Alive);
     }
 
     #[test]
@@ -515,7 +522,7 @@ mod tests {
         let fresh = Timing::millis(Timing::default().lease_fresh);
         let ahead = present(
             session(),
-            awaitable(),
+            &awaitable(),
             NOW_MS.saturating_add(fresh).saturating_add(1),
         );
         assert_eq!(verdict(&ahead, NOW_MS), Verdict::Dead(ExitState::Failed));
@@ -523,14 +530,14 @@ mod tests {
 
     #[test]
     fn a_lease_for_another_spawn_is_dead() {
-        let other_awaitable = present(session(), AwaitableId::parse("sign_1x").unwrap(), NOW_MS);
+        let other_awaitable = present(session(), &AwaitableId::parse("sign_1x").unwrap(), NOW_MS);
         assert_eq!(
             verdict(&other_awaitable, NOW_MS),
             Verdict::Dead(ExitState::Killed)
         );
         let other_session = SessionName::parse("cf7a.wu03.wrk.claude.b2").unwrap();
         assert_eq!(
-            verdict(&present(other_session, awaitable(), NOW_MS), NOW_MS),
+            verdict(&present(other_session, &awaitable(), NOW_MS), NOW_MS),
             Verdict::Dead(ExitState::Killed)
         );
     }

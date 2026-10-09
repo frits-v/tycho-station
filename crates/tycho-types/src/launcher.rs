@@ -27,6 +27,33 @@ checked_string!(
     check_awaitable_id
 );
 
+fn check_awaitable_digest(value: &str) -> Result<(), TokenError> {
+    crate::token::check_hex(value, &[AWAITABLE_DIGEST_HEX_DIGITS])
+}
+
+pub const AWAITABLE_DIGEST_HEX_DIGITS: usize = 64;
+
+checked_string!(
+    /// SHA-256 of an awaitable id in lowercase hex: names the awaitable without granting it.
+    AwaitableDigest,
+    check_awaitable_digest
+);
+
+impl AwaitableDigest {
+    #[must_use]
+    pub fn of(awaitable: &AwaitableId) -> Self {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write;
+        let mut hex = String::with_capacity(AWAITABLE_DIGEST_HEX_DIGITS);
+        for byte in Sha256::digest(awaitable.as_str().as_bytes()) {
+            if write!(hex, "{byte:02x}").is_err() {
+                break;
+            }
+        }
+        Self(hex)
+    }
+}
+
 /// The per-session heartbeat secret; it has no serialization and a redacted `Debug`.
 #[derive(Clone)]
 pub struct SessionSecret(String);
@@ -310,6 +337,18 @@ mod tests {
         assert!(!secret.verify(&SECRET.replace('0', "1")));
         assert!(!secret.verify(&SECRET[1..]));
         assert!(!secret.verify(""));
+    }
+
+    #[test]
+    fn digest_is_lowercase_sha256_and_parses_back() {
+        let digest = AwaitableDigest::of(&AwaitableId::parse("abc").unwrap());
+        assert_eq!(
+            digest.as_str(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(AwaitableDigest::parse(digest.as_str()).unwrap(), digest);
+        assert!(AwaitableDigest::parse("sign_1abc").is_err());
+        assert!(AwaitableDigest::parse(&digest.as_str().to_uppercase()).is_err());
     }
 
     #[test]

@@ -354,10 +354,10 @@ impl Session {
             fresh_ms,
         );
         let (pid, outcome) = match (decision, lease) {
-            (SpawnDecision::Adopt, Some(lease)) => {
+            (SpawnDecision::Adopt | SpawnDecision::AdoptEnded, Some(lease)) => {
                 (lease.pid(), SpawnOutcome::Adopted { pid: lease.pid() })
             }
-            (SpawnDecision::Spawn | SpawnDecision::Adopt, _) => {
+            (SpawnDecision::Spawn | SpawnDecision::Adopt | SpawnDecision::AdoptEnded, _) => {
                 let pid = self.start_session(&object_context, &name, &request).await?;
                 (pid, SpawnOutcome::Spawned { pid })
             }

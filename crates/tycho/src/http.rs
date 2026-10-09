@@ -63,6 +63,28 @@ impl Http {
     }
 }
 
+impl Http {
+    /// A POST with a content type and extra headers, such as an idempotency key.
+    #[must_use]
+    pub fn post(
+        &self,
+        url: &str,
+        content_type: &str,
+        headers: &[(&str, &str)],
+        body: String,
+    ) -> Outcome {
+        let mut request = self
+            .http1
+            .post(url)
+            .header("content-type", content_type)
+            .body(body);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        read(request.send())
+    }
+}
+
 fn read(sent: reqwest::Result<reqwest::blocking::Response>) -> Outcome {
     let response = match sent {
         Ok(response) => response,
