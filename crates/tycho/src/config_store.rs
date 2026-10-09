@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tycho_types::task_packet::{Effort, RoutingName};
 
+use crate::private_dir;
+
+mod bounds;
+
 pub const CONFIG_DIR_ENV: &str = "TYCHO_CONFIG_DIR";
 /// Under the core home, so only the core's user can change what the services read.
 pub const CONFIG_SUBDIR: &str = "config";
@@ -45,6 +49,7 @@ pub enum StoreError {
     Unrecognised(String, String),
     Invalid(String, String),
     RelativeDir(PathBuf),
+    Dir(String),
 }
 
 impl fmt::Display for StoreError {
@@ -74,6 +79,7 @@ impl fmt::Display for StoreError {
                 write!(formatter, "{name}.json: unrecognised value at {what}")
             }
             Self::Invalid(name, what) => write!(formatter, "{name}.json: {what}"),
+            Self::Dir(error) => write!(formatter, "configuration directory: {error}"),
             Self::RelativeDir(path) => {
                 write!(
                     formatter,
@@ -209,7 +215,6 @@ pub struct Tier {
 #[serde(deny_unknown_fields)]
 pub struct RoutingTables {
     pub classes: BTreeMap<RoutingName, Class>,
-    pub attempt_cap_default: u16,
     pub tiers: BTreeMap<RoutingName, Tier>,
 }
 
@@ -268,94 +273,59 @@ pub struct Thresholds {
     pub mandate: MandateThresholds,
 }
 
-fn check_routing(routing: &RoutingTables) -> Result<(), String> {
-    if routing.classes.is_empty() || routing.classes.len() > CLASSES_MAX_ITEMS {
-        return Err(format!(
-            "{} classes; expected 1..={CLASSES_MAX_ITEMS}",
-            routing.classes.len()
-        ));
-    }
-    if routing.tiers.is_empty() || routing.tiers.len() > TIERS_MAX_ITEMS {
-        return Err(format!(
-            "{} tiers; expected 1..={TIERS_MAX_ITEMS}",
-            routing.tiers.len()
-        ));
-    }
-    for (name, class) in &routing.classes {
-        if !routing.tiers.contains_key(&class.minimum_tier) {
-            return Err(format!("class {name} names a missing tier"));
-        }
-        if class.attempt_cap == 0 {
-            return Err(format!("class {name} has an attempt cap of zero"));
-        }
-    }
-    for (name, tier) in &routing.tiers {
-        let models = [&tier.models.claude, &tier.models.codex];
-        if models
-            .iter()
-            .any(|model| model.is_empty() || model.len() > MODEL_MAX_BYTES)
-        {
-            return Err(format!(
-                "tier {name} has a model name outside 1..={MODEL_MAX_BYTES} bytes"
-            ));
-        }
-        if tier
-            .fallback
-            .as_ref()
-            .is_some_and(|fallback| !routing.tiers.contains_key(fallback))
-        {
-            return Err(format!("tier {name} falls back to a missing tier"));
-        }
-    }
-    if routing.attempt_cap_default == 0 {
-        return Err("attempt_cap_default is zero".to_string());
-    }
-    Ok(())
-}
-
-fn check_thresholds(thresholds: &Thresholds) -> Result<(), String> {
-    let stall = thresholds.stall;
-    let retry = thresholds.retry;
-    let session = thresholds.session;
-    let positive = [
-        stall.silence_seconds,
-        retry.backoff_initial_seconds,
-        retry.slot_retry_delay_seconds,
-        session.heartbeat_interval_seconds,
-        session.spawn_grace_seconds,
-        session.reconciler_interval_seconds,
-        u64::from(thresholds.slots.control),
-        u64::from(thresholds.slots.worker),
-        u64::from(retry.port_step_attempts_max),
-        u64::from(retry.unit_attempt_cap),
-    ];
-    if positive.contains(&0) {
-        return Err("a duration, slot count or attempt cap is zero".to_string());
-    }
-    if stall.progress_seconds <= stall.silence_seconds
-        || retry.backoff_max_seconds < retry.backoff_initial_seconds
-        || session.lease_fresh_seconds <= session.heartbeat_interval_seconds
-    {
-        return Err(
-            "T2 must exceed T1, the backoff cap its start, the lease the heartbeat".to_string(),
-        );
-    }
-    if retry.backoff_factor != 2 {
-        return Err("backoff_factor must be 2; the spine implements doubling".to_string());
-    }
-    if !(session.rollover_fraction > 0.0 && session.rollover_fraction < 1.0) {
-        return Err("rollover_fraction is outside (0, 1)".to_string());
-    }
-    Ok(())
-}
-
-/// The content hashes a work unit records at its start.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConfigHashes {
     pub routing: String,
     pub thresholds: String,
 }
+
+/// What a work unit journals at its start and runs with from then on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnitConfig {
+    pub hashes: ConfigHashes,
+    pub unit_attempt_cap: u16,
+}
+
+/// What a worker run journals at its start: its class's attempt cap and the tiers it climbs,
+/// starting with the requested one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Route {
+    pub hashes: ConfigHashes,
+    pub attempt_cap: u16,
+    pub tiers: Vec<RoutingName>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteError {
+    UnknownClass(RoutingName),
+    UnknownTier(RoutingName),
+    BelowMinimum {
+        tier: RoutingName,
+        minimum: RoutingName,
+    },
+}
+
+impl fmt::Display for RouteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnknownClass(class) => {
+                write!(formatter, "class {class} is not in the routing table")
+            }
+            Self::UnknownTier(tier) => write!(formatter, "tier {tier} is not in the routing table"),
+            Self::BelowMinimum { tier, minimum } => {
+                write!(
+                    formatter,
+                    "tier {tier} is below the class minimum {minimum}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for RouteError {}
 
 /// The configuration the services run with.
 #[derive(Debug, Clone, PartialEq)]
@@ -400,9 +370,9 @@ impl FactoryConfig {
                 format!("classes.{name}.effort"),
             ));
         }
-        check_routing(&routing.value)
+        bounds::check_routing(&routing.value)
             .map_err(|what| StoreError::Invalid(ROUTING.to_string(), what))?;
-        check_thresholds(&thresholds.value)
+        bounds::check_thresholds(&thresholds.value)
             .map_err(|what| StoreError::Invalid(THRESHOLDS.to_string(), what))?;
         Ok(Self {
             routing,
@@ -418,14 +388,58 @@ impl FactoryConfig {
         }
     }
 
-    /// The attempt cap of a task class, or the table's default for a class it does not list.
     #[must_use]
-    pub fn attempt_cap(&self, class: &RoutingName) -> u16 {
+    pub fn unit_config(&self) -> UnitConfig {
+        UnitConfig {
+            hashes: self.hashes(),
+            unit_attempt_cap: self.thresholds.value.retry.unit_attempt_cap,
+        }
+    }
+
+    /// Refuses a class the table does not list and a tier below the class minimum.
+    pub fn route(&self, class: &RoutingName, tier: &RoutingName) -> Result<Route, RouteError> {
         let routing = &self.routing.value;
-        routing
+        let listed = routing
             .classes
             .get(class)
-            .map_or(routing.attempt_cap_default, |listed| listed.attempt_cap)
+            .ok_or_else(|| RouteError::UnknownClass(class.clone()))?;
+        if !routing.tiers.contains_key(tier) {
+            return Err(RouteError::UnknownTier(tier.clone()));
+        }
+        let ladder = self.ladder(&listed.minimum_tier);
+        let position = ladder.iter().position(|name| name == tier).ok_or_else(|| {
+            RouteError::BelowMinimum {
+                tier: tier.clone(),
+                minimum: listed.minimum_tier.clone(),
+            }
+        })?;
+        Ok(Route {
+            hashes: self.hashes(),
+            attempt_cap: listed.attempt_cap,
+            tiers: ladder.into_iter().skip(position).collect(),
+        })
+    }
+
+    /// The tier and its fallbacks in order, stopping at the top or at a tier seen before.
+    fn ladder(&self, from: &RoutingName) -> Vec<RoutingName> {
+        let mut ladder: Vec<RoutingName> = Vec::new();
+        let mut current = Some(from.clone());
+        for _ in 0..TIERS_MAX_ITEMS {
+            let Some(name) = current.take() else {
+                break;
+            };
+            if ladder.contains(&name) {
+                break;
+            }
+            current = self
+                .routing
+                .value
+                .tiers
+                .get(&name)
+                .and_then(|tier| tier.fallback.clone());
+            ladder.push(name);
+        }
+        ladder
     }
 }
 
@@ -462,9 +476,19 @@ pub fn resolve_source(
     }
 }
 
+/// A directory is read only when it is the user's own and not writable by others.
 pub fn load(source: &ConfigSource) -> Result<FactoryConfig, StoreError> {
     match source {
-        ConfigSource::Dir(dir) => FactoryConfig::load(dir),
+        ConfigSource::Dir(dir) => {
+            if !dir.is_dir() {
+                return Err(StoreError::Dir(format!(
+                    "{} is not a directory",
+                    dir.display()
+                )));
+            }
+            private_dir::ensure_owned(dir).map_err(|error| StoreError::Dir(error.to_string()))?;
+            FactoryConfig::load(dir)
+        }
         ConfigSource::Embedded => FactoryConfig::embedded(),
     }
 }
@@ -500,17 +524,73 @@ mod tests {
         assert_eq!(config.hashes().routing, sha256_hex(ROUTING_JSON));
     }
 
+    fn name(text: &str) -> RoutingName {
+        RoutingName::parse(text).unwrap()
+    }
+
     #[test]
-    fn a_listed_class_takes_its_cap_and_an_unlisted_one_the_default() {
+    fn a_route_climbs_from_the_requested_tier_to_the_top() {
+        let config = FactoryConfig::embedded().unwrap();
+        let route = config.route(&name("implement"), &name("standard")).unwrap();
+        assert_eq!(route.attempt_cap, 3);
+        assert_eq!(route.tiers, vec![name("standard"), name("strong")]);
+        assert_eq!(route.hashes, config.hashes());
+        let top = config.route(&name("implement"), &name("strong")).unwrap();
+        assert_eq!(top.tiers, vec![name("strong")]);
+    }
+
+    #[test]
+    fn a_route_refuses_an_unlisted_class_an_unknown_tier_and_a_tier_below_the_minimum() {
         let config = FactoryConfig::embedded().unwrap();
         assert_eq!(
-            config.attempt_cap(&RoutingName::parse("implement").unwrap()),
-            3
+            config.route(&name("unlisted"), &name("standard")),
+            Err(RouteError::UnknownClass(name("unlisted")))
         );
         assert_eq!(
-            config.attempt_cap(&RoutingName::parse("unlisted").unwrap()),
-            3
+            config.route(&name("implement"), &name("huge")),
+            Err(RouteError::UnknownTier(name("huge")))
         );
+        assert_eq!(
+            config.route(&name("implement"), &name("light")),
+            Err(RouteError::BelowMinimum {
+                tier: name("light"),
+                minimum: name("standard")
+            })
+        );
+    }
+
+    #[test]
+    fn a_fallback_cycle_ends_the_ladder() {
+        let mut config = FactoryConfig::embedded().unwrap();
+        config
+            .routing
+            .value
+            .tiers
+            .get_mut(&name("strong"))
+            .unwrap()
+            .fallback = Some(name("standard"));
+        let route = config.route(&name("implement"), &name("standard")).unwrap();
+        assert_eq!(route.tiers, vec![name("standard"), name("strong")]);
+    }
+
+    #[test]
+    fn a_directory_open_to_others_is_refused_before_any_file_is_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("config-store-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let refused = load(&ConfigSource::Dir(dir.clone()));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let empty = load(&ConfigSource::Dir(dir.clone()));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(matches!(refused, Err(StoreError::Dir(_))), "{refused:?}");
+        assert!(matches!(empty, Err(StoreError::Read(..))), "{empty:?}");
+        assert!(matches!(
+            load(&ConfigSource::Dir(PathBuf::from("/nonexistent-config"))),
+            Err(StoreError::Dir(_))
+        ));
     }
 
     #[test]
@@ -547,10 +627,8 @@ mod tests {
 
     #[test]
     fn refuses_unknown_fields_and_oversized_files() {
-        let text = String::from_utf8_lossy(ROUTING_JSON).replace(
-            "\"attempt_cap_default\"",
-            "\"extra\": 1, \"attempt_cap_default\"",
-        );
+        let text =
+            String::from_utf8_lossy(ROUTING_JSON).replace("\"tiers\"", "\"extra\": 1, \"tiers\"");
         let (bytes, line) = hashed(&text);
         assert!(matches!(
             decode::<RoutingTables>("routing", &bytes, &line),

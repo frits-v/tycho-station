@@ -10,7 +10,9 @@ use sha2::{Digest, Sha256};
 
 use crate::process::{run_bounded, Exit};
 
+const CONFIG_DIR: &str = "config";
 const CONFIG_SCHEMA: &str = "config/schema.cue";
+const MANDATE_DOC: &str = "docs/mandate.md";
 const EXPORT_DIR: &str = "config/export";
 const SCHEMA_EXPORT_SUBDIR: &str = "schema";
 const SCHEMAS_DIR: &str = "schemas";
@@ -23,6 +25,7 @@ const SCHEMAS: [(&str, &str); 3] = [
 ];
 const CUE_TIMEOUT: Duration = Duration::from_secs(120);
 const EXPORT_DIR_MAX_FILES: usize = 256;
+const EXPORT_DIR_MAX_DEPTH: usize = 4;
 const SCHEMA_SOURCES_MAX: usize = 64;
 
 /// What one `cue` invocation came to; anything outside the known shapes is unrecognised.
@@ -190,25 +193,112 @@ pub fn config_export() -> i32 {
     }
 }
 
-/// Files under the export directory, as paths relative to it, one level of subdirectory deep.
+/// Every entry under the export directory, as a path relative to it; a directory is walked
+/// with an explicit bounded stack, anything that is neither file nor directory is a defect.
 fn checked_in_files() -> Result<Vec<PathBuf>, String> {
     let mut found = Vec::new();
-    for subdir in [Path::new(""), Path::new(SCHEMA_EXPORT_SUBDIR)] {
-        let dir = Path::new(EXPORT_DIR).join(subdir);
+    let mut stack = vec![(PathBuf::new(), 0_usize)];
+    while let Some((relative, depth)) = stack.pop() {
+        let dir = Path::new(EXPORT_DIR).join(&relative);
         let entries = fs::read_dir(&dir)
             .map_err(|error| format!("cannot list {}: {error}", dir.display()))?;
         for entry in entries.flatten() {
             if found.len() >= EXPORT_DIR_MAX_FILES {
                 return Err(format!(
-                    "more than {EXPORT_DIR_MAX_FILES} files under {EXPORT_DIR}"
+                    "more than {EXPORT_DIR_MAX_FILES} entries under {EXPORT_DIR}"
                 ));
             }
-            if entry.path().is_file() {
-                found.push(subdir.join(entry.file_name()));
+            let path = relative.join(entry.file_name());
+            let kind = entry
+                .file_type()
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            if kind.is_dir() && depth < EXPORT_DIR_MAX_DEPTH {
+                stack.push((path, depth.saturating_add(1)));
+            } else {
+                found.push(path);
             }
         }
     }
     Ok(found)
+}
+
+/// `.cue` files under `config/` that neither the schema nor a value export accounts for.
+fn stray_sources(names: &[String]) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| {
+            let path = Path::new(name.as_str());
+            let is_cue = path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("cue"));
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("");
+            is_cue && stem != "schema" && !VALUES.contains(&stem)
+        })
+        .map(|name| format!("config/{name} is neither schema.cue nor a value file"))
+        .collect()
+}
+
+fn config_sources() -> Result<Vec<String>, String> {
+    let entries =
+        fs::read_dir(CONFIG_DIR).map_err(|error| format!("cannot list {CONFIG_DIR}: {error}"))?;
+    let names: Vec<String> = entries
+        .flatten()
+        .take(EXPORT_DIR_MAX_FILES.saturating_add(1))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    if names.len() > EXPORT_DIR_MAX_FILES {
+        return Err(format!(
+            "more than {EXPORT_DIR_MAX_FILES} entries in {CONFIG_DIR}"
+        ));
+    }
+    Ok(names)
+}
+
+/// The numbered clauses of the mandate: lines that start with `<article>.<clause> `.
+fn clause_ids_in(text: &str) -> Vec<String> {
+    let mut ids: Vec<String> = text
+        .lines()
+        .filter_map(|line| line.split_once(' ').map(|(head, _)| head))
+        .filter(|head| {
+            head.split_once('.').is_some_and(|(article, clause)| {
+                !article.is_empty()
+                    && !clause.is_empty()
+                    && article.bytes().all(|b| b.is_ascii_digit())
+                    && clause.bytes().all(|b| b.is_ascii_digit())
+            })
+        })
+        .map(str::to_string)
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn clause_defects(mandate_export: &[u8]) -> Vec<String> {
+    let document = match fs::read_to_string(MANDATE_DOC) {
+        Ok(text) => clause_ids_in(&text),
+        Err(error) => return vec![format!("cannot read {MANDATE_DOC}: {error}")],
+    };
+    let mut mapped: Vec<String> = serde_json::from_slice::<serde_json::Value>(mandate_export)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("clauses")?
+                .as_object()
+                .map(|clauses| clauses.keys().cloned().collect())
+        })
+        .unwrap_or_default();
+    mapped.sort();
+    if document.is_empty() || document != mapped {
+        return vec![format!(
+            "{MANDATE_DOC} numbers {} clauses and config/mandate.cue maps {}; the ids must match",
+            document.len(),
+            mapped.len()
+        )];
+    }
+    Vec::new()
 }
 
 fn drift(fresh: &Path, exports: &[Export]) -> Vec<String> {
@@ -232,6 +322,16 @@ fn drift(fresh: &Path, exports: &[Export]) -> Vec<String> {
             Vec::new()
         }
     };
+    match config_sources() {
+        Ok(names) => defects.extend(stray_sources(&names)),
+        Err(error) => defects.push(error),
+    }
+    if let Some(mandate) = exports
+        .iter()
+        .find(|export| export.relative == Path::new("mandate.json"))
+    {
+        defects.extend(clause_defects(&mandate.bytes));
+    }
     for relative in checked_in {
         if !exports.iter().any(|export| export.relative == relative) {
             defects.push(format!(
@@ -297,6 +397,33 @@ mod tests {
                 "{exit:?}: {outcome:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_cue_file_outside_the_schema_and_the_values_is_stray() {
+        let names: Vec<String> = [
+            "schema.cue",
+            "routing.cue",
+            "export",
+            "notes.cue",
+            "old.cue.bak",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(
+            stray_sources(&names),
+            vec!["config/notes.cue is neither schema.cue nor a value file".to_string()]
+        );
+    }
+
+    #[test]
+    fn clause_ids_come_from_numbered_lines_only() {
+        let text = "## 14. Amendment\n\n14.5 Thresholds are set.\nsee 1.2 above\n15.4 A check.\n";
+        assert_eq!(
+            clause_ids_in(text),
+            vec!["14.5".to_string(), "15.4".to_string()]
+        );
     }
 
     #[test]

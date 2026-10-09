@@ -406,7 +406,7 @@
             "not": {
                 "pattern": "^[^.]*\\.root\\.(ctl|wrk)\\."
             },
-            "pattern": "^[a-z0-9][a-z0-9-]*\\.(root|[a-z0-9][a-z0-9-]*\\.(ctl|wrk))\\.(claude|codex|antigravity|amp|opencode)(\\.[a-z0-9][a-z0-9-]*)?$"
+            "pattern": "^[a-z0-9][a-z0-9-]{0,15}\\.(root|[a-z0-9][a-z0-9-]{0,15}\\.(ctl|wrk))\\.(claude|codex|antigravity|amp|opencode)(\\.[a-z0-9][a-z0-9-]{0,12})?$"
         },
         "ShortText": {
             "type": "string",

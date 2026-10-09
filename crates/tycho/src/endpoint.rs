@@ -22,7 +22,7 @@ pub fn build(ports: &Ports) -> Endpoint {
         .bind(Epic::new(ports))
         .bind(Session::new(ports))
         .bind(Reconciler::new(ports))
-        .bind(Operator::new(ports.operator_secret.clone()))
+        .bind(Operator::new(ports))
         .bind(WorkUnit::new(ports))
         .bind(WorkerRun::new(ports))
         .build()

@@ -276,3 +276,297 @@ fn serialized_exit_states_validate() {
         assert!(!schema.is_valid(&Value::from(unwritten)), "{unwritten}");
     }
 }
+
+/// One bound: a fixture at the maximum and one past it.
+struct Bound {
+    name: &'static str,
+    at_max: String,
+    over: String,
+}
+
+fn bound(name: &'static str, build: impl Fn(usize) -> String, max: usize) -> Bound {
+    Bound {
+        name,
+        at_max: build(max),
+        over: build(max.saturating_add(1)),
+    }
+}
+
+fn packet_count_bounds() -> Vec<Bound> {
+    vec![
+        bound(
+            "writable_paths",
+            |n| task_packet_count("writable_paths", r#"["crates"]"#, r#""crates""#, n),
+            PATHS_MAX_ITEMS,
+        ),
+        bound(
+            "done_criteria",
+            |n| {
+                task_packet_count(
+                    "done_criteria",
+                    r#"[{"kind":"command","command":"cargo test","expected_exit":0},{"kind":"file_absent","path":"TODO.md"}]"#,
+                    r#"{"kind":"file_absent","path":"TODO.md"}"#,
+                    n,
+                )
+            },
+            CRITERIA_MAX_ITEMS,
+        ),
+        bound(
+            "forbidden_actions",
+            |n| task_packet_count("forbidden_actions", r#"["push"]"#, r#""push""#, n),
+            REFS_MAX_ITEMS,
+        ),
+        bound(
+            "inputs",
+            |n| {
+                task_packet_count(
+                    "inputs",
+                    &format!(r#"["{}"]"#, digest('f')),
+                    &format!(r#""{}""#, digest('d')),
+                    n,
+                )
+            },
+            REFS_MAX_ITEMS,
+        ),
+    ]
+}
+
+fn report_count_bounds() -> Vec<Bound> {
+    let criterion = r#"{"criterion":0,"passed":true,"evidence":[]}"#;
+    let one_criterion = format!(
+        r#"[{{"criterion":0,"passed":true,"evidence":["{}"]}}]"#,
+        digest('b')
+    );
+    vec![
+        bound(
+            "criteria",
+            |n| {
+                envelope(
+                    "result",
+                    &result_payload()
+                        .replace(&one_criterion, &format!("[{}]", repeated(criterion, n))),
+                )
+            },
+            CRITERIA_MAX_ITEMS,
+        ),
+        bound(
+            "criteria.evidence",
+            |n| {
+                envelope(
+                    "result",
+                    &result_payload().replace(
+                        &format!(r#"["{}"]"#, digest('b')),
+                        &format!("[{}]", refs(n)),
+                    ),
+                )
+            },
+            REFS_MAX_ITEMS,
+        ),
+        bound(
+            "blockers",
+            |n| {
+                envelope(
+                    "status",
+                    &status_payload()
+                        .replace(r#""blockers":[]"#, &format!(r#""blockers":[{}]"#, refs(n))),
+                )
+            },
+            REFS_MAX_ITEMS,
+        ),
+        bound(
+            "options",
+            |n| envelope("escalation", &escalation_payload(n)),
+            OPTIONS_MAX_ITEMS,
+        ),
+    ]
+}
+
+fn escalation_count_bounds() -> Vec<Bound> {
+    vec![
+        bound(
+            "evidence",
+            |n| {
+                envelope(
+                    "escalation",
+                    &escalation_payload(2)
+                        .replace(r#""evidence":[]"#, &format!(r#""evidence":[{}]"#, refs(n))),
+                )
+            },
+            REFS_MAX_ITEMS,
+        ),
+        bound(
+            "cases_consulted",
+            |n| {
+                envelope(
+                    "escalation",
+                    &escalation_payload(2).replace(
+                        r#""cases_consulted":["case-12"]"#,
+                        &format!(r#""cases_consulted":[{}]"#, repeated(r#""case-12""#, n)),
+                    ),
+                )
+            },
+            REFS_MAX_ITEMS,
+        ),
+    ]
+}
+
+fn text_bounds() -> Vec<Bound> {
+    let base = envelope("result", &result_payload());
+    vec![
+        bound(
+            "id",
+            |n| base.replace("01J9Z3K7Q8R2W5X6Y7Z8A9B0C1", &"a".repeat(n)),
+            RECORD_ID_MAX_BYTES,
+        ),
+        bound(
+            "summary",
+            |n| {
+                envelope(
+                    "status",
+                    &status_payload().replace("tests green", &"x".repeat(n)),
+                )
+            },
+            TEXT_MAX_BYTES,
+        ),
+        bound(
+            "branch",
+            |n| base.replace("wu03/task-7", &"b".repeat(n)),
+            BRANCH_MAX_BYTES,
+        ),
+    ]
+}
+
+fn path_and_state_bounds() -> Vec<Bound> {
+    let packet = |payload: String| downward("task_packet", &payload);
+    vec![
+        bound(
+            "state",
+            |n| {
+                envelope(
+                    "status",
+                    &status_payload().replace("verifying", &"s".repeat(n)),
+                )
+            },
+            STATE_NAME_MAX_BYTES,
+        ),
+        bound(
+            "worktree",
+            |n| {
+                packet(task_packet_payload().replace(
+                    "/Users/agent/wt/cf7a-wu03",
+                    &format!("/{}", "w".repeat(n.saturating_sub(1))),
+                ))
+            },
+            crate::task_packet::PATH_MAX_BYTES,
+        ),
+        bound(
+            "writable path",
+            |n| {
+                packet(task_packet_payload().replace(
+                    r#""writable_paths":["crates"]"#,
+                    &format!(r#""writable_paths":["{}"]"#, "p".repeat(n)),
+                ))
+            },
+            crate::task_packet::PATH_MAX_BYTES,
+        ),
+    ]
+}
+
+fn name_bounds() -> Vec<Bound> {
+    let packet = |payload: String| downward("task_packet", &payload);
+    vec![
+        bound(
+            "class",
+            |n| {
+                packet(task_packet_payload().replace(
+                    r#""class":"implement""#,
+                    &format!(r#""class":"{}""#, "c".repeat(n)),
+                ))
+            },
+            crate::task_packet::ROUTING_NAME_MAX_BYTES,
+        ),
+        bound(
+            "epic",
+            |n| {
+                let epic = "e".repeat(n);
+                routed(
+                    &format!("{epic}.wu03.wrk.claude.a1f3"),
+                    &format!("{epic}.wu03.ctl.codex"),
+                    "wu03",
+                    &epic,
+                )
+            },
+            crate::service::ID_MAX_BYTES,
+        ),
+        bound(
+            "unit",
+            |n| {
+                let unit = "u".repeat(n);
+                routed(
+                    &format!("cf7a.{unit}.wrk.claude.a1f3"),
+                    &format!("cf7a.{unit}.ctl.codex"),
+                    &unit,
+                    "cf7a",
+                )
+            },
+            crate::service::ID_MAX_BYTES,
+        ),
+    ]
+}
+
+fn suffix_and_budget_bounds() -> Vec<Bound> {
+    vec![
+        bound(
+            "suffix",
+            |n| {
+                routed(
+                    &format!("cf7a.wu03.wrk.claude.{}", "s".repeat(n)),
+                    "cf7a.wu03.ctl.codex",
+                    "wu03",
+                    "cf7a",
+                )
+            },
+            crate::session::SUFFIX_MAX_BYTES,
+        ),
+        bound(
+            "wall_clock_max_ms",
+            |n| with_budget(1, u64::try_from(n).unwrap()),
+            usize::try_from(crate::task_packet::BUDGET_WALL_CLOCK_MAX_MS).unwrap(),
+        ),
+        bound(
+            "tokens_max",
+            |n| with_budget(u64::try_from(n).unwrap(), 1),
+            usize::try_from(crate::task_packet::BUDGET_TOKENS_MAX_COUNT).unwrap(),
+        ),
+    ]
+}
+
+#[test]
+fn every_bound_validates_at_its_maximum_and_is_refused_one_past() {
+    let schema = validator("envelope");
+    let groups = [
+        packet_count_bounds(),
+        report_count_bounds(),
+        escalation_count_bounds(),
+        text_bounds(),
+        path_and_state_bounds(),
+        name_bounds(),
+        suffix_and_budget_bounds(),
+    ];
+    for case in groups.into_iter().flatten() {
+        let name = case.name;
+        assert!(
+            Envelope::parse(case.at_max.as_bytes()).is_ok(),
+            "{name} at max, Rust"
+        );
+        assert!(
+            schema.is_valid(&json(&case.at_max)),
+            "{name} at max, schema"
+        );
+        assert!(
+            Envelope::parse(case.over.as_bytes()).is_err(),
+            "{name} over, Rust"
+        );
+        assert!(!schema.is_valid(&json(&case.over)), "{name} over, schema");
+    }
+}

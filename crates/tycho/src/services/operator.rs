@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -10,10 +11,11 @@ use tycho_types::envelope::ShortText;
 use tycho_types::launcher::{SessionSecret, SESSION_SECRET_MAX_BYTES};
 use tycho_types::service::{EpicId, WorkUnitId};
 
+use crate::config_store::FactoryConfig;
 use crate::private_dir;
 use crate::services::epic::{AddUnitAnswer, EpicClient, EpicState, StartRequest};
 use crate::services::work_unit::{RuleCall, WorkUnitClient, WorkUnitRequest};
-use crate::services::{blocking, refuse, secret, CODE_NOT_FOUND};
+use crate::services::{blocking, refuse, secret, Ports, CODE_BAD_REQUEST, CODE_NOT_FOUND};
 
 pub const CODE_UNAUTHORIZED: u16 = 401;
 
@@ -123,14 +125,29 @@ pub fn authorized(path: Option<&Path>, candidate: &str) -> bool {
         .is_some_and(|stored| stored.verify(candidate))
 }
 
+/// Every planned task's class and tier against the routing table.
+pub fn check_plan_routes(config: &FactoryConfig, request: &WorkUnitRequest) -> Result<(), String> {
+    for planned in &request.plan {
+        let routing = &planned.worker.routing;
+        config
+            .route(&routing.class, &routing.tier)
+            .map_err(|error| format!("task {}: {error}", planned.task))?;
+    }
+    Ok(())
+}
+
 pub struct Operator {
     secret_path: Option<PathBuf>,
+    config: Arc<FactoryConfig>,
 }
 
 impl Operator {
     #[must_use]
-    pub const fn new(secret_path: Option<PathBuf>) -> Self {
-        Self { secret_path }
+    pub fn new(ports: &Ports) -> Self {
+        Self {
+            secret_path: ports.operator_secret.clone(),
+            config: Arc::clone(&ports.config),
+        }
     }
 
     async fn check(&self, service_context: &Context<'_>, candidate: String) -> HandlerResult<()> {
@@ -155,6 +172,7 @@ impl fmt::Debug for Operator {
         formatter
             .debug_struct("Operator")
             .field("secret_path", &self.secret_path)
+            .field("config", &self.config.hashes())
             .finish()
     }
 }
@@ -206,6 +224,15 @@ impl Operator {
                 ),
             ));
         }
+        let config = Arc::clone(&self.config);
+        let request = call.request.clone();
+        service_context
+            .run(|| async move {
+                check_plan_routes(&config, &request)
+                    .map_err(|error| refuse(CODE_BAD_REQUEST, error))
+            })
+            .name("route check")
+            .await?;
         let handle = service_context
             .workflow_client::<WorkUnitClient>(call.unit.as_str())
             .run(Json(call.request))
@@ -253,6 +280,49 @@ impl Operator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan(class: &str, tier: &str) -> WorkUnitRequest {
+        serde_json::from_str(&format!(
+            r#"{{"epic":"cf7a","control_vendor":"codex","plan":[{{"task":"t1","worker":{{"epic":"cf7a","work_unit":"wu01","vendor":"claude","argv":["l"],"routing":{{"class":"{class}","tier":"{tier}","effort":"low","binding":null,"rationale":"r"}},"ledger":"seat","reservation":1}}}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_plan_is_checked_against_the_routing_table() {
+        let config = FactoryConfig::embedded().unwrap();
+        assert_eq!(
+            check_plan_routes(&config, &plan("implement", "standard")),
+            Ok(())
+        );
+        assert_eq!(
+            check_plan_routes(&config, &plan("implement", "strong")),
+            Ok(())
+        );
+        for (class, tier) in [
+            ("unlisted", "standard"),
+            ("implement", "light"),
+            ("implement", "huge"),
+        ] {
+            let refused = check_plan_routes(&config, &plan(class, tier));
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|error| error.starts_with("task t1: ")),
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plan_naming_a_fallback_tier_does_not_decode() {
+        let text = serde_json::to_string(&plan("implement", "standard")).unwrap();
+        let with_fallback = text.replace(
+            r#""rationale":"r""#,
+            r#""rationale":"r","fallback_tier":"strong""#,
+        );
+        assert!(serde_json::from_str::<WorkUnitRequest>(&with_fallback).is_err());
+    }
     use std::fs;
 
     fn scratch(name: &str) -> PathBuf {

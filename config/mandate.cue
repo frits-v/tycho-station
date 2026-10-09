@@ -1,4 +1,5 @@
-// Article-to-mechanism map of design section 14: the source; the design table renders it.
+// Article-to-mechanism map of design section 14. The design table is written by hand until a
+// follow-up renders it from config/export/mandate.json.
 package config
 
 mandate: #Mandate & {

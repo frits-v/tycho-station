@@ -34,7 +34,7 @@ pub fn refuse(code: u16, message: impl Into<String>) -> HandlerError {
 }
 
 /// The durations and retry bound every service reads; tests shorten them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Timing {
     pub stall_silence: Duration,
     pub stall_progress: Duration,
