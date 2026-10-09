@@ -16,6 +16,7 @@ use tycho::config::{self, CoreConfig, ENDPOINT_PORT, PROBE_TIMEOUT, WATCHDOG_INT
 use tycho::epic_command::{self, OperatorAnswer};
 use tycho::http::Http;
 use tycho::launchd::Agent;
+use tycho::launcher;
 use tycho::services::merge_gate::NoGate;
 use tycho::services::spawner::NoLauncher;
 use tycho::services::{Ports, Timing};
@@ -34,7 +35,9 @@ const USAGE: &str = "usage: tycho <command>
   graph query <checkout> impact <path>   entities changed under the path since HEAD~1
   epic start <id> <goal>      start an epic through the operator service
   epic add-unit <id> <unit>   add a work unit to an epic through the operator service
-  epic dispatch <id> <unit> <plan.json>   start a listed unit's run with a dispatch plan";
+  epic dispatch <id> <unit> <plan.json>   start a listed unit's run with a dispatch plan
+  launch --spec <spec file>       run a vendor session: lease, heartbeat, spool, resolve
+  launch --replay <spool file>    deliver a spooled result that was never acknowledged";
 
 fn main() {
     let arguments: Vec<String> = env::args().skip(1).collect();
@@ -79,6 +82,8 @@ fn main() {
                 .and_then(|agent| agent.uninstall())
                 .map_err(|error| error.to_string()),
         ),
+        ["launch", "--replay", spool] => replay(spool),
+        ["launch", "--spec", spec] => launch(spec),
         ["graph", "build", checkout, unit] => report_result(graph::build(checkout, unit)),
         ["graph", "query", checkout, kind, argument] => {
             report_result(graph::query(checkout, kind, argument))
@@ -89,6 +94,57 @@ fn main() {
         }
     };
     process::exit(code);
+}
+
+const LAUNCH_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn launch_http() -> Result<Http, i32> {
+    Http::new(LAUNCH_HTTP_TIMEOUT).map_err(|error| {
+        eprintln!("tycho: cannot build the HTTP client: {error}");
+        launcher::EXIT_REFUSED_TO_START
+    })
+}
+
+/// Fails closed before anything runs: no lease, no vendor, no ingress call.
+fn launch(spec: &str) -> i32 {
+    let (settings, vendor) = match launcher::take_spec(Path::new(spec)) {
+        Ok(taken) => taken,
+        Err(error) => {
+            eprintln!("tycho: launch refused: {error}");
+            return launcher::EXIT_REFUSED_TO_START;
+        }
+    };
+    let http = match launch_http() {
+        Ok(http) => http,
+        Err(code) => return code,
+    };
+    match launcher::launch(&settings, &vendor, &http) {
+        Ok(end) => {
+            println!("{end}");
+            end.exit_code()
+        }
+        Err(error) => {
+            eprintln!("tycho: launch: lease not written: {error}");
+            launcher::EXIT_REFUSED_TO_START
+        }
+    }
+}
+
+fn replay(spool: &str) -> i32 {
+    let http = match launch_http() {
+        Ok(http) => http,
+        Err(code) => return code,
+    };
+    match tycho::spool::replay(&http, Path::new(spool), &mut thread::sleep) {
+        Ok(delivery) => {
+            println!("{delivery:?}");
+            i32::from(!delivery.acknowledged())
+        }
+        Err(error) => {
+            eprintln!("tycho: replay refused: {error}");
+            launcher::EXIT_REFUSED_TO_START
+        }
+    }
 }
 
 fn serve_endpoint() -> i32 {

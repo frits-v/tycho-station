@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 
 use restate_sdk::prelude::{Endpoint, HttpServer};
 
+use crate::launch_probe::LaunchProbe;
 use crate::probe::Probe;
 use crate::services::epic::Epic;
 use crate::services::operator::Operator;
@@ -19,6 +20,7 @@ use crate::services::Ports;
 pub fn build(ports: &Ports) -> Endpoint {
     Endpoint::builder()
         .bind(Probe)
+        .bind(LaunchProbe)
         .bind(Epic)
         .bind(Session::new(ports))
         .bind(Reconciler::new(ports))

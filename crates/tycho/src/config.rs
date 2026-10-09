@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use nix::unistd::{Uid, User};
-use tycho_types::session::SOCKET_PATH_MAX_BYTES;
+use tycho_types::session::{SessionName, SOCKET_PATH_MAX_BYTES};
 
 use crate::command::{self, CommandError};
 
@@ -53,6 +53,12 @@ pub const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
 /// One `watchdog run` lasts at most this many ticks, then exits for launchd to restart it.
 pub const WATCHDOG_ITERATIONS_MAX: u32 = 120;
 pub const LIST_SESSIONS_MAX: usize = 256;
+
+pub const AGENT_DIR_ENV: &str = "TYCHO_AGENT_DIR";
+/// Shared with the developer's group so Ghostty can attach to agent sessions.
+pub const AGENT_SOCKET_DIR_DEFAULT: &str = "/Users/Shared/tycho-agent-zmx";
+pub const LEASE_DIR: &str = "leases";
+pub const SPOOL_DIR: &str = "spool";
 
 pub const ENTIRE_GRAPH_ENV: &str = "TYCHO_ENTIRE_GRAPH";
 pub const GRAPH_INDEX_DIR: &str = "graph";
@@ -149,6 +155,54 @@ pub fn ingress_url(path: &str) -> String {
 #[must_use]
 pub fn endpoint_url(path: &str) -> String {
     format!("http://{}{path}", loopback(ENDPOINT_PORT))
+}
+
+/// The agent socket directory and the lease and spool directories under it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentDirs {
+    pub socket_dir: PathBuf,
+}
+
+impl AgentDirs {
+    /// `TYCHO_AGENT_DIR` when set and absolute, else the shared default.
+    pub fn from_environment() -> Result<Self, ConfigError> {
+        let socket_dir = env::var_os(AGENT_DIR_ENV)
+            .map_or_else(|| PathBuf::from(AGENT_SOCKET_DIR_DEFAULT), PathBuf::from);
+        Self::new(socket_dir)
+    }
+
+    pub fn new(socket_dir: PathBuf) -> Result<Self, ConfigError> {
+        if !socket_dir.is_absolute() {
+            return Err(ConfigError::RelativePath(AGENT_DIR_ENV, socket_dir));
+        }
+        Ok(Self { socket_dir })
+    }
+
+    #[must_use]
+    pub fn lease_dir(&self) -> PathBuf {
+        self.socket_dir.join(LEASE_DIR)
+    }
+
+    #[must_use]
+    pub fn spool_root(&self) -> PathBuf {
+        self.socket_dir.join(SPOOL_DIR)
+    }
+
+    #[must_use]
+    pub fn lease_path(&self, session: &SessionName) -> PathBuf {
+        self.lease_dir().join(format!("{session}.lease"))
+    }
+
+    /// The heartbeat sequence counter, beside the lease so a restarted launcher continues it.
+    #[must_use]
+    pub fn sequence_path(&self, session: &SessionName) -> PathBuf {
+        self.lease_dir().join(format!("{session}.seq"))
+    }
+
+    #[must_use]
+    pub fn spool_dir(&self, session: &SessionName) -> PathBuf {
+        self.spool_root().join(session.to_string())
+    }
 }
 
 #[derive(Debug)]
