@@ -246,10 +246,11 @@ pub fn worker_command(
     let binary = ports
         .binary(command.vendor)
         .ok_or_else(|| format!("no headless binary for {}", command.vendor.as_str()))?;
+    ports
+        .repositories
+        .ensure_briefs_dir()
+        .map_err(|error| error.to_string())?;
     let brief = ports.repositories.brief_path(command.session);
-    if let Some(dir) = brief.parent() {
-        std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
-    }
     write_durable(&brief, command.task.brief.as_str().as_bytes())
         .map_err(|error| format!("{}: {error}", brief.display()))?;
     let args = WorkerArgs {

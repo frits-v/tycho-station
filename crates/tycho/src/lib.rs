@@ -5,6 +5,7 @@
 )]
 
 pub mod agent_files;
+pub mod agent_tree;
 pub mod code_graph;
 pub mod command;
 pub mod config;
