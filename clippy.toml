@@ -1,0 +1,6 @@
+too-many-lines-threshold = 60
+cognitive-complexity-threshold = 15
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
