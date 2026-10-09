@@ -545,7 +545,6 @@ fn decode_claude_version(stdout: &str) -> Option<String> {
     Some(version.to_string())
 }
 
-/// Documented shape (`codex-cli <semver>`); no codex binary exists here to sample from.
 fn decode_codex_version(stdout: &str) -> Option<String> {
     let mut tokens = stdout.lines().next().unwrap_or_default().split_whitespace();
     if tokens.next()? != "codex-cli" {
@@ -794,7 +793,7 @@ fn decode_entire_auth_status(code: Option<i32>, stdout: &str) -> AuthStatus {
     }
 }
 
-/// No codex binary has been available to capture a `login status` sample from.
+/// Only a logged-out sample (`Not logged in`, exit 1) has been captured; without a logged-in one, every result stays unrecognised.
 const fn decode_codex_login_status(_code: Option<i32>, _stdout: &str) -> AuthStatus {
     AuthStatus::Unrecognised
 }
@@ -1891,6 +1890,10 @@ mod tests {
             decode_codex_login_status(Some(0), "Logged in"),
             AuthStatus::Unrecognised
         );
+        assert_eq!(
+            decode_codex_login_status(Some(1), "Not logged in\n"),
+            AuthStatus::Unrecognised
+        );
     }
 
     #[test]
@@ -2130,8 +2133,8 @@ mod tests {
         assert_eq!(decode_claude_version("2.1.280\n"), None);
 
         assert_eq!(
-            decode_codex_version("codex-cli 0.5.0\n"),
-            Some("0.5.0".to_string())
+            decode_codex_version("codex-cli 0.160.1\n"),
+            Some("0.160.1".to_string())
         );
         assert_eq!(decode_codex_version("codex 0.5.0\n"), None);
     }
