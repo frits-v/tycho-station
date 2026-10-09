@@ -107,6 +107,9 @@ pub enum MessageType {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Spend in micro-dollars for a metered vendor; zero under a seat.
+    #[serde(default)]
+    pub cost_micro_dollars: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

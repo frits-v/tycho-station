@@ -2,13 +2,17 @@
 //! operator secret from the core home.
 
 use std::fmt;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 
 use tycho_types::envelope::ShortText;
 use tycho_types::service::{handler, EpicId, WorkUnitId};
 
 use crate::config::{ingress_url, spine, CoreConfig};
 use crate::http::{Http, Outcome};
-use crate::services::operator::{read_secret_file, AddUnitCall, StartEpicCall};
+use crate::services::operator::{read_secret_file, AddUnitCall, DispatchUnitCall, StartEpicCall};
+use crate::services::work_unit::{PlannedTask, WorkUnitRequest};
 
 pub const OPERATOR_SERVICE: &str = "Operator";
 
@@ -90,6 +94,55 @@ pub fn add_unit(
     Ok(call(http, handler::OPERATOR_ADD_UNIT, body))
 }
 
+/// Bounds the dispatch plan file `tycho epic dispatch` reads.
+pub const PLAN_FILE_MAX_BYTES: u64 = 65_536;
+
+/// The plan file: the control session's vendor and the tasks, without the epic.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanFile {
+    pub control_vendor: tycho_types::session::Vendor,
+    pub plan: Vec<PlannedTask>,
+}
+
+pub fn read_plan(path: &Path) -> Result<PlanFile, String> {
+    let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(PLAN_FILE_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > PLAN_FILE_MAX_BYTES {
+        return Err(format!(
+            "{} is over {PLAN_FILE_MAX_BYTES} bytes",
+            path.display()
+        ));
+    }
+    serde_json::from_slice(&bytes).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// Dispatches a listed unit's run with the plan from a file.
+pub fn dispatch(
+    config: &CoreConfig,
+    http: &Http,
+    epic: &str,
+    unit: &str,
+    plan_path: &Path,
+) -> Result<OperatorAnswer, String> {
+    let secret = read_secret_file(&config.operator_secret_file())?;
+    let plan = read_plan(plan_path)?;
+    let request = DispatchUnitCall {
+        secret: secret.expose().to_string(),
+        unit: WorkUnitId::parse(unit).map_err(|error| format!("work unit id: {error}"))?,
+        request: WorkUnitRequest {
+            epic: EpicId::parse(epic).map_err(|error| format!("epic id: {error}"))?,
+            control_vendor: plan.control_vendor,
+            plan: plan.plan,
+        },
+    };
+    let body = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+    Ok(call(http, handler::OPERATOR_DISPATCH_UNIT, body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +181,17 @@ mod tests {
             decode(Outcome::BodyTooLarge),
             OperatorAnswer::Unrecognised(_)
         ));
+    }
+
+    #[test]
+    fn a_plan_file_over_its_maximum_is_refused() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("plan-over-{}.json", std::process::id()));
+        let size = usize::try_from(PLAN_FILE_MAX_BYTES.saturating_add(1)).unwrap();
+        std::fs::write(&path, vec![b' '; size]).unwrap();
+        let read = read_plan(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(read.unwrap_err().contains("over"));
     }
 }

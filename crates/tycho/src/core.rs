@@ -42,18 +42,14 @@ impl fmt::Display for StartReport {
     }
 }
 
-/// Starts whatever is missing, registers the endpoint, writes the operator secret if absent,
-/// and starts a reconciler tick chain, which ends any older chain.
+/// The watchdog's pass, the operator secret if absent, and a new reconciler tick chain.
 #[must_use]
 pub fn start(supervisor: &Supervisor, config: &CoreConfig) -> StartReport {
     let once = supervisor.once();
     let operator_secret =
-        operator::ensure_secret_file(&config.operator_secret_file()).map(|created| {
-            if created {
-                "created".to_string()
-            } else {
-                "present".to_string()
-            }
+        operator::ensure_secret_file(&config.operator_secret_file()).and_then(|created| {
+            operator::read_secret_file(&config.operator_secret_file())?;
+            Ok(if created { "created" } else { "present" }.to_string())
         });
     let reconciler = if once.succeeded() {
         start_reconciler(supervisor.http())

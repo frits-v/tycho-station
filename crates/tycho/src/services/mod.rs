@@ -8,6 +8,8 @@ pub mod reconciler;
 pub mod secret;
 pub mod session;
 pub mod spawner;
+pub mod work_unit;
+pub mod worker_run;
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -22,6 +24,8 @@ pub const CODE_BAD_REQUEST: u16 = 400;
 pub const CODE_FORBIDDEN: u16 = 403;
 pub const CODE_NOT_FOUND: u16 = 404;
 pub const CODE_CONFLICT: u16 = 409;
+/// Restate's code for a cancelled invocation, the same number as a conflict.
+pub const CODE_CANCELLED: u16 = 409;
 pub const CODE_INTERNAL: u16 = 500;
 
 #[must_use]
@@ -68,6 +72,14 @@ impl Timing {
             .max_attempts(spine::PORT_STEP_ATTEMPTS_MAX)
     }
 
+    /// A nudge is best-effort: three tries, two seconds apart.
+    #[must_use]
+    pub fn nudge_retry() -> RunRetryPolicy {
+        RunRetryPolicy::new()
+            .initial_delay(Duration::from_secs(2))
+            .max_attempts(3)
+    }
+
     #[must_use]
     pub fn millis(duration: Duration) -> u64 {
         u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
@@ -78,6 +90,7 @@ impl Timing {
 #[derive(Clone)]
 pub struct Ports {
     pub spawner: Arc<dyn Spawner>,
+    pub merge_gate: Arc<dyn merge_gate::MergeGate>,
     pub timing: Timing,
     /// The operator secret file; `None` refuses every operator call.
     pub operator_secret: Option<std::path::PathBuf>,
@@ -88,6 +101,7 @@ impl std::fmt::Debug for Ports {
         formatter
             .debug_struct("Ports")
             .field("spawner", &self.spawner.describe())
+            .field("merge_gate", &self.merge_gate.describe())
             .field("timing", &self.timing)
             .field("operator_secret", &self.operator_secret)
             .finish()
@@ -132,5 +146,12 @@ mod tests {
         let bound = format!("max_attempts: Some({})", spine::PORT_STEP_ATTEMPTS_MAX);
         assert!(policy.contains(&bound), "{policy}");
         assert!(policy.contains("factor: 2.0"), "{policy}");
+    }
+
+    #[test]
+    fn nudge_retry_is_short() {
+        let policy = format!("{:?}", Timing::nudge_retry());
+        assert!(policy.contains("max_attempts: Some(3)"), "{policy}");
+        assert!(policy.contains("initial_delay: 2s"), "{policy}");
     }
 }

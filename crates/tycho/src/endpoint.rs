@@ -10,6 +10,8 @@ use crate::services::epic::Epic;
 use crate::services::operator::Operator;
 use crate::services::reconciler::Reconciler;
 use crate::services::session::Session;
+use crate::services::work_unit::WorkUnit;
+use crate::services::worker_run::WorkerRun;
 use crate::services::Ports;
 
 /// The probe and the spine services, built from the given ports.
@@ -21,6 +23,8 @@ pub fn build(ports: &Ports) -> Endpoint {
         .bind(Session::new(ports))
         .bind(Reconciler::new(ports))
         .bind(Operator::new(ports.operator_secret.clone()))
+        .bind(WorkUnit::new(ports))
+        .bind(WorkerRun::new(ports))
         .build()
 }
 
