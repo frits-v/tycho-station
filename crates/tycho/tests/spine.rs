@@ -40,6 +40,7 @@ use tycho::services::operator::read_secret_file;
 use tycho::services::spawner::{SpawnSpec, Spawner};
 use tycho::services::{Ports, Timing};
 use tycho::spool::check_result_envelope;
+use tycho::vendors::control::NoVendor;
 use tycho::zmx::{ListEntry, Zmx};
 use tycho_types::envelope::{
     CommitSha, EscalationOption, EscalationPayload, QuestionType, Reversibility, ShortText,
@@ -331,6 +332,7 @@ fn start_core_with_spawner(
     assert!(report.contains("reconciler: generation 1"), "{report}");
     let mut ports = Ports {
         spawner,
+        vendor: Arc::new(NoVendor),
         merge_gate,
         timing,
         config: Arc::new(test_config()),

@@ -168,6 +168,7 @@ impl MergeGate for FixedGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::spawner::SpawnTerminal;
     use std::sync::atomic::{AtomicU32, Ordering};
     use tycho_types::envelope::{BranchName, CommitSha};
     use tycho_types::launcher::{AwaitableId, LauncherEnv, SessionSecret};
@@ -186,6 +187,8 @@ mod tests {
                 session_secret: SessionSecret::parse(&"s".repeat(40)).unwrap(),
                 session_name: session(),
             },
+            terminal: SpawnTerminal::Files,
+            working_dir: None,
         }
     }
 

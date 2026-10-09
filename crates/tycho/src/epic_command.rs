@@ -103,6 +103,8 @@ pub const PLAN_FILE_MAX_BYTES: u64 = 65_536;
 pub struct PlanFile {
     pub control_vendor: tycho_types::session::Vendor,
     pub plan: Vec<PlannedTask>,
+    #[serde(default)]
+    pub control: Option<crate::services::work_unit::ControlStart>,
 }
 
 pub fn read_plan(path: &Path) -> Result<PlanFile, String> {
@@ -137,6 +139,7 @@ pub fn dispatch(
             epic: EpicId::parse(epic).map_err(|error| format!("epic id: {error}"))?,
             control_vendor: plan.control_vendor,
             plan: plan.plan,
+            control: plan.control,
         },
     };
     let body = serde_json::to_string(&request).map_err(|error| error.to_string())?;

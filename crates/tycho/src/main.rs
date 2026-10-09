@@ -25,6 +25,7 @@ use tycho::services::merge_gate::NoGate;
 use tycho::services::operator::read_secret_file;
 use tycho::services::spawner::NoLauncher;
 use tycho::services::{Ports, Timing};
+use tycho::vendors::control::NoVendor;
 use tycho::watchdog::{self, LoopEnd, Supervisor};
 use tycho::{agent_files, core, endpoint, verdicts};
 
@@ -227,6 +228,7 @@ fn serve_endpoint() -> i32 {
     };
     let ports = Ports {
         spawner: Arc::new(NoLauncher),
+        vendor: Arc::new(NoVendor),
         merge_gate: Arc::new(NoGate),
         timing: Timing::from_thresholds(&factory.thresholds.value),
         config: Arc::new(factory),

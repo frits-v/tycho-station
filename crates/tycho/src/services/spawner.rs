@@ -7,13 +7,27 @@ use tycho_types::envelope::ShortText;
 use tycho_types::launcher::LauncherEnv;
 use tycho_types::lease::Lease;
 use tycho_types::session::SessionName;
+use tycho_types::task_packet::AbsolutePath;
 
-/// One detached zmx session: the name, the launcher's argv, and the launcher environment.
+/// Whether the vendor writes bounded files or owns the session's pty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnTerminal {
+    #[default]
+    Files,
+    /// An interactive control session.
+    Inherit,
+}
+
+/// One detached zmx session: the name, the launcher's argv, the launcher environment, and
+/// how and where the vendor runs.
 #[derive(Debug, Clone)]
 pub struct SpawnSpec {
     pub session: SessionName,
     pub argv: Vec<ShortText>,
     pub environment: LauncherEnv,
+    pub terminal: SpawnTerminal,
+    pub working_dir: Option<AbsolutePath>,
 }
 
 /// What became of a lease read; an unreadable file is a failure, never an absent lease.
@@ -56,7 +70,8 @@ pub trait Spawner: Send + Sync + 'static {
     fn kill_by_name(&self, session: &SessionName) -> Result<(), SpawnerError>;
     /// Saves the session's scrollback as evidence and returns where it went.
     fn save_scrollback(&self, session: &SessionName) -> Result<ShortText, SpawnerError>;
-    /// Types one line into the session's stdin, for a nudge.
+    /// Types one line into the session's stdin and submits it: a nudge, or an instruction
+    /// the vendor's inbox did not take.
     fn send(&self, session: &SessionName, text: &ShortText) -> Result<(), SpawnerError>;
     /// Reads the lease file the launcher keeps for this session name.
     fn read_lease(&self, session: &SessionName) -> LeaseRead;

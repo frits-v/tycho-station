@@ -33,6 +33,11 @@ use crate::services::{
     blocking, refuse, secret, Ports, Timing, CODE_BAD_REQUEST, CODE_CANCELLED, CODE_CONFLICT,
     CODE_FORBIDDEN, CODE_INTERNAL, CODE_NOT_FOUND,
 };
+use crate::vendors::control::SessionVendor;
+
+mod control;
+
+pub use control::ControlStart;
 
 const VIEW_KEY: &str = "view";
 const SECRET_KEY: &str = "control_secret";
@@ -159,6 +164,10 @@ pub struct WorkUnitRequest {
     pub epic: EpicId,
     pub control_vendor: Vendor,
     pub plan: Vec<PlannedTask>,
+    /// Set, the unit spawns its control session and instructs it with the task packet
+    /// reference before dispatch; the plan still comes from this request.
+    #[serde(default)]
+    pub control: Option<ControlStart>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,6 +442,7 @@ fn failure(code: u16, message: impl Into<String>) -> TerminalError {
 
 pub struct WorkUnit {
     merge_gate: Arc<dyn MergeGate>,
+    vendor: Arc<dyn SessionVendor>,
     timing: Timing,
     config: Arc<FactoryConfig>,
     packet_dir: Option<PathBuf>,
@@ -444,6 +454,7 @@ impl WorkUnit {
     pub fn new(ports: &Ports) -> Self {
         Self {
             merge_gate: Arc::clone(&ports.merge_gate),
+            vendor: Arc::clone(&ports.vendor),
             timing: ports.timing,
             config: Arc::clone(&ports.config),
             packet_dir: ports.packet_dir.clone(),
@@ -457,6 +468,7 @@ impl fmt::Debug for WorkUnit {
         formatter
             .debug_struct("WorkUnit")
             .field("merge_gate", &self.merge_gate.describe())
+            .field("vendor", &self.vendor.describe())
             .field("timing", &self.timing)
             .field("config", &self.config.hashes())
             .field("packet_dir", &self.packet_dir)
@@ -680,6 +692,9 @@ impl WorkUnit {
         let cap = Attempt::new(unit.view.config.unit_attempt_cap)
             .map_err(|error| failure(CODE_INTERNAL, error.to_string()))?;
         let mut attempt = Attempt::FIRST;
+        if let Some(start) = &request.control {
+            self.start_control(unit, unit_id, start).await?;
+        }
         unit.step(Event::ChildClaimsLease)?;
         unit.step(Event::FirstStatus)?;
         for _ in 0..spine::UNIT_ROUNDS_MAX {
@@ -714,6 +729,31 @@ impl WorkUnit {
                 .map_err(|error| failure(CODE_BAD_REQUEST, error.to_string()))?;
         }
         Err(failure(CODE_INTERNAL, "the unit ran out of rounds"))
+    }
+
+    async fn start_control(
+        &self,
+        unit: &Unit<'_>,
+        unit_id: &WorkUnitId,
+        start: &ControlStart,
+    ) -> Result<(), TerminalError> {
+        let session = SessionName::parse(&unit.view.control_session)
+            .map_err(|error| failure(CODE_INTERNAL, error.to_string()))?;
+        let control_secret = unit
+            .workflow_context
+            .get::<String>(SECRET_KEY)
+            .await?
+            .ok_or_else(|| failure(CODE_INTERNAL, "the control secret is missing"))?;
+        control::start_control(
+            unit.workflow_context,
+            &self.vendor,
+            unit_id,
+            &session,
+            control_secret,
+            start,
+        )
+        .await
+        .map(drop)
     }
 
     fn after_criteria(
@@ -1392,6 +1432,7 @@ mod tests {
             epic: EpicId::parse("cf7a").unwrap(),
             control_vendor: Vendor::Codex,
             plan: Vec::new(),
+            control: None,
         };
         assert!(check_plan(&request).is_err());
         request.plan = vec![planned(); spine::PLAN_TASKS_MAX];

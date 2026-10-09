@@ -365,6 +365,7 @@ fn start(test: &str) -> (Core, TestEndpoint, Arc<WorkerPorts>) {
     };
     let ports = Ports {
         spawner: Arc::new(spawner),
+        vendor: Arc::new(tycho::vendors::control::NoVendor),
         merge_gate: Arc::new(FixedGate::new(GateVerdict::Merged { default_sha: head })),
         timing: Timing {
             reconciler_interval: Duration::from_secs(1),

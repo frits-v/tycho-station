@@ -48,12 +48,14 @@ mod tests {
     use crate::services::merge_gate::NoGate;
     use crate::services::spawner::NoLauncher;
     use crate::services::Timing;
+    use crate::vendors::control::NoVendor;
     use std::sync::Arc;
 
     #[test]
     fn production_endpoint_never_binds_the_launch_probe() {
         let ports = Ports {
             spawner: Arc::new(NoLauncher),
+            vendor: Arc::new(NoVendor),
             merge_gate: Arc::new(NoGate),
             timing: Timing::default(),
             config: Arc::new(crate::config_store::FactoryConfig::embedded().unwrap()),

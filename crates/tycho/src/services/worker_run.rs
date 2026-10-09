@@ -28,6 +28,7 @@ use crate::services::session::{
 use crate::services::workers::{
     worker_command, WorkerCommand, WorkerEvidence, WorkerPorts, WorkerTaskRequest,
 };
+use crate::services::spawner::SpawnTerminal;
 use crate::services::{
     blocking, refuse, secret, wall_clock_unix_ms, Ports, Timing, CODE_BAD_REQUEST, CODE_CANCELLED,
     CODE_INTERNAL,
@@ -666,6 +667,8 @@ impl WorkerRun {
             secret: session_secret,
             inbox_socket: None,
             resume_handle: resume_handle.clone(),
+            terminal: SpawnTerminal::Files,
+            working_dir: None,
         };
         let spawned = workflow_context
             .object_client::<SessionClient>(session.to_string())
