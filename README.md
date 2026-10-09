@@ -15,6 +15,16 @@ described in the design.
 - `docs/design.html`: the design and requirements document, with mocks. Open it in a
   browser. The same page is published as a Claude artifact for comments.
 - `.worktrees/`: per-task git worktrees, ignored.
+- `xtask/`: build, check and release logic in Rust. `mise run ci` runs it.
+
+## Conventions
+
+Tools are pinned through mise. Logic lives in typed code, never in bash or workflow
+YAML, and the single CI workflow only checks out, sets up mise and runs the xtask. Git
+hooks run through lefthook; commit messages and pull request titles follow the
+conventional commit grammar, checked by the xtask. Commits are signed, history is
+linear, and the default branch advances only by squash or rebase merges of pull
+requests.
 
 ## Decisions in force
 
