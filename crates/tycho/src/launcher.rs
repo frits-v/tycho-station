@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal;
 use serde::{Deserialize, Serialize};
-use tycho_types::envelope::StatusPayload;
+use tycho_types::agent_call::{HeartbeatCall, CONTEXT_TOKENS_MAX};
 use tycho_types::launcher::{
     EnvError, IdempotencyKey, LauncherEnv, ENV_AWAITABLE_ID, ENV_SESSION_SECRET,
     ENV_VALUE_MAX_BYTES, SEQUENCE_MAX,
@@ -250,32 +250,6 @@ pub fn check_vendor(vendor: &[String]) -> Result<(), SettingsError> {
         )));
     }
     Ok(())
-}
-
-/// Above any vendor's context window; a larger report is a defect, not a measurement.
-pub const CONTEXT_TOKENS_MAX: u64 = 10_000_000;
-
-/// The `Session/<name>/heartbeat` input. Restate does not hand the idempotency key to the
-/// handler, so the body repeats the sequence and the handler ignores any it has seen.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HeartbeatBody {
-    pub secret: String,
-    pub sequence: u64,
-    pub status: StatusPayload,
-    pub context_tokens: u64,
-}
-
-impl fmt::Debug for HeartbeatBody {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("HeartbeatBody")
-            .field("secret", &"redacted")
-            .field("sequence", &self.sequence)
-            .field("status", &self.status)
-            .field("context_tokens", &self.context_tokens)
-            .finish()
-    }
 }
 
 /// The files of one session under its spool directory.
@@ -657,7 +631,7 @@ impl<I: Ingress> Run<'_, I> {
             &read_progress(&self.files.progress),
             self.lease.started_unix_ms(),
         )?;
-        let body = HeartbeatBody {
+        let body = HeartbeatCall {
             secret: env.session_secret.expose().to_string(),
             sequence,
             status,
@@ -868,10 +842,10 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_body_matches_the_session_input_shape() {
+    fn heartbeat_body_is_the_session_input() {
         let (status, _) =
             crate::exit_decode::status_payload(&crate::exit_decode::Progress::Absent, 1).unwrap();
-        let body = HeartbeatBody {
+        let body = HeartbeatCall {
             secret: SECRET.to_string(),
             sequence: 3,
             status,
@@ -886,7 +860,7 @@ mod tests {
             .collect();
         assert_eq!(keys, vec!["context_tokens", "secret", "sequence", "status"]);
         assert!(!format!("{body:?}").contains(SECRET));
-        let back: HeartbeatBody = serde_json::from_value(value).unwrap();
+        let back: HeartbeatCall = serde_json::from_value(value).unwrap();
         assert_eq!(back, body);
     }
 
@@ -910,7 +884,7 @@ mod tests {
         }
 
         fn heartbeat(&self, call: &HeartbeatSend<'_>) -> Ack {
-            let body: HeartbeatBody = serde_json::from_str(&call.body).unwrap();
+            let body: HeartbeatCall = serde_json::from_str(&call.body).unwrap();
             self.events.borrow_mut().push(format!(
                 "heartbeat {} {} {} lease={}",
                 call.service,

@@ -5,7 +5,7 @@
 
 use restate_sdk::prelude::*;
 
-use crate::launcher::HeartbeatBody;
+use tycho_types::agent_call::HeartbeatCall;
 
 pub const LAUNCH_PROBE_SERVICE: &str = "LaunchProbe";
 pub const LAUNCH_PROBE_HEARTBEAT_HANDLER: &str = "heartbeat";
@@ -57,7 +57,7 @@ impl LaunchProbe {
     async fn heartbeat(
         &self,
         object_context: ObjectContext<'_>,
-        Json(body): Json<HeartbeatBody>,
+        Json(body): Json<HeartbeatCall>,
     ) -> HandlerResult<u64> {
         if body.secret.is_empty() {
             return Err(TerminalError::new("heartbeat without the session secret").into());
