@@ -176,7 +176,11 @@ fn print_capped(text: &str) {
     }
 }
 
+/// Reads stdout as one JSON document, or failing that its last line that opens an object.
 fn parse_json(stdout: &str) -> Result<serde_json::Value, String> {
+    if let Ok(value) = serde_json::from_str(stdout.trim()) {
+        return Ok(value);
+    }
     let line = stdout
         .lines()
         .rev()
@@ -362,14 +366,23 @@ fn remove_dry_run_worktree(root: &Path) {
         let path = scratch.to_string_lossy().into_owned();
         git_in(root, &["worktree", "remove", "--force", &path]);
     }
-    git_in(root, &["worktree", "prune"]);
 }
 
 /// Runs `release-plz update` in a detached scratch worktree at HEAD and shows what it would change.
 fn release_pr_dry_run() -> i32 {
     let root = PathBuf::from(".");
     remove_dry_run_worktree(&root);
-    let added = git_in(&root, &["worktree", "add", "--detach", DRY_RUN_DIR, "HEAD"]);
+    let added = git_in(
+        &root,
+        &[
+            "worktree",
+            "add",
+            "--force",
+            "--detach",
+            DRY_RUN_DIR,
+            "HEAD",
+        ],
+    );
     if added.exit != Exit::Code(0) {
         eprintln!(
             "xtask release-pr --dry-run: worktree add ended {:?}",
@@ -424,8 +437,19 @@ fn dry_run_in(scratch: &Path) -> i32 {
 
 /// `xtask release`: tags a merged release pull request and creates its GitHub release.
 pub fn release() -> i32 {
+    let Some(token) = env::var("GITHUB_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+    else {
+        eprintln!(
+            "xtask release: GITHUB_TOKEN is not set; release-plz needs it to tag and release"
+        );
+        return 1;
+    };
     let captured = run_bounded(
-        Command::new("release-plz").args(["release", "--output", "json"]),
+        Command::new("release-plz")
+            .args(["release", "--output", "json"])
+            .env("GIT_TOKEN", token),
         RELEASE_PLZ_TIMEOUT,
     );
     match decode_release(captured.exit, &captured.stdout) {
@@ -640,7 +664,7 @@ mod tests {
 
     #[test]
     fn dist_decoder_requires_safe_artifact_names() {
-        let built = r#"{"artifacts":{"tycho-aarch64-apple-darwin.tar.xz":{},"tycho-aarch64-apple-darwin.tar.xz.sha256":{}}}"#;
+        let built = "{\n  \"artifacts\": {\n    \"tycho-aarch64-apple-darwin.tar.xz\": {},\n    \"tycho-aarch64-apple-darwin.tar.xz.sha256\": {}\n  }\n}\n";
         assert!(matches!(
             decode_dist(Exit::Code(0), built),
             DistOutcome::Built(names) if names.len() == 2
