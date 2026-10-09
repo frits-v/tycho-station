@@ -6,8 +6,11 @@
 //! lifecycle state.
 
 use std::fmt;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
+
+use tycho_types::service::WorkUnitId;
 
 pub const STEP_KEY_MAX_BYTES: usize = 128;
 pub const GRAPH_PATH_MAX_BYTES: usize = 1024;
@@ -27,7 +30,10 @@ pub enum InputError {
     NotAbsolute(PathBuf),
     NotRelative(String),
     ParentComponent(String),
+    Range(String),
     NotUtf8(PathBuf),
+    NotCanonical(PathBuf),
+    Unresolvable(PathBuf, String),
 }
 
 impl fmt::Display for InputError {
@@ -41,7 +47,14 @@ impl fmt::Display for InputError {
             Self::NotAbsolute(path) => write!(formatter, "{} is not absolute", path.display()),
             Self::NotRelative(path) => write!(formatter, "{path} is not a relative path"),
             Self::ParentComponent(path) => write!(formatter, "{path} contains `..`"),
+            Self::Range(text) => write!(formatter, "{text} is a range, not a revision"),
             Self::NotUtf8(path) => write!(formatter, "{} is not UTF-8", path.display()),
+            Self::NotCanonical(path) => {
+                write!(formatter, "{} is not a canonical path", path.display())
+            }
+            Self::Unresolvable(path, error) => {
+                write!(formatter, "cannot resolve {}: {error}", path.display())
+            }
         }
     }
 }
@@ -88,7 +101,8 @@ impl StepKey {
     }
 }
 
-/// An absolute checkout path, UTF-8 because it is passed to the tool as an argument.
+/// A canonical checkout path: absolute, no symlinks, and UTF-8 because it is passed to the
+/// tool as an argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkout(PathBuf);
 
@@ -104,7 +118,12 @@ impl Checkout {
         if path.components().any(|part| part == Component::ParentDir) {
             return Err(InputError::ParentComponent(text.to_string()));
         }
-        Ok(Self(path.to_path_buf()))
+        let canonical = fs::canonicalize(path)
+            .map_err(|error| InputError::Unresolvable(path.to_path_buf(), error.to_string()))?;
+        if canonical != path {
+            return Err(InputError::NotCanonical(path.to_path_buf()));
+        }
+        Ok(Self(canonical))
     }
 
     #[must_use]
@@ -141,6 +160,9 @@ pub struct Revision(String);
 impl Revision {
     pub fn parse(text: &str) -> Result<Self, InputError> {
         bounded_text("revision", text, GRAPH_REVISION_MAX_BYTES)?;
+        if text.contains("..") {
+            return Err(InputError::Range(text.to_string()));
+        }
         refuse_characters("revision", text, |c| {
             c.is_ascii_alphanumeric() || "._/~^-".contains(c)
         })?;
@@ -206,6 +228,7 @@ pub enum Completeness {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexTime {
     pub step_key: String,
+    pub work_unit: WorkUnitId,
     pub checkout: String,
     pub commit: String,
     pub wall_clock_ms: u64,
@@ -216,6 +239,7 @@ pub struct IndexTime {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildReport {
     pub key: StepKey,
+    pub work_unit: WorkUnitId,
     pub checkout: Checkout,
     pub index_dir: PathBuf,
     pub plugin_version: String,
@@ -232,6 +256,7 @@ impl BuildReport {
     pub fn index_time(&self) -> IndexTime {
         IndexTime {
             step_key: self.key.as_str().to_string(),
+            work_unit: self.work_unit.clone(),
             checkout: self.checkout.as_str().to_string(),
             commit: self.commit.clone(),
             wall_clock_ms: u64::try_from(self.wall_clock.as_millis()).unwrap_or(u64::MAX),
@@ -245,6 +270,7 @@ impl fmt::Display for BuildReport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let time = self.index_time();
         writeln!(formatter, "step key: {}", self.key.as_str())?;
+        writeln!(formatter, "work unit: {}", self.work_unit)?;
         writeln!(formatter, "checkout: {}", self.checkout.as_str())?;
         writeln!(formatter, "commit: {}", self.commit)?;
         writeln!(formatter, "index: {}", self.index_dir.display())?;
@@ -310,10 +336,19 @@ pub enum Callers {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    Added,
+    Removed,
+    Renamed,
+    SignatureChanged,
+    BodyChanged,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangedEntity {
     pub file_path: String,
-    pub change: String,
+    pub change: ChangeKind,
     pub kind: String,
     pub name: String,
     pub dependents: u64,
@@ -326,9 +361,17 @@ pub enum Impact {
     Partial(Vec<ChangedEntity>),
 }
 
+/// The tree a query answered about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Revisions {
+    Commit(String),
+    Range { base: String, head: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryReport<T> {
     pub key: StepKey,
+    pub revisions: Revisions,
     /// False when the query found no cached index and built one itself.
     pub index_cache_hit: Option<bool>,
     pub answer: T,
@@ -386,7 +429,7 @@ impl fmt::Display for Impact {
         for entity in entities {
             writeln!(
                 formatter,
-                "  {} {} {} in {}, {} dependents",
+                "  {:?} {} {} in {}, {} dependents",
                 entity.change, entity.kind, entity.name, entity.file_path, entity.dependents
             )?;
         }
@@ -397,6 +440,10 @@ impl fmt::Display for Impact {
 impl<T: fmt::Display> fmt::Display for QueryReport<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(formatter, "step key: {}", self.key.as_str())?;
+        match &self.revisions {
+            Revisions::Commit(commit) => writeln!(formatter, "commit: {commit}")?,
+            Revisions::Range { base, head } => writeln!(formatter, "range: {base}..{head}")?,
+        }
         match self.index_cache_hit {
             Some(hit) => writeln!(formatter, "index cache hit: {hit}")?,
             None => writeln!(formatter, "index cache hit: not reported")?,
@@ -466,10 +513,20 @@ impl From<InputError> for GraphError {
 /// Builds and queries the code graph of one checkout.
 pub trait CodeGraph {
     /// After a worktree clone.
-    fn build(&self, key: &StepKey, checkout: &Checkout) -> Result<BuildReport, GraphError>;
+    fn build(
+        &self,
+        key: &StepKey,
+        unit: &WorkUnitId,
+        checkout: &Checkout,
+    ) -> Result<BuildReport, GraphError>;
 
     /// After a worker commit. The index has no incremental mode, so this is a full build.
-    fn rebuild(&self, key: &StepKey, checkout: &Checkout) -> Result<BuildReport, GraphError>;
+    fn rebuild(
+        &self,
+        key: &StepKey,
+        unit: &WorkUnitId,
+        checkout: &Checkout,
+    ) -> Result<BuildReport, GraphError>;
 
     fn definitions(
         &self,
@@ -502,7 +559,8 @@ mod tests {
     #[test]
     fn accepts_inputs_within_bounds() {
         assert!(StepKey::parse("wu03.graph:7").is_ok());
-        assert!(Checkout::parse(Path::new("/Users/someone/.tycho/wt/wu03")).is_ok());
+        let canonical = fs::canonicalize(env!("CARGO_MANIFEST_DIR")).unwrap();
+        assert!(Checkout::parse(&canonical).is_ok());
         assert!(Symbol::parse("crates/tycho/src/zmx.rs:42").is_ok());
         assert!(Revision::parse("HEAD~1").is_ok());
         assert!(RepoPath::parse_all(&["crates/tycho/src/zmx.rs"]).is_ok());
@@ -558,6 +616,24 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_checkout_through_a_symlink_or_missing() {
+        let base = fs::canonicalize(env!("CARGO_MANIFEST_DIR"))
+            .unwrap()
+            .join("../../target")
+            .join(format!("checkout-symlink-{}", std::process::id()));
+        fs::create_dir_all(base.join("real")).unwrap();
+        let base = fs::canonicalize(base).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        let through_link = Checkout::parse(&base.join("link"));
+        let direct = Checkout::parse(&base.join("real"));
+        let missing = Checkout::parse(&base.join("missing"));
+        fs::remove_dir_all(&base).unwrap();
+        assert!(matches!(through_link, Err(InputError::NotCanonical(_))));
+        assert!(direct.is_ok());
+        assert!(matches!(missing, Err(InputError::Unresolvable(_, _))));
+    }
+
+    #[test]
     fn rejects_repository_paths_outside_the_checkout() {
         assert!(matches!(
             RepoPath::parse("/etc/passwd"),
@@ -592,7 +668,11 @@ mod tests {
             Err(InputError::LeadingDash("revision"))
         );
         assert_eq!(
-            Revision::parse("main..HEAD:x"),
+            Revision::parse("main..HEAD"),
+            Err(InputError::Range("main..HEAD".to_string()))
+        );
+        assert_eq!(
+            Revision::parse("HEAD:x"),
             Err(InputError::Character("revision", ':'))
         );
         let long = "r".repeat(GRAPH_REVISION_MAX_BYTES + 1);

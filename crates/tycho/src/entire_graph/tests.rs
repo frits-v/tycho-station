@@ -2,6 +2,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 
 use super::*;
+use crate::code_graph::ChangeKind;
 
 const VERSION_PINNED: &str = include_str!("../fixtures/entire-graph-version-pinned.json");
 const VERSION_OTHER: &str = include_str!("../fixtures/entire-graph-version-other.json");
@@ -18,6 +19,7 @@ const NEIGHBORS_FUZZY: &str = include_str!("../fixtures/entire-graph-neighbors-f
 const NEIGHBORS_AMBIGUOUS: &str = include_str!("../fixtures/entire-graph-neighbors-ambiguous.json");
 const DIFF_FOUND: &str = include_str!("../fixtures/entire-graph-diff-found.json");
 const DIFF_EMPTY: &str = include_str!("../fixtures/entire-graph-diff-empty.json");
+const DIFF_KINDS: &str = include_str!("../fixtures/entire-graph-diff-kinds.json");
 const DIFF_BAD_REVISION: &str = include_str!("../fixtures/entire-graph-diff-bad-revision.txt");
 const GARBAGE: [&str; 4] = ["", "not json", "[1, 2]", "{\"unexpected\": true}"];
 
@@ -218,12 +220,17 @@ fn index_garbage_is_unrecognised() {
 fn def_sample_is_found() {
     let Decoded::Answer {
         answer,
+        revisions,
         index_cache_hit,
     } = decode_definitions(true, DEF_FOUND, "")
     else {
         panic!("no answer");
     };
     assert_eq!(index_cache_hit, Some(false));
+    assert_eq!(
+        revisions,
+        Revisions::Commit("d6d29b11631c2a2e8d29e50490fed10f1558b73e".to_string())
+    );
     assert_eq!(
         answer,
         Definitions::Found {
@@ -376,6 +383,10 @@ fn diff_empty_sample_has_a_null_file_list() {
         decode_impact(true, DIFF_EMPTY, ""),
         Decoded::Answer {
             answer: Impact::Complete(Vec::new()),
+            revisions: Revisions::Range {
+                base: "HEAD~1".to_string(),
+                head: "HEAD".to_string(),
+            },
             index_cache_hit: None,
         }
     );
@@ -422,24 +433,230 @@ fn a_long_failure_message_is_cut_to_its_bound() {
     assert!(message.len() <= MESSAGE_MAX_BYTES);
 }
 
+/// A canonical directory under `target`, removed when dropped.
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new(label: &str) -> Self {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(format!("entire-graph-{label}-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(std::fs::canonicalize(path).unwrap())
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        drop(std::fs::remove_dir_all(&self.0));
+    }
+}
+
+/// A shell stand-in for the plugin: the pinned version, the given doctor report, and
+/// `index_bytes` zero bytes from `index`.
+fn stub(dir: &TestDir, doctor: &str, index_bytes: usize) -> PathBuf {
+    let path = dir.0.join("entire-graph");
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in\n  version) printf '%s' '{}' ;;\n  doctor) printf '%s' '{}' ;;\n  index) head -c {index_bytes} /dev/zero ;;\nesac\n",
+        VERSION_PINNED.trim(),
+        doctor.trim()
+    );
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    path
+}
+
 #[test]
 fn index_names_are_stable_and_distinct_per_checkout() {
-    let first = Checkout::parse(Path::new("/w/one/wu03")).unwrap();
-    let second = Checkout::parse(Path::new("/w/two/wu03")).unwrap();
+    let dir = TestDir::new("names");
+    for name in ["one/wu03", "two/wu03"] {
+        std::fs::create_dir_all(dir.0.join(name)).unwrap();
+    }
+    let first = Checkout::parse(&dir.0.join("one/wu03")).unwrap();
+    let second = Checkout::parse(&dir.0.join("two/wu03")).unwrap();
     assert_eq!(index_name(&first), index_name(&first));
     assert_ne!(index_name(&first), index_name(&second));
     assert!(index_name(&first).starts_with("wu03-"));
 }
 
 #[test]
+fn an_index_name_keeps_only_its_bound_of_the_directory_name() {
+    let dir = TestDir::new("long-name");
+    let stem = "n".repeat(INDEX_NAME_MAX_BYTES);
+    for suffix in ["a", "b"] {
+        std::fs::create_dir_all(dir.0.join(format!("{stem}{suffix}"))).unwrap();
+    }
+    let first = index_name(&Checkout::parse(&dir.0.join(format!("{stem}a"))).unwrap());
+    let second = index_name(&Checkout::parse(&dir.0.join(format!("{stem}b"))).unwrap());
+    assert_eq!(first.len(), INDEX_NAME_MAX_BYTES + 17);
+    assert!(first.starts_with(&format!("{stem}-")));
+    assert_ne!(first, second);
+}
+
+#[test]
 fn an_index_inside_the_checkout_is_refused() {
+    let dir = TestDir::new("inside");
     let graph = EntireGraph {
         binary: PathBuf::from("/nonexistent/entire-graph"),
-        index_root: PathBuf::from("/w/wu03/.graph"),
+        index_root: dir.0.join(".graph"),
     };
-    let checkout = Checkout::parse(Path::new("/w/wu03")).unwrap();
+    let checkout = Checkout::parse(&dir.0).unwrap();
     assert!(matches!(
         graph.prepare(&checkout),
         Err(GraphError::IndexInsideCheckout(_))
     ));
+}
+
+#[test]
+fn an_index_root_reached_through_a_symlink_into_the_checkout_is_refused() {
+    let dir = TestDir::new("symlink");
+    let checkout_path = dir.0.join("checkout");
+    std::fs::create_dir_all(&checkout_path).unwrap();
+    std::os::unix::fs::symlink(&checkout_path, dir.0.join("link")).unwrap();
+    let binary = stub(&dir, DOCTOR, 0);
+    let graph = EntireGraph::open(&binary, &dir.0.join("link/graph")).unwrap();
+    assert_eq!(graph.index_root(), checkout_path.join("graph"));
+    let checkout = Checkout::parse(&checkout_path).unwrap();
+    assert!(matches!(
+        graph.prepare(&checkout),
+        Err(GraphError::IndexInsideCheckout(_))
+    ));
+}
+
+#[test]
+fn open_refuses_a_plugin_that_reports_egress() {
+    let dir = TestDir::new("egress");
+    let remote = DOCTOR.replace("\"upload_telemetry\":false", "\"upload_telemetry\":true");
+    let binary = stub(&dir, &remote, 0);
+    let graph = EntireGraph::open(&binary, &dir.0.join("index"));
+    assert!(
+        matches!(graph, Err(GraphError::EgressNotRuledOut(reason)) if reason == "upload_telemetry")
+    );
+    let binary = stub(&dir, DOCTOR, 0);
+    assert!(EntireGraph::open(&binary, &dir.0.join("index")).is_ok());
+}
+
+#[test]
+fn index_output_over_the_adapter_cap_is_refused() {
+    let dir = TestDir::new("output-cap");
+    let checkout_path = dir.0.join("checkout");
+    std::fs::create_dir_all(&checkout_path).unwrap();
+    let binary = stub(&dir, DOCTOR, GRAPH_OUTPUT_MAX_BYTES + 1);
+    let graph = EntireGraph::open(&binary, &dir.0.join("index")).unwrap();
+    let checkout = Checkout::parse(&checkout_path).unwrap();
+    let unit = WorkUnitId::parse("wu-graph").unwrap();
+    let result = graph.build(&StepKey::parse("graph.cap").unwrap(), &unit, &checkout);
+    let Err(GraphError::Command("index", message)) = result else {
+        panic!("output over the cap was accepted: {result:?}");
+    };
+    assert!(
+        message.contains(&GRAPH_OUTPUT_MAX_BYTES.to_string()),
+        "{message}"
+    );
+}
+
+#[test]
+fn inherited_entire_variables_are_removed() {
+    let names = ["ENTIRE_PLUGIN_DATA_DIR", "ENTIRE_REPO_ROOT", "HOME", "PATH"]
+        .into_iter()
+        .map(OsString::from);
+    assert_eq!(
+        entire_variables(names),
+        [
+            OsString::from("ENTIRE_PLUGIN_DATA_DIR"),
+            OsString::from("ENTIRE_REPO_ROOT")
+        ]
+    );
+}
+
+#[test]
+fn every_versioned_decoder_refuses_another_format_version() {
+    let bumped = |text: &str| text.replacen("\"format_version\":1", "\"format_version\":2", 1);
+    assert!(matches!(
+        decode_index(true, &bumped(INDEX_BUILT), ""),
+        IndexOutcome::Unrecognised(_)
+    ));
+    assert!(is_unrecognised(&decode_definitions(
+        true,
+        &bumped(DEF_FOUND),
+        ""
+    )));
+    assert!(is_unrecognised(&decode_callers(
+        true,
+        &bumped(NEIGHBORS_FOUND),
+        ""
+    )));
+    let versioned_diff = DIFF_EMPTY.replacen('{', "{\"format_version\":1,", 1);
+    assert!(is_unrecognised(&decode_impact(true, &versioned_diff, "")));
+    let versioned_doctor = DOCTOR.replacen('{', "{\"format_version\":1,", 1);
+    assert!(matches!(
+        decode_doctor(&versioned_doctor),
+        EgressState::Unrecognised(_)
+    ));
+    let versioned_version = VERSION_PINNED.replacen('{', "{\"format_version\":1,", 1);
+    assert!(matches!(
+        decode_version(&captured(0, &versioned_version)),
+        VersionState::Unrecognised(_)
+    ));
+}
+
+#[test]
+fn neighbors_with_a_fuzzy_kind_and_no_flag_is_not_found() {
+    let kind_only = NEIGHBORS_FUZZY.replace("\"fuzzy_match\":true,", "");
+    assert!(!kind_only.contains("\"fuzzy_match\":"));
+    let Decoded::Answer { answer, .. } = decode_callers(true, &kind_only, "") else {
+        panic!("no answer");
+    };
+    assert!(matches!(answer, Callers::NotFound { .. }));
+}
+
+#[test]
+fn neighbors_with_a_non_boolean_fuzzy_flag_is_unrecognised() {
+    let odd = NEIGHBORS_FUZZY.replace("\"fuzzy_match\":true", "\"fuzzy_match\":\"yes\"");
+    assert!(is_unrecognised(&decode_callers(true, &odd, "")));
+}
+
+#[test]
+fn diff_kinds_sample_decodes_every_change_type() {
+    let Decoded::Answer { answer, .. } = decode_impact(true, DIFF_KINDS, "") else {
+        panic!("no answer");
+    };
+    let Impact::Complete(entities) = answer else {
+        panic!("not complete");
+    };
+    let kinds: Vec<ChangeKind> = entities.iter().map(|entity| entity.change).collect();
+    assert_eq!(
+        kinds,
+        [
+            ChangeKind::SignatureChanged,
+            ChangeKind::BodyChanged,
+            ChangeKind::Removed,
+            ChangeKind::Removed,
+            ChangeKind::Renamed
+        ]
+    );
+}
+
+#[test]
+fn diff_with_an_unknown_change_type_is_unrecognised() {
+    let unknown = DIFF_KINDS.replacen("\"body_changed\"", "\"moved\"", 1);
+    assert!(is_unrecognised(&decode_impact(true, &unknown, "")));
+    assert_eq!(
+        decode_change_type("moved"),
+        ChangeType::Unrecognised("moved".to_string())
+    );
+}
+
+#[test]
+fn diff_with_no_dependents_count_is_unrecognised() {
+    let mut value: Value = serde_json::from_str(DIFF_FOUND).unwrap();
+    value["files"][0]["changes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("dependents_count");
+    assert!(is_unrecognised(&decode_impact(
+        true,
+        &value.to_string(),
+        ""
+    )));
 }

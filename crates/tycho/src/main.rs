@@ -23,7 +23,7 @@ const USAGE: &str = "usage: tycho <command>
   core start|stop|status      the restate-server and endpoint zmx sessions
   watchdog once|run           probe both sessions and restart what is missing
   watchdog install|uninstall  the launchd user agent that runs `watchdog run`
-  graph build <checkout>      build the semantic graph index of a checkout
+  graph build <checkout> <work-unit>   build the semantic graph index of a checkout
   graph query <checkout> definitions|callers <symbol>
   graph query <checkout> impact <path>   entities changed under the path since HEAD~1";
 
@@ -61,7 +61,7 @@ fn main() {
                 .and_then(|agent| agent.uninstall())
                 .map_err(|error| error.to_string()),
         ),
-        ["graph", "build", checkout] => report_result(graph::build(checkout)),
+        ["graph", "build", checkout, unit] => report_result(graph::build(checkout, unit)),
         ["graph", "query", checkout, kind, argument] => {
             report_result(graph::query(checkout, kind, argument))
         }

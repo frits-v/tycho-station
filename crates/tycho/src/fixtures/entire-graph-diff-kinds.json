@@ -1,0 +1,75 @@
+{
+  "base": "HEAD~1",
+  "head": "HEAD",
+  "files": [
+    {
+      "path": "crates/tycho/src/command.rs",
+      "status": "M",
+      "language": "Rust",
+      "changes": [
+        {
+          "type": "signature_changed",
+          "kind": "function",
+          "name": "run_captured",
+          "old_signature": "pub fn run_captured( program: \u0026Path, arguments: \u0026[\u0026str], environment: \u0026[(\u0026str, \u0026str)], timeout: Duration, ) -\u003e Result\u003cCaptured, CommandError\u003e",
+          "new_signature": "pub fn run_captured( program: \u0026Path, arguments: \u0026[\u0026str], environment: \u0026[(\u0026str, \u0026str)], timeout: Duration, extra: u8, ) -\u003e Result\u003cCaptured, CommandError\u003e",
+          "before_start_line": 55,
+          "after_start_line": 55,
+          "dependents_count": 8
+        },
+        {
+          "type": "body_changed",
+          "kind": "function",
+          "name": "run_detached",
+          "before_start_line": 103,
+          "after_start_line": 105,
+          "dependents_count": 1
+        }
+      ]
+    },
+    {
+      "path": "crates/tycho/src/probe.rs",
+      "status": "D",
+      "language": "Rust",
+      "changes": [
+        {
+          "type": "removed",
+          "kind": "struct",
+          "name": "Probe",
+          "old_signature": "pub struct Probe",
+          "before_start_line": 15,
+          "dependents_count": 2
+        },
+        {
+          "type": "removed",
+          "kind": "method",
+          "name": "Probe.slow",
+          "old_signature": "async fn slow( \u0026self, object_context: ObjectContext\u003c'_\u003e, milliseconds: u64, ) -\u003e HandlerResult\u003cu64\u003e",
+          "before_start_line": 20,
+          "dependents_count": 1
+        }
+      ]
+    },
+    {
+      "path": "crates/tycho/src/watchdog.rs",
+      "status": "M",
+      "language": "Rust",
+      "changes": [
+        {
+          "type": "renamed",
+          "kind": "function",
+          "name": "run_bounded_renamed",
+          "old_name": "run_bounded",
+          "new_name": "run_bounded_renamed",
+          "old_signature": "pub fn run_bounded( iterations_max: u32, interval: Duration, mut stop_requested: impl FnMut() -\u003e bool, mut tick: impl FnMut(u32), mut sleep: impl FnMut(Duration), ) -\u003e LoopEnd",
+          "new_signature": "pub fn run_bounded_renamed( iterations_max: u32, interval: Duration, mut stop_requested: impl FnMut() -\u003e bool, mut tick: impl FnMut(u32), mut sleep: impl FnMut(Duration), ) -\u003e LoopEnd",
+          "before_start_line": 273,
+          "after_start_line": 273,
+          "dependents_count": 0,
+          "similarity": 1,
+          "reconciliation": "RENAMED"
+        }
+      ]
+    }
+  ]
+}

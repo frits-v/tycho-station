@@ -1,5 +1,6 @@
 //! Runs an external program with a timeout and a cap on the output it may produce.
 
+use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read};
 use std::path::Path;
@@ -79,21 +80,28 @@ pub fn run_status(
         program,
         arguments,
         environment,
+        &[],
         timeout,
         COMMAND_OUTPUT_MAX_BYTES,
     )
 }
 
-/// `run_status` with a caller's cap on each of stdout and stderr.
+/// `run_status` with inherited variables removed and a caller's cap on each of stdout and
+/// stderr.
 pub fn run_status_capped(
     program: &Path,
     arguments: &[&str],
     environment: &[(&str, &str)],
+    removed: &[OsString],
     timeout: Duration,
     output_max_bytes: usize,
 ) -> Result<Captured, CommandError> {
     let name = program.display().to_string();
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    for variable in removed {
+        command.env_remove(variable);
+    }
+    let mut child = command
         .args(arguments)
         .envs(environment.iter().copied())
         .stdin(Stdio::null())
@@ -267,6 +275,7 @@ mod tests {
             Path::new("/usr/bin/head"),
             &["-c", "65", "/dev/zero"],
             &[],
+            &[],
             Duration::from_secs(5),
             64,
         );
@@ -280,10 +289,29 @@ mod tests {
             Path::new("/usr/bin/head"),
             &["-c", &count, "/dev/zero"],
             &[],
+            &[],
             Duration::from_secs(5),
             COMMAND_OUTPUT_MAX_BYTES * 2,
         )
         .unwrap();
         assert_eq!(captured.stdout.len(), COMMAND_OUTPUT_MAX_BYTES + 1);
+    }
+
+    #[test]
+    fn removes_an_inherited_variable_and_keeps_a_set_one() {
+        let captured = run_status_capped(
+            Path::new("/usr/bin/env"),
+            &[],
+            &[("TYCHO_COMMAND_SET", "kept")],
+            &[OsString::from("HOME")],
+            Duration::from_secs(5),
+            COMMAND_OUTPUT_MAX_BYTES,
+        )
+        .unwrap();
+        assert!(captured.stdout.contains("TYCHO_COMMAND_SET=kept"));
+        assert!(!captured
+            .stdout
+            .lines()
+            .any(|line| line.starts_with("HOME=")));
     }
 }

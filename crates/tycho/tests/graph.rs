@@ -23,6 +23,7 @@ use tycho::code_graph::{
 };
 use tycho::config;
 use tycho::entire_graph::EntireGraph;
+use tycho_types::service::WorkUnitId;
 
 const PROBE_FILE: &str = "crates/tycho/src/graph_probe.rs";
 const PROBE_SYMBOL: &str = "graph_probe_marker";
@@ -83,9 +84,9 @@ fn default_cache_entries() -> Option<usize> {
     fs::read_dir(cache).ok().map(Iterator::count)
 }
 
-fn clone_this_repository(scratch: &Scratch) -> Checkout {
+fn clone_this_repository(scratch: &Scratch, name: &str) -> Checkout {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let checkout_path = scratch.0.join("checkout");
+    let checkout_path = scratch.0.join(name);
     let status = Command::new("git")
         .args(["clone", "--quiet", "--no-hardlinks"])
         .arg(&source)
@@ -98,6 +99,20 @@ fn clone_this_repository(scratch: &Scratch) -> Checkout {
 
 fn key(text: &str) -> StepKey {
     StepKey::parse(text).unwrap()
+}
+
+/// A query on a checkout with no index builds one on the caller's path; the report says so.
+fn query_unbuilt(graph: &EntireGraph, scratch: &Scratch) {
+    let unbuilt = clone_this_repository(scratch, "unbuilt");
+    let symbol = Symbol::parse("run_bounded").unwrap();
+    let report = graph
+        .definitions(&key("graph-test.unbuilt"), &unbuilt, &symbol)
+        .unwrap();
+    assert_eq!(report.index_cache_hit, Some(false));
+    println!(
+        "query on an unbuilt checkout: index cache hit {:?}",
+        report.index_cache_hit
+    );
 }
 
 fn query_known_symbol(graph: &EntireGraph, checkout: &Checkout) {
@@ -154,30 +169,37 @@ fn query_probe(graph: &EntireGraph, checkout: &Checkout) {
 fn builds_rebuilds_and_queries_this_repository() {
     let default_cache_before = default_cache_entries();
     let scratch = scratch();
-    let checkout = clone_this_repository(&scratch);
+    let checkout = clone_this_repository(&scratch, "checkout");
+    let unit = WorkUnitId::parse("wu-graph-test").unwrap();
     let binary = config::entire_graph_path().unwrap();
     let graph = EntireGraph::open(&binary, &scratch.0.join("index")).unwrap();
 
-    let built = graph.build(&key("graph-test.build"), &checkout).unwrap();
+    let built = graph
+        .build(&key("graph-test.build"), &unit, &checkout)
+        .unwrap();
     record("index build after clone", &built);
     assert!(!built.cache_hit);
     assert!(built.counts.files > 0 && built.counts.symbols > 0);
     assert!(built.index_dir.starts_with(&scratch.0));
     assert_eq!(built.key.as_str(), "graph-test.build");
+    assert_eq!(built.index_time().work_unit, unit);
 
-    let unchanged = graph.rebuild(&key("graph-test.same"), &checkout).unwrap();
+    let unchanged = graph
+        .rebuild(&key("graph-test.same"), &unit, &checkout)
+        .unwrap();
     record("rebuild with no commit", &unchanged);
     assert!(unchanged.cache_hit);
     query_known_symbol(&graph, &checkout);
 
     commit_probe(&checkout);
     let rebuilt = graph
-        .rebuild(&key("graph-test.rebuild"), &checkout)
+        .rebuild(&key("graph-test.rebuild"), &unit, &checkout)
         .unwrap();
     record("rebuild after a commit", &rebuilt);
     assert!(!rebuilt.cache_hit);
     assert_ne!(rebuilt.commit, built.commit);
     query_probe(&graph, &checkout);
+    query_unbuilt(&graph, &scratch);
 
     let index_files = fs::read_dir(&built.index_dir).unwrap().count();
     assert!(index_files > 0, "nothing written to the index directory");

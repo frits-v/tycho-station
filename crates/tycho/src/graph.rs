@@ -8,6 +8,7 @@ use tycho::code_graph::{Checkout, CodeGraph, RepoPath, Revision, StepKey, Symbol
 use tycho::config::{self, GRAPH_INDEX_DIR};
 use tycho::entire_graph::EntireGraph;
 use tycho::private_dir;
+use tycho_types::service::WorkUnitId;
 
 /// The commit a worker most recently added, which is what a reviewer asks about.
 const IMPACT_BASE: &str = "HEAD~1";
@@ -27,10 +28,11 @@ fn open(checkout: &str) -> Result<(EntireGraph, StepKey, Checkout), String> {
     Ok((graph, key, checkout))
 }
 
-pub fn build(checkout: &str) -> Result<String, String> {
+pub fn build(checkout: &str, unit: &str) -> Result<String, String> {
+    let unit = WorkUnitId::parse(unit).map_err(|error| format!("work unit {unit}: {error}"))?;
     let (graph, key, checkout) = open(checkout)?;
     graph
-        .build(&key, &checkout)
+        .build(&key, &unit, &checkout)
         .map(|report| report.to_string())
         .map_err(|error| error.to_string())
 }

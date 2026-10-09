@@ -32,5 +32,5 @@ description = "Install the entire semantic graph plugin at the pinned version"
 run = "entire plugin install graph --pin v0.4.0 --yes"
 
 [tasks.graph-tests]
-description = "Build, rebuild and query the semantic graph index of a copy of this repository and record the index build time"
+description = "Build, rebuild and query the semantic graph index of a copy of this repository and record the index build time; needs `mise run graph-plugin` first"
 run = "cargo test -p tycho --test graph -- --ignored --test-threads=1 --nocapture"

@@ -7,21 +7,26 @@
 //! passed as `ENTIRE_PLUGIN_DATA_DIR`, because the plugin's cache is keyed on the checkout
 //! path and queries take no cache flag of their own.
 
+use std::env;
+use std::ffi::OsString;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use tycho_types::service::WorkUnitId;
+
 use crate::code_graph::{
-    BuildReport, Callers, ChangedEntity, Checkout, CodeGraph, Completeness, Definitions,
-    GraphCounts, GraphError, Impact, Location, QueryReport, RepoPath, Revision, StepKey, Symbol,
-    GRAPH_RESULTS_MAX_ITEMS, IMPACT_ENTITIES_MAX_ITEMS,
+    BuildReport, Callers, ChangeKind, ChangedEntity, Checkout, CodeGraph, Completeness,
+    Definitions, GraphCounts, GraphError, Impact, Location, QueryReport, RepoPath, Revision,
+    Revisions, StepKey, Symbol, GRAPH_RESULTS_MAX_ITEMS, IMPACT_ENTITIES_MAX_ITEMS,
 };
 use crate::command::{self, Captured, CommandError};
 use crate::config::{
-    COMMAND_TIMEOUT, ENTIRE_GRAPH_PINNED_VERSION, GRAPH_BUILD_TIMEOUT, GRAPH_DIFF_BUDGET_SECONDS,
-    GRAPH_OUTPUT_MAX_BYTES, GRAPH_QUERY_TIMEOUT,
+    COMMAND_OUTPUT_MAX_BYTES, COMMAND_TIMEOUT, ENTIRE_GRAPH_PINNED_VERSION, GRAPH_BUILD_TIMEOUT,
+    GRAPH_DIFF_BUDGET_SECONDS, GRAPH_OUTPUT_MAX_BYTES, GRAPH_QUERY_TIMEOUT, MISE_NO_INSTALL,
 };
 use crate::private_dir;
 
@@ -32,6 +37,29 @@ const PROFILE: &str = "full";
 const MESSAGE_MAX_BYTES: usize = 512;
 const INDEX_NAME_MAX_BYTES: usize = 64;
 const BUDGET_EXCEEDED: &str = "W_ANALYSIS_BUDGET_EXCEEDED";
+/// The `format_version` of the `index`, `def` and `neighbors` captures; `version`, `doctor`
+/// and `diff` carry none.
+const FORMAT_VERSION: u64 = 1;
+const ENTIRE_PREFIX: &str = "ENTIRE_";
+
+/// One `type` value of a `diff` change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChangeType {
+    Known(ChangeKind),
+    Unrecognised(String),
+}
+
+#[must_use]
+pub fn decode_change_type(text: &str) -> ChangeType {
+    match text {
+        "added" => ChangeType::Known(ChangeKind::Added),
+        "removed" => ChangeType::Known(ChangeKind::Removed),
+        "renamed" => ChangeType::Known(ChangeKind::Renamed),
+        "signature_changed" => ChangeType::Known(ChangeKind::SignatureChanged),
+        "body_changed" => ChangeType::Known(ChangeKind::BodyChanged),
+        other => ChangeType::Unrecognised(excerpt(other)),
+    }
+}
 
 /// `version --json`, or the absence of the binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +103,7 @@ pub enum IndexOutcome {
 pub enum Decoded<T> {
     Answer {
         answer: T,
+        revisions: Revisions,
         index_cache_hit: Option<bool>,
     },
     Failed(String),
@@ -99,6 +128,20 @@ fn parse_object(stdout: &str) -> Result<Value, String> {
     }
 }
 
+fn check_format(value: &Value, expected: Option<u64>) -> Result<(), String> {
+    match (value.get("format_version"), expected) {
+        (None, None) => Ok(()),
+        (Some(found), Some(expected)) if found.as_u64() == Some(expected) => Ok(()),
+        (found, _) => Err(format!("format_version {found:?}, expected {expected:?}")),
+    }
+}
+
+fn parse_versioned(stdout: &str, expected: Option<u64>) -> Result<Value, String> {
+    let value = parse_object(stdout)?;
+    check_format(&value, expected)?;
+    Ok(value)
+}
+
 fn text_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
@@ -121,7 +164,7 @@ pub fn decode_version(result: &Result<Captured, CommandError>) -> VersionState {
         }
         Err(error) => return VersionState::Unrecognised(error.to_string()),
     };
-    let value = match parse_object(&captured.stdout) {
+    let value = match parse_versioned(&captured.stdout, None) {
         Ok(value) => value,
         Err(reason) => return VersionState::Unrecognised(reason),
     };
@@ -139,7 +182,7 @@ pub fn decode_version(result: &Result<Captured, CommandError>) -> VersionState {
 
 #[must_use]
 pub fn decode_doctor(stdout: &str) -> EgressState {
-    let value = match parse_object(stdout) {
+    let value = match parse_versioned(stdout, None) {
         Ok(value) => value,
         Err(reason) => return EgressState::Unrecognised(reason),
     };
@@ -182,6 +225,7 @@ fn decode_counts(value: &Value) -> Option<(GraphCounts, Option<Completeness>)> {
 }
 
 fn decode_index_summary(value: &Value) -> Result<IndexSummary, String> {
+    check_format(value, Some(FORMAT_VERSION))?;
     let provider = text_field(value, "provider");
     let version = text_field(value, "provider_version");
     if provider != Some(PROVIDER) || version != Some(ENTIRE_GRAPH_PINNED_VERSION) {
@@ -238,19 +282,45 @@ fn array_field<'a>(value: &'a Value, key: &str) -> Option<&'a [Value]> {
     value.get(key).and_then(Value::as_array).map(Vec::as_slice)
 }
 
-fn query_object<T>(success: bool, stdout: &str, stderr: &str) -> Result<Value, Decoded<T>> {
+fn query_object<T>(
+    success: bool,
+    stdout: &str,
+    stderr: &str,
+    format: Option<u64>,
+) -> Result<Value, Decoded<T>> {
     if !success {
         return Err(Decoded::Failed(excerpt(stderr)));
     }
-    parse_object(stdout).map_err(Decoded::Unrecognised)
+    parse_versioned(stdout, format).map_err(Decoded::Unrecognised)
+}
+
+/// A fuzzy fallback match, which names near symbols rather than the one asked for.
+fn fuzzy(value: &Value) -> Result<bool, String> {
+    let flagged = match value.get("fuzzy_match") {
+        None => false,
+        Some(Value::Bool(flag)) => *flag,
+        Some(_) => return Err("fuzzy_match is not a boolean".to_string()),
+    };
+    Ok(flagged || value.get("fuzzy_match_kind").is_some())
+}
+
+fn commit(value: &Value) -> Result<Revisions, String> {
+    text_field(value, "commit")
+        .map(|commit| Revisions::Commit(commit.to_string()))
+        .ok_or_else(|| "no commit".to_string())
 }
 
 #[must_use]
 pub fn decode_definitions(success: bool, stdout: &str, stderr: &str) -> Decoded<Definitions> {
-    let value = match query_object(success, stdout, stderr) {
+    let value = match query_object(success, stdout, stderr, Some(FORMAT_VERSION)) {
         Ok(value) => value,
         Err(decoded) => return decoded,
     };
+    let (revisions, fuzzy) =
+        match commit(&value).and_then(|revisions| Ok((revisions, fuzzy(&value)?))) {
+            Ok(decoded) => decoded,
+            Err(reason) => return Decoded::Unrecognised(reason),
+        };
     let Some(items) = array_field(&value, "declarations") else {
         return Decoded::Unrecognised("no declarations array".to_string());
     };
@@ -260,10 +330,7 @@ pub fn decode_definitions(success: bool, stdout: &str, stderr: &str) -> Decoded<
     let Some(locations) = decode_locations(items, "") else {
         return Decoded::Unrecognised("a declaration is malformed".to_string());
     };
-    let answer = match (
-        value.get("fuzzy_match_kind").is_some(),
-        flag_field(&value, "truncated"),
-    ) {
+    let answer = match (fuzzy, flag_field(&value, "truncated")) {
         (true, _) => Definitions::NotFound { nearest: locations },
         (false, _) if locations.is_empty() => Definitions::NotFound { nearest: locations },
         (false, Some(truncated)) => Definitions::Found {
@@ -274,12 +341,13 @@ pub fn decode_definitions(success: bool, stdout: &str, stderr: &str) -> Decoded<
     };
     Decoded::Answer {
         answer,
+        revisions,
         index_cache_hit: flag_field(&value, "index_cache_hit"),
     }
 }
 
 fn decode_callers_answer(value: &Value, matches: &[Value]) -> Result<Callers, String> {
-    let fuzzy = flag_field(value, "fuzzy_match") == Some(true);
+    let fuzzy = fuzzy(value)?;
     let ambiguous = flag_field(value, "disambiguation_required").ok_or("no disambiguation flag")?;
     let candidates = decode_locations(matches, "/symbol").ok_or("a match is malformed")?;
     if fuzzy || matches.is_empty() {
@@ -305,9 +373,13 @@ fn decode_callers_answer(value: &Value, matches: &[Value]) -> Result<Callers, St
 
 #[must_use]
 pub fn decode_callers(success: bool, stdout: &str, stderr: &str) -> Decoded<Callers> {
-    let value = match query_object(success, stdout, stderr) {
+    let value = match query_object(success, stdout, stderr, Some(FORMAT_VERSION)) {
         Ok(value) => value,
         Err(decoded) => return decoded,
+    };
+    let revisions = match commit(&value) {
+        Ok(revisions) => revisions,
+        Err(reason) => return Decoded::Unrecognised(reason),
     };
     let Some(matches) = array_field(&value, "matches") else {
         return Decoded::Unrecognised("no matches array".to_string());
@@ -318,31 +390,53 @@ pub fn decode_callers(success: bool, stdout: &str, stderr: &str) -> Decoded<Call
     match decode_callers_answer(&value, matches) {
         Ok(answer) => Decoded::Answer {
             answer,
+            revisions,
             index_cache_hit: flag_field(&value, "index_cache_hit"),
         },
         Err(reason) => Decoded::Unrecognised(reason),
     }
 }
 
-fn decode_file_changes(file: &Value) -> Option<Vec<ChangedEntity>> {
-    let path = text_field(file, "path")?;
-    let changes = match file.get("changes")? {
-        Value::Null => &[][..],
-        Value::Array(changes) => changes.as_slice(),
-        _ => return None,
+fn decode_change(path: &str, change: &Value) -> Result<ChangedEntity, String> {
+    let kind = match decode_change_type(text_field(change, "type").ok_or("a change has no type")?) {
+        ChangeType::Known(kind) => kind,
+        ChangeType::Unrecognised(text) => return Err(format!("change type {text}")),
+    };
+    Ok(ChangedEntity {
+        file_path: path.to_string(),
+        change: kind,
+        kind: text_field(change, "kind")
+            .ok_or("a change has no kind")?
+            .to_string(),
+        name: text_field(change, "name")
+            .ok_or("a change has no name")?
+            .to_string(),
+        dependents: number_field(change, "dependents_count")
+            .ok_or("a change has no dependents_count")?,
+    })
+}
+
+fn decode_file_changes(file: &Value) -> Result<Vec<ChangedEntity>, String> {
+    let path = text_field(file, "path").ok_or("a file has no path")?;
+    let changes = match file.get("changes") {
+        Some(Value::Null) => &[][..],
+        Some(Value::Array(changes)) => changes.as_slice(),
+        _ => return Err(format!("{path} has no changes list")),
     };
     changes
         .iter()
-        .map(|change| {
-            Some(ChangedEntity {
-                file_path: path.to_string(),
-                change: text_field(change, "type")?.to_string(),
-                kind: text_field(change, "kind")?.to_string(),
-                name: text_field(change, "name")?.to_string(),
-                dependents: number_field(change, "dependents_count").unwrap_or(0),
-            })
-        })
+        .map(|change| decode_change(path, change))
         .collect()
+}
+
+fn range(value: &Value) -> Result<Revisions, String> {
+    match (text_field(value, "base"), text_field(value, "head")) {
+        (Some(base), Some(head)) => Ok(Revisions::Range {
+            base: base.to_string(),
+            head: head.to_string(),
+        }),
+        _ => Err("no base or head".to_string()),
+    }
 }
 
 fn budget_exceeded(value: &Value) -> Option<bool> {
@@ -360,9 +454,13 @@ fn budget_exceeded(value: &Value) -> Option<bool> {
 /// `diff --json`, which has no format version and writes `null` for an empty file list.
 #[must_use]
 pub fn decode_impact(success: bool, stdout: &str, stderr: &str) -> Decoded<Impact> {
-    let value = match query_object(success, stdout, stderr) {
+    let value = match query_object(success, stdout, stderr, None) {
         Ok(value) => value,
         Err(decoded) => return decoded,
+    };
+    let revisions = match range(&value) {
+        Ok(revisions) => revisions,
+        Err(reason) => return Decoded::Unrecognised(reason),
     };
     let files = match value.get("files") {
         Some(Value::Null) => &[][..],
@@ -371,8 +469,9 @@ pub fn decode_impact(success: bool, stdout: &str, stderr: &str) -> Decoded<Impac
     };
     let mut entities = Vec::new();
     for file in files {
-        let Some(changes) = decode_file_changes(file) else {
-            return Decoded::Unrecognised("a file entry is malformed".to_string());
+        let changes = match decode_file_changes(file) {
+            Ok(changes) => changes,
+            Err(reason) => return Decoded::Unrecognised(reason),
         };
         entities.extend(changes);
         if entities.len() > IMPACT_ENTITIES_MAX_ITEMS {
@@ -386,6 +485,7 @@ pub fn decode_impact(success: bool, stdout: &str, stderr: &str) -> Decoded<Impac
     };
     Decoded::Answer {
         answer,
+        revisions,
         index_cache_hit: None,
     }
 }
@@ -412,6 +512,40 @@ pub fn index_name(checkout: &Checkout) -> String {
     format!("{base}-{:016x}", fnv1a(checkout.as_str().as_bytes()))
 }
 
+/// Inherited `ENTIRE_*` variables, removed from the plugin's environment so only the ones
+/// the adapter sets reach it.
+#[must_use]
+pub fn entire_variables(names: impl Iterator<Item = OsString>) -> Vec<OsString> {
+    names
+        .filter(|name| {
+            name.to_str()
+                .is_none_or(|text| text.starts_with(ENTIRE_PREFIX))
+        })
+        .collect()
+}
+
+fn run_plugin(
+    binary: &Path,
+    arguments: &[&str],
+    data_dir: Option<&str>,
+    timeout: Duration,
+    output_max_bytes: usize,
+) -> Result<Captured, CommandError> {
+    let mut environment = MISE_NO_INSTALL.to_vec();
+    if let Some(data_dir) = data_dir {
+        environment.push((DATA_DIR_ENV, data_dir));
+    }
+    let removed = entire_variables(env::vars_os().map(|(name, _)| name));
+    command::run_status_capped(
+        binary,
+        arguments,
+        &environment,
+        &removed,
+        timeout,
+        output_max_bytes,
+    )
+}
+
 /// The adapter, opened only when the plugin is the pinned version and reports no egress.
 #[derive(Debug, Clone)]
 pub struct EntireGraph {
@@ -421,7 +555,13 @@ pub struct EntireGraph {
 
 impl EntireGraph {
     pub fn open(binary: &Path, index_root: &Path) -> Result<Self, GraphError> {
-        let version = command::run_status(binary, &["version", "--json"], &[], COMMAND_TIMEOUT);
+        let version = run_plugin(
+            binary,
+            &["version", "--json"],
+            None,
+            COMMAND_TIMEOUT,
+            COMMAND_OUTPUT_MAX_BYTES,
+        );
         match decode_version(&version) {
             VersionState::Pinned => {}
             VersionState::Other(found) => {
@@ -438,17 +578,32 @@ impl EntireGraph {
             }
             VersionState::Unrecognised(reason) => return Err(GraphError::VersionRefused(reason)),
         }
-        let doctor = command::run_captured(binary, &["doctor", "--json"], &[], COMMAND_TIMEOUT)
-            .map_err(|error| GraphError::Command("doctor", error.to_string()))?;
+        let doctor = run_plugin(
+            binary,
+            &["doctor", "--json"],
+            None,
+            COMMAND_TIMEOUT,
+            COMMAND_OUTPUT_MAX_BYTES,
+        )
+        .map_err(|error| GraphError::Command("doctor", error.to_string()))?;
+        if !doctor.status.success() {
+            return Err(GraphError::Failed("doctor", excerpt(&doctor.stderr)));
+        }
         match decode_doctor(&doctor.stdout) {
-            EgressState::NoEgress => Ok(Self {
-                binary: binary.to_path_buf(),
-                index_root: index_root.to_path_buf(),
-            }),
+            EgressState::NoEgress => {}
             EgressState::Egress(reason) | EgressState::Unrecognised(reason) => {
-                Err(GraphError::EgressNotRuledOut(reason))
+                return Err(GraphError::EgressNotRuledOut(reason))
             }
         }
+        Ok(Self {
+            binary: binary.to_path_buf(),
+            index_root: canonical_root(index_root)?,
+        })
+    }
+
+    #[must_use]
+    pub fn index_root(&self) -> &Path {
+        &self.index_root
     }
 
     #[must_use]
@@ -477,17 +632,22 @@ impl EntireGraph {
         let data_dir = index_dir.to_str().ok_or_else(|| {
             GraphError::CannotPrepare(index_dir.to_path_buf(), "not UTF-8".to_string())
         })?;
-        command::run_status_capped(
+        run_plugin(
             &self.binary,
             arguments,
-            &[(DATA_DIR_ENV, data_dir)],
+            Some(data_dir),
             timeout,
             GRAPH_OUTPUT_MAX_BYTES,
         )
         .map_err(|error| GraphError::Command(command, error.to_string()))
     }
 
-    fn index(&self, key: &StepKey, checkout: &Checkout) -> Result<BuildReport, GraphError> {
+    fn index(
+        &self,
+        key: &StepKey,
+        unit: &WorkUnitId,
+        checkout: &Checkout,
+    ) -> Result<BuildReport, GraphError> {
         let index_dir = self.prepare(checkout)?;
         let arguments = [
             "index",
@@ -518,6 +678,7 @@ impl EntireGraph {
         };
         Ok(BuildReport {
             key: key.clone(),
+            work_unit: unit.clone(),
             checkout: checkout.clone(),
             index_dir,
             plugin_version: summary.provider_version,
@@ -547,9 +708,11 @@ impl EntireGraph {
         ) {
             Decoded::Answer {
                 answer,
+                revisions,
                 index_cache_hit,
             } => Ok(QueryReport {
                 key: key.clone(),
+                revisions,
                 index_cache_hit,
                 answer,
             }),
@@ -561,12 +724,22 @@ impl EntireGraph {
 }
 
 impl CodeGraph for EntireGraph {
-    fn build(&self, key: &StepKey, checkout: &Checkout) -> Result<BuildReport, GraphError> {
-        self.index(key, checkout)
+    fn build(
+        &self,
+        key: &StepKey,
+        unit: &WorkUnitId,
+        checkout: &Checkout,
+    ) -> Result<BuildReport, GraphError> {
+        self.index(key, unit, checkout)
     }
 
-    fn rebuild(&self, key: &StepKey, checkout: &Checkout) -> Result<BuildReport, GraphError> {
-        self.index(key, checkout)
+    fn rebuild(
+        &self,
+        key: &StepKey,
+        unit: &WorkUnitId,
+        checkout: &Checkout,
+    ) -> Result<BuildReport, GraphError> {
+        self.index(key, unit, checkout)
     }
 
     fn definitions(
@@ -644,6 +817,15 @@ impl CodeGraph for EntireGraph {
         arguments.extend(paths.iter().map(RepoPath::as_str));
         self.query("diff", key, checkout, &arguments, decode_impact)
     }
+}
+
+/// Creates the root if missing and resolves it, so the inside-the-checkout check compares
+/// real paths, not spellings.
+fn canonical_root(index_root: &Path) -> Result<PathBuf, GraphError> {
+    private_dir::ensure(&[index_root.to_path_buf()])
+        .map_err(|error| GraphError::CannotPrepare(index_root.to_path_buf(), error.to_string()))?;
+    fs::canonicalize(index_root)
+        .map_err(|error| GraphError::CannotPrepare(index_root.to_path_buf(), error.to_string()))
 }
 
 #[cfg(test)]
