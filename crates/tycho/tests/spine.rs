@@ -1357,3 +1357,44 @@ fn a_unit_with_a_control_start_spawns_and_instructs_its_control_session_before_d
     let session_view: serde_json::Value = serde_json::from_str(&session_view).unwrap();
     assert_eq!(session_view["last_instruction"]["path"], "socket");
 }
+
+#[test]
+#[ignore = "starts real processes; run with mise run spine-tests"]
+fn a_unit_whose_control_instruction_is_refused_is_abandoned_without_dispatch() {
+    let spawner = launcher_double(Launcher::Resolve("a1", Duration::from_millis(500)));
+    let vendor = RecordingVendor::refusing(&spawner);
+    let ports_vendor = vendor.clone();
+    let (core, _doubles, _ports) = start_core_with_spawner(
+        "refused",
+        Arc::new(spawner.clone()),
+        Arc::new(NoGate),
+        test_timing(),
+        &move |ports, _| ports.vendor = Arc::new(ports_vendor.clone()),
+    );
+    let invocation = dispatch_plan(&core, &control_plan_file(&core));
+    let (status, body) = attach(&invocation);
+    assert_eq!(status, 200, "{body}");
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    println!("evidence: refused unit view {view}");
+    assert_eq!(view["lifecycle"], "abandoned");
+    assert_eq!(view["control_delivery"]["path"], "refused");
+    assert!(
+        view["reason"]
+            .as_str()
+            .unwrap()
+            .contains("did not receive the task packet"),
+        "{view}"
+    );
+    let sessions: Vec<String> = spawner
+        .log()
+        .spawned
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        sessions,
+        ["cf7a.wu01.ctl.claude"],
+        "the control session only; no worker was dispatched"
+    );
+    assert_eq!(vendor.calls().len(), 1);
+}

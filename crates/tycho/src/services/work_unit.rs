@@ -22,7 +22,7 @@ use crate::packets::{self, Blocker, PacketContext, PacketError};
 use crate::repositories::{pin_ref, unit_branch, RepositoryError, Worktree};
 use crate::services::epic::EpicClient;
 use crate::services::merge_gate::{Claim, GateError, GateVerdict, MergeGate, VerifyRequest};
-use crate::services::session::InstructionRecord;
+use crate::services::session::{InstructionPath, InstructionRecord};
 use crate::services::worker_run::{
     worker_key, WorkerRunClient, WorkerRunOutcome, WorkerRunRequest,
 };
@@ -354,6 +354,18 @@ pub fn backoff(timing: &Timing, attempt: Attempt) -> Duration {
         .retry_backoff_initial
         .saturating_mul(2_u32.saturating_pow(doublings))
         .min(timing.retry_backoff_max)
+}
+
+/// Why the unit cannot dispatch: no instruction reached its control session, so nothing
+/// would advise the run.
+#[must_use]
+pub fn control_refusal(record: &InstructionRecord) -> Option<String> {
+    (record.path == InstructionPath::Refused).then(|| {
+        format!(
+            "the control session did not receive the task packet: {:?}",
+            record.delivery
+        )
+    })
 }
 
 pub fn check_plan(request: &WorkUnitRequest, vendor: &dyn SessionVendor) -> Result<(), String> {
@@ -759,9 +771,10 @@ impl WorkUnit {
             start,
         )
         .await?;
+        let refusal = control_refusal(&record);
         unit.view.control_delivery = Some(record);
         unit.save();
-        Ok(())
+        refusal.map_or(Ok(()), |reason| Err(failure(CODE_CONFLICT, reason)))
     }
 
     fn after_criteria(
@@ -1578,6 +1591,30 @@ mod tests {
                 attempt: 3,
                 question: Question::Absent
             }
+        );
+    }
+
+    #[test]
+    fn only_a_refused_control_instruction_stops_the_unit() {
+        use crate::services::session::path_for;
+        use crate::vendors::control::Delivery;
+        let record = |delivery: Delivery| InstructionRecord {
+            key: ShortText::parse("wu01:task_packet:1").unwrap(),
+            path: path_for(&delivery),
+            delivery,
+        };
+        let socket = "/tmp/i.sock".to_string();
+        let refused = control_refusal(&record(Delivery::Refused {
+            socket: socket.clone(),
+        }));
+        assert!(refused.is_some_and(|reason| reason.contains("did not receive the task packet")));
+        assert!(control_refusal(&record(Delivery::NoSession)).is_some());
+        assert_eq!(control_refusal(&record(Delivery::Posted { socket })), None);
+        assert_eq!(
+            control_refusal(&record(Delivery::Relayed {
+                file: "a.json".to_string()
+            })),
+            None
         );
     }
 }

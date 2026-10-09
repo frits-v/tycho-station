@@ -211,6 +211,8 @@ pub trait SessionVendor: Send + Sync + 'static {
     /// The handle a later `control_command` with `resume` takes.
     fn resume_handle(&self, session: &VendorSessionId) -> Result<ShortText, VendorError>;
     fn context_size(&self, session: &VendorSessionId) -> ContextReport;
+    /// Removes what the port keeps for a session that was killed or reaped.
+    fn release(&self, session: &SessionName) -> Result<(), String>;
 }
 
 /// The production stand-in until a control vendor is installed: every call is refused.
@@ -257,6 +259,10 @@ impl SessionVendor for NoVendor {
         ContextReport::Unreadable {
             reason: NO_VENDOR.to_string(),
         }
+    }
+
+    fn release(&self, _session: &SessionName) -> Result<(), String> {
+        Ok(())
     }
 }
 

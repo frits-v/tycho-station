@@ -998,6 +998,7 @@ mod tests {
             scrollback: None,
             awaiting_reap: false,
             last_instruction: None,
+            release_error: None,
         }
     }
 

@@ -303,6 +303,10 @@ impl SessionVendor for ForcedRelay {
     fn context_size(&self, session: &VendorSessionId) -> ContextReport {
         self.direct.context_size(session)
     }
+
+    fn release(&self, session: &SessionName) -> Result<(), String> {
+        self.direct.release(session)
+    }
 }
 
 /// One control session the test started: its zmx name, vendor id and secret.
@@ -861,6 +865,16 @@ fn an_instruction_posted_from_a_handler_step_reaches_the_session_over_its_socket
     assert!(matches!(held, ContextReport::Tokens { tokens } if tokens > 0));
     relay_reaches_the_session(&harness, &control);
     harness.kill(&control);
+    let relay = relay_dir(&harness.spawner.dirs, &control.name);
+    println!(
+        "evidence: relay directory {} exists after the kill: {}",
+        relay.display(),
+        relay.exists()
+    );
+    assert!(
+        !relay.exists(),
+        "the kill removes the session's relay directory"
+    );
 }
 
 /// With the socket path forced off, the instruction goes to the relay and the launcher posts it.

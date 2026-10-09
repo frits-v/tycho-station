@@ -18,13 +18,13 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use tycho_types::envelope::{ShortText, TEXT_MAX_BYTES};
 use tycho_types::lease::PID_MAX;
-use tycho_types::session::Vendor;
+use tycho_types::session::{SessionName, Vendor};
 use tycho_types::task_packet::Effort;
 
 use crate::agent_files::read_checked;
 use crate::config::AgentDirs;
 use crate::launch_spec::VendorTerminal;
-use crate::relay::write_instruction;
+use crate::relay::{remove_relay_dir, write_instruction};
 use crate::vendors::control::{
     bounded, AddressTarget, ContextReport, ControlCommand, ControlLaunch, Delivery, Observation,
     PermissionMode, SessionVendor, VendorError, VendorSessionId, WaitingFor, MODEL_NAME_MAX_BYTES,
@@ -406,7 +406,8 @@ impl ClaudeControl {
         }
     }
 
-    /// Scans the registry for live processes holding the id; over the bound is an error.
+    /// Scans the registry for live processes holding the id; over the bound is an error. A file
+    /// that cannot be read or decoded makes the lookup unreadable only when nothing matched.
     #[must_use]
     pub fn locate(&self, session: &VendorSessionId) -> Located {
         let dir = self.config_dir.join("sessions");
@@ -421,6 +422,7 @@ impl ClaudeControl {
             }
         };
         let mut found = Vec::new();
+        let mut failed: Option<String> = None;
         for (count, entry) in entries.enumerate() {
             if count >= REGISTRY_FILES_MAX {
                 return Located::Unreadable(format!(
@@ -438,13 +440,14 @@ impl ClaudeControl {
             match Self::read_entry(&path, session) {
                 Ok(Some(record)) => found.push(record),
                 Ok(None) => {}
-                Err(reason) => return Located::Unreadable(reason),
+                Err(reason) => failed = failed.or(Some(reason)),
             }
         }
-        match found.len() {
-            0 => Located::Absent,
-            1 => found.pop().map_or(Located::Absent, Located::Found),
-            many => Located::Ambiguous(many),
+        match (found.len(), failed) {
+            (0, Some(reason)) => Located::Unreadable(reason),
+            (0, None) => Located::Absent,
+            (1, _) => found.pop().map_or(Located::Absent, Located::Found),
+            (many, _) => Located::Ambiguous(many),
         }
     }
 
@@ -592,6 +595,12 @@ impl SessionVendor for ClaudeControl {
             Ok(None) => ContextReport::NoTurnYet,
             Err(reason) => ContextReport::Unreadable { reason },
         }
+    }
+
+    fn release(&self, session: &SessionName) -> Result<(), String> {
+        self.relay_dirs
+            .as_ref()
+            .map_or(Ok(()), |dirs| remove_relay_dir(dirs, session))
     }
 }
 

@@ -500,3 +500,45 @@ fn a_registry_file_that_cannot_be_read_or_decoded_is_unreadable_not_absent() {
     ));
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_live_entry_is_found_beside_a_registry_file_that_cannot_be_decoded() {
+    let dir = scratch("beside");
+    let socket = dir.join("i.sock");
+    fs::write(dir.join("sessions").join("9.json"), "{\"pid\":").unwrap();
+    registry_file(&dir, "2.json", std::process::id(), &socket);
+    assert!(matches!(
+        adapter(&dir).locate(&session()),
+        Located::Found(entry) if entry.pid == std::process::id()
+    ));
+    fs::remove_file(dir.join("sessions").join("2.json")).unwrap();
+    assert!(matches!(
+        adapter(&dir).locate(&session()),
+        Located::Unreadable(reason) if reason.contains("9.json")
+    ));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_pre_existing_relay_file_is_relayed_only_when_it_is_the_cores_identical_line() {
+    let dir = scratch("existing");
+    let agent = AgentDirs::new(dir.join("agent")).unwrap();
+    fs::create_dir_all(&agent.socket_dir).unwrap();
+    let always = adapter(&dir).with_relay(agent.clone(), RelayMode::Always);
+    let file = crate::relay::relay_file_name(&ShortText::parse("wu03:task_packet:1").unwrap());
+    assert_eq!(go(&always), Delivery::Relayed { file: file.clone() });
+    assert_eq!(go(&always), Delivery::Relayed { file: file.clone() });
+    let written = crate::relay::relay_dir(&agent, &target().session).join(&file);
+    fs::remove_file(&written).unwrap();
+    // Another writer's file cannot be made here; a different line stands in for it.
+    let planted = instruction_line(&ShortText::parse("planted").unwrap());
+    crate::agent_files::write_new_mode(&written, planted.as_bytes(), 0o640).unwrap();
+    assert!(matches!(
+        go(&always),
+        Delivery::RelayFailed { reason } if reason.contains("another instruction")
+    ));
+    always.release(&target().session).unwrap();
+    assert!(!crate::relay::relay_dir(&agent, &target().session).exists());
+    assert_eq!(go(&always), Delivery::Relayed { file });
+    fs::remove_dir_all(&dir).unwrap();
+}

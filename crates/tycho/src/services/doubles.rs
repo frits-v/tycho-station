@@ -141,11 +141,13 @@ pub struct AddressCall {
     pub spawns_before: usize,
 }
 
-/// A Claude control vendor that records every address and answers it as posted.
+/// A Claude control vendor that records every address and answers it as posted, or as
+/// refused when built with `refusing`.
 #[derive(Clone)]
 pub struct RecordingVendor {
     spawner: RecordingSpawner,
     calls: Arc<Mutex<Vec<AddressCall>>>,
+    refuse: bool,
 }
 
 impl std::fmt::Debug for RecordingVendor {
@@ -162,6 +164,15 @@ impl RecordingVendor {
         Self {
             spawner: spawner.clone(),
             calls: Arc::default(),
+            refuse: false,
+        }
+    }
+
+    #[must_use]
+    pub fn refusing(spawner: &RecordingSpawner) -> Self {
+        Self {
+            refuse: true,
+            ..Self::new(spawner)
         }
     }
 
@@ -211,8 +222,11 @@ impl SessionVendor for RecordingVendor {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(call);
-        Delivery::Posted {
-            socket: DOUBLE_SOCKET.to_string(),
+        let socket = DOUBLE_SOCKET.to_string();
+        if self.refuse {
+            Delivery::Refused { socket }
+        } else {
+            Delivery::Posted { socket }
         }
     }
 
@@ -226,6 +240,10 @@ impl SessionVendor for RecordingVendor {
 
     fn context_size(&self, _session: &VendorSessionId) -> ContextReport {
         ContextReport::NoTurnYet
+    }
+
+    fn release(&self, _session: &SessionName) -> Result<(), String> {
+        Ok(())
     }
 }
 

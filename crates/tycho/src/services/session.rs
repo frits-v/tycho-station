@@ -62,6 +62,9 @@ pub struct SessionState {
     /// The last instructions, newest last, so a repeated key is answered without a re-post.
     #[serde(default)]
     pub instructions: Vec<InstructionRecord>,
+    /// Why the vendor port could not remove what it kept for the session once it ended.
+    #[serde(default)]
+    pub release_error: Option<String>,
 }
 
 /// Which way an instruction reached the session.
@@ -171,6 +174,8 @@ pub struct SessionView {
     pub awaiting_reap: bool,
     /// The last instruction's key, path and delivery, a refusal included.
     pub last_instruction: Option<InstructionRecord>,
+    #[serde(default)]
+    pub release_error: Option<String>,
 }
 
 impl From<&SessionState> for SessionView {
@@ -190,6 +195,7 @@ impl From<&SessionState> for SessionView {
             scrollback: state.scrollback.clone(),
             awaiting_reap: state.awaiting_reap,
             last_instruction: state.instructions.last().cloned(),
+            release_error: state.release_error.clone(),
         }
     }
 }
@@ -600,6 +606,7 @@ impl Session {
             .name("kill")
             .retry_policy(self.timing.port_retry())
             .await?;
+        state.release_error = self.release(&object_context, &name).await?;
         state.phase = SessionPhase::Killed;
         state.scrollback.clone_from(&scrollback);
         object_context.set(STATE_KEY, Json(state));
@@ -641,15 +648,17 @@ impl Session {
         let Some(state) = object_context.get::<Json<SessionState>>(STATE_KEY).await? else {
             return Ok(false);
         };
-        let Some(next) = reaped(&state.into_inner()) else {
+        let Some(mut next) = reaped(&state.into_inner()) else {
             return Ok(false);
         };
         let spawner = Arc::clone(&self.spawner);
+        let target = name.clone();
         object_context
-            .run(|| blocking(move || spawner.kill_by_name(&name).map_err(spawner_failure)))
+            .run(|| blocking(move || spawner.kill_by_name(&target).map_err(spawner_failure)))
             .name("reap")
             .retry_policy(self.timing.port_retry())
             .await?;
+        next.release_error = self.release(&object_context, &name).await?;
         object_context.set(STATE_KEY, Json(next));
         Ok(true)
     }
@@ -751,6 +760,23 @@ impl Session {
         Ok(delivery.into_inner())
     }
 
+    /// Removes the vendor port's files for the ended session; a failure is kept on the state
+    /// and never undoes the kill.
+    async fn release(
+        &self,
+        object_context: &ObjectContext<'_>,
+        name: &SessionName,
+    ) -> Result<Option<String>, HandlerError> {
+        let vendor = Arc::clone(&self.vendor);
+        let target = name.clone();
+        let released = object_context
+            .run(|| blocking(move || Ok(Json(vendor.release(&target).err()))))
+            .name("release")
+            .retry_policy(self.timing.port_retry())
+            .await?;
+        Ok(released.into_inner())
+    }
+
     async fn save_scrollback(
         &self,
         object_context: &ObjectContext<'_>,
@@ -800,6 +826,7 @@ pub fn spawn_record(
         scrollback: None,
         awaiting_reap: false,
         instructions: Vec::new(),
+        release_error: None,
     };
     let expectation = ExpectRequest {
         session: name.clone(),
@@ -877,6 +904,7 @@ mod tests {
             scrollback: None,
             awaiting_reap: false,
             instructions: Vec::new(),
+            release_error: None,
         }
     }
 
