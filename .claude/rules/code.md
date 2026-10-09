@@ -2,7 +2,7 @@
 paths:
   - "**/*.rs"
 ---
-Beyond what clippy denies (see `Cargo.toml` lints and `xtask check-*`):
+Beyond what clippy and `xtask check-*` enforce (`docs/style.md` names each):
 
 - Every loop has a fixed bound or walks a finite collection; no recursion, use an explicit bounded stack.
 - Every external input declares a maximum (bytes, items, length); exceeding it is an error, never a truncation.
