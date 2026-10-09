@@ -187,11 +187,12 @@ html{scroll-behavior:smooth}
     <li><a href="#s10">10 Inbox and surfaces</a></li>
     <li><a href="#s11">11 State and checkpoints</a></li>
     <li><a href="#s12">12 Pane host</a></li>
-    <li><a href="#s13">13 Requirements</a></li>
-    <li><a href="#s14">14 Open choices</a></li>
-    <li><a href="#s15">15 Risks</a></li>
-    <li><a href="#s16">16 Slices</a></li>
-    <li><a href="#s17">17 Sources</a></li>
+    <li><a href="#s13">13 Ports and adapters</a></li>
+    <li><a href="#s14">14 Requirements</a></li>
+    <li><a href="#s15">15 Open choices</a></li>
+    <li><a href="#s16">16 Risks</a></li>
+    <li><a href="#s17">17 Slices</a></li>
+    <li><a href="#s18">18 Sources</a></li>
   </ol>
 </nav>
 
@@ -659,7 +660,7 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
 <tr><td>checkpoint</td><td>control</td><td>reconciler</td><td>restores session, precedes escalation</td></tr>
 </table></div>
 <p>Every query the factory needs (what blocked this, which cases apply, what did this session touch) is a join or a shallow recursive query. No graph database is needed.</p>
-<p>Two graphs, two jobs. The factory graph above holds orchestration state. The code knowledge graph is entire.io's semantic graph plugin: a local index per worktree of definitions, callers, types, routes and change impact, built without network or model calls. Workers and reviewers query it before reading files, and a worker's task packet names the graph query results it relied on as evidence. A checkpoint links a commit to the agent session through entire.io's checkpoint ref and to the factory's work unit through the commit trailer. Those checkpoint refs hold full transcripts, so the launcher redacts before capture and the per-unit token's push refspec excludes them; transcripts never reach a remote.</p>
+<p>Two graphs, two jobs. The factory graph above holds orchestration state. The code knowledge graph is entire.io's semantic graph plugin: a local index per worktree of definitions, callers, types, routes and change impact, built without network or model calls. Workers and reviewers query it before reading files, and a worker's task packet names the graph query results it relied on as evidence. A checkpoint links a commit to the agent session through entire.io's checkpoint ref and to the factory's work unit through the commit trailer. Those checkpoint refs hold transcripts with secrets already replaced by entire's redaction; the worktree's push refspec excludes the refs, every remote the core controls hides them, and the core fetches them into a factory-owned bare repository for provenance. The graph index is built per worktree after the clone and rebuilt after each worker commit, since it has no incremental mode and its cache is keyed on the checkout path.</p>
 <h4>Restart after a kill</h4>
 <ul>
   <li>Nothing in git is reset.</li>
@@ -684,7 +685,23 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
 </table></div>
 <p>Two things a dedicated terminal app would still add: an always-visible sidebar with per-unit colour, and hibernation so dozens of open tabs stay cheap. The reader's TUI covers the first. If the second ever matters, agterm is the candidate: MIT licensed, rendered with libghostty, with a zmx live mode and a control CLI that creates a session with a command, types without stealing focus, exposes status glyphs, and publishes a resumable event stream. Those are exactly the gaps that forking supacode would have had to fill. Supacode stays usable as a viewer, since its panes are zmx sessions too, but nothing in the factory depends on it.</p>
 
-<h2 id="s13"><span class="num">13</span>Requirements</h2>
+<h2 id="s13"><span class="num">13</span>Ports and adapters</h2>
+<p>The Restate services are the core and know nothing about any particular vendor, tracker, git host or terminal. Every external system sits behind a port: a Rust trait the core calls only inside journaled steps, so a replay never repeats a side effect and every call carries an idempotency key. Adapters are chosen per project in a content-hashed configuration read at epic start. Every adapter decodes the external system's output into an enumerated set of states with an explicit unrecognised state, and no adapter is ever the source of truth for lifecycle state.</p>
+<div class="tblwrap"><table>
+<tr><th>Port</th><th>What the core needs from it</th><th>Adapters in v1</th><th>Later</th></tr>
+<tr><td>SessionVendor</td><td>spawn, address, observe, resume, kill an agent session; report usage and context size</td><td>Claude, Codex</td><td>Antigravity, Amp, OpenCode</td></tr>
+<tr><td>PaneHost</td><td>show a session, focus it, open a tab running an attach</td><td>Ghostty via AppleScript</td><td>agterm, supacode</td></tr>
+<tr><td>TaskTracker</td><td>intake of epics and work units from issues; status, comments and links out</td><td>beads (local CLI)</td><td>Linear, Jira, GitHub Issues</td></tr>
+<tr><td>RemoteSync</td><td>push the canonical default branch after a merge</td><td>any git remote over ssh or https</td><td>entire mirror as a second remote</td></tr>
+<tr><td>CodeGraph</td><td>definitions, callers, impact for workers and reviewers</td><td>entire semantic graph</td><td></td></tr>
+<tr><td>CheckpointStore</td><td>link a commit to the agent session that produced it</td><td>none in slice zero; entire checkpoints for Claude workers in slice one</td><td>Codex and Antigravity capture once tested</td></tr>
+<tr><td>Notifier</td><td>deliver an inbox item to a human</td><td>macOS notification</td><td>Slack, mail</td></tr>
+<tr><td>Redactor</td><td>scrub secrets before any capture or mirror</td><td>built-in patterns</td><td>per-project patterns</td></tr>
+</table></div>
+<h3>The tracker port</h3>
+<p>Inbound, an epic is created from a tracker reference such as a beads id, a Linear issue key or a Jira key, and the issue's children become the initial work units. Changes arrive by webhook into an authenticated ingress handler for hosted trackers, or by polling the CLI for local ones, each delivery deduplicated by its id. Outbound, the core mirrors work unit transitions as status changes and posts a comment with the localhost link when a decision packet is waiting; cases stay internal. Mirroring is a best-effort step with retry, off the critical path: a tracker outage never blocks a unit, and a unit's state never depends on what the tracker says. Ruling from inside a tracker is an adapter capability for later; the inbox remains the surface where a verdict is recorded.</p>
+
+<h2 id="s14"><span class="num">14</span>Requirements</h2>
 <div class="tblwrap"><table class="req">
 <tr><th>Id</th><th>Level</th><th>Requirement</th></tr>
 <tr><td>R1</td><td><span class="kw must">must</span></td><td>Every long-lived process is a zmx session created by the factory with run and a detached flag, on the latest pinned zmx release; no process is owned by a GUI, TUI or web process.</td></tr>
@@ -716,24 +733,22 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
 <tr><td>R27</td><td><span class="kw must">must</span></td><td>A session is alive when its lease file is fresh; the launcher's exit trap spools the result, resolves with retry, and kills its own session.</td></tr>
 <tr><td>R28</td><td><span class="kw must">must</span></td><td>The WorkUnit run handler is the only writer of lifecycle state; control sessions advise through awaitables. Exclusive handlers never block on another service.</td></tr>
 <tr><td>R29</td><td><span class="kw must">must</span></td><td>Budgets settle on every exit including cancel and kill; each vendor account has a spend limit outside the factory.</td></tr>
-<tr><td>R30</td><td><span class="kw must">must</span></td><td>Transcripts are redacted before any capture and never pushed to a remote.</td></tr>
+<tr><td>R30</td><td><span class="kw must">must</span></td><td>Nothing leaves the agent user's trust domain unredacted: the core fetches only redacted checkpoint refs, raw transcripts are deleted with the worktree, and checkpoint refs are excluded from every push by the worktree's refspec and hidden on every remote the core controls.</td></tr>
 <tr><td>R31</td><td><span class="kw must">must</span></td><td>Control sessions roll over at a context threshold and at phase boundaries from a structured handoff note and a brief rendered from state; vendor compaction is never relied on, and a compaction that fires is recorded as a defect.</td></tr>
 <tr><td>R32</td><td><span class="kw must">must</span></td><td>Control sessions receive results and status as structured records and references, never raw worker output or transcripts; tool output size is capped by a hook.</td></tr>
+<tr><td>R33</td><td><span class="kw must">must</span></td><td>Every external system is behind a port trait; adapter calls run only inside journaled steps with idempotency keys and decode to enumerated states with an unrecognised state.</td></tr>
+<tr><td>R34</td><td><span class="kw must">must</span></td><td>A task tracker is intake and projection only; outbound mirroring is off the critical path and a unit's lifecycle never depends on tracker state.</td></tr>
 </table></div>
 
-<h2 id="s14"><span class="num">14</span>Open choices</h2>
-<p>Settled since the first draft: the durable execution engine is Restate, chosen over Temporal for a single binary with an embedded journal, a first-class Rust SDK, and keyed objects that give one invocation per work unit; the reader and core are Rust; the pane host is Ghostty driven by the reader, with no dedicated terminal app on the critical path. One choice remains, laid out the way a decision packet would be.</p>
+<h2 id="s15"><span class="num">15</span>Open choices</h2>
+<p>Every choice is now settled. For the record: the durable execution engine is Restate, chosen over Temporal for a single binary with an embedded journal, a first-class Rust SDK, and keyed objects that give one invocation per work unit; the reader and core are Rust; the pane host is Ghostty driven by the reader, with no dedicated terminal app on the critical path; entire.io's parts are adopted as below, after an empirical probe of the CLI and the graph plugin.</p>
 
 <div class="choice">
-  <h3>1. Which parts of entire.io to adopt</h3>
-  <p class="q">entire.io is three separable things. Checkpoints: every commit gets a checkpoint pairing the code change with the agent session that produced it, stored as refs in the repo's own git objects; rewind was removed, there is no fork, and resume hands back the vendor's own resume command. Semantic graph: a CLI plugin that builds a local, tree-sitter based map of a repository (definitions, callers, types, routes, change impact, semantic diffs between revisions) with no network, no model calls and no login, queried by agents through CLI commands. Hosted services: search over sessions and commits, intent-aware review of a branch by several agents, regional git mirrors; these need a login and have no published pricing.</p>
-  <div class="tblwrap"><table>
-    <tr><th></th><th>Checkpoints</th><th>Semantic graph</th><th>Hosted search and review</th></tr>
-    <tr><td>Role in the factory</td><td>transcript provenance per worker commit; a checkpoint notice can cite the ref</td><td>the code knowledge graph every worker and reviewer queries before reading files; built per worktree by the launcher</td><td>a candidate second opinion for councils on a branch; search as a case-law evidence source</td></tr>
-    <tr><td>Accepting that</td><td>it writes hook files into tracked repo paths; headless capture unproven; Antigravity supported, Amp not</td><td>index build time per worktree; a plugin dependency in every worker environment</td><td>data leaves the machine after redaction; login and unknown cost; coupling to a hosted service for an in-loop step</td></tr>
-    <tr><td>Reversibility</td><td>two-way</td><td>two-way</td><td>two-way</td></tr>
-  </table></div>
-  <div class="recline">Recommend the semantic graph in slice zero and checkpoints in a later slice, once redaction before capture and the push exclusion of its refs are proven; hosted services deferred. The factory's own graph (work units, sessions, decisions, cases) stays separate: it holds orchestration state, which entire.io does not model.</div>
+  <h3>Decided: entire.io</h3>
+  <p class="q">Semantic graph in slice zero, pinned to the probed plugin version because its command names changed between the release and the default branch. It runs locally with no network and no login, and its cache sits under the plugin directory, not in the repo. It is per worktree: a cold build on a 1,573-file repository took 42 seconds, warm queries under a second, there is no incremental update, and the cache is keyed on the checkout path, so a shared index on the canonical repo does not fit. The launcher builds it after the worktree clone and rebuilds after each worker commit.</p>
+  <p class="q">Checkpoints for Claude Code workers in slice one, earlier than first planned, because the probe answered the two questions that held them back. Headless capture works without a login: one print-mode run produced a checkpoint ref linked by a commit trailer. Hooks need not live in tracked paths: they pass through the vendor settings file the launcher already supplies, and entire's git hooks follow the core-owned hooks path. The per-worktree settings file it insists on goes in the worktree's local exclude list. Keeping refs off remotes takes three settings together: the push-sessions option off, a negative refspec on the worktree's push configuration, and hidden refs on every remote the core controls; with those, even a mirror push left them behind. The core keeps transcripts by fetching the checkpoint refs from the worktree into a factory-owned bare repository. Codex and Antigravity are supported but their headless capture is untested; Amp would need an external agent plugin.</p>
+  <p class="q">Hosted services deferred. The entire address for this project is a private mirror of the GitHub repository with push-through, not a primary, so the sync step pushes to GitHub only; pushing to the mirror as well would be redundant and would give checkpoint refs a way off the machine. Search needs the hosted side and sees only mirrored repositories, so it is not a case-law evidence source for local checkpoints. Resume works from local refs.</p>
+  <p class="q">Redaction is narrower than the design first assumed: entire redacts what enters git objects (a planted cloud key and a token both came out replaced), while the raw vendor transcript under the agent's home and the metadata file in the worktree stay in plain text. Those live inside the agent user's trust domain and are deleted with the worktree; the core only ever fetches the redacted refs. Requirement R30 is reworded accordingly. Two network behaviours are handled by the launcher: every command checks a public API for a new version once a day with no switch to disable it, which the agent sandbox's allowlist simply refuses; the session-start hook calls the entire service when the origin is a forge URL, which worktrees cloned from the local canonical path never trigger. Telemetry is switched off by environment variable in every agent environment.</p>
 </div>
 
 <div class="choice">
@@ -741,7 +756,7 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
   <p class="q">Pane host: Ghostty plus zmx plus the reader, after a probe of zmx 0.8.1 and Ghostty 1.3.1 showed that zmx covers spawn, nudge, tail, labels and fan-in, and Ghostty's AppleScript dictionary covers tabs, splits, focus by id and typed input. supacode-next is out (Electron, no zmx, overlapping orchestration tools); Swift supacode stays an optional viewer; agterm is the candidate if a sidebar app with hibernation is ever wanted. Stack: Rust throughout (Ratatui, axum, htmx, SSE; launcher, reconciler and CLI in the same crate), for one static binary and one toolchain.</p>
 </div>
 
-<h2 id="s15"><span class="num">15</span>Risks</h2>
+<h2 id="s16"><span class="num">16</span>Risks</h2>
 <div class="tblwrap"><table>
 <tr><th>Risk</th><th>Mitigation</th><th>Trigger to revisit</th></tr>
 <tr><td>Bare mode becomes the default for Claude print mode, dropping subscription auth and the inbox socket for headless workers</td><td>Pin the CLI version; launcher asserts non-bare; control sessions are interactive and unaffected</td><td>A release note announcing the change</td></tr>
@@ -753,6 +768,7 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
 <tr><td>An interactive Claude control session stalls on a permission prompt or degrades as its context grows</td><td>Permission mode that never prompts plus an allowlist and a PermissionRequest hook; settings re-passed on every resume; rollover at a context threshold and phase boundaries from a handoff note, with compaction never relied on; a headless control session is the fallback if socket posting from the core fails in the slice</td><td>Slice zero result; rollover fidelity in the harness</td></tr>
 <tr><td>macOS asks for Automation consent when the reader drives Ghostty, and which app the prompt names depends on how the reader was started</td><td>Slice zero records the prompt under zmx and under launchd; the fallback is a tab opened with the open command and its arguments, which needs no Automation permission</td><td>Slice zero result</td></tr>
 <tr><td>zmx does not check who connects to a shared socket directory, so any process in the agent user's group can send to or kill any agent session</td><td>Core sessions in a separate directory; agent sessions all belong to one trust domain anyway; kill goes by recorded pid</td><td>A need for isolation between work units</td></tr>
+<tr><td>The graph index is rebuilt from cold after every worker commit, tens of seconds on a large repository, and the plugin's command names moved between versions</td><td>Pinned plugin version; rebuild runs in the launcher after the commit, off the worker's path; the harness records index time per unit</td><td>Index time dominating cycle time, or an incremental mode appearing upstream</td></tr>
 <tr><td>Durable timers fire late or in a burst after laptop sleep</td><td>T2 compares progress markers, not elapsed time alone; the reconciler re-checks leases after wake</td><td>Harness run across a forced sleep</td></tr>
 <tr><td>Journal growth on long work units: hours of heartbeats or a chatty control loop could bloat a workflow's journal</td><td>Heartbeats write state, not promises; payloads are references; the harness measures journal size per unit</td><td>Journal size above the threshold the harness sets</td></tr>
 <tr><td>Restate's exclusive handler per key blocks a work unit's shared handlers while a long step runs</td><td>Long work happens outside the engine; handlers are short; status readers are shared handlers</td><td>Handler latency in the harness</td></tr>
@@ -760,21 +776,29 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
 <tr><td>Precedent locks in early mistakes</td><td>Fingerprint demotion, review dates, outcome feedback, human overrule</td><td>Reversal rate in the harness</td></tr>
 </table></div>
 
-<h2 id="s16"><span class="num">16</span>Slices and evaluation</h2>
+<h2 id="s17"><span class="num">17</span>Slices and evaluation</h2>
 <p>The pre-mortem sized the first vertical slice at about sixteen components, which is a platform. The build is therefore three slices, each answering questions the research could not, and nothing in a later slice is started until the earlier one passes its tests.</p>
+<h4>Engineering conventions for the repository</h4>
+<ul>
+  <li>Every tool is installed and pinned through mise; nothing is installed by hand or by a workflow step.</li>
+  <li>Logic lives in typed code. Build, check and release tasks are a Rust xtask; there are no bash scripts and no logic in workflow YAML.</li>
+  <li>Continuous integration is one workflow of the repository's own that checks out, sets up mise and runs the xtask; no reusable workflows and no marketplace actions beyond that setup.</li>
+  <li>Git hooks run through lefthook: commit messages are checked by the xtask against the conventional commit grammar, formatting and lints run before commit.</li>
+  <li>Commits are signed; the default branch advances only by squash or rebase merges of pull requests whose titles are conventional commits; history is linear. The ruleset that enforces this on the host is staged and applies once the repository qualifies.</li>
+</ul>
 <h4>Slice zero: the spine</h4>
 <ol>
   <li>Restate server and the Rust endpoint under zmx, the launchd watchdog, the agent user with no credentials and core-owned read-only settings. Services: Epic, WorkUnit, Session, Reconciler, WorkerRun. Boundary tests as the agent user: read the developer's keychain and config directories, write the agent's own settings file, reach the Restate admin port. All must fail. Attach tests: a Ghostty tab as the developer attaches to a zmx session owned by the agent user through the shared socket directory; the reader opens that tab through AppleScript while running under zmx and under launchd, and the macOS Automation consent prompt is recorded for each.</li>
   <li>A WorkUnit workflow spawns an interactive Claude control session with the accept setting, and a handler step posts into its inbox socket, with <code>zmx send</code> as the fallback path. Settles the socket payload schema and whether an interactive session can be driven without stalling on prompts.</li>
-  <li>A WorkerRun workflow spawns a headless worker in a worktree cloned from the canonical repo, hands it an awaitable id, the worker commits in its worktree, the launcher spools and resolves, the handler records a checkpoint and a pin ref.</li>
+  <li>A WorkerRun workflow spawns a headless worker in a worktree cloned from the canonical repo with the semantic graph index built, hands it an awaitable id, the worker commits in its worktree, the launcher spools and resolves, the handler records a checkpoint and a pin ref.</li>
   <li>Kill tests: the terminal app, then the Restate server between worker exit and resolve, then the endpoint, then the launcher before its trap. Each comes back and the unit continues from its last step with nothing lost and no second session spawned.</li>
   <li>The merge gate with its three negative tests run as the agent user: a direct write to the canonical repo, an edit to its hooks directory, a push to its default branch. All three must fail on permissions. Then the positive path: the core fetches from the worktree, verifies, fast-forwards, and syncs to a throwaway remote.</li>
   <li>A blocker produces a markdown packet in a directory and a verdict typed into a file. No council, no reader, no supacode yet.</li>
 </ol>
-<h4>Slice one: judgment</h4>
-<p>Escalation, Council on two vendors at persuasive weight, CaseLaw, DecisionPacket with the lint, the reader's rule action with its secret. The planted contradiction from the synthetic epic forces a split and a packet.</p>
+<h4>Slice one: judgment and provenance</h4>
+<p>Escalation, Council on two vendors at persuasive weight, CaseLaw, DecisionPacket with the lint, the reader's rule action with its secret. The planted contradiction from the synthetic epic forces a split and a packet. entire checkpoints for Claude workers with the three-part push exclusion, the hidden refs on the canonical repo, and the core's fetch of checkpoint refs; a test pushes with every git form, including mirror, and confirms no checkpoint ref reaches a remote.</p>
 <h4>Slice two: surfaces</h4>
-<p>The reader's TUI and web view, Ghostty hand-off and deep links, the read-only browser terminal, entire.io semantic graph for workers, then entire.io checkpoints once redaction and push exclusion are proven. agterm is evaluated here only if tab count makes Ghostty alone uncomfortable.</p>
+<p>The reader's TUI and web view, Ghostty hand-off and deep links, the read-only browser terminal. agterm is evaluated here only if tab count makes Ghostty alone uncomfortable. Codex and Antigravity checkpoint capture is tested here.</p>
 <div class="tblwrap"><table>
 <tr><th>Metric</th><th>Definition</th><th>Measured at</th><th>v1 target</th></tr>
 <tr><td>Human interrupts per work unit</td><td>inbox items with severity blocks, per merged unit</td><td>store</td><td>at most 0.2 on the synthetic epic</td></tr>
@@ -789,7 +813,7 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
 </table></div>
 <p>Chaos tests kill the terminal app, kill a control session, corrupt a checkpoint and exhaust a budget, each with a pass condition. Hard gates (restart recovery, escalation behaviour, packet time) block a change to prompts, hooks or routing; soft gates (cost, cycle time) warn with an override path. Packets are scored by cold-reader time to decision; a deep link opened in more than half of packets, or more than thirty percent answered with a request for more information, means the packet writer is at fault.</p>
 
-<h2 id="s17"><span class="num">17</span>Sources</h2>
+<h2 id="s18"><span class="num">18</span>Sources</h2>
 <p class="src">Research memos in the project's agent research directory, dated 2026-10-08: session substrate, Claude Code spawn modes, supervision, terminal app surface, protocol, arbitration, decision packet, knowledge and checkpoints, inbox and observability, prior art, evaluation. Each memo cites its primary sources and marks claims as verified or inferred.</p>
 <ul class="src">
   <li>Shapes borrowed: Symphony's scheduling state machine and stall timers; Gas Town's escalation record with severity, acknowledgement and re-escalation cap; Omnigent's Polly rules for a control session that never writes code; MCP Agent Mail's archive-plus-index split; the LangGraph resume command shape for returning a ruling.</li>
@@ -799,6 +823,7 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
   <li>Restate: concepts (services, virtual objects, workflows, durable promises, awakeables), the Rust SDK reference, the invocation lifecycle and CLI, and the durable AI agent examples (human approval with timeout, orchestrator and worker, parallel agents).</li>
   <li>Pre-mortem on draft 1: three independent judges (architecture, feasibility, safety), consolidated in the project's council folder. Draft 2 folds in every P0 and P1.</li>
   <li>Pane host dives: zmx 0.8.1 probed in a throwaway socket directory and Ghostty 1.3.1 CLI, AppleScript dictionary and source; the libghostty ecosystem survey (119 repositories), with agterm and ADHDev read in depth; Rust terminal widgets and libghostty bindings.</li>
+  <li>entire.io probe: CLI 0.11.4 and graph plugin 0.4.0 run in a throwaway repository, with one headless capture, push tests against throwaway remotes in every git form, index timings on a large repository, source reading for network calls, and the hosted side inspected read-only.</li>
 </ul>
 
 </main>
