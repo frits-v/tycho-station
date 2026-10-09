@@ -290,11 +290,12 @@ fn set_own_process_group(_builder: &mut Command) {}
 
 /// Kills the child's whole process group through `program` (`kill` in production)
 /// and describes the result; a group kill that could not run is reported, not hidden.
+/// The `--` is required: procps `kill` rejects `-KILL -<pid>` as a malformed option.
 #[cfg(unix)]
 fn kill_group(program: &str, pid: u32) -> String {
     let group = format!("-{pid}");
     let status = Command::new(program)
-        .args(["-KILL", &group])
+        .args(["-KILL", "--", &group])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -428,8 +429,8 @@ mod tests {
     use crate::work_units::{self, FixtureError};
 
     const GRANDCHILD_FIXTURE: &str = "fixtures/scripts/background_sleep.sh";
-    /// An orphaned grandchild stays a zombie until init reaps it, and `kill -0` succeeds on a zombie.
-    const GONE_POLLS_MAX: usize = 40;
+    /// Bounds the wait for `SIGKILL` to land on a grandchild the test does not own.
+    const KILLED_POLLS_MAX: usize = 40;
 
     /// The checkout and the criterion logs share one temporary root, so nothing a test
     /// writes lands outside a directory the test owns.
@@ -600,34 +601,46 @@ mod tests {
 
     #[derive(Debug, PartialEq, Eq)]
     enum Liveness {
-        Alive,
+        Running(String),
+        /// Killed, not yet reaped by whichever process inherited it.
+        Zombie,
         Gone,
     }
 
-    /// `kill -0` decoded: success is alive, "No such process" is gone, and anything
-    /// else means the probe could not answer, which fails the test.
+    /// `ps -o stat= -p <pid>` decoded: a `Z` state is a killed process awaiting its
+    /// reaper, any other state is running, and no row with empty stderr is gone.
+    /// Anything else means the probe could not answer, which fails the test.
     fn probe_process(pid: u32) -> Liveness {
-        let output = Command::new("kill")
-            .args(["-0", &pid.to_string()])
+        let output = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
             .stdin(Stdio::null())
             .output()
-            .unwrap_or_else(|error| panic!("kill -0 {pid} could not run: {error}"));
-        if output.status.success() {
-            return Liveness::Alive;
-        }
+            .unwrap_or_else(|error| panic!("ps -p {pid} could not run: {error}"));
+        let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.success() && state.starts_with('Z') {
+            return Liveness::Zombie;
+        }
+        if output.status.success() && !state.is_empty() {
+            return Liveness::Running(state);
+        }
         assert!(
-            stderr.contains("No such process"),
-            "kill -0 {pid} could not answer: {} {stderr}",
+            state.is_empty() && stderr.trim().is_empty(),
+            "ps -p {pid} could not answer: {} {state:?} {stderr}",
             output.status
         );
         Liveness::Gone
     }
 
-    fn wait_until_gone(pid: u32) -> Liveness {
-        for _ in 0..GONE_POLLS_MAX {
-            if probe_process(pid) == Liveness::Gone {
-                return Liveness::Gone;
+    fn killed(liveness: &Liveness) -> bool {
+        matches!(liveness, Liveness::Zombie | Liveness::Gone)
+    }
+
+    fn wait_until_killed(pid: u32) -> Liveness {
+        for _ in 0..KILLED_POLLS_MAX {
+            let liveness = probe_process(pid);
+            if killed(&liveness) {
+                return liveness;
             }
             thread::sleep(POLL_INTERVAL);
         }
@@ -678,7 +691,8 @@ mod tests {
             "took {elapsed:?}: {detail}"
         );
         let grandchild = read_recorded_pid(&pid_file);
-        assert_eq!(wait_until_gone(grandchild), Liveness::Gone, "{detail}");
+        let liveness = wait_until_killed(grandchild);
+        assert!(killed(&liveness), "{liveness:?}: {detail}");
     }
 
     #[test]
