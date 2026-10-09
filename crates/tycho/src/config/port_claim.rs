@@ -25,11 +25,11 @@ pub enum ClaimError {
     Lock(PathBuf, Errno),
     /// Every slot tried was held by another live test core.
     Exhausted(u16),
-    /// The slot was free among test cores, but a process outside them holds one of its ports.
+    /// Every slot free among the test cores had a port that a process outside them holds.
     Taken {
         home: PathBuf,
-        offset: PortOffset,
-        detail: String,
+        tried: u16,
+        last: String,
     },
 }
 
@@ -40,13 +40,9 @@ impl fmt::Display for ClaimError {
             Self::Open(path, error) => write!(formatter, "cannot open {}: {error}", path.display()),
             Self::Lock(path, errno) => write!(formatter, "cannot lock {}: {errno}", path.display()),
             Self::Exhausted(tried) => write!(formatter, "all {tried} port slots tried are held"),
-            Self::Taken {
-                home,
-                offset,
-                detail,
-            } => write!(
+            Self::Taken { home, tried, last } => write!(
                 formatter,
-                "port collision: {} at port offset {offset}: {detail}",
+                "port collision: {}: all {tried} slots have a port held outside the test cores; last {last}",
                 home.display()
             ),
         }
@@ -59,6 +55,8 @@ impl std::error::Error for ClaimError {}
 pub struct PortClaim {
     pub home: PathBuf,
     pub ports: CorePorts,
+    /// The slots passed over because a process outside the test cores held one of their ports.
+    pub skipped: Vec<String>,
     _lock: Flock<File>,
 }
 
@@ -68,6 +66,7 @@ impl fmt::Debug for PortClaim {
             .debug_struct("PortClaim")
             .field("home", &self.home)
             .field("ports", &self.ports)
+            .field("skipped", &self.skipped)
             .finish_non_exhaustive()
     }
 }
@@ -85,25 +84,52 @@ impl fmt::Display for PortClaim {
             ports.node().port(),
             ports.endpoint().port(),
             ports.test_endpoint().port(),
-        )
+        )?;
+        for skipped in &self.skipped {
+            write!(formatter, "; skipped {skipped}")?;
+        }
+        Ok(())
     }
 }
 
 impl CorePorts {
-    /// Locks the first slot no other test core holds, starting at the home's own, then checks
-    /// the five ports against processes outside the test cores.
+    /// Locks the first slot no other test core holds, starting at the home's own, and moves on
+    /// past a slot whose ports a process outside the test cores holds.
     pub fn claim(home: &Path) -> Result<PortClaim, ClaimError> {
         let user_home = user_home().map_err(|error| ClaimError::Dir(error.to_string()))?;
-        let claim = claim_in(&user_home.join(PORT_SLOT_DIR), home, PORT_OFFSET_SLOTS)?;
-        match claim.ports.first_taken() {
-            Some(detail) => Err(ClaimError::Taken {
-                home: claim.home,
-                offset: claim.ports.offset,
-                detail,
-            }),
-            None => Ok(claim),
-        }
+        let dir = user_home.join(PORT_SLOT_DIR);
+        let start = PortOffset::for_test_home(home).slot().unwrap_or(0);
+        claim_free(&dir, home, start, &|ports| ports.first_taken())
     }
+}
+
+/// Claims slots from `start` until `taken` finds all five ports free, at most one pass over
+/// the slots; each slot skipped for a port held outside the test cores is kept on the claim.
+fn claim_free(
+    dir: &Path,
+    home: &Path,
+    start: u16,
+    taken: &dyn Fn(CorePorts) -> Option<String>,
+) -> Result<PortClaim, ClaimError> {
+    let mut skipped = Vec::new();
+    let mut next = start;
+    for _ in 0..PORT_OFFSET_SLOTS {
+        let mut claim = claim_from(dir, home, next, PORT_OFFSET_SLOTS)?;
+        let Some(detail) = taken(claim.ports) else {
+            claim.skipped = skipped;
+            return Ok(claim);
+        };
+        let slot = claim.ports.offset.slot().unwrap_or(0);
+        skipped.push(format!("offset {}: {detail}", claim.ports.offset));
+        next = PortOffset::for_slot(u32::from(slot).saturating_add(1))
+            .slot()
+            .unwrap_or(0);
+    }
+    Err(ClaimError::Taken {
+        home: home.to_path_buf(),
+        tried: PORT_OFFSET_SLOTS,
+        last: skipped.pop().unwrap_or_default(),
+    })
 }
 
 /// Tries at most `attempts` slots, never more than there are, from the home's own slot on.
@@ -133,6 +159,7 @@ fn claim_from(dir: &Path, home: &Path, start: u16, attempts: u16) -> Result<Port
                 return Ok(PortClaim {
                     home: home.to_path_buf(),
                     ports: CorePorts::at(offset),
+                    skipped: Vec::new(),
                     _lock: lock,
                 })
             }
@@ -192,6 +219,31 @@ mod tests {
         let wrapped = claim_from(&dir, home, PORT_OFFSET_SLOTS - 1, 2).unwrap();
         assert_eq!(wrapped.ports.offset.slot(), Some(0));
         drop((last, wrapped));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_slot_with_a_port_held_outside_the_test_cores_is_skipped_and_named() {
+        let dir = scratch("outside");
+        let home = Path::new("/h");
+        let outside = PortOffset::for_slot(5);
+        let claim = claim_free(&dir, home, 5, &|ports| {
+            (ports.offset == outside).then(|| "127.0.0.1:44000: bind: in use".to_string())
+        })
+        .unwrap();
+        assert_eq!(claim.ports.offset.slot(), Some(6));
+        assert_eq!(claim.skipped.len(), 1);
+        assert!(claim
+            .to_string()
+            .contains("skipped offset 1104: 127.0.0.1:44000"));
+        drop(claim);
+        assert!(matches!(
+            claim_free(&dir, home, 5, &|_| Some("held".to_string())),
+            Err(ClaimError::Taken {
+                tried: PORT_OFFSET_SLOTS,
+                ..
+            })
+        ));
         fs::remove_dir_all(&dir).unwrap();
     }
 
