@@ -126,16 +126,16 @@ pub const METRIC_TABLE: [Metric; 14] = [
         measured_at: "suite runs",
         target: "baseline; after slice one the port offsets stay only if concurrency shortened review turnaround",
         measured_value: MeasuredValue::Recorded(
-            "alone with fixed ports: spine 125, kill 45 to 49, launcher 88, chaos 122 s, 384 s in sequence, 768 s for two worktrees; alone with offsets: spine 124, kill 47, launcher 87, chaos 122 s; concurrently from two worktrees: 140 to 146 s per round, median 141 s, over ten rounds",
+            "alone with fixed ports: spine 125, kill 45 to 49, launcher 88, chaos 122 s, 384 s in sequence (768 s for two worktrees, computed as twice that, not run); alone with claimed offsets: spine 126, kill 47, launcher 88, chaos 124 s; concurrently from two worktrees: 140 to 147 s per round, median 143.5 s, over ten rounds",
         ),
     },
     Metric {
         name: "Port collisions",
-        definition: "test cores that found one of their five ports bound or answering before they started, which fails that suite run naming the address",
+        definition: "test cores that found one of their five ports bound or answering before they started, after claiming a port slot that no other live test core holds",
         measured_at: "suite runs",
-        target: "baseline, counted and never retried",
+        target: "zero; a slot whose ports another process holds is passed over and named",
         measured_value: MeasuredValue::Recorded(
-            "3 in ten concurrent rounds of the four suites from two worktrees (80 suite runs, 580 test cores), each two homes drawing the same of 1800 offsets while both cores ran",
+            "0 in ten concurrent rounds of the four suites from two worktrees (80 suite runs, 580 claims, no slot passed over); before the claims, with a bare hash, 3 in the same ten-round measurement",
         ),
     },
 ];
