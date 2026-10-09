@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::thread;
@@ -36,6 +36,12 @@ fn adapter(config_dir: &Path) -> ClaudeControl {
         PathBuf::from("/opt/claude/bin/claude"),
         config_dir.to_path_buf(),
     )
+    .with_sockets_dir(config_dir.to_path_buf())
+}
+
+/// The socket path a registry entry of this test process names in `dir`.
+fn own_socket(dir: &Path) -> PathBuf {
+    dir.join(format!("{}.sock", std::process::id()))
 }
 
 fn launch(resume: bool) -> ControlLaunch {
@@ -284,7 +290,7 @@ fn registry_file(dir: &Path, name: &str, pid: u32, socket: &Path) {
 fn a_session_is_found_only_through_a_live_process_holding_its_id() {
     let dir = scratch("locate");
     let control = adapter(&dir);
-    let socket = dir.join("i.sock");
+    let socket = own_socket(&dir);
     assert_eq!(control.locate(&session()), Located::Absent);
     registry_file(&dir, "1.json", PID_MAX, &socket);
     assert_eq!(control.locate(&session()), Located::Absent, "a dead pid");
@@ -332,7 +338,7 @@ fn a_registry_over_its_bound_is_unreadable_not_partly_scanned() {
 #[test]
 fn the_context_size_reads_the_sessions_transcript() {
     let dir = scratch("context");
-    let socket = dir.join("i.sock");
+    let socket = own_socket(&dir);
     registry_file(&dir, "2.json", std::process::id(), &socket);
     let project = dir.join("projects").join("-w");
     fs::create_dir_all(&project).unwrap();
@@ -454,7 +460,7 @@ fn a_socket_or_registry_of_another_user_sends_the_instruction_to_the_relay() {
     let dir = scratch("relay");
     let agent = AgentDirs::new(dir.join("agent")).unwrap();
     fs::create_dir_all(&agent.socket_dir).unwrap();
-    let socket = dir.join("i.sock");
+    let socket = own_socket(&dir);
     registry_file(&dir, "2.json", std::process::id(), &socket);
     let _held = UnixListener::bind(&socket).unwrap();
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o000)).unwrap();
@@ -504,7 +510,7 @@ fn a_registry_file_that_cannot_be_read_or_decoded_is_unreadable_not_absent() {
 #[test]
 fn a_live_entry_is_found_beside_a_registry_file_that_cannot_be_decoded() {
     let dir = scratch("beside");
-    let socket = dir.join("i.sock");
+    let socket = own_socket(&dir);
     fs::write(dir.join("sessions").join("9.json"), "{\"pid\":").unwrap();
     registry_file(&dir, "2.json", std::process::id(), &socket);
     assert!(matches!(
@@ -540,5 +546,182 @@ fn a_pre_existing_relay_file_is_relayed_only_when_it_is_the_cores_identical_line
     always.release(&target().session).unwrap();
     assert!(!crate::relay::relay_dir(&agent, &target().session).exists());
     assert_eq!(go(&always), Delivery::Relayed { file });
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A listener the adapter must never connect to.
+fn untouched(path: &Path) -> UnixListener {
+    let listener = UnixListener::bind(path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    listener
+}
+
+fn never_connected(listener: &UnixListener) -> bool {
+    matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+}
+
+#[test]
+fn a_socket_path_must_be_absolute_and_named_for_the_pid_in_the_sockets_directory() {
+    let sockets = Path::new(SOCKETS_DIR);
+    assert_eq!(
+        socket_shape("/tmp/cc-socks/7.sock", 7, sockets).unwrap(),
+        PathBuf::from("/tmp/cc-socks/7.sock")
+    );
+    for raw in [
+        "",
+        "7.sock",
+        "tmp/cc-socks/7.sock",
+        "/tmp/cc-socks/../cc-socks/7.sock",
+        "/tmp/cc-socks/sub/../7.sock",
+        "/tmp/cc-socks/sub/7.sock",
+        "/tmp/7.sock",
+        "/tmp/cc-socks/8.sock",
+        "/tmp/cc-socks/7.sock.x",
+        "/tmp/cc-socks",
+    ] {
+        assert!(socket_shape(raw, 7, sockets).is_err(), "{raw:?}");
+    }
+}
+
+#[test]
+fn a_registry_socket_outside_the_sockets_directory_is_refused_unconnected() {
+    let dir = scratch("outside");
+    let elsewhere = dir.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let socket = own_socket(&elsewhere);
+    let held = untouched(&socket);
+    registry_file(&dir, "2.json", std::process::id(), &socket);
+    let delivery = go(&adapter(&dir));
+    assert!(
+        matches!(&delivery, Delivery::Untrusted { reason } if reason.contains("is not in")),
+        "{delivery:?}"
+    );
+    assert!(never_connected(&held));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_registry_socket_not_named_for_the_entrys_pid_is_refused_unconnected() {
+    let dir = scratch("name");
+    let socket = dir.join(format!("{}.sock", std::process::id().wrapping_add(1)));
+    let held = untouched(&socket);
+    registry_file(&dir, "2.json", std::process::id(), &socket);
+    let delivery = go(&adapter(&dir));
+    assert!(
+        matches!(&delivery, Delivery::Untrusted { reason } if reason.contains("is not named")),
+        "{delivery:?}"
+    );
+    assert!(never_connected(&held));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_symlink_at_the_socket_path_is_refused_unconnected() {
+    let dir = scratch("link");
+    let elsewhere = dir.join("elsewhere");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let real = elsewhere.join("real.sock");
+    let held = untouched(&real);
+    let socket = own_socket(&dir);
+    symlink(&real, &socket).unwrap();
+    registry_file(&dir, "2.json", std::process::id(), &socket);
+    let delivery = go(&adapter(&dir));
+    assert!(
+        matches!(&delivery, Delivery::Untrusted { reason } if reason.contains("Symlink")),
+        "{delivery:?}"
+    );
+    assert!(never_connected(&held));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_regular_file_at_the_socket_path_is_refused() {
+    let dir = scratch("regular");
+    let socket = own_socket(&dir);
+    fs::write(&socket, "").unwrap();
+    registry_file(&dir, "2.json", std::process::id(), &socket);
+    let delivery = go(&adapter(&dir));
+    assert!(
+        matches!(&delivery, Delivery::Untrusted { reason } if reason.contains("Regular")),
+        "{delivery:?}"
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_socket_of_another_owner_is_refused_unconnected() {
+    let dir = scratch("owner");
+    let socket = own_socket(&dir);
+    let held = untouched(&socket);
+    registry_file(&dir, "2.json", std::process::id(), &socket);
+    let other = current_uid().wrapping_add(1);
+    let delivery = go(&adapter(&dir).with_agent_uid(other));
+    assert!(
+        matches!(&delivery, Delivery::Untrusted { reason } if reason.contains("owned by uid")),
+        "{delivery:?}"
+    );
+    assert!(never_connected(&held));
+    let socket_of = |uid| PathFacts {
+        kind: PathKind::Socket,
+        uid,
+    };
+    assert!(check_socket_facts(socket_of(current_uid()), current_uid()).is_ok());
+    assert!(check_socket_facts(socket_of(other), current_uid()).is_err());
+    for kind in [
+        PathKind::Symlink,
+        PathKind::Regular,
+        PathKind::Directory,
+        PathKind::Other,
+    ] {
+        let facts = PathFacts {
+            kind,
+            uid: current_uid(),
+        };
+        assert!(
+            check_socket_facts(facts, current_uid()).is_err(),
+            "{kind:?}"
+        );
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_transcript_outside_the_projects_directory_reports_no_context() {
+    let dir = scratch("transcript-link");
+    registry_file(&dir, "2.json", std::process::id(), &own_socket(&dir));
+    let name = format!("{SESSION_ID}.jsonl");
+    let outside = dir.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join(&name), TRANSCRIPT_TAIL).unwrap();
+    let projects = dir.join("projects");
+    fs::create_dir_all(&projects).unwrap();
+    let project = projects.join("-w");
+    symlink(&outside, &project).unwrap();
+    let linked_dir = adapter(&dir).context_size(&session());
+    assert!(
+        matches!(linked_dir, ContextReport::Unrecognised { .. }),
+        "{linked_dir:?}"
+    );
+    fs::remove_file(&project).unwrap();
+    fs::create_dir(&project).unwrap();
+    symlink(outside.join(&name), project.join(&name)).unwrap();
+    let linked_file = adapter(&dir).context_size(&session());
+    assert!(
+        matches!(linked_file, ContextReport::Unrecognised { .. }),
+        "{linked_file:?}"
+    );
+    fs::remove_file(project.join(&name)).unwrap();
+    fs::write(project.join(&name), TRANSCRIPT_TAIL).unwrap();
+    let other_owner = adapter(&dir)
+        .with_agent_uid(current_uid().wrapping_add(1))
+        .context_size(&session());
+    assert!(
+        matches!(other_owner, ContextReport::Unrecognised { .. }),
+        "{other_owner:?}"
+    );
+    assert_eq!(
+        adapter(&dir).context_size(&session()),
+        ContextReport::Tokens { tokens: 41_913 }
+    );
     fs::remove_dir_all(&dir).unwrap();
 }
