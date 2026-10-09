@@ -437,7 +437,9 @@ impl<I: Ingress> Run<'_, I> {
         };
         let config_dir = PathBuf::from(home).join(".claude");
         let outcome = match socket_of_pid(&config_dir, vendor_pid) {
-            Ok(Some(socket)) => relay_once(&dir, core_uid, &socket),
+            Ok(Some(socket)) => {
+                relay_once(&dir, core_uid, &self.settings.env.session_name, &socket)
+            }
             Ok(None) => Ok(Vec::new()),
             Err(reason) => Err(reason),
         };

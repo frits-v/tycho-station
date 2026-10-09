@@ -3,7 +3,9 @@
 //! The core leaves an instruction in a directory it owns and the agent user's group can read;
 //! the session's launcher, running as the agent user, posts it to the socket. The directory is
 //! sticky and group-writable, so the launcher can add its outcome markers (`<name>.posted`,
-//! `<name>.failed`) but can neither replace nor remove the core's files.
+//! `<name>.failed`) but can neither replace nor remove the core's files. Each file names its
+//! session and key, so a file linked into another session's directory or under another name is
+//! refused on its content.
 
 use std::collections::BTreeSet;
 use std::fs::{self, DirBuilder, OpenOptions};
@@ -13,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use nix::fcntl::OFlag;
 use nix::unistd::Uid;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tycho_types::envelope::ShortText;
 use tycho_types::session::SessionName;
@@ -58,6 +61,28 @@ pub fn relay_file_name(key: &ShortText) -> String {
         .map(|nibble| char::from_digit(u32::from(nibble), 16).unwrap_or('0'))
         .collect();
     format!("{hex}.json")
+}
+
+/// One relay file: the session and key it was written for, and the line the vendor reads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RelayEnvelope {
+    session: String,
+    key: String,
+    message: serde_json::Value,
+}
+
+/// The file line for an instruction line: the envelope with the session and key.
+fn envelope_line(session: &SessionName, key: &ShortText, line: &str) -> Result<String, String> {
+    let message: serde_json::Value =
+        serde_json::from_str(line.trim_end()).map_err(|error| bounded(&error.to_string()))?;
+    let envelope = RelayEnvelope {
+        session: session.to_string(),
+        key: key.to_string(),
+        message,
+    };
+    let text = serde_json::to_string(&envelope).map_err(|error| error.to_string())?;
+    Ok(format!("{text}\n"))
 }
 
 fn ensure_relay_dir(dir: &Path) -> io::Result<()> {
@@ -123,14 +148,21 @@ fn read_relay_file(path: &Path, owner: u32) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// Leaves one instruction line for the launcher; an existing file for the key counts as relayed
-/// only when it is the core's own single-linked file holding the same line.
+/// Leaves one instruction for the launcher; an existing file for the key counts as relayed
+/// only when it is the core's own single-linked file holding the same envelope.
 pub fn write_instruction(
     dirs: &AgentDirs,
     session: &SessionName,
     key: &ShortText,
     line: &str,
 ) -> Result<String, String> {
+    if line.len() > RELAY_FILE_MAX_BYTES {
+        return Err(format!(
+            "an instruction of {} bytes exceeds {RELAY_FILE_MAX_BYTES}",
+            line.len()
+        ));
+    }
+    let line = envelope_line(session, key, line)?;
     if line.len() > RELAY_FILE_MAX_BYTES {
         return Err(format!(
             "an instruction of {} bytes exceeds {RELAY_FILE_MAX_BYTES}",
@@ -241,25 +273,57 @@ pub fn pending(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files.into_iter().map(|(_, path)| path).collect())
 }
 
-/// Reads one instruction file of the core: regular, at most 0640, one link, one JSON line.
-pub fn read_instruction(path: &Path, core_uid: u32) -> Result<String, String> {
+/// Reads one instruction file of the core (regular, at most 0640, one link) and returns the
+/// vendor line when the file names this session, is named for its key, and is not yet posted.
+pub fn read_instruction(
+    path: &Path,
+    core_uid: u32,
+    session: &SessionName,
+) -> Result<String, String> {
     let bytes = read_relay_file(path, core_uid)?;
     let line = String::from_utf8(bytes).map_err(|error| error.to_string())?;
-    let single = line.ends_with('\n') && line.matches('\n').count() == 1;
-    let message: serde_json::Value =
-        serde_json::from_str(line.trim_end()).map_err(|error| bounded(&error.to_string()))?;
-    if !single || message.get("type").and_then(serde_json::Value::as_str) != Some("user") {
-        return Err("not one user message line".to_string());
+    if !(line.ends_with('\n') && line.matches('\n').count() == 1) {
+        return Err("not one line".to_string());
     }
-    Ok(line)
+    let envelope: RelayEnvelope =
+        serde_json::from_str(line.trim_end()).map_err(|error| bounded(&error.to_string()))?;
+    if envelope.session != session.to_string() {
+        return Err(format!(
+            "written for session {}, not {session}",
+            bounded(&envelope.session)
+        ));
+    }
+    let key = ShortText::parse(&envelope.key).map_err(|error| error.to_string())?;
+    let name = relay_file_name(&key);
+    if path.file_name().and_then(|name| name.to_str()) != Some(name.as_str()) {
+        return Err(format!("the key names {name}, not this file"));
+    }
+    if marker(path, POSTED_SUFFIX).exists() {
+        return Err(format!("the key {key} was already posted"));
+    }
+    if envelope
+        .message
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        != Some("user")
+    {
+        return Err("not a user message".to_string());
+    }
+    let message = serde_json::to_string(&envelope.message).map_err(|error| error.to_string())?;
+    Ok(format!("{message}\n"))
 }
 
 /// One poll: posts pending instructions up to the bound and marks each posted or failed.
-pub fn relay_once(dir: &Path, core_uid: u32, socket: &Path) -> Result<Vec<Delivery>, String> {
+pub fn relay_once(
+    dir: &Path,
+    core_uid: u32,
+    session: &SessionName,
+    socket: &Path,
+) -> Result<Vec<Delivery>, String> {
     check_relay_dir(dir, core_uid)?;
     let mut outcomes = Vec::new();
     for path in pending(dir)?.into_iter().take(RELAY_POSTS_PER_POLL_MAX) {
-        let delivery = match read_instruction(&path, core_uid) {
+        let delivery = match read_instruction(&path, core_uid, session) {
             Ok(line) => post(socket, &line),
             Err(reason) => Delivery::Unrecognised { reason },
         };
@@ -276,32 +340,7 @@ pub fn relay_once(dir: &Path, core_uid: u32, socket: &Path) -> Result<Vec<Delive
     Ok(outcomes)
 }
 
-/// Truncates a regular file of this user; any other entry is left to the directory removal.
-fn empty_own_file(path: &Path) -> Result<(), String> {
-    let listed = match fs::symlink_metadata(path) {
-        Ok(listed) => listed,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("{}: {error}", path.display())),
-    };
-    if !listed.file_type().is_file() || listed.uid() != current_uid() {
-        return Ok(());
-    }
-    let file = OpenOptions::new()
-        .write(true)
-        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits())
-        .open(path)
-        .map_err(|error| format!("{}: cannot open: {error}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    if metadata.file_type().is_file() && metadata.uid() == current_uid() {
-        file.set_len(0)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-    }
-    Ok(())
-}
-
-/// Removes an ended session's relay directory; a missing one is already removed.
+/// Unlinks an ended session's relay directory and its entries; a missing one is removed.
 pub fn remove_relay_dir(dirs: &AgentDirs, session: &SessionName) -> Result<(), String> {
     let dir = relay_dir(dirs, session);
     match fs::symlink_metadata(&dir) {
@@ -312,11 +351,9 @@ pub fn remove_relay_dir(dirs: &AgentDirs, session: &SessionName) -> Result<(), S
         }
         Ok(_) => {}
     }
-    // A hard link of an instruction planted elsewhere shares its inode; emptying the file
-    // first leaves that link no line to replay once its count drops to one.
-    for name in list_names(&dir)? {
-        empty_own_file(&dir.join(name))?;
-    }
+    // Only names are unlinked, never a file opened or written: a planted hard link may share
+    // its inode with any file of the core. A link of an instruction left elsewhere names this
+    // session, which no other launcher posts.
     fs::remove_dir_all(&dir).map_err(|error| format!("{}: {error}", dir.display()))
 }
 
@@ -373,7 +410,10 @@ mod tests {
         );
         let other = write_instruction(&dirs, &session(), &key, &line("again")).unwrap_err();
         assert!(other.contains("another instruction"), "{other}");
-        assert_eq!(read_instruction(&file, current_uid()).unwrap(), line("go"));
+        assert_eq!(
+            read_instruction(&file, current_uid(), &session()).unwrap(),
+            line("go")
+        );
         let long = "x".repeat(RELAY_FILE_MAX_BYTES + 1);
         assert!(write_instruction(&dirs, &session(), &key, &long).is_err());
         fs::remove_dir_all(&dirs.socket_dir).unwrap();
@@ -386,14 +426,16 @@ mod tests {
         let name = write_instruction(&dirs, &session(), &key, &line("go")).unwrap();
         let file = relay_dir(&dirs, &session()).join(name);
         let other = current_uid().wrapping_add(1);
-        assert!(read_instruction(&file, other).is_err());
+        assert!(read_instruction(&file, other, &session()).is_err());
         assert!(check_relay_dir(&relay_dir(&dirs, &session()), other).is_err());
         fs::set_permissions(&file, fs::Permissions::from_mode(0o660)).unwrap();
-        assert!(read_instruction(&file, current_uid()).is_err());
+        assert!(read_instruction(&file, current_uid(), &session()).is_err());
         fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
         fs::remove_file(&file).unwrap();
-        write_new_mode(&file, b"{\"type\":\"auth\"}\n", 0o640).unwrap();
-        assert!(read_instruction(&file, current_uid()).is_err());
+        let auth = envelope_line(&session(), &key, "{\"type\":\"auth\"}").unwrap();
+        write_new_mode(&file, auth.as_bytes(), 0o640).unwrap();
+        let refused = read_instruction(&file, current_uid(), &session()).unwrap_err();
+        assert!(refused.contains("not a user message"), "{refused}");
         fs::remove_dir_all(&dirs.socket_dir).unwrap();
     }
 
@@ -418,52 +460,102 @@ mod tests {
             write_instruction(&dirs, &session(), &key, &line(text)).unwrap();
             thread::sleep(std::time::Duration::from_millis(20));
         }
-        let outcomes = relay_once(&dir, current_uid(), &socket).unwrap();
+        let outcomes = relay_once(&dir, current_uid(), &session(), &socket).unwrap();
         assert_eq!(outcomes.len(), 2);
         assert!(outcomes.iter().all(Delivery::written), "{outcomes:?}");
         assert_eq!(server.join().unwrap(), [line("first"), line("second")]);
         assert!(pending(&dir).unwrap().is_empty(), "both are marked posted");
-        assert!(relay_once(&dir, current_uid(), &socket).unwrap().is_empty());
+        assert!(relay_once(&dir, current_uid(), &session(), &socket)
+            .unwrap()
+            .is_empty());
         fs::remove_file(&socket).unwrap();
         let key = ShortText::parse("k3").unwrap();
         let name = write_instruction(&dirs, &session(), &key, &line("third")).unwrap();
-        let failed = relay_once(&dir, current_uid(), &socket).unwrap();
+        let failed = relay_once(&dir, current_uid(), &session(), &socket).unwrap();
         assert!(matches!(failed.as_slice(), [Delivery::NoSocket { .. }]));
         assert!(marker(&dir.join(name), FAILED_SUFFIX).exists());
         fs::remove_dir_all(&dirs.socket_dir).unwrap();
     }
 
     #[test]
-    fn a_hard_linked_instruction_is_refused_under_another_session_and_in_its_own() {
+    fn a_hard_linked_instruction_is_refused_by_its_link_count() {
         let dirs = scratch("link");
-        let name = write_instruction(
-            &dirs,
-            &session(),
-            &ShortText::parse("k").unwrap(),
-            &line("go"),
-        )
-        .unwrap();
+        let key = ShortText::parse("k").unwrap();
+        let name = write_instruction(&dirs, &session(), &key, &line("go")).unwrap();
         let file = relay_dir(&dirs, &session()).join(&name);
-        assert_eq!(read_instruction(&file, current_uid()).unwrap(), line("go"));
-        write_instruction(
-            &dirs,
-            &other_session(),
-            &ShortText::parse("k2").unwrap(),
-            &line("b"),
-        )
-        .unwrap();
-        let planted = relay_dir(&dirs, &other_session()).join("0000000000000000.json");
-        fs::hard_link(&file, &planted).unwrap();
-        let refused = read_instruction(&planted, current_uid()).unwrap_err();
-        assert!(refused.contains("2 links, expected 1"), "{refused}");
-        assert!(read_instruction(&file, current_uid()).is_err());
-        fs::remove_file(&planted).unwrap();
         let replay = relay_dir(&dirs, &session()).join("ffffffffffffffff.json");
         fs::hard_link(&file, &replay).unwrap();
-        let refused = read_instruction(&replay, current_uid()).unwrap_err();
+        let refused = read_instruction(&replay, current_uid(), &session()).unwrap_err();
         assert!(refused.contains("2 links, expected 1"), "{refused}");
+        assert!(read_instruction(&file, current_uid(), &session()).is_err());
         fs::remove_file(&replay).unwrap();
-        assert_eq!(read_instruction(&file, current_uid()).unwrap(), line("go"));
+        assert_eq!(
+            read_instruction(&file, current_uid(), &session()).unwrap(),
+            line("go")
+        );
+        fs::remove_dir_all(&dirs.socket_dir).unwrap();
+    }
+
+    #[test]
+    fn a_line_linked_into_another_sessions_directory_is_refused_by_content() {
+        let dirs = scratch("content");
+        let key = ShortText::parse("k").unwrap();
+        let name = write_instruction(&dirs, &session(), &key, &line("go")).unwrap();
+        let file = relay_dir(&dirs, &session()).join(&name);
+        let other_key = ShortText::parse("k2").unwrap();
+        write_instruction(&dirs, &other_session(), &other_key, &line("b")).unwrap();
+        let other_dir = relay_dir(&dirs, &other_session());
+        let planted = other_dir.join(&name);
+        fs::hard_link(&file, &planted).unwrap();
+        // With the original name gone the link count is one again; only the content refuses it.
+        fs::remove_file(&file).unwrap();
+        let refused = read_instruction(&planted, current_uid(), &other_session()).unwrap_err();
+        assert!(
+            refused.contains("written for session cf7a.wu03"),
+            "{refused}"
+        );
+        let socket = dirs.socket_dir.join("absent.sock");
+        let outcomes = relay_once(&other_dir, current_uid(), &other_session(), &socket).unwrap();
+        assert!(
+            outcomes
+                .iter()
+                .any(|delivery| matches!(delivery, Delivery::Unrecognised { reason } if reason.contains("written for session"))),
+            "{outcomes:?}"
+        );
+        assert!(marker(&planted, FAILED_SUFFIX).exists());
+        fs::remove_dir_all(&dirs.socket_dir).unwrap();
+    }
+
+    #[test]
+    fn a_posted_key_is_refused_by_its_marker_and_a_renamed_file_by_its_key() {
+        let dirs = scratch("replay");
+        let dir = relay_dir(&dirs, &session());
+        let key = ShortText::parse("k").unwrap();
+        let name = write_instruction(&dirs, &session(), &key, &line("go")).unwrap();
+        let file = dir.join(&name);
+        let socket = dirs.socket_dir.join("i.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            line
+        });
+        let outcomes = relay_once(&dir, current_uid(), &session(), &socket).unwrap();
+        assert!(
+            matches!(outcomes.as_slice(), [Delivery::Posted { .. }]),
+            "{outcomes:?}"
+        );
+        assert_eq!(server.join().unwrap(), line("go"));
+        let refused = read_instruction(&file, current_uid(), &session()).unwrap_err();
+        assert!(refused.contains("already posted"), "{refused}");
+        let renamed = dir.join("0123456789abcdef.json");
+        fs::rename(&file, &renamed).unwrap();
+        let refused = read_instruction(&renamed, current_uid(), &session()).unwrap_err();
+        assert!(
+            refused.contains(&format!("the key names {name}")),
+            "{refused}"
+        );
         fs::remove_dir_all(&dirs.socket_dir).unwrap();
     }
 
@@ -484,7 +576,8 @@ mod tests {
         let refused = write_instruction(&dirs, &session(), &key, &line("go")).unwrap_err();
         assert!(refused.contains("another instruction"), "{refused}");
         fs::remove_file(&file).unwrap();
-        write_new_mode(&file, line("go").as_bytes(), RELAY_FILE_MODE).unwrap();
+        let identical = envelope_line(&session(), &key, &line("go")).unwrap();
+        write_new_mode(&file, identical.as_bytes(), RELAY_FILE_MODE).unwrap();
         fs::set_permissions(&file, fs::Permissions::from_mode(0o660)).unwrap();
         let refused = write_instruction(&dirs, &session(), &key, &line("go")).unwrap_err();
         assert!(refused.contains("wider than 640"), "{refused}");
@@ -502,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_sessions_directory_empties_its_instructions_first() {
+    fn a_hard_link_to_a_core_file_outside_the_relay_survives_cleanup_with_its_content() {
         let dirs = scratch("remove");
         let name = write_instruction(
             &dirs,
@@ -511,26 +604,15 @@ mod tests {
             &line("go"),
         )
         .unwrap();
-        let file = relay_dir(&dirs, &session()).join(&name);
-        write_new(&marker(&file, POSTED_SUFFIX), b"{}").unwrap();
-        write_instruction(
-            &dirs,
-            &other_session(),
-            &ShortText::parse("k2").unwrap(),
-            &line("b"),
-        )
-        .unwrap();
-        let planted = relay_dir(&dirs, &other_session()).join("0000000000000000.json");
-        fs::hard_link(&file, &planted).unwrap();
+        let dir = relay_dir(&dirs, &session());
+        write_new(&marker(&dir.join(&name), POSTED_SUFFIX), b"{}").unwrap();
+        let secret = dirs.socket_dir.join("operator-secret");
+        write_new(&secret, b"0123456789abcdef").unwrap();
+        fs::hard_link(&secret, dir.join("0000000000000000.json")).unwrap();
         remove_relay_dir(&dirs, &session()).unwrap();
-        assert!(!relay_dir(&dirs, &session()).exists());
-        let left = fs::metadata(&planted).unwrap();
-        assert_eq!(
-            (left.nlink(), left.len()),
-            (1, 0),
-            "the link is single and empty"
-        );
-        assert!(read_instruction(&planted, current_uid()).is_err());
+        assert!(!dir.exists());
+        assert_eq!(fs::read(&secret).unwrap(), b"0123456789abcdef");
+        assert_eq!(fs::metadata(&secret).unwrap().nlink(), 1);
         remove_relay_dir(&dirs, &session()).unwrap();
         fs::remove_dir_all(&dirs.socket_dir).unwrap();
     }
@@ -556,7 +638,7 @@ mod tests {
         });
         let key = ShortText::parse("k130").unwrap();
         write_instruction(&dirs, &session(), &key, &line("new")).unwrap();
-        let outcomes = relay_once(&dir, current_uid(), &socket).unwrap();
+        let outcomes = relay_once(&dir, current_uid(), &session(), &socket).unwrap();
         assert!(
             matches!(outcomes.as_slice(), [Delivery::Posted { .. }]),
             "{outcomes:?}"
