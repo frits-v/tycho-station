@@ -9,7 +9,7 @@ use tycho_types::session::SessionName;
 use std::io::Write;
 
 use crate::agent_files::open_append;
-use crate::config::{AgentDirs, LOG_DIR};
+use crate::config::{AgentDirs, CorePorts, LOG_DIR};
 use crate::kill::{kill_by_name, kill_session, KillReport, KillRequest};
 use crate::launch_spec::{HeartbeatTarget, VendorTerminal};
 use crate::private_dir;
@@ -35,6 +35,8 @@ pub struct LauncherSpawner {
     pub core_home: PathBuf,
     pub agent_uid: u32,
     pub heartbeat: HeartbeatTarget,
+    /// The ports of the core whose ingress the launchers report to.
+    pub ports: CorePorts,
 }
 
 /// Every spawn outcome maps to a pid or a refusal; only an unreadable state is worth a retry.
@@ -109,6 +111,7 @@ impl Spawner for LauncherSpawner {
             tier,
             terminal,
             vendor_dir: vendor_dir.as_deref(),
+            ports: self.ports,
         })
         .and_then(spawned_pid)
     }
@@ -171,6 +174,7 @@ mod tests {
             core_home: home.join("core"),
             agent_uid: 1,
             heartbeat: HeartbeatTarget::Session,
+            ports: CorePorts::PRODUCTION,
         };
         let report = KillReport {
             zmx_kill: Ok(()),

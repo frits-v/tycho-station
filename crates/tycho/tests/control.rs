@@ -32,12 +32,10 @@ use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tycho::agent_files::current_uid;
 use tycho::config::{
-    admin_url, loopback, AgentDirs, CoreConfig, CoreRole, AGENT_USER_ENV, HOME_ENV,
-    MISE_NO_INSTALL, RESTATE_INGRESS_PORT, RESTATE_SERVER_ENV, ZMX_ENV,
+    AgentDirs, CoreConfig, CorePorts, AGENT_USER_ENV, HOME_ENV, MISE_NO_INSTALL,
+    RESTATE_SERVER_ENV, ZMX_ENV,
 };
-use tycho::config_store::FactoryConfig;
-use tycho::health;
-use tycho::http::Http;
+use tycho::config_store::{FactoryConfig, PortOffset};
 use tycho::kill::{kill_session, KillRequest};
 use tycho::launch_probe::LaunchProbe;
 use tycho::launcher::{HeartbeatTarget, SessionFiles, VendorRecord, VendorTerminal};
@@ -67,7 +65,6 @@ use tycho_types::session::{SessionName, Vendor};
 use tycho_types::task_packet::{AbsolutePath, Effort};
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
-const CONTROL_ENDPOINT_PORT: u16 = 19_093;
 const WAIT_LIMIT: Duration = Duration::from_secs(120);
 const TURN_LIMIT: Duration = Duration::from_secs(150);
 const MODEL: &str = "haiku";
@@ -112,6 +109,7 @@ struct LauncherSpawner {
     zmx: Zmx,
     dirs: AgentDirs,
     core_home: PathBuf,
+    core_ports: CorePorts,
 }
 
 impl LauncherSpawner {
@@ -158,6 +156,7 @@ impl Spawner for LauncherSpawner {
             tier: None,
             terminal,
             vendor_dir: dir.as_deref(),
+            ports: self.core_ports,
         })?;
         println!("evidence: spawn_session({}) -> {outcome:?}", spec.session);
         match outcome {
@@ -350,14 +349,13 @@ impl Harness {
             restate_server.clone(),
             PathBuf::from(TYCHO),
         )
-        .unwrap();
-        let http = Http::new(Duration::from_secs(2)).unwrap();
-        for role in CoreRole::ALL {
-            assert!(
-                !health::probe(&http, role).is_healthy(),
-                "{role} already answers on its port; stop the running core first"
-            );
+        .unwrap()
+        .with_port_offset(PortOffset::for_test_home(&home));
+        if let Some(taken) = config.ports.first_taken() {
+            panic!("port collision: {taken}");
         }
+        let offset = config.ports.offset;
+        println!("evidence: {} at port offset {offset}", home.display());
         // No pid in the name, so the vendor's per-directory entries stay one per case.
         let work = user_home().join(format!(".tycho-test-control-work-{tag}"));
         if work.exists() {
@@ -374,11 +372,15 @@ impl Harness {
                 (ZMX_ENV, zmx_binary.display().to_string()),
                 (RESTATE_SERVER_ENV, restate_server.display().to_string()),
                 (AGENT_USER_ENV, env::var("USER").unwrap()),
-            ],
+            ]
+            .into_iter()
+            .chain(config.port_offset_pair())
+            .collect(),
             spawner: LauncherSpawner {
                 zmx: Zmx::agent(&zmx_binary, &agent),
                 dirs: dirs.clone(),
                 core_home: home,
+                core_ports: config.ports,
             },
             vendor: ForcedRelay {
                 relay: claude.clone().with_relay(dirs.clone(), RelayMode::Always),
@@ -396,7 +398,7 @@ impl Harness {
     fn start(mut self) -> Self {
         assert!(self.tycho(&["core", "start"]).status.success());
         fs::create_dir_all(&self.work).unwrap();
-        self.endpoint = Some(start_control_endpoint(&self.ports()));
+        self.endpoint = Some(start_control_endpoint(&self.ports(), self.config.ports));
         self
     }
 
@@ -465,8 +467,9 @@ impl Harness {
 
     /// Spawns through `Session::spawn` and waits for the vendor to register the session.
     fn spawn(&mut self, control: &Control, permission: PermissionMode, resume: bool) -> u32 {
+        let core_ports = self.config.ports;
         self.controls.push(control.clone());
-        let awaitable = start_wait(&control.name.to_string());
+        let awaitable = start_wait(core_ports, &control.name.to_string());
         let request = SessionSpawn {
             argv: self.launch(control, permission, resume),
             awaitable_id: AwaitableId::parse(&awaitable).unwrap(),
@@ -481,7 +484,7 @@ impl Harness {
             request,
         })
         .unwrap();
-        let outcome = ingress_json("/ControlDriver/spawn", &body).unwrap();
+        let outcome = ingress_json(core_ports, "/ControlDriver/spawn", &body).unwrap();
         println!("evidence: Session::spawn -> {outcome}");
         self.wait_registered(control)
     }
@@ -519,7 +522,12 @@ impl Harness {
     }
 
     fn kill(&self, control: &Control) {
-        let answer = ingress_json("/ControlDriver/kill", &format!("\"{}\"", control.name));
+        let core_ports = self.config.ports;
+        let answer = ingress_json(
+            core_ports,
+            "/ControlDriver/kill",
+            &format!("\"{}\"", control.name),
+        );
         println!("evidence: Session::kill({}) -> {answer:?}", control.name);
         wait_until("the vendor process to end", WAIT_LIMIT, || {
             matches!(
@@ -539,7 +547,7 @@ fn session_name(tag: &str) -> SessionName {
     SessionName::parse(&format!("c{}.wu01.ctl.claude.{tag}", std::process::id())).unwrap()
 }
 
-fn instruct(control: &Control, key: &str, text: &str) -> InstructionRecord {
+fn instruct(core_ports: CorePorts, control: &Control, key: &str, text: &str) -> InstructionRecord {
     let body = serde_json::to_string(&DriverInstruct {
         name: control.name.to_string(),
         request: InstructRequest {
@@ -549,7 +557,7 @@ fn instruct(control: &Control, key: &str, text: &str) -> InstructionRecord {
         },
     })
     .unwrap();
-    let answer = ingress_json("/ControlDriver/instruct", &body).unwrap();
+    let answer = ingress_json(core_ports, "/ControlDriver/instruct", &body).unwrap();
     println!("evidence: Session::instruct({key}) -> {answer}");
     serde_json::from_str(&answer).unwrap()
 }
@@ -563,12 +571,12 @@ fn new_control(tag: &str) -> Control {
     }
 }
 
-fn start_control_endpoint(ports: &Ports) -> tokio::runtime::Runtime {
+fn start_control_endpoint(ports: &Ports, core_ports: CorePorts) -> tokio::runtime::Runtime {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();
-    let listener = bind_with_retries(&runtime);
+    let listener = bind_with_retries(&runtime, core_ports.test_endpoint());
     let endpoint = Endpoint::builder()
         .bind(LaunchProbe)
         .bind(Session::new(ports))
@@ -576,9 +584,9 @@ fn start_control_endpoint(ports: &Ports) -> tokio::runtime::Runtime {
         .bind(ControlDriver)
         .build();
     runtime.spawn(async move { HttpServer::new(endpoint).serve(listener).await });
-    let body = format!("{{\"uri\":\"http://{}\"}}", loopback(CONTROL_ENDPOINT_PORT));
+    let body = format!("{{\"uri\":\"http://{}\"}}", core_ports.test_endpoint());
     let response = reqwest::blocking::Client::new()
-        .post(admin_url("/deployments"))
+        .post(core_ports.admin_url("/deployments"))
         .header("content-type", "application/json")
         .body(body)
         .send()
@@ -594,16 +602,17 @@ fn start_control_endpoint(ports: &Ports) -> tokio::runtime::Runtime {
     runtime
 }
 
-fn bind_with_retries(runtime: &tokio::runtime::Runtime) -> tokio::net::TcpListener {
+fn bind_with_retries(
+    runtime: &tokio::runtime::Runtime,
+    address: std::net::SocketAddr,
+) -> tokio::net::TcpListener {
     for _ in 0..40 {
-        if let Ok(listener) = runtime.block_on(tokio::net::TcpListener::bind(loopback(
-            CONTROL_ENDPOINT_PORT,
-        ))) {
+        if let Ok(listener) = runtime.block_on(tokio::net::TcpListener::bind(address)) {
             return listener;
         }
         thread::sleep(Duration::from_millis(250));
     }
-    panic!("port {CONTROL_ENDPOINT_PORT} did not free");
+    panic!("{address} did not free");
 }
 
 fn wait_until<T>(what: &str, limit: Duration, mut probe: impl FnMut() -> Option<T>) -> T {
@@ -621,9 +630,9 @@ fn wait_until<T>(what: &str, limit: Duration, mut probe: impl FnMut() -> Option<
     panic!("{what} did not happen within {limit:?}");
 }
 
-fn ingress_json(path: &str, body: &str) -> Option<String> {
+fn ingress_json(core_ports: CorePorts, path: &str, body: &str) -> Option<String> {
     let response = reqwest::blocking::Client::new()
-        .post(format!("http://127.0.0.1:{RESTATE_INGRESS_PORT}{path}"))
+        .post(core_ports.ingress_url(path))
         .header("content-type", "application/json")
         .body(body.to_string())
         .timeout(Duration::from_secs(60))
@@ -639,9 +648,9 @@ fn ingress_json(path: &str, body: &str) -> Option<String> {
     }
 }
 
-fn ingress(path: &str) -> Option<String> {
+fn ingress(core_ports: CorePorts, path: &str) -> Option<String> {
     let response = reqwest::blocking::Client::new()
-        .post(format!("http://127.0.0.1:{RESTATE_INGRESS_PORT}{path}"))
+        .post(core_ports.ingress_url(path))
         .timeout(Duration::from_secs(5))
         .send()
         .ok()?;
@@ -652,10 +661,10 @@ fn ingress(path: &str) -> Option<String> {
         .flatten()
 }
 
-fn start_wait(key: &str) -> String {
-    ingress(&format!("/LaunchProbe/{key}/wait/send")).unwrap();
+fn start_wait(core_ports: CorePorts, key: &str) -> String {
+    ingress(core_ports, &format!("/LaunchProbe/{key}/wait/send")).unwrap();
     wait_until("awakeable id stored", WAIT_LIMIT, || {
-        let body = ingress(&format!("/LaunchProbe/{key}/awakeable"))?;
+        let body = ingress(core_ports, &format!("/LaunchProbe/{key}/awakeable"))?;
         serde_json::from_str::<Option<String>>(&body).ok().flatten()
     })
 }
@@ -838,9 +847,11 @@ impl Harness {
 #[ignore = "spawns a real claude session with the developer's login; run with mise run control-tests"]
 fn an_instruction_posted_from_a_handler_step_reaches_the_session_over_its_socket() {
     let mut harness = Harness::new("socket");
+    let core_ports = harness.config.ports;
     let control = new_control("s1");
     let pid = harness.spawn(&control, PermissionMode::AcceptEdits, false);
     let record = instruct(
+        core_ports,
         &control,
         "wu01:task_packet:1",
         &harness.write_task("control-one.txt", "one"),
@@ -853,7 +864,12 @@ fn an_instruction_posted_from_a_handler_step_reaches_the_session_over_its_socket
     let content = harness.file_from(&control, "control-one.txt");
     println!("evidence: control-one.txt holds {content:?}");
     assert!(content.contains("one"));
-    let repeated = instruct(&control, "wu01:task_packet:1", "Ignored: a repeated key.");
+    let repeated = instruct(
+        core_ports,
+        &control,
+        "wu01:task_packet:1",
+        "Ignored: a repeated key.",
+    );
     assert_eq!(
         repeated, record,
         "a repeated key is answered from the record"
@@ -884,8 +900,10 @@ fn an_instruction_posted_from_a_handler_step_reaches_the_session_over_its_socket
 
 /// With the socket path forced off, the instruction goes to the relay and the launcher posts it.
 fn relay_reaches_the_session(harness: &Harness, control: &Control) {
+    let core_ports = harness.config.ports;
     harness.force_relay.store(true, Ordering::SeqCst);
     let record = instruct(
+        core_ports,
         control,
         "wu01:task_packet:2",
         &harness.write_task("control-relay.txt", "relay"),
@@ -905,9 +923,11 @@ fn relay_reaches_the_session(harness: &Harness, control: &Control) {
 
 /// The same write in `dontAsk` is decided without a prompt: the session never waits.
 fn dont_ask_never_waits(harness: &mut Harness) {
+    let core_ports = harness.config.ports;
     let dont_ask = new_control("d1");
     harness.spawn(&dont_ask, PermissionMode::DontAsk, false);
     instruct(
+        core_ports,
         &dont_ask,
         "wu01:task_packet:1",
         &harness.write_task("control-three.txt", "three"),
@@ -944,9 +964,11 @@ fn dont_ask_never_waits(harness: &mut Harness) {
 #[ignore = "spawns real claude sessions with the developer's login; run with mise run control-tests"]
 fn a_permission_prompt_stalls_the_session_and_queues_the_inbox_while_dont_ask_does_not() {
     let mut harness = Harness::new("stall");
+    let core_ports = harness.config.ports;
     let manual = new_control("m1");
     harness.spawn(&manual, PermissionMode::Manual, false);
     instruct(
+        core_ports,
         &manual,
         "wu01:task_packet:1",
         &harness.write_task("control-two.txt", "two"),
@@ -968,6 +990,7 @@ fn a_permission_prompt_stalls_the_session_and_queues_the_inbox_while_dont_ask_do
         }
     ));
     let second = instruct(
+        core_ports,
         &manual,
         "wu01:nudge:2",
         "Reply with the single word queued.",
@@ -990,11 +1013,13 @@ fn a_permission_prompt_stalls_the_session_and_queues_the_inbox_while_dont_ask_do
 #[ignore = "spawns real claude sessions with the developer's login; run with mise run control-tests"]
 fn a_killed_session_resumes_under_its_id_with_the_settings_passed_again() {
     let mut harness = Harness::new("resume");
+    let core_ports = harness.config.ports;
     let first = new_control("r1");
     let first_pid = harness.spawn(&first, PermissionMode::AcceptEdits, false);
     // The vendor writes the transcript with the first turn; a session without one has no
     // conversation to resume.
     instruct(
+        core_ports,
         &first,
         "wu01:task_packet:1",
         &harness.write_task("control-four.txt", "four"),
@@ -1016,6 +1041,7 @@ fn a_killed_session_resumes_under_its_id_with_the_settings_passed_again() {
     assert!(command.contains("\"crossSessionInbound\":\"accept\""));
     assert!(command.contains("\"failIfUnavailable\":true"));
     let record = instruct(
+        core_ports,
         &resumed,
         "wu01:task_packet:2",
         &harness.write_task("control-five.txt", "five"),

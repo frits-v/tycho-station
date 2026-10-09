@@ -46,7 +46,7 @@ pub fn render_plist(config: &CoreConfig, label: &str) -> String {
     <key>{ZMX_ENV}</key>
     <string>{zmx}</string>
     <key>{RESTATE_SERVER_ENV}</key>
-    <string>{restate_server}</string>
+    <string>{restate_server}</string>{port_offset}
   </dict>
   <key>RunAtLoad</key>
   <true/>
@@ -68,6 +68,10 @@ pub fn render_plist(config: &CoreConfig, label: &str) -> String {
         home = config.home.display(),
         zmx = config.zmx.display(),
         restate_server = config.restate_server.display(),
+        port_offset = config
+            .port_offset_pair()
+            .map(|(name, value)| format!("\n    <key>{name}</key>\n    <string>{value}</string>"))
+            .unwrap_or_default(),
         log = log.display(),
     )
 }
@@ -346,6 +350,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(render_plist(&config, LAUNCHD_LABEL), EXPECTED);
+    }
+
+    #[test]
+    fn renders_a_test_core_offset_beside_the_home() {
+        let offset = crate::config_store::PortOffset::new(1056).unwrap();
+        let config = CoreConfig::new(
+            PathBuf::from("/Users/someone/.tycho-test"),
+            PathBuf::from("/opt/zmx/0.8.1/zmx"),
+            PathBuf::from("/opt/restate-server/1.7.13/restate-server"),
+            PathBuf::from("/opt/bin/tycho"),
+        )
+        .unwrap()
+        .with_port_offset(offset);
+        let plist = render_plist(&config, LAUNCHD_LABEL);
+        assert!(plist.contains(
+            "<string>/opt/restate-server/1.7.13/restate-server</string>\n    \
+             <key>TYCHO_PORT_OFFSET</key>\n    <string>1056</string>\n  </dict>"
+        ));
+        assert!(!EXPECTED.contains("TYCHO_PORT_OFFSET"));
     }
 
     const RUNNING: &str = include_str!("fixtures/launchctl-print-running.txt");

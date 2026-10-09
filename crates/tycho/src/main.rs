@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 
 use tycho::config::{
-    self, CoreConfig, ENDPOINT_PORT, PROBE_TIMEOUT, VERDICT_INTERVAL, VERDICT_ITERATIONS_MAX,
+    self, CoreConfig, CorePorts, PROBE_TIMEOUT, VERDICT_INTERVAL, VERDICT_ITERATIONS_MAX,
     WATCHDOG_INTERVAL,
 };
 use tycho::config_store::{self, FactoryConfig, CONFIG_DIR_ENV};
@@ -25,6 +25,7 @@ use tycho::services::merge_gate::NoGate;
 use tycho::services::operator::read_secret_file;
 use tycho::services::spawner::NoLauncher;
 use tycho::services::{Ports, Timing};
+use tycho::spool::CoreIngress;
 use tycho::vendors::control::NoVendor;
 use tycho::watchdog::{self, LoopEnd, Supervisor};
 use tycho::{agent_files, core, endpoint, verdicts};
@@ -140,7 +141,11 @@ fn launch(spec: &str, tier: Option<&str>) -> i32 {
         Ok(http) => http,
         Err(code) => return code,
     };
-    match launcher::launch(&settings, &vendor, &http) {
+    let ingress = CoreIngress {
+        http,
+        ports: settings.ports,
+    };
+    match launcher::launch(&settings, &vendor, &ingress) {
         Ok(end) => {
             println!("{end}");
             end.exit_code()
@@ -185,6 +190,13 @@ fn replay(spool: &str) -> i32 {
         Ok(http) => http,
         Err(code) => return code,
     };
+    let ports = match config::port_offset_from_environment() {
+        Ok(offset) => CorePorts::at(offset),
+        Err(error) => {
+            eprintln!("tycho: replay refused: {error}");
+            return launcher::EXIT_REFUSED_TO_START;
+        }
+    };
     let owner = match config::agent_uid() {
         Ok(owner) => owner,
         Err(error) => {
@@ -192,7 +204,8 @@ fn replay(spool: &str) -> i32 {
             return launcher::EXIT_REFUSED_TO_START;
         }
     };
-    match tycho::spool::replay(&http, Path::new(spool), owner, &mut thread::sleep) {
+    let ingress = CoreIngress { http, ports };
+    match tycho::spool::replay(&ingress, Path::new(spool), owner, &mut thread::sleep) {
         Ok(delivery) => {
             println!("{delivery:?}");
             i32::from(!delivery.acknowledged())
@@ -218,6 +231,13 @@ fn factory_config(home: Option<&Path>) -> Result<FactoryConfig, String> {
 }
 
 fn serve_endpoint() -> i32 {
+    let ports = match config::port_offset_from_environment() {
+        Ok(offset) => CorePorts::at(offset),
+        Err(error) => {
+            eprintln!("tycho: endpoint: {error}");
+            return 1;
+        }
+    };
     let home = env::var_os(config::HOME_ENV).map(PathBuf::from);
     let factory = match factory_config(home.as_deref()) {
         Ok(factory) => factory,
@@ -226,7 +246,7 @@ fn serve_endpoint() -> i32 {
             return 1;
         }
     };
-    let ports = Ports {
+    let services = Ports {
         spawner: Arc::new(NoLauncher),
         vendor: Arc::new(NoVendor),
         merge_gate: Arc::new(NoGate),
@@ -238,7 +258,7 @@ fn serve_endpoint() -> i32 {
         packet_dir: home.map(|home| home.join(config::PACKET_DIR)),
         workers: None,
     };
-    match endpoint::serve(config::loopback(ENDPOINT_PORT), &ports) {
+    match endpoint::serve(ports.endpoint(), &services) {
         Ok(()) => 0,
         Err(error) => {
             eprintln!("tycho: endpoint: {error}");
@@ -334,7 +354,9 @@ fn verdicts_once(config: &CoreConfig) -> i32 {
     let report = verdicts::pass(
         &config.packet_dir(),
         agent_files::current_uid(),
-        &mut |request| verdicts::rule_through_operator(&http, secret.expose(), request),
+        &mut |request| {
+            verdicts::rule_through_operator(&http, config.ports, secret.expose(), request)
+        },
     );
     print!("{report}");
     i32::from(!report.succeeded())

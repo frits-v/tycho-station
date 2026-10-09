@@ -86,11 +86,11 @@ description = "Spawn launchers under zmx against a throwaway core, then kill the
 run = "cargo test -p tycho --test launcher -- --ignored --test-threads=1 --nocapture"
 
 [tasks.worker-tests]
-description = "Dispatch the synthetic epic's trivial unit to a real headless claude worker through a throwaway core; needs a Claude login and `mise run graph-plugin` first (macOS)"
+description = "Dispatch the synthetic epic's trivial unit to a real headless claude worker through a throwaway core; needs a Claude login and `mise run graph-plugin` first; run it alone, never beside the control suite, since both use the vendor seat (macOS)"
 run = "cargo test -p tycho --test worker -- --ignored --test-threads=1 --nocapture"
 
 [tasks.control-tests]
-description = "Spawn real interactive claude control sessions under zmx through the launcher, instruct them over the inbox socket from a handler step, then stall, kill and resume them (macOS, uses the developer's claude login)"
+description = "Spawn real interactive claude control sessions under zmx through the launcher, instruct them over the inbox socket from a handler step, then stall, kill and resume them; run it alone, never beside the worker suite, since both use the vendor seat (macOS, uses the developer's claude login)"
 run = "cargo test -p tycho --test control -- --ignored --test-threads=1 --nocapture"
 
 [tasks.chaos-tests]

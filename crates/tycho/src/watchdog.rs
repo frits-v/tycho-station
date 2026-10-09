@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::command;
 use crate::config::{
-    CoreConfig, CoreRole, COMMAND_TIMEOUT, HEALTH_WAIT_POLLS_MAX, POLL_INTERVAL,
+    CoreConfig, CorePorts, CoreRole, COMMAND_TIMEOUT, HEALTH_WAIT_POLLS_MAX, POLL_INTERVAL,
     SESSION_WAIT_POLLS_MAX, STARTUP_GRACE_SECONDS,
 };
 use crate::health::{self, Health, Registration};
@@ -132,6 +132,11 @@ impl Supervisor {
         &self.http
     }
 
+    #[must_use]
+    pub const fn ports(&self) -> CorePorts {
+        self.config.ports
+    }
+
     /// One probe and repair pass over both core sessions.
     #[must_use]
     pub fn once(&self) -> OnceReport {
@@ -153,7 +158,7 @@ impl Supervisor {
                 }
             };
             let presence = presence(&entries, role.session_name());
-            let health = health::probe(&self.http, role);
+            let health = health::probe(&self.http, self.config.ports, role);
             let action = decide(presence, &health, now_unix_seconds());
             let result = self.apply(role, action);
             report.roles.push(RoleReport {
@@ -166,9 +171,9 @@ impl Supervisor {
         }
         if CoreRole::ALL
             .iter()
-            .all(|role| health::probe(&self.http, *role).is_healthy())
+            .all(|role| health::probe(&self.http, self.config.ports, *role).is_healthy())
         {
-            report.registration = Some(health::register(&self.http));
+            report.registration = Some(health::register(&self.http, self.config.ports));
         }
         report
     }
@@ -246,7 +251,7 @@ impl Supervisor {
     fn wait_for_health(&self, role: CoreRole) -> Result<(), String> {
         let mut last = Health::Unrecognised("not probed".to_string());
         for _ in 0..HEALTH_WAIT_POLLS_MAX {
-            last = health::probe(&self.http, role);
+            last = health::probe(&self.http, self.config.ports, role);
             if last.is_healthy() {
                 return Ok(());
             }

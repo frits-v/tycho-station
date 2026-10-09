@@ -16,6 +16,12 @@ use tycho_types::task_packet::{Effort, RoutingName};
 use crate::private_dir;
 
 mod bounds;
+mod port_offset;
+
+pub use port_offset::{
+    resolve_port_offset, PortOffset, PortOffsetError, PORT_OFFSET_BASE, PORT_OFFSET_ENV,
+    PORT_OFFSET_MAX, PORT_OFFSET_SLOTS, PORT_OFFSET_STRIDE,
+};
 
 pub const CONFIG_DIR_ENV: &str = "TYCHO_CONFIG_DIR";
 /// Under the core home, so only the core's user can change what the services read.

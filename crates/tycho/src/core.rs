@@ -4,7 +4,7 @@ use std::fmt;
 
 use tycho_types::service::{handler, Service, RECONCILER_KEY};
 
-use crate::config::{ingress_url, CoreConfig, CoreRole};
+use crate::config::{CoreConfig, CorePorts, CoreRole};
 use crate::health::{self, Health};
 use crate::http::{Http, Outcome};
 use crate::services::operator;
@@ -52,7 +52,7 @@ pub fn start(supervisor: &Supervisor, config: &CoreConfig) -> StartReport {
             Ok(if created { "created" } else { "present" }.to_string())
         });
     let reconciler = if once.succeeded() {
-        start_reconciler(supervisor.http())
+        start_reconciler(supervisor.http(), supervisor.ports())
     } else {
         Err("not attempted: the core did not come up".to_string())
     };
@@ -63,13 +63,13 @@ pub fn start(supervisor: &Supervisor, config: &CoreConfig) -> StartReport {
     }
 }
 
-fn start_reconciler(http: &Http) -> Result<String, String> {
+fn start_reconciler(http: &Http, ports: CorePorts) -> Result<String, String> {
     let path = format!(
         "/{}/{RECONCILER_KEY}/{}",
         Service::Reconciler.name(),
         handler::RECONCILER_START
     );
-    match http.post_empty(&ingress_url(&path)) {
+    match http.post_empty(&ports.ingress_url(&path)) {
         Outcome::Response { status: 200, body } => Ok(format!("generation {}", body.trim())),
         Outcome::Response { status, body } => Err(format!("status {status}: {body}")),
         Outcome::Unreachable(reason) => Err(format!("ingress unreachable: {reason}")),
@@ -170,7 +170,7 @@ pub fn status(supervisor: &Supervisor) -> StatusReport {
             (
                 *role,
                 presence(&entries, role.session_name()),
-                health::probe(supervisor.http(), *role),
+                health::probe(supervisor.http(), supervisor.ports(), *role),
             )
         })
         .collect();

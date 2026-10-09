@@ -5,7 +5,7 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -13,13 +13,17 @@ use nix::unistd::{Uid, User};
 use tycho_types::session::{SessionName, SOCKET_PATH_MAX_BYTES};
 
 use crate::command::{self, CommandError};
-use crate::config_store::CONFIG_DIR_ENV;
+use crate::config_store::{
+    resolve_port_offset, PortOffset, PortOffsetError, CONFIG_DIR_ENV, PORT_OFFSET_ENV,
+};
 
 pub const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;
 pub const RESTATE_ADMIN_PORT: u16 = 19070;
 pub const RESTATE_INGRESS_PORT: u16 = 18080;
 pub const RESTATE_NODE_PORT: u16 = 15122;
 pub const ENDPOINT_PORT: u16 = 19080;
+/// The test suites' in-process endpoint with test doubles; the production core never binds it.
+pub const TEST_ENDPOINT_PORT: u16 = 19081;
 /// A fixed node name, so a restarted server finds its own metadata on disk.
 pub const RESTATE_NODE_NAME: &str = "tycho";
 
@@ -47,6 +51,8 @@ pub const LAUNCHD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 pub const CORE_PROCESS_PATH: &str = "/usr/bin:/bin";
 
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// A connect to a loopback port that nothing holds is refused at once.
+pub const PORT_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 pub const COMMAND_OUTPUT_MAX_BYTES: usize = 64 * 1024;
 pub const HTTP_BODY_MAX_BYTES: usize = 64 * 1024;
@@ -136,19 +142,92 @@ pub const fn loopback(port: u16) -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(LOOPBACK, port))
 }
 
-#[must_use]
-pub fn admin_url(path: &str) -> String {
-    format!("http://{}{path}", loopback(RESTATE_ADMIN_PORT))
+/// The loopback ports of one core: the configured ports shifted by the core's offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CorePorts {
+    pub offset: PortOffset,
 }
 
-#[must_use]
-pub fn ingress_url(path: &str) -> String {
-    format!("http://{}{path}", loopback(RESTATE_INGRESS_PORT))
+impl CorePorts {
+    pub const PRODUCTION: Self = Self::at(PortOffset::PRODUCTION);
+
+    #[must_use]
+    pub const fn at(offset: PortOffset) -> Self {
+        Self { offset }
+    }
+
+    #[must_use]
+    pub const fn admin(self) -> SocketAddr {
+        loopback(self.offset.shift(RESTATE_ADMIN_PORT))
+    }
+
+    #[must_use]
+    pub const fn ingress(self) -> SocketAddr {
+        loopback(self.offset.shift(RESTATE_INGRESS_PORT))
+    }
+
+    #[must_use]
+    pub const fn node(self) -> SocketAddr {
+        loopback(self.offset.shift(RESTATE_NODE_PORT))
+    }
+
+    #[must_use]
+    pub const fn endpoint(self) -> SocketAddr {
+        loopback(self.offset.shift(ENDPOINT_PORT))
+    }
+
+    #[must_use]
+    pub const fn test_endpoint(self) -> SocketAddr {
+        loopback(self.offset.shift(TEST_ENDPOINT_PORT))
+    }
+
+    #[must_use]
+    pub const fn all(self) -> [SocketAddr; 5] {
+        [
+            self.admin(),
+            self.ingress(),
+            self.node(),
+            self.endpoint(),
+            self.test_endpoint(),
+        ]
+    }
+
+    #[must_use]
+    pub fn admin_url(self, path: &str) -> String {
+        format!("http://{}{path}", self.admin())
+    }
+
+    #[must_use]
+    pub fn ingress_url(self, path: &str) -> String {
+        format!("http://{}{path}", self.ingress())
+    }
+
+    #[must_use]
+    pub fn endpoint_url(self, path: &str) -> String {
+        format!("http://{}{path}", self.endpoint())
+    }
+
+    /// The first port another process holds: one that refuses a bind or answers a connect.
+    #[must_use]
+    pub fn first_taken(self) -> Option<String> {
+        self.all().into_iter().find_map(|address| {
+            if let Err(error) = TcpListener::bind(address) {
+                return Some(format!("{address}: bind: {error}"));
+            }
+            TcpStream::connect_timeout(&address, PORT_CONNECT_TIMEOUT)
+                .is_ok()
+                .then(|| format!("{address}: answers a connect"))
+        })
+    }
 }
 
-#[must_use]
-pub fn endpoint_url(path: &str) -> String {
-    format!("http://{}{path}", loopback(ENDPOINT_PORT))
+/// `TYCHO_PORT_OFFSET`, honoured only beside `TYCHO_HOME`; unset, the production ports.
+pub fn port_offset_from_environment() -> Result<PortOffset, ConfigError> {
+    resolve_port_offset(
+        env::var_os(PORT_OFFSET_ENV),
+        env::var_os(HOME_ENV).is_some(),
+    )
+    .map_err(ConfigError::PortOffset)
 }
 
 /// The agent socket directory and the lease and spool directories under it.
@@ -233,6 +312,7 @@ pub enum ConfigError {
     SocketPathTooLong(usize),
     CurrentExe(std::io::Error),
     RelativePath(&'static str, PathBuf),
+    PortOffset(PortOffsetError),
 }
 
 impl fmt::Display for ConfigError {
@@ -275,6 +355,7 @@ impl fmt::Display for ConfigError {
             Self::RelativePath(variable, path) => {
                 write!(formatter, "{variable}={} is not absolute", path.display())
             }
+            Self::PortOffset(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -288,6 +369,9 @@ pub struct CoreConfig {
     pub tycho: PathBuf,
     /// `TYCHO_CONFIG_DIR`, forwarded to the endpoint's session when set.
     pub config_dir: Option<PathBuf>,
+    /// Every process of the core reads its ports from here; a test core's offset is forwarded
+    /// to the endpoint's session and the watchdog's plist.
+    pub ports: CorePorts,
 }
 
 impl CoreConfig {
@@ -295,11 +379,27 @@ impl CoreConfig {
     /// `TYCHO_HOME` when that names a directory under it; tools come from `mise which`.
     pub fn from_environment() -> Result<Self, ConfigError> {
         let home = core_home()?;
+        let offset = port_offset_from_environment()?;
         let zmx = tool_path(ZMX_ENV, "zmx")?;
         let restate_server = tool_path(RESTATE_SERVER_ENV, "restate-server")?;
         let tycho = env::current_exe().map_err(ConfigError::CurrentExe)?;
-        Self::new(home, zmx, restate_server, tycho)?
-            .with_config_dir(env::var_os(CONFIG_DIR_ENV).map(PathBuf::from))
+        Ok(Self::new(home, zmx, restate_server, tycho)?
+            .with_config_dir(env::var_os(CONFIG_DIR_ENV).map(PathBuf::from))?
+            .with_port_offset(offset))
+    }
+
+    /// A test core's offset; the production core keeps `PortOffset::PRODUCTION`.
+    #[must_use]
+    pub const fn with_port_offset(mut self, offset: PortOffset) -> Self {
+        self.ports = CorePorts::at(offset);
+        self
+    }
+
+    /// The offset pair a `tycho` process of this core needs, absent for the production core.
+    #[must_use]
+    pub fn port_offset_pair(&self) -> Option<(&'static str, String)> {
+        let offset = self.ports.offset;
+        (!offset.is_production()).then(|| (PORT_OFFSET_ENV, offset.to_string()))
     }
 
     /// The directory is typed into the endpoint's session, so it must be absolute and shell-safe.
@@ -334,6 +434,7 @@ impl CoreConfig {
             restate_server,
             tycho,
             config_dir: None,
+            ports: CorePorts::PRODUCTION,
         };
         let longest = CoreRole::ALL
             .iter()
@@ -405,20 +506,24 @@ impl CoreConfig {
                  RESTATE_LISTEN_MODE=tcp RESTATE_NODE_NAME={RESTATE_NODE_NAME} \
                  RESTATE_DISABLE_TELEMETRY=true {server} --base-dir {data}",
                 home = self.home.display(),
-                admin = loopback(RESTATE_ADMIN_PORT),
-                ingress = loopback(RESTATE_INGRESS_PORT),
-                node = loopback(RESTATE_NODE_PORT),
+                admin = self.ports.admin(),
+                ingress = self.ports.ingress(),
+                node = self.ports.node(),
                 server = self.restate_server.display(),
                 data = self.restate_data_dir().display(),
             ),
             CoreRole::Endpoint => format!(
-                "exec /usr/bin/env -i HOME={home} PATH={CORE_PROCESS_PATH} {HOME_ENV}={home} {config_dir}{} endpoint",
+                "exec /usr/bin/env -i HOME={home} PATH={CORE_PROCESS_PATH} {HOME_ENV}={home} {config_dir}{port_offset}{} endpoint",
                 self.tycho.display(),
                 home = self.home.display(),
                 config_dir = self
                     .config_dir
                     .as_ref()
                     .map(|dir| format!("{CONFIG_DIR_ENV}={} ", dir.display()))
+                    .unwrap_or_default(),
+                port_offset = self
+                    .port_offset_pair()
+                    .map(|(name, value)| format!("{name}={value} "))
                     .unwrap_or_default(),
             ),
         }
@@ -648,6 +753,56 @@ mod tests {
             config.with_config_dir(Some(PathBuf::from("config"))),
             Err(ConfigError::RelativePath(CONFIG_DIR_ENV, _))
         ));
+    }
+
+    #[test]
+    fn a_test_core_binds_and_forwards_its_offset() {
+        let offset = PortOffset::new(1056).unwrap();
+        let config = config("/h").unwrap().with_port_offset(offset);
+        assert_eq!(
+            config.session_command(CoreRole::Endpoint),
+            "exec /usr/bin/env -i HOME=/h PATH=/usr/bin:/bin TYCHO_HOME=/h \
+             TYCHO_PORT_OFFSET=1056 /opt/tycho endpoint"
+        );
+        assert_eq!(
+            config.session_command(CoreRole::Restate),
+            "exec /usr/bin/env -i HOME=/h PATH=/usr/bin:/bin \
+             RESTATE_ADMIN__BIND_ADDRESS=127.0.0.1:20126 \
+             RESTATE_INGRESS__BIND_ADDRESS=127.0.0.1:19136 RESTATE_BIND_ADDRESS=127.0.0.1:16178 \
+             RESTATE_LISTEN_MODE=tcp RESTATE_NODE_NAME=tycho RESTATE_DISABLE_TELEMETRY=true \
+             /opt/restate-server --base-dir /h/restate"
+        );
+        assert_eq!(
+            config.ports.endpoint_url("/health"),
+            "http://127.0.0.1:20136/health"
+        );
+        assert_eq!(config.ports.test_endpoint(), loopback(20137));
+    }
+
+    #[test]
+    fn no_two_cores_in_the_range_share_a_port() {
+        let mut seen = std::collections::BTreeMap::new();
+        let offsets = std::iter::once(PortOffset::PRODUCTION).chain(
+            (0..u64::from(crate::config_store::PORT_OFFSET_SLOTS)).map(PortOffset::for_hash),
+        );
+        let mut cores = 0_u32;
+        for offset in offsets {
+            cores += 1;
+            for address in CorePorts::at(offset).all() {
+                if let Some(other) = seen.insert(address.port(), offset) {
+                    panic!(
+                        "port {} of offset {offset} is also offset {other}'s",
+                        address.port()
+                    );
+                }
+                assert!(
+                    address.port() < 49_152,
+                    "{address} is in the ephemeral range"
+                );
+            }
+        }
+        assert_eq!(cores, 901);
+        assert_eq!(seen.len(), 901 * 5);
     }
 
     #[test]
