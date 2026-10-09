@@ -304,14 +304,22 @@ fn start_core_with(
     merge_gate: Arc<dyn MergeGate>,
     timing: Timing,
 ) -> (Core, DoublesEndpoint, Ports) {
-    start_core_with_spawner(test, Arc::new(spawner.clone()), merge_gate, timing)
+    start_core_with_spawner(
+        test,
+        Arc::new(spawner.clone()),
+        merge_gate,
+        timing,
+        &|_, _| {},
+    )
 }
 
+/// `adjust` sees the ports before the endpoint starts, with the core for its paths.
 fn start_core_with_spawner(
     test: &str,
     spawner: Arc<dyn Spawner>,
     merge_gate: Arc<dyn MergeGate>,
     timing: Timing,
+    adjust: &dyn Fn(&mut Ports, &Core),
 ) -> (Core, DoublesEndpoint, Ports) {
     let core = Core::new(test);
     let started = core.tycho(&["core", "start"]);
@@ -319,7 +327,7 @@ fn start_core_with_spawner(
     let report = String::from_utf8_lossy(&started.stdout).to_string();
     assert!(report.contains("operator secret: created"), "{report}");
     assert!(report.contains("reconciler: generation 1"), "{report}");
-    let ports = Ports {
+    let mut ports = Ports {
         spawner,
         merge_gate,
         timing,
@@ -327,6 +335,7 @@ fn start_core_with_spawner(
         operator_secret: Some(core.config.operator_secret_file()),
         packet_dir: Some(core.config.packet_dir()),
     };
+    adjust(&mut ports, &core);
     let doubles = DoublesEndpoint::start(&ports);
     register_doubles();
     (core, doubles, ports)
@@ -846,16 +855,21 @@ fn an_escalated_unit_waits_for_a_ruling_through_the_operator() {
     });
     let rule = |secret: &str, attempt: u16| {
         format!(
-            r#"{{"secret":"{secret}","unit":"wu01","rule":{{"attempt":{attempt},"ruling":{{"verdict":"abandon","reason":"the planted contradiction stands"}}}}}}"#
+            r#"{{"secret":"{secret}","unit":"wu01","rule":{{"epic":"cf7a","attempt":{attempt},"ruling":{{"verdict":"abandon","reason":"the planted contradiction stands"}}}}}}"#
         )
     };
     let path = format!("/Operator/{}", handler::OPERATOR_RULE_UNIT);
     assert_eq!(
-        call(&path, &rule(&"x".repeat(64), 1), None).0,
+        call(&path, &rule(&"x".repeat(64), 1), Some("probe-key")).0,
         401,
         "a wrong secret"
     );
     let secret = operator_secret(&core);
+    assert_eq!(
+        call(&path, &rule(&secret, 1), Some("probe-key")).0,
+        401,
+        "Restate answers a reused idempotency key with the cached refusal"
+    );
     assert_eq!(
         call(&path, &rule(&secret, 2), None).0,
         409,
@@ -975,7 +989,7 @@ fn assert_packet(core: &Core, packet: &Path) {
         "edit a budget ceiling value directly without a council ruling",
         "leave the ceiling and ask for a council ruling",
         question.question.as_str(),
-        "Unverified claims: 2",
+        "Unverified claims: 1",
     ] {
         assert!(text.contains(expected), "the packet lacks {expected:?}");
     }
@@ -1013,7 +1027,7 @@ fn a_certified_question_lands_as_a_packet_and_continue_resumes_the_unit() {
     let packet = wait_for_packet();
     assert_packet(&core, &packet);
     let verdict = packet.with_extension("verdict");
-    let pass = rule_by_file(&core, &verdict, "continue\nchoose B and ask the council\n");
+    let pass = rule_by_file(&core, &verdict, "continue\nB: ask the council\n");
     assert!(pass.status.success());
     assert!(!verdict.exists(), "the verdict file was moved");
     assert!(sibling(&verdict, "applied").exists(), "marked applied");
@@ -1022,7 +1036,7 @@ fn a_certified_question_lands_as_a_packet_and_continue_resumes_the_unit() {
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(view["lifecycle"], "done");
     assert_eq!(view["attempt"], 2, "the verdict started a new attempt");
-    assert_eq!(view["findings"][0], "verdict: choose B and ask the council");
+    assert_eq!(view["chosen_option"], "B: ask the council");
     assert_eq!(
         spawner.log().spawned.len(),
         2,
@@ -1077,6 +1091,19 @@ fn a_malformed_or_stale_verdict_is_rejected_and_the_unit_stays_escalated() {
     let reason = fs::read_to_string(sibling(&stale, "reason")).unwrap();
     println!("evidence: stale verdict reason: {reason}");
     assert!(reason.starts_with("409"), "{reason}");
+    let other_epic = core.config.packet_dir().join("b0b0");
+    fs::create_dir(&other_epic).unwrap();
+    fs::set_permissions(&other_epic, fs::Permissions::from_mode(0o700)).unwrap();
+    let elsewhere = other_epic.join("wu01-1.verdict");
+    assert!(rule_by_file(&core, &elsewhere, "continue\n")
+        .status
+        .success());
+    let reason = fs::read_to_string(sibling(&elsewhere, "reason")).unwrap();
+    println!("evidence: wrong-epic verdict reason: {reason}");
+    assert!(
+        reason.starts_with("400") && reason.contains("epic"),
+        "{reason}"
+    );
     thread::sleep(Duration::from_secs(1));
     let view = unit_status();
     assert_eq!(view["lifecycle"], "escalated");
@@ -1095,7 +1122,7 @@ fn a_malformed_or_stale_verdict_is_rejected_and_the_unit_stays_escalated() {
 fn a_headless_worker_rejects_on_the_planted_contradiction(spawner: Arc<dyn Spawner>) {
     let gate = Arc::new(NoGate);
     let (core, _doubles, _) =
-        start_core_with_spawner("packet-headless", spawner, gate, test_timing());
+        start_core_with_spawner("packet-headless", spawner, gate, test_timing(), &|_, _| {});
     let invocation = dispatch(&core, &["wu01-t8"]);
     let packet = wait_for_packet();
     let text = fs::read_to_string(&packet).unwrap();
@@ -1109,4 +1136,138 @@ fn a_headless_worker_rejects_on_the_planted_contradiction(spawner: Arc<dyn Spawn
     let (status, body) = attach(&invocation);
     assert_eq!(status, 200, "{body}");
     assert!(body.contains("abandoned"), "{body}");
+}
+
+fn config_with_unit_cap(cap: u16) -> FactoryConfig {
+    let mut config = test_config();
+    config.thresholds.value.retry.unit_attempt_cap = cap;
+    config
+}
+
+/// A unit with cap 1 whose only attempt ends without a merge escalates on its own give-up rule.
+fn assert_cap_packet(
+    core_name: &str,
+    spawner: &RecordingSpawner,
+    gate: Arc<dyn MergeGate>,
+    why: &str,
+) {
+    let (core, _doubles, _) = start_core_with_spawner(
+        core_name,
+        Arc::new(spawner.clone()),
+        gate,
+        test_timing(),
+        &|ports, _| ports.config = Arc::new(config_with_unit_cap(1)),
+    );
+    dispatch(&core, &["wu01-t9"]);
+    let packet = wait_for_packet();
+    let text = fs::read_to_string(&packet).unwrap();
+    println!("evidence: cap packet text\n{text}");
+    for expected in ["Continue with attempt 2, or abandon the unit?", why] {
+        assert!(text.contains(expected), "the packet lacks {expected:?}");
+    }
+    assert_eq!(
+        packet,
+        core.config.packet_dir().join("cf7a").join("wu01-1.md")
+    );
+    assert_eq!(mode(&packet), 0o600);
+}
+
+#[test]
+#[ignore = "starts real processes; run with mise run spine-tests"]
+fn criteria_failing_at_the_unit_cap_write_a_continue_or_abandon_packet() {
+    let spawner = launcher_double(Launcher::Resolve("a1", Duration::from_millis(500)));
+    let gate = FixedGate::new(GateVerdict::Failed {
+        findings: vec![ShortText::parse("criterion 0 failed").unwrap()],
+    });
+    assert_cap_packet(
+        "cap-criteria",
+        &spawner,
+        Arc::new(gate),
+        "the done criteria failed on the last attempt the cap allows",
+    );
+}
+
+#[test]
+#[ignore = "starts real processes; run with mise run spine-tests"]
+fn a_worker_giving_up_at_the_unit_cap_writes_a_continue_or_abandon_packet() {
+    let spawner = launcher_double(Launcher::Reject("cancelled", Duration::from_millis(500)));
+    assert_cap_packet(
+        "cap-attempts",
+        &spawner,
+        Arc::new(NoGate),
+        "the worker runs gave up on the last attempt the cap allows",
+    );
+}
+
+#[test]
+#[ignore = "starts real processes; run with mise run spine-tests"]
+fn an_escalation_without_a_packet_directory_abandons_the_unit_with_the_reason() {
+    let spawner = escalating_double();
+    let (core, _doubles, _) = start_core_with_spawner(
+        "packet-none",
+        Arc::new(spawner),
+        Arc::new(NoGate),
+        test_timing(),
+        &|ports, _| ports.packet_dir = None,
+    );
+    let invocation = dispatch(&core, &["wu01-t8"]);
+    let (status, body) = attach(&invocation);
+    assert_eq!(status, 200, "{body}");
+    let view: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(view["lifecycle"], "abandoned");
+    let reason = view["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("no packet directory is configured"),
+        "{reason}"
+    );
+}
+
+#[test]
+#[ignore = "starts real processes; run with mise run spine-tests"]
+fn a_packet_that_cannot_be_written_stays_on_the_view_and_is_written_on_the_next_try() {
+    let spawner = escalating_double();
+    let timing = Timing {
+        retry_backoff_initial: Duration::from_millis(100),
+        retry_backoff_max: Duration::from_secs(1),
+        port_step_attempts_max: 2,
+        ..test_timing()
+    };
+    let (core, _doubles, _) = start_core_with_spawner(
+        "packet-retry",
+        Arc::new(spawner),
+        Arc::new(FixedGate::new(GateVerdict::Merged {
+            default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
+        })),
+        timing,
+        &|ports, core| {
+            let blocked = core.config.home.join("blocked");
+            fs::write(
+                &blocked,
+                "a file where the packet directory's parent should be",
+            )
+            .unwrap();
+            ports.packet_dir = Some(blocked.join("packets"));
+        },
+    );
+    dispatch(&core, &["wu01-t8"]);
+    let mut error = String::new();
+    wait_until("the unit escalated with a packet error", || {
+        let view = unit_status();
+        error = view["packet_error"].as_str().unwrap_or("").to_string();
+        view["lifecycle"] == "escalated" && !error.is_empty() && view["packet"].is_null()
+    });
+    println!("evidence: packet error on the view: {error}");
+    let blocked = core.config.home.join("blocked");
+    fs::remove_file(&blocked).unwrap();
+    fs::create_dir(&blocked).unwrap();
+    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
+    let packet = wait_for_packet();
+    assert_eq!(
+        packet,
+        blocked.join("packets").join("cf7a").join("wu01-1.md")
+    );
+    assert_eq!(mode(&packet), 0o600);
+    let view = unit_status();
+    assert!(view["packet_error"].is_null(), "{view}");
+    assert_eq!(view["lifecycle"], "escalated");
 }

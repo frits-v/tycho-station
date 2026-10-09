@@ -5,8 +5,8 @@
 - Attempt: 1
 - Head: none
 - Checkpoint: none
-- Blocks: yes
-- Default: none; the unit waits for a verdict
+- Blocks: yes; the unit waits for this verdict
+- Default: none
 
 ## Question
 
@@ -20,17 +20,23 @@ Type: authority, raised at the worker level. Full question: sha256:aaaaaaaaaaaaa
 
 ### A: raise the ceiling as the objective asks
 
-- Accepting: every unit in the epic runs under the new ceiling
+- Gains: not supplied by the worker
+- Accepting that: not supplied by the worker
+- Blast radius: every unit in the epic runs under the new ceiling
 - Reversibility: costly
 
 ### B: leave the ceiling and ask for a council ruling
 
-- Accepting: the trivial unit stays constrained until the ruling
+- Gains: not supplied by the worker
+- Accepting that: not supplied by the worker
+- Blast radius: the trivial unit stays constrained until the ruling
 - Reversibility: two-way
 
 ## Recommendation
 
-Proposed ruling: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+- Proposed ruling: sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+- Confidence: not supplied by the worker
+- Strongest dissent: not supplied by the worker
 
 ## Evidence
 
@@ -47,6 +53,6 @@ None.
 
 ## Verdict
 
-Write `/home/packets/cf7a/wu01-1.verdict` with one line, `continue` or `abandon`. `continue` starts attempt 2; `abandon` ends the unit. An optional second line is the rationale, at most 280 bytes; for `abandon` it is the reason the unit records. Any other content is rejected and the unit stays escalated.
+Write `/home/packets/cf7a/wu01-1.verdict` with one line, `continue` or `abandon`. `continue` starts attempt 2; `abandon` ends the unit. An optional second line is the rationale, at most 280 bytes; for `abandon` it is the reason the unit records. Begin the rationale with the letter of the option you choose, as in `B: ask the council`; `continue` records it as the chosen option. Any other content is rejected and the unit stays escalated.
 
 Unverified claims: 3

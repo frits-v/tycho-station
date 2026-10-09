@@ -91,9 +91,17 @@ pub fn parse_name(file_name: &str) -> Option<(WorkUnitId, Attempt)> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileRefusal {
     NotRegular,
-    Owner { found: u32, expected: u32 },
-    TooLarge { bytes: u64, max: usize },
+    Owner {
+        found: u32,
+        expected: u32,
+    },
+    TooLarge {
+        bytes: u64,
+        max: usize,
+    },
     Unreadable(String),
+    /// The descriptor could not be stat'ed; the file waits for the next pass.
+    Stat(String),
 }
 
 impl fmt::Display for FileRefusal {
@@ -107,6 +115,7 @@ impl fmt::Display for FileRefusal {
                 write!(formatter, "{bytes} bytes; maximum is {max}")
             }
             Self::Unreadable(reason) => write!(formatter, "cannot open: {reason}"),
+            Self::Stat(reason) => write!(formatter, "cannot stat: {reason}"),
         }
     }
 }
@@ -134,15 +143,25 @@ pub fn judge(
     Ok(())
 }
 
+/// A verdict file's bytes and the identity of the descriptor they were read through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerdictFile {
+    pub bytes: Vec<u8>,
+    /// Inode, modification seconds and nanoseconds: a file typed again gets a new identity.
+    pub identity: (u64, i64, i64),
+}
+
 /// Never follows a symlink and never blocks on a FIFO; the descriptor is judged before reading.
-pub fn read_verdict(path: &Path, expected_owner: u32) -> Result<Vec<u8>, FileRefusal> {
+pub fn read_verdict(path: &Path, expected_owner: u32) -> Result<VerdictFile, FileRefusal> {
     let unreadable = |error: io::Error| FileRefusal::Unreadable(error.to_string());
     let file = OpenOptions::new()
         .read(true)
         .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits())
         .open(path)
         .map_err(unreadable)?;
-    let metadata = file.metadata().map_err(unreadable)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| FileRefusal::Stat(error.to_string()))?;
     judge(
         metadata.file_type().is_file(),
         metadata.uid(),
@@ -161,26 +180,36 @@ pub fn read_verdict(path: &Path, expected_owner: u32) -> Result<Vec<u8>, FileRef
             max: VERDICT_MAX_BYTES,
         });
     }
-    Ok(bytes)
+    Ok(VerdictFile {
+        bytes,
+        identity: (metadata.ino(), metadata.mtime(), metadata.mtime_nsec()),
+    })
 }
 
 /// How the Operator answered one ruling.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RuleAnswer {
     Applied,
-    /// A bad request, an unknown unit, or a 409 for an attempt that is not current.
+    /// A 400 for a bad request or the wrong epic, or a 409 for an attempt that is not current.
     Refused(String),
     /// The core's own operator secret was refused; the verdict is not at fault.
     Unauthorized(String),
-    /// Unreachable or an answer no one enumerated; the file waits for the next pass.
+    /// Unreachable, another 4xx such as 404, 408 or 429, or an answer no one enumerated; the
+    /// file waits for the next pass.
     Unavailable(String),
 }
 
+/// Only 400 and 409 condemn the verdict itself; every other refusal may pass on a later try.
 #[must_use]
 pub fn rule_answer(answer: OperatorAnswer) -> RuleAnswer {
     match answer {
         OperatorAnswer::Done(_) => RuleAnswer::Applied,
-        OperatorAnswer::Rejected(status, body) => RuleAnswer::Refused(format!("{status}: {body}")),
+        OperatorAnswer::Rejected(status @ (400 | 409), body) => {
+            RuleAnswer::Refused(format!("{status}: {body}"))
+        }
+        OperatorAnswer::Rejected(status, body) => {
+            RuleAnswer::Unavailable(format!("{status}: {body}"))
+        }
         OperatorAnswer::Unauthorized(body) => RuleAnswer::Unauthorized(body),
         OperatorAnswer::Unreachable(reason) | OperatorAnswer::Unrecognised(reason) => {
             RuleAnswer::Unavailable(reason)
@@ -228,6 +257,11 @@ pub enum Disposition {
     Rejected(String),
     /// Left in place for the next pass.
     Deferred(String),
+    /// The Operator could not be reached or answered for now; the pass stops here.
+    Unavailable(String),
+    /// Renamed rejected, since a retry under the same key returns the same refusal, and the
+    /// pass fails: the core refused its own secret.
+    CoreRefused(String),
     /// Left in place; the pass fails, since the fault is the core's.
     Failed(String),
 }
@@ -245,10 +279,12 @@ impl PassReport {
     #[must_use]
     pub fn succeeded(&self) -> bool {
         self.errors.is_empty()
-            && !self
-                .examined
-                .iter()
-                .any(|(_, disposition)| matches!(disposition, Disposition::Failed(_)))
+            && !self.examined.iter().any(|(_, disposition)| {
+                matches!(
+                    disposition,
+                    Disposition::Failed(_) | Disposition::CoreRefused(_)
+                )
+            })
     }
 
     fn count(&self, wanted: fn(&Disposition) -> bool) -> usize {
@@ -267,8 +303,18 @@ impl fmt::Display for PassReport {
             self.examined.len(),
             self.count(|disposition| matches!(disposition, Disposition::Applied)),
             self.count(|disposition| matches!(disposition, Disposition::Rejected(_))),
-            self.count(|disposition| matches!(disposition, Disposition::Deferred(_))),
-            self.count(|disposition| matches!(disposition, Disposition::Failed(_))),
+            self.count(|disposition| {
+                matches!(
+                    disposition,
+                    Disposition::Deferred(_) | Disposition::Unavailable(_)
+                )
+            }),
+            self.count(|disposition| {
+                matches!(
+                    disposition,
+                    Disposition::Failed(_) | Disposition::CoreRefused(_)
+                )
+            }),
             self.left
         )?;
         for (path, disposition) in &self.examined {
@@ -299,7 +345,7 @@ fn bounded_entries(dir: &Path, max: usize) -> Result<Vec<(String, PathBuf)>, Str
 }
 
 /// The verdict files under each epic directory, sorted, at most `max` of them.
-fn verdict_files(packet_dir: &Path, report: &mut PassReport, max: usize) -> Vec<PathBuf> {
+fn verdict_files(packet_dir: &Path, report: &mut PassReport, max: usize) -> Vec<(EpicId, PathBuf)> {
     let epics = match bounded_entries(packet_dir, EPIC_DIRS_MAX) {
         Ok(epics) => epics,
         Err(error) => {
@@ -310,7 +356,10 @@ fn verdict_files(packet_dir: &Path, report: &mut PassReport, max: usize) -> Vec<
     let mut found = Vec::new();
     for (name, epic_dir) in epics {
         let is_dir = fs::symlink_metadata(&epic_dir).is_ok_and(|metadata| metadata.is_dir());
-        if !is_dir || EpicId::parse(&name).is_err() {
+        let Ok(epic) = EpicId::parse(&name) else {
+            continue;
+        };
+        if !is_dir {
             continue;
         }
         match bounded_entries(&epic_dir, DIR_ENTRIES_MAX) {
@@ -318,7 +367,7 @@ fn verdict_files(packet_dir: &Path, report: &mut PassReport, max: usize) -> Vec<
                 entries
                     .into_iter()
                     .filter(|(file, _)| file.ends_with(&format!(".{VERDICT_EXTENSION}")))
-                    .map(|(_, path)| path),
+                    .map(|(_, path)| (epic.clone(), path)),
             ),
             Err(error) => report.errors.push(error),
         }
@@ -341,13 +390,21 @@ pub fn pass(
             .push(format!("{}: {error}", packet_dir.display()));
         return report;
     }
-    for path in verdict_files(packet_dir, &mut report, VERDICT_FILES_PER_PASS_MAX) {
-        let disposition = consider(&path, owner, rule);
+    let files = verdict_files(packet_dir, &mut report, VERDICT_FILES_PER_PASS_MAX);
+    let total = files.len();
+    for (epic, path) in files {
+        let disposition = consider(&epic, &path, owner, rule);
         let disposition = match dispose(&path, &disposition) {
             Ok(()) => disposition,
             Err(error) => Disposition::Failed(format!("{disposition:?}, then {error}")),
         };
+        let stop = matches!(disposition, Disposition::Unavailable(_));
         report.examined.push((path, disposition));
+        if stop {
+            let rest = total.saturating_sub(report.examined.len());
+            report.left = report.left.saturating_add(rest);
+            break;
+        }
     }
     report
 }
@@ -360,6 +417,7 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 
 /// Decides one file without touching it.
 fn consider(
+    epic: &EpicId,
     path: &Path,
     owner: u32,
     rule: &mut dyn FnMut(&RuleRequest) -> RuleAnswer,
@@ -374,11 +432,12 @@ fn consider(
     if fs::symlink_metadata(sibling(path, APPLIED)).is_ok() {
         return Disposition::Rejected("a verdict for this attempt was already applied".to_string());
     }
-    let bytes = match read_verdict(path, owner) {
-        Ok(bytes) => bytes,
+    let file = match read_verdict(path, owner) {
+        Ok(file) => file,
+        Err(refusal @ FileRefusal::Stat(_)) => return Disposition::Deferred(refusal.to_string()),
         Err(refusal) => return Disposition::Rejected(refusal.to_string()),
     };
-    let (verdict, rationale) = match decode(&bytes) {
+    let (verdict, rationale) = match decode(&file.bytes) {
         VerdictText::Ruled { verdict, rationale } => (verdict, rationale),
         VerdictText::Unrecognised(reason) => return Disposition::Rejected(reason),
     };
@@ -388,16 +447,20 @@ fn consider(
     let request = RuleRequest {
         unit,
         call: RuleCall {
+            epic: epic.clone(),
             attempt: attempt.get(),
             ruling: Ruling { verdict, reason },
         },
-        idempotency_key: idempotency_key(path, name),
+        idempotency_key: idempotency_key(epic, name, file.identity),
     };
     match rule(&request) {
         RuleAnswer::Applied => Disposition::Applied,
         RuleAnswer::Refused(reason) => Disposition::Rejected(reason),
-        RuleAnswer::Unauthorized(reason) => Disposition::Failed(format!("unauthorized: {reason}")),
-        RuleAnswer::Unavailable(reason) => Disposition::Deferred(reason),
+        RuleAnswer::Unauthorized(reason) => Disposition::CoreRefused(format!(
+            "the core's own operator secret was refused ({reason}); fix the core, then type the \
+             verdict again"
+        )),
+        RuleAnswer::Unavailable(reason) => Disposition::Unavailable(reason),
     }
 }
 
@@ -410,12 +473,9 @@ fn default_reason(verdict: RulingVerdict) -> Option<ShortText> {
 }
 
 /// The same file keeps its key across passes; a file typed again gets a new one.
-fn idempotency_key(path: &Path, name: &str) -> String {
-    let identity = fs::symlink_metadata(path).map_or((0, 0, 0), |metadata| {
-        (metadata.ino(), metadata.mtime(), metadata.mtime_nsec())
-    });
+fn idempotency_key(epic: &EpicId, name: &str, identity: (u64, i64, i64)) -> String {
     format!(
-        "verdict:{name}:{}:{}:{}",
+        "verdict:{epic}:{name}:{}:{}:{}",
         identity.0, identity.1, identity.2
     )
 }
@@ -428,13 +488,13 @@ fn dispose(path: &Path, disposition: &Disposition) -> io::Result<()> {
             agent_files::check_replaceable(&applied)?;
             fs::rename(path, applied)
         }
-        Disposition::Rejected(reason) => {
+        Disposition::Rejected(reason) | Disposition::CoreRefused(reason) => {
             let rejected = sibling(path, REJECTED);
             agent_files::check_replaceable(&rejected)?;
             fs::rename(path, rejected)?;
             agent_files::write_durable(&sibling(path, REASON), format!("{reason}\n").as_bytes())
         }
-        Disposition::Deferred(_) | Disposition::Failed(_) => Ok(()),
+        Disposition::Deferred(_) | Disposition::Unavailable(_) | Disposition::Failed(_) => Ok(()),
     }
 }
 
@@ -586,7 +646,7 @@ mod tests {
         assert_eq!(outcomes.1, Err(FileRefusal::NotRegular));
         assert!(matches!(outcomes.2, Err(FileRefusal::TooLarge { .. })));
         assert!(matches!(outcomes.3, Err(FileRefusal::Owner { .. })));
-        assert_eq!(outcomes.4, Ok(b"continue\n".to_vec()));
+        assert_eq!(outcomes.4.unwrap().bytes, b"continue\n".to_vec());
     }
 
     fn names(dir: &Path) -> Vec<String> {
@@ -623,6 +683,14 @@ mod tests {
         assert_eq!(first.examined, vec![(verdict, Disposition::Applied)]);
         assert_eq!(calls.get(), 1, "the second file never reached the operator");
         assert_eq!(seen[0].unit.as_str(), "wu01");
+        assert_eq!(
+            seen[0].call.epic.as_str(),
+            "cf7a",
+            "the epic is the directory's"
+        );
+        assert!(seen[0]
+            .idempotency_key
+            .starts_with("verdict:cf7a:wu01-1.verdict:"));
         assert_eq!(seen[0].call.attempt, 1);
         assert_eq!(seen[0].call.ruling.verdict, RulingVerdict::Abandon);
         assert_eq!(seen[0].call.ruling.reason.as_str(), "the policy forbids it");
@@ -645,15 +713,16 @@ mod tests {
         let base = scratch("answers");
         let packets = base.join("packets");
         let epic = packets.join("cf7a");
-        for (unit, _) in [("wa", 0), ("wb", 1), ("wc", 2), ("wd", 3)] {
+        for unit in ["wa", "wb", "wc", "wd", "we"] {
             fs::write(epic.join(format!("{unit}-2.verdict")), "continue\n").unwrap();
         }
         fs::write(epic.join("bad-name.verdict"), "continue\n").unwrap();
         let mut rule = |request: &RuleRequest| match request.unit.as_str() {
             "wa" => RuleAnswer::Applied,
             "wb" => RuleAnswer::Refused("409: attempt 2 is not the current attempt".to_string()),
-            "wc" => RuleAnswer::Unavailable("connection refused".to_string()),
-            _ => RuleAnswer::Unauthorized("operator secret missing or wrong".to_string()),
+            "wc" => RuleAnswer::Unauthorized("operator secret missing or wrong".to_string()),
+            "wd" => RuleAnswer::Unavailable("connection refused".to_string()),
+            _ => panic!("the pass went on after the operator was unavailable"),
         };
         let report = pass(&packets, agent_files::current_uid(), &mut rule);
         let listing = names(&epic);
@@ -670,25 +739,45 @@ mod tests {
                 Disposition::Rejected(why) if why.contains("not <unit>") => "bad name",
                 Disposition::Rejected(why) if why.starts_with("409") => "conflict",
                 Disposition::Rejected(_) => "rejected",
+                Disposition::CoreRefused(why) if why.contains("type the verdict again") => {
+                    "core refused"
+                }
+                Disposition::CoreRefused(_) => "core refused without the instruction",
                 Disposition::Deferred(_) => "deferred",
+                Disposition::Unavailable(_) => "unavailable",
                 Disposition::Failed(_) => "failed",
             })
             .collect();
         assert_eq!(
             kinds,
-            ["bad name", "applied", "conflict", "deferred", "failed"]
+            [
+                "bad name",
+                "applied",
+                "conflict",
+                "core refused",
+                "unavailable"
+            ]
         );
-        assert!(!report.succeeded(), "an unauthorized core fails the pass");
+        assert_eq!(
+            report.left, 1,
+            "the pass stopped at the unavailable operator"
+        );
+        assert!(!report.succeeded(), "a refused core secret fails the pass");
         let expected = [
             "bad-name.verdict.reason",
             "bad-name.verdict.rejected",
             "wa-2.verdict.applied",
             "wb-2.verdict.reason",
             "wb-2.verdict.rejected",
-            "wc-2.verdict",
+            "wc-2.verdict.reason",
+            "wc-2.verdict.rejected",
             "wd-2.verdict",
+            "we-2.verdict",
         ];
-        assert_eq!(listing, expected, "deferred and failed files stay in place");
+        assert_eq!(
+            listing, expected,
+            "unavailable and unread files stay in place"
+        );
     }
 
     #[test]
@@ -741,9 +830,17 @@ mod tests {
             rule_answer(OperatorAnswer::Unauthorized(String::new())),
             RuleAnswer::Unauthorized(_)
         ));
+        assert!(matches!(
+            rule_answer(OperatorAnswer::Rejected(400, "wrong epic".to_string())),
+            RuleAnswer::Refused(_)
+        ));
         for unavailable in [
             OperatorAnswer::Unreachable(String::new()),
             OperatorAnswer::Unrecognised(String::new()),
+            OperatorAnswer::Rejected(404, String::new()),
+            OperatorAnswer::Rejected(408, String::new()),
+            OperatorAnswer::Rejected(429, String::new()),
+            OperatorAnswer::Rejected(418, String::new()),
         ] {
             assert!(matches!(
                 rule_answer(unavailable),

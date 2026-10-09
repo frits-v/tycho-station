@@ -99,6 +99,8 @@ pub mod spine {
     pub const PLAN_TASKS_MAX: usize = 16;
     /// Attempts and rulings one unit run goes through before it is abandoned.
     pub const UNIT_ROUNDS_MAX: u32 = 16;
+    /// Times an escalated unit writes a failed packet again, one retry backoff maximum apart.
+    pub const PACKET_RETRIES_MAX: u32 = 288;
     /// Ledger limits `tycho epic start` gives a new epic: seat tokens and metered micro-dollars.
     pub const EPIC_SEAT_LIMIT_DEFAULT: u64 = 50_000_000;
     pub const EPIC_METERED_LIMIT_DEFAULT: u64 = 0;

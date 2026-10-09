@@ -3,12 +3,14 @@
 //! A blocker is rendered as a choice and written 0600 under
 //! `<core home>/packets/<epic>/<unit>-<attempt>.md`, beside the verdict path the human types into.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use tycho_types::envelope::{
     CommitSha, ContentRef, EscalationOption, EscalationPayload, QuestionType, Reversibility,
+    OPTIONS_MAX_ITEMS,
 };
 use tycho_types::service::{Attempt, EpicId, WorkUnitId};
 use tycho_types::session::Level;
@@ -26,6 +28,9 @@ pub const PACKET_EXTENSION: &str = "md";
 pub const VERDICT_EXTENSION: &str = "verdict";
 
 const OPTION_LETTERS: [&str; 4] = ["A", "B", "C", "D"];
+const _: () = assert!(OPTION_LETTERS.len() == OPTIONS_MAX_ITEMS);
+/// Mandate 10.2: a row the payload cannot fill is shown as missing, never dropped.
+const NOT_SUPPLIED: &str = "not supplied by the worker";
 
 /// Why the unit is escalated: a worker's certified question, or the unit's own give-up rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,17 +119,20 @@ pub fn render(
     max: usize,
 ) -> Result<String, PacketError> {
     let mut text = String::new();
-    header(&mut text, blocker, context);
-    let unverified = match blocker {
-        Blocker::Certified(payload) => certified(&mut text, payload, verified),
+    header(&mut text, context);
+    let (unverified, lettered) = match blocker {
+        Blocker::Certified(payload) => (
+            certified(&mut text, payload, verified),
+            !payload.options.is_empty(),
+        ),
         Blocker::Uncertified { reason } => {
             uncertified(&mut text, reason, context.attempt);
-            0
+            (0, false)
         }
     };
     tried(&mut text, context);
     cases(&mut text, blocker);
-    verdict_section(&mut text, verdict, context.attempt);
+    verdict_section(&mut text, verdict, context.attempt, lettered);
     line(&mut text, &format!("Unverified claims: {unverified}"));
     if text.len() > max {
         return Err(PacketError::TooLarge {
@@ -146,11 +154,7 @@ fn heading(text: &mut String, value: &str) {
     line(text, "");
 }
 
-fn header(text: &mut String, blocker: &Blocker, context: &PacketContext) {
-    let blocks = match blocker {
-        Blocker::Certified(payload) if !payload.blocking => "no",
-        Blocker::Certified(_) | Blocker::Uncertified { .. } => "yes",
-    };
+fn header(text: &mut String, context: &PacketContext) {
     let sha = |value: Option<&CommitSha>| value.map_or("none", CommitSha::as_str).to_string();
     line(
         text,
@@ -167,8 +171,8 @@ fn header(text: &mut String, blocker: &Blocker, context: &PacketContext) {
         ("Attempt", context.attempt.get().to_string()),
         ("Head", sha(context.head_sha.as_ref())),
         ("Checkpoint", sha(context.checkpoint.as_ref())),
-        ("Blocks", blocks.to_string()),
-        ("Default", "none; the unit waits for a verdict".to_string()),
+        ("Blocks", "yes; the unit waits for this verdict".to_string()),
+        ("Default", "none".to_string()),
     ] {
         line(text, &format!("- {label}: {value}"));
     }
@@ -206,32 +210,73 @@ fn certified(
         ),
     );
     heading(text, "## Options");
+    if lettered.is_empty() {
+        line(text, &format!("None: {NOT_SUPPLIED}."));
+    }
     for (index, (letter, option)) in lettered.iter().enumerate() {
         if index > 0 {
             line(text, "");
         }
-        line(text, &format!("### {letter}: {}", option.label));
-        line(text, "");
-        line(text, &format!("- Accepting: {}", option.blast_radius));
-        line(
+        let blast_radius = option.blast_radius.to_string();
+        option_rows(
             text,
-            &format!("- Reversibility: {}", reversibility(option.reversibility)),
+            &format!("{letter}: {}", option.label),
+            [
+                NOT_SUPPLIED,
+                NOT_SUPPLIED,
+                &blast_radius,
+                reversibility(option.reversibility),
+            ],
         );
     }
-    heading(text, "## Recommendation");
-    match &payload.proposed_ruling {
-        Some(ruling) => line(text, &format!("Proposed ruling: {ruling}")),
-        None => line(text, "None proposed."),
-    }
+    let ruling = payload.proposed_ruling.as_ref().map(ToString::to_string);
+    recommendation(text, ruling.as_deref().unwrap_or(NOT_SUPPLIED));
+    evidence(text, payload, verified)
+}
+
+/// Lists the evidence and returns how many distinct references are unverified.
+fn evidence(
+    text: &mut String,
+    payload: &EscalationPayload,
+    verified: &dyn Fn(&ContentRef) -> bool,
+) -> usize {
     heading(text, "## Evidence");
     if payload.evidence.is_empty() {
-        line(text, "None.");
+        line(text, &format!("None: {NOT_SUPPLIED}."));
     }
     for reference in &payload.evidence {
         line(text, &format!("- {reference}"));
     }
-    let claims = payload.evidence.iter().chain(&payload.proposed_ruling);
-    claims.filter(|reference| !verified(reference)).count()
+    let claims: BTreeSet<&ContentRef> = payload
+        .evidence
+        .iter()
+        .chain(&payload.proposed_ruling)
+        .collect();
+    claims
+        .into_iter()
+        .filter(|reference| !verified(reference))
+        .count()
+}
+
+/// One option: gains, accepting that, blast radius, reversibility, each on its own row.
+fn option_rows(text: &mut String, title: &str, rows: [&str; 4]) {
+    line(text, &format!("### {title}"));
+    line(text, "");
+    let labels = ["Gains", "Accepting that", "Blast radius", "Reversibility"];
+    for (label, value) in labels.into_iter().zip(rows) {
+        line(text, &format!("- {label}: {value}"));
+    }
+}
+
+fn recommendation(text: &mut String, ruling: &str) {
+    heading(text, "## Recommendation");
+    for (label, value) in [
+        ("Proposed ruling", ruling),
+        ("Confidence", NOT_SUPPLIED),
+        ("Strongest dissent", NOT_SUPPLIED),
+    ] {
+        line(text, &format!("- {label}: {value}"));
+    }
 }
 
 fn uncertified(text: &mut String, reason: &str, attempt: Attempt) {
@@ -244,16 +289,32 @@ fn uncertified(text: &mut String, reason: &str, attempt: Attempt) {
     line(text, "");
     line(text, &format!("The unit stopped because {reason}."));
     heading(text, "## Options");
-    line(text, "### Continue");
-    line(text, "");
-    line(
+    let budget = format!("attempt {next} spends another attempt's budget");
+    option_rows(
         text,
-        &format!("- Accepting: attempt {next} spends another attempt's budget"),
+        "Continue",
+        [
+            "another attempt at the done criteria",
+            &budget,
+            "this unit only",
+            "two-way",
+        ],
     );
     line(text, "");
-    line(text, "### Abandon");
-    line(text, "");
-    line(text, "- Accepting: the unit ends unmerged");
+    option_rows(
+        text,
+        "Abandon",
+        [
+            "no further budget spent on this unit",
+            "the unit ends unmerged",
+            "this unit only",
+            "costly: the unit must be dispatched again",
+        ],
+    );
+    recommendation(
+        text,
+        "not supplied; the unit's own give-up rule raised this blocker",
+    );
 }
 
 fn tried(text: &mut String, context: &PacketContext) {
@@ -296,14 +357,20 @@ fn cases(text: &mut String, blocker: &Blocker) {
     }
 }
 
-fn verdict_section(text: &mut String, verdict: &Path, attempt: Attempt) {
+fn verdict_section(text: &mut String, verdict: &Path, attempt: Attempt, lettered: bool) {
     let next = attempt.get().saturating_add(1);
     heading(text, "## Verdict");
+    let letter = if lettered {
+        " Begin the rationale with the letter of the option you choose, as in `B: ask the \
+         council`; `continue` records it as the chosen option."
+    } else {
+        ""
+    };
     let body = format!(
         "Write `{}` with one line, `continue` or `abandon`. `continue` starts attempt {next}; \
          `abandon` ends the unit. An optional second line is the rationale, at most \
-         {RATIONALE_MAX_BYTES} bytes; for `abandon` it is the reason the unit records. Any \
-         other content is rejected and the unit stays escalated.",
+         {RATIONALE_MAX_BYTES} bytes; for `abandon` it is the reason the unit records.{letter} \
+         Any other content is rejected and the unit stays escalated.",
         verdict.display()
     );
     line(text, &body);
@@ -443,7 +510,11 @@ mod tests {
             PACKET_MAX_BYTES,
         )
         .unwrap();
-        assert!(rendered.contains("None proposed."), "{rendered}");
+        assert!(
+            rendered.contains("- Proposed ruling: not supplied by the worker"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("None: not supplied by the worker."));
         assert!(rendered.ends_with("Unverified claims: 0\n"), "{rendered}");
     }
 
@@ -505,5 +576,55 @@ mod tests {
             "`{}`",
             packet_dir.join("cf7a").join("wu01-1.verdict").display()
         )));
+    }
+
+    #[test]
+    fn a_reference_cited_twice_counts_once() {
+        let mut twice = payload();
+        twice.proposed_ruling = Some(reference('c'));
+        let rendered = render(
+            &Blocker::Certified(twice),
+            &context(),
+            Path::new("/v"),
+            &|_| false,
+            PACKET_MAX_BYTES,
+        )
+        .unwrap();
+        assert!(rendered.ends_with("Unverified claims: 2\n"), "{rendered}");
+    }
+
+    #[test]
+    fn a_payload_at_every_bound_stays_under_the_packet_bound() {
+        use tycho_types::envelope::{RecordId, REFS_MAX_ITEMS, TEXT_MAX_BYTES};
+        let long = text(&"t".repeat(TEXT_MAX_BYTES));
+        let mut widest = payload();
+        widest.give_up_reason = long.clone();
+        widest.options = vec![
+            EscalationOption {
+                label: long.clone(),
+                reversibility: Reversibility::OneWay,
+                blast_radius: long,
+            };
+            OPTIONS_MAX_ITEMS
+        ];
+        widest.evidence = vec![reference('e'); REFS_MAX_ITEMS];
+        widest.cases_consulted = vec![RecordId::parse(&"c".repeat(64)).unwrap(); REFS_MAX_ITEMS];
+        let mut unit = context();
+        unit.attempt = Attempt::new(9).unwrap();
+        unit.findings = vec!["f".repeat(FINDING_MAX_BYTES); FINDINGS_MAX_ITEMS];
+        let verdict = PathBuf::from("/").join("v".repeat(1024));
+        let rendered = render(
+            &Blocker::Certified(widest),
+            &unit,
+            &verdict,
+            &|_| false,
+            PACKET_MAX_BYTES,
+        )
+        .unwrap();
+        assert!(
+            rendered.len() < PACKET_MAX_BYTES,
+            "{} bytes",
+            rendered.len()
+        );
     }
 }

@@ -3,9 +3,11 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use restate_sdk::context::DurableFuture;
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tycho_types::envelope::{CommitSha, EscalationPayload, ResultPayload, ShortText};
@@ -168,6 +170,15 @@ pub struct WorkUnitView {
     /// The decision packet of the current escalation, once written.
     #[serde(default)]
     pub packet: Option<String>,
+    /// Why the packet could not be written; the run writes it again on a timer.
+    #[serde(default)]
+    pub packet_error: Option<String>,
+    /// The epic the unit runs under, checked against the directory a verdict came from.
+    #[serde(default)]
+    pub epic: Option<EpicId>,
+    /// The rationale of the last `continue` verdict, which names the chosen option.
+    #[serde(default)]
+    pub chosen_option: Option<ShortText>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -188,6 +199,7 @@ pub struct Ruling {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuleCall {
+    pub epic: EpicId,
     pub attempt: u16,
     pub ruling: Ruling,
 }
@@ -222,6 +234,10 @@ pub enum ControlError {
     },
     /// A ruling reaches only an escalated unit, so it never waits ahead of the escalation.
     NotEscalated(Option<Lifecycle>),
+    WrongEpic {
+        named: EpicId,
+        actual: Option<EpicId>,
+    },
 }
 
 impl fmt::Display for ControlError {
@@ -238,6 +254,12 @@ impl fmt::Display for ControlError {
             Self::NotEscalated(lifecycle) => {
                 write!(formatter, "the unit is {lifecycle:?}, not escalated")
             }
+            Self::WrongEpic { named, actual } => {
+                write!(
+                    formatter,
+                    "the ruling names epic {named}; the unit runs under {actual:?}"
+                )
+            }
         }
     }
 }
@@ -246,7 +268,7 @@ impl ControlError {
     const fn code(&self) -> u16 {
         match self {
             Self::Secret => CODE_FORBIDDEN,
-            Self::Attempt(_) => CODE_BAD_REQUEST,
+            Self::Attempt(_) | Self::WrongEpic { .. } => CODE_BAD_REQUEST,
             Self::NotCurrent { .. } | Self::NotEscalated(_) => CODE_CONFLICT,
         }
     }
@@ -265,12 +287,20 @@ pub fn current_promise(
     Ok(PromiseName::new(phase, checked))
 }
 
-/// `ruling.<attempt>`, only while the unit is escalated in that attempt.
+/// `ruling.<attempt>`, only while the unit is escalated in that attempt under that epic.
 pub fn ruling_promise(
     view: Option<&WorkUnitView>,
+    epic: &EpicId,
     attempt: u16,
 ) -> Result<PromiseName, ControlError> {
     let name = current_promise(Phase::Ruling, attempt, view.map(|view| view.attempt))?;
+    let actual = view.and_then(|view| view.epic.clone());
+    if actual.as_ref() != Some(epic) {
+        return Err(ControlError::WrongEpic {
+            named: epic.clone(),
+            actual,
+        });
+    }
     match view.map(|view| view.lifecycle) {
         Some(Lifecycle::Escalated) => Ok(name),
         other => Err(ControlError::NotEscalated(other)),
@@ -353,6 +383,27 @@ fn worker_blocker(task: &TaskId, outcome: WorkerRunOutcome) -> Blocker {
         | WorkerRunOutcome::Exhausted { .. }) => format!("task {task} ended as {other:?}"),
     };
     Blocker::Uncertified { reason }
+}
+
+/// A packet the run still has to write: where, what, and for which unit attempt.
+struct PendingPacket {
+    packet_dir: PathBuf,
+    blocker: Blocker,
+    context: PacketContext,
+}
+
+enum RulingWake {
+    Ruling(Result<Json<Ruling>, TerminalError>),
+    Retry,
+}
+
+type RulingFuture<'run> = Pin<Box<dyn DurableFuture<Output = RulingWake> + Send + 'run>>;
+
+fn retry_timer<'run>(
+    workflow_context: &'run WorkflowContext<'_>,
+    wait: Duration,
+) -> RulingFuture<'run> {
+    Box::pin(workflow_context.sleep(wait).map(|_| RulingWake::Retry))
 }
 
 fn packet_failure(error: PacketError) -> HandlerError {
@@ -508,8 +559,12 @@ impl WorkUnit {
     ) -> HandlerResult<()> {
         let call = call.into_inner();
         let view = shared_context.get::<Json<WorkUnitView>>(VIEW_KEY).await?;
-        let name = ruling_promise(view.map(Json::into_inner).as_ref(), call.attempt)
-            .map_err(|error| refuse(error.code(), error.to_string()))?;
+        let name = ruling_promise(
+            view.map(Json::into_inner).as_ref(),
+            &call.epic,
+            call.attempt,
+        )
+        .map_err(|error| refuse(error.code(), error.to_string()))?;
         shared_context.resolve_promise(&name.to_string(), Json(call.ruling));
         Ok(())
     }
@@ -586,6 +641,9 @@ impl WorkUnit {
                 reason: None,
                 config: start.config,
                 packet: None,
+                packet_error: None,
+                epic: Some(request.epic.clone()),
+                chosen_option: None,
             },
             timing: start.timing,
         };
@@ -624,9 +682,10 @@ impl WorkUnit {
                 AttemptEnd::Escalated(blocker) => After::Escalate(blocker),
             };
             if let After::Escalate(blocker) = after {
-                self.packet(unit, unit_id, request, attempt, blocker)
+                let pending = self
+                    .packet(unit, unit_id, request, attempt, blocker)
                     .await?;
-                if !self.ruling(unit, attempt).await? {
+                if !self.ruling(unit, attempt, pending).await? {
                     return Ok(());
                 }
             }
@@ -672,18 +731,58 @@ impl WorkUnit {
         Ok(After::Retry)
     }
 
-    /// Awaits `ruling.<attempt>`; true when the verdict lets the unit continue.
-    async fn ruling(&self, unit: &mut Unit<'_>, attempt: Attempt) -> Result<bool, TerminalError> {
+    /// Awaits `ruling.<attempt>`, writing a pending packet again on a timer meanwhile; true when
+    /// the verdict lets the unit continue.
+    async fn ruling(
+        &self,
+        unit: &mut Unit<'_>,
+        attempt: Attempt,
+        mut pending: Option<PendingPacket>,
+    ) -> Result<bool, TerminalError> {
+        let workflow_context = unit.workflow_context;
+        let retry_after = unit.timing.retry_backoff_max;
         let name = PromiseName::new(Phase::Ruling, attempt).to_string();
-        let ruling = unit
-            .workflow_context
-            .promise::<Json<Ruling>>(&name)
-            .await?
-            .into_inner();
+        let mut futures: DurableFuturesUnordered<RulingFuture<'_>> = DurableFuturesUnordered::new();
+        futures.push(Box::pin(
+            workflow_context
+                .promise::<Json<Ruling>>(&name)
+                .map(RulingWake::Ruling),
+        ));
+        let mut retries_left = spine::PACKET_RETRIES_MAX;
+        if pending.is_some() {
+            futures.push(retry_timer(workflow_context, retry_after));
+            retries_left = retries_left.saturating_sub(1);
+        }
+        for _ in 0..=spine::PACKET_RETRIES_MAX {
+            let Some((_, woke)) = futures.next().await? else {
+                break;
+            };
+            match woke {
+                RulingWake::Ruling(ruling) => return Self::apply(unit, ruling?.into_inner()),
+                RulingWake::Retry => {
+                    let Some(packet) = pending.take() else {
+                        continue;
+                    };
+                    if !Self::write_packet(unit, &packet).await? && retries_left > 0 {
+                        futures.push(retry_timer(workflow_context, retry_after));
+                        retries_left = retries_left.saturating_sub(1);
+                        pending = Some(packet);
+                    }
+                }
+            }
+        }
+        Err(failure(
+            CODE_INTERNAL,
+            "the ruling wait ended without a ruling",
+        ))
+    }
+
+    fn apply(unit: &mut Unit<'_>, ruling: Ruling) -> Result<bool, TerminalError> {
         match ruling.verdict {
             RulingVerdict::Continue => {
-                unit.view.findings = vec![format!("verdict: {}", ruling.reason)];
+                unit.view.chosen_option = Some(ruling.reason);
                 unit.view.packet = None;
+                unit.view.packet_error = None;
                 unit.step(Event::Verdict)?;
                 Ok(true)
             }
@@ -695,7 +794,7 @@ impl WorkUnit {
         }
     }
 
-    /// Writes the decision packet in a journaled step and records its path on the view.
+    /// Writes the decision packet; a packet that cannot be written comes back to retry.
     async fn packet(
         &self,
         unit: &mut Unit<'_>,
@@ -703,22 +802,40 @@ impl WorkUnit {
         request: &WorkUnitRequest,
         attempt: Attempt,
         blocker: Blocker,
-    ) -> Result<(), TerminalError> {
+    ) -> Result<Option<PendingPacket>, TerminalError> {
         let packet_dir = self.packet_dir.clone().ok_or_else(|| {
             failure(
                 CODE_INTERNAL,
                 "no packet directory is configured, so the escalation would reach no one",
             )
         })?;
-        let context = PacketContext {
-            epic: request.epic.clone(),
-            unit: unit_id.clone(),
-            attempt,
-            head_sha: unit.view.head_sha.clone(),
-            checkpoint: None,
-            findings: unit.view.findings.clone(),
+        let packet = PendingPacket {
+            packet_dir,
+            blocker,
+            context: PacketContext {
+                epic: request.epic.clone(),
+                unit: unit_id.clone(),
+                attempt,
+                head_sha: unit.view.head_sha.clone(),
+                checkpoint: None,
+                findings: unit.view.findings.clone(),
+            },
         };
-        let path = unit
+        let written = Self::write_packet(unit, &packet).await?;
+        Ok((!written).then_some(packet))
+    }
+
+    /// One journaled write; a failure other than a cancel is recorded on the view, not raised.
+    async fn write_packet(
+        unit: &mut Unit<'_>,
+        packet: &PendingPacket,
+    ) -> Result<bool, TerminalError> {
+        let (packet_dir, blocker, context) = (
+            packet.packet_dir.clone(),
+            packet.blocker.clone(),
+            packet.context.clone(),
+        );
+        let written = unit
             .workflow_context
             .run(|| {
                 blocking(move || {
@@ -729,10 +846,21 @@ impl WorkUnit {
             })
             .name("packet")
             .retry_policy(unit.timing.port_retry())
-            .await?;
-        unit.view.packet = Some(path);
-        unit.save();
-        Ok(())
+            .await;
+        match written {
+            Ok(path) => {
+                unit.view.packet = Some(path);
+                unit.view.packet_error = None;
+                unit.save();
+                Ok(true)
+            }
+            Err(error) if error.code() == CODE_CANCELLED => Err(error),
+            Err(error) => {
+                unit.view.packet_error = Some(error.message().to_string());
+                unit.save();
+                Ok(false)
+            }
+        }
     }
 
     /// Dispatches the plan's tasks in order, then verifies every claim.
@@ -1039,17 +1167,33 @@ mod tests {
             reason: None,
             config: UnitConfig::default(),
             packet: None,
+            packet_error: None,
+            epic: Some(EpicId::parse("cf7a").unwrap()),
+            chosen_option: None,
         }
     }
 
     #[test]
     fn a_ruling_reaches_only_an_escalated_unit_in_its_current_attempt() {
+        let epic = EpicId::parse("cf7a").unwrap();
         let escalated = view(Lifecycle::Escalated, 2);
         assert_eq!(
-            ruling_promise(Some(&escalated), 2).unwrap().to_string(),
+            ruling_promise(Some(&escalated), &epic, 2)
+                .unwrap()
+                .to_string(),
             "ruling.2"
         );
-        let stale = ruling_promise(Some(&escalated), 1);
+        let other = EpicId::parse("b0b0").unwrap();
+        let wrong = ruling_promise(Some(&escalated), &other, 2);
+        assert_eq!(
+            wrong,
+            Err(ControlError::WrongEpic {
+                named: other,
+                actual: Some(epic.clone())
+            })
+        );
+        assert_eq!(wrong.unwrap_err().code(), CODE_BAD_REQUEST);
+        let stale = ruling_promise(Some(&escalated), &epic, 1);
         assert_eq!(
             stale,
             Err(ControlError::NotCurrent {
@@ -1057,13 +1201,13 @@ mod tests {
                 current: Some(2)
             })
         );
-        let running = ruling_promise(Some(&view(Lifecycle::Running, 2)), 2);
+        let running = ruling_promise(Some(&view(Lifecycle::Running, 2)), &epic, 2);
         assert_eq!(
             running,
             Err(ControlError::NotEscalated(Some(Lifecycle::Running)))
         );
         assert_eq!(running.unwrap_err().code(), CODE_CONFLICT);
-        assert!(ruling_promise(None, 1).is_err());
+        assert!(ruling_promise(None, &epic, 1).is_err());
     }
 
     #[test]
