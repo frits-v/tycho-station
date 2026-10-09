@@ -717,7 +717,10 @@ impl WorkUnit {
             .map_err(|error| failure(CODE_INTERNAL, error.to_string()))?;
         let mut attempt = Attempt::FIRST;
         if let Some(start) = &request.control {
-            self.start_control(unit, unit_id, start).await?;
+            if let Some(reason) = self.start_control(unit, unit_id, start).await? {
+                unit.view.reason = Some(reason);
+                return unit.step(Event::TerminalFailure);
+            }
         }
         unit.step(Event::ChildClaimsLease)?;
         unit.step(Event::FirstStatus)?;
@@ -755,12 +758,13 @@ impl WorkUnit {
         Err(failure(CODE_INTERNAL, "the unit ran out of rounds"))
     }
 
+    /// Starts and instructs the control session; `Some` is why the unit cannot dispatch.
     async fn start_control(
         &self,
         unit: &mut Unit<'_>,
         unit_id: &WorkUnitId,
         start: &ControlStart,
-    ) -> Result<(), TerminalError> {
+    ) -> Result<Option<String>, TerminalError> {
         let session = SessionName::parse(&unit.view.control_session)
             .map_err(|error| failure(CODE_INTERNAL, error.to_string()))?;
         let record = control::start_control(
@@ -774,7 +778,7 @@ impl WorkUnit {
         let refusal = control_refusal(&record);
         unit.view.control_delivery = Some(record);
         unit.save();
-        refusal.map_or(Ok(()), |reason| Err(failure(CODE_CONFLICT, reason)))
+        Ok(refusal)
     }
 
     fn after_criteria(
