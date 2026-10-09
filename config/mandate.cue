@@ -69,8 +69,15 @@ mandate: #Mandate & {
 			partial:  false
 			slices: ["one"]
 		}
+		"1.4": {
+			requires: "The mandate binds every session the operator starts on the station's own repository; until the station merges its own changes, the ruleset and ci stand in for the merge gate of article 6, and the design lists the gap."
+			mechanisms: ["ruleset", "ci"]
+			coverage: "ruleset and ci stand in for the merge gate on this repository: a pull request merges only with a green ci check, which runs the change's own xtask"
+			partial:  true
+			slices: ["unscheduled"]
+		}
 		"2.1": {
-			requires: "Instruments rank: mandate, human rulings, binding cases, arbiter rulings, task packets, vendor, prompt and session instructions."
+			requires: "Instruments rank: mandate, human rulings, arbiter rulings, task packets, vendor, prompt and session instructions; a case ranks with the level that made it."
 			mechanisms: []
 			coverage: ""
 			partial:  false
@@ -139,6 +146,13 @@ mandate: #Mandate & {
 			partial:  false
 			slices: ["zero"]
 		}
+		"4.6": {
+			requires: "A contrary instruction is not followed; it is escalated naming the article it would breach."
+			mechanisms: []
+			coverage: ""
+			partial:  false
+			slices: ["one"]
+		}
 		"5.1": {
 			requires: "A certified question is answered or returned, never ignored."
 			mechanisms: []
@@ -161,9 +175,9 @@ mandate: #Mandate & {
 			slices: ["zero", "one"]
 		}
 		"5.4": {
-			requires: "No kill without the reason recorded and the scrollback saved."
+			requires: "No kill without the reason recorded and the scrollback saved; a human stop without a reason records that none was given."
 			mechanisms: ["spine_services"]
-			coverage: "spine services: kill by recorded pid, scrollback saved when the caller asks; no reason is taken"
+			coverage: "spine services: kill by recorded pid, scrollback saved when the caller asks; no reason, and no record that none was given, is taken"
 			partial:  true
 			slices: ["zero"]
 		}
@@ -175,7 +189,7 @@ mandate: #Mandate & {
 			slices: ["one"]
 		}
 		"6.1": {
-			requires: "Only the core advances a default branch, after verifying on a fresh checkout with criteria it holds."
+			requires: "Only the core advances the default branch of a canonical repository, after verifying on a fresh checkout with criteria it holds."
 			mechanisms: []
 			coverage: ""
 			partial:  false
@@ -216,6 +230,13 @@ mandate: #Mandate & {
 			partial:  false
 			slices: ["one"]
 		}
+		"7.4": {
+			requires: "The most secure option that does the work, with the trade-off named; no token issued to a person; credentials shortest-lived, narrowest, issued to the station's own identity."
+			mechanisms: []
+			coverage: ""
+			partial:  false
+			slices: ["zero"]
+		}
 		"8.1": {
 			requires: "A case is scoped, fingerprinted and dated; a changed fingerprint demotes it to persuasive."
 			mechanisms: []
@@ -238,7 +259,7 @@ mandate: #Mandate & {
 			slices: ["one"]
 		}
 		"8.4": {
-			requires: "Human cases carry a review date and are suspended after two failed citations."
+			requires: "Human cases carry a review date and are suspended after two failed citations; a citation fails when the case's check fails as cited or a higher level reverses its holding on the same facts."
 			mechanisms: []
 			coverage: ""
 			partial:  false
@@ -364,14 +385,14 @@ mandate: #Mandate & {
 			slices: ["one"]
 		}
 		"14.5": {
-			requires: "Thresholds and periods live in configuration, are reported with every petition, and change only by the operator."
+			requires: "Thresholds and periods of articles 14 and 15 live in configuration, are reported with every petition, and change only by the operator."
 			mechanisms: []
 			coverage: ""
 			partial:  false
 			slices: ["one"]
 		}
 		"15.1": {
-			requires: "Every citation and every firing is recorded in the store with what cited it and when."
+			requires: "Every citation and every firing is recorded in the store with what cited it and when; a citation names a clause by number in a ruling, case, escalation, packet, petition or refusal, and a brief carrying the mandate whole cites nothing."
 			mechanisms: []
 			coverage: ""
 			partial:  false
@@ -397,6 +418,13 @@ mandate: #Mandate & {
 			coverage: "ci: check-names, check-comments, check-rules and check-config fail at zero files examined"
 			partial:  true
 			slices: ["zero", "one"]
+		}
+		"15.5": {
+			requires: "A firing is a run that refused, blocked, reported a defect or could not run; a run that found nothing is an examination with its count and does not count against dormancy."
+			mechanisms: []
+			coverage: ""
+			partial:  false
+			slices: ["one"]
 		}
 	}
 }
