@@ -1,11 +1,23 @@
+#![allow(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::exit,
+    reason = "xtask is a command line tool; its output and exit code are its interface"
+)]
+
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
-use std::process::{self, Command, ExitStatus};
+use std::io::{self, Read};
+use std::path::Path;
+use std::process::{self, Command, ExitStatus, Output};
 
 const TYPES: [&str; 11] = [
     "feat", "fix", "docs", "chore", "refactor", "test", "build", "ci", "perf", "style", "revert",
 ];
 const SUBJECT_MAX: usize = 72;
+const HOOK_INPUT_MAX_BYTES: u64 = 1 << 20;
+const HOOK_REPORT_MAX_LINES: usize = 40;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
@@ -47,7 +59,7 @@ fn check_subject(line: &str) -> Verdict {
     if subject.is_empty() {
         return Verdict::EmptySubject;
     }
-    if subject.chars().next().is_some_and(|c| c.is_uppercase()) {
+    if subject.chars().next().is_some_and(char::is_uppercase) {
         return Verdict::UppercaseSubject;
     }
     if subject.ends_with('.') {
@@ -89,7 +101,7 @@ fn check_commit_msg(path: &str) -> i32 {
         }
     };
     let line = first_non_comment_line(&text);
-    report("commit message", line, check_subject(line))
+    report("commit message", line, &check_subject(line))
 }
 
 fn pr_title_from_event() -> Option<String> {
@@ -104,21 +116,21 @@ fn pr_title_from_event() -> Option<String> {
 }
 
 fn check_pr_title(title: Option<String>) -> i32 {
-    match title {
-        Some(t) => report("pull request title", &t, check_subject(&t)),
-        None => {
+    title.map_or_else(
+        || {
             println!("xtask: no pull request title available; skipping the title check");
             0
-        }
-    }
+        },
+        |t| report("pull request title", &t, &check_subject(&t)),
+    )
 }
 
-fn report(what: &str, line: &str, verdict: Verdict) -> i32 {
-    if verdict == Verdict::Ok {
+fn report(what: &str, line: &str, verdict: &Verdict) -> i32 {
+    if *verdict == Verdict::Ok {
         println!("xtask: {what} ok: {line}");
         0
     } else {
-        eprintln!("xtask: {what} rejected: {line}\n  {}", explain(&verdict));
+        eprintln!("xtask: {what} rejected: {line}\n  {}", explain(verdict));
         1
     }
 }
@@ -163,20 +175,74 @@ fn ci() -> i32 {
     check_pr_title(pr_title_from_event())
 }
 
+fn capture(program: &str, args: &[&str]) -> Option<Output> {
+    Command::new(program).args(args).output().ok()
+}
+
+fn edited_rust_file() -> Option<String> {
+    let mut text = String::new();
+    io::stdin()
+        .take(HOOK_INPUT_MAX_BYTES)
+        .read_to_string(&mut text)
+        .ok()?;
+    let event: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let path = event.get("tool_input")?.get("file_path")?.as_str()?;
+    (Path::new(path).extension() == Some(OsStr::new("rs"))).then(|| path.to_string())
+}
+
+fn hook_post_tool_use() -> i32 {
+    let Some(path) = edited_rust_file() else {
+        return 0;
+    };
+    capture("cargo", &["fmt", "--", &path]);
+    let Some(output) = capture(
+        "cargo",
+        &[
+            "clippy",
+            "-q",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    ) else {
+        println!("xtask hook: clippy could not run");
+        return 0;
+    };
+    if output.status.success() {
+        println!("xtask hook: {path} formatted, clippy clean");
+        return 0;
+    }
+    let report = String::from_utf8_lossy(&output.stderr);
+    println!("xtask hook: clippy findings after editing {path}");
+    for line in report.lines().take(HOOK_REPORT_MAX_LINES) {
+        println!("{line}");
+    }
+    0
+}
+
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
-        Some("check-commit-msg") => match args.get(1) {
-            Some(path) => check_commit_msg(path),
-            None => {
+        Some("check-commit-msg") => args.get(1).map_or_else(
+            || {
                 eprintln!("usage: xtask check-commit-msg <file>");
                 2
-            }
-        },
+            },
+            |path| check_commit_msg(path),
+        ),
         Some("check-pr-title") => check_pr_title(args.get(1).cloned().or_else(pr_title_from_event)),
         Some("ci") => ci(),
+        Some("hook") if args.get(1).map(String::as_str) == Some("post-tool-use") => {
+            hook_post_tool_use()
+        }
+        Some("hook") => {
+            eprintln!("usage: xtask hook post-tool-use");
+            2
+        }
         _ => {
-            eprintln!("usage: xtask <check-commit-msg <file> | check-pr-title [title] | ci>");
+            eprintln!("usage: xtask <check-commit-msg <file> | check-pr-title [title] | ci | hook post-tool-use>");
             2
         }
     };
