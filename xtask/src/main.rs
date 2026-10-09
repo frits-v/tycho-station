@@ -135,7 +135,7 @@ fn run(program: &str, args: &[&str]) -> ExitStatus {
 }
 
 fn ci() -> i32 {
-    let steps: [(&str, &[&str]); 3] = [
+    let steps: [(&str, &[&str]); 5] = [
         ("cargo", &["fmt", "--all", "--", "--check"]),
         (
             "cargo",
@@ -149,6 +149,11 @@ fn ci() -> i32 {
             ],
         ),
         ("cargo", &["test", "--workspace"]),
+        (
+            "zizmor",
+            &["--pedantic", "--no-progress", ".github/workflows"],
+        ),
+        ("actionlint", &[]),
     ];
     for (program, args) in steps {
         if !run(program, args).success() {
