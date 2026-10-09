@@ -211,12 +211,13 @@ fn committing_worker(repository: PathBuf, checkout: PathBuf, acks: &Acks) -> Rec
     }))
 }
 
-/// Bytes Restate's journal holds per service, from `sys_journal.raw_length`.
+/// Bytes Restate's journal holds per service, from `sys_journal.raw_length`; the test's own
+/// `status` probes are left out.
 fn journal_bytes() -> (u64, u64) {
     let rows = admin_query(
         "SELECT i.target_service_name AS service, COUNT(*) AS entries, \
          SUM(j.raw_length) AS bytes FROM sys_journal j JOIN sys_invocation i ON j.id = i.id \
-         GROUP BY i.target_service_name",
+         WHERE i.target_handler_name <> 'status' GROUP BY i.target_service_name",
     );
     let (mut unit, mut reconciler) = (0_u64, 0_u64);
     for row in &rows {

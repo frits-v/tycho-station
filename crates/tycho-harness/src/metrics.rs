@@ -107,7 +107,7 @@ pub const METRIC_TABLE: [Metric; 12] = [
         measured_at: "store",
         target: "baseline, recorded in slice zero",
         measured_value: MeasuredValue::Recorded(
-            "15781 bytes over 103 entries for a one-task unit through a fixed gate, summed from sys_journal.raw_length across every invocation but the reconciler's",
+            "14721 bytes over 97 entries for a one-task unit through a fixed gate, summed from sys_journal.raw_length across every invocation but the reconciler's and status reads",
         ),
     },
     Metric {
@@ -116,7 +116,7 @@ pub const METRIC_TABLE: [Metric; 12] = [
         measured_at: "worktree clone",
         target: "baseline, recorded in slice zero",
         measured_value: MeasuredValue::Recorded(
-            "507 ms for the synthetic checkout (5 files, 21 symbols), a cold build through the graph port",
+            "252 to 507 ms over three cold builds of the synthetic checkout (5 files, 21 symbols) through the graph port",
         ),
     },
 ];
