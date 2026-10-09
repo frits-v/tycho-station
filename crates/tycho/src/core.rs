@@ -42,8 +42,7 @@ impl fmt::Display for StartReport {
     }
 }
 
-/// Starts whatever is missing, registers the endpoint, writes the operator secret if absent,
-/// and starts a reconciler tick chain, which ends any older chain.
+/// The watchdog's pass, the operator secret if absent, and a new reconciler tick chain.
 #[must_use]
 pub fn start(supervisor: &Supervisor, config: &CoreConfig) -> StartReport {
     let once = supervisor.once();

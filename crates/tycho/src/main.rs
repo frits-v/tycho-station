@@ -16,6 +16,7 @@ use tycho::config::{self, CoreConfig, ENDPOINT_PORT, PROBE_TIMEOUT, WATCHDOG_INT
 use tycho::epic_command::{self, OperatorAnswer};
 use tycho::http::Http;
 use tycho::launchd::Agent;
+use tycho::services::merge_gate::NoGate;
 use tycho::services::spawner::NoLauncher;
 use tycho::services::{Ports, Timing};
 use tycho::watchdog::{self, LoopEnd, Supervisor};
@@ -89,6 +90,7 @@ fn main() {
 fn serve_endpoint() -> i32 {
     let ports = Ports {
         spawner: Arc::new(NoLauncher),
+        merge_gate: Arc::new(NoGate),
         timing: Timing::default(),
         operator_secret: env::var_os(config::HOME_ENV)
             .map(|home| PathBuf::from(home).join(config::OPERATOR_SECRET_FILE)),

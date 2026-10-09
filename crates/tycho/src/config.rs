@@ -93,6 +93,12 @@ pub mod spine {
     pub const EPIC_UNITS_MAX: usize = 64;
     pub const EPIC_RESERVATIONS_MAX: usize = 64;
     pub const SPAWN_ARGV_MAX_ITEMS: usize = 64;
+    /// Full-slot answers a run accepts before it gives up; with the slot delay, about an hour.
+    pub const RESERVE_ROUNDS_MAX: u32 = 360;
+    /// Timer wakes one attempt watches through before it treats the session as stalled.
+    pub const WATCH_ROUNDS_MAX: u32 = 10_000;
+    /// Tasks one work unit's dispatch plan may name.
+    pub const PLAN_TASKS_MAX: usize = 16;
     /// Ledger limits `tycho epic start` gives a new epic: seat tokens and metered micro-dollars.
     pub const EPIC_SEAT_LIMIT_DEFAULT: u64 = 50_000_000;
     pub const EPIC_METERED_LIMIT_DEFAULT: u64 = 0;

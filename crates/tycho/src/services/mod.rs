@@ -8,6 +8,8 @@ pub mod reconciler;
 pub mod secret;
 pub mod session;
 pub mod spawner;
+pub mod work_unit;
+pub mod worker_run;
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -78,6 +80,7 @@ impl Timing {
 #[derive(Clone)]
 pub struct Ports {
     pub spawner: Arc<dyn Spawner>,
+    pub merge_gate: Arc<dyn merge_gate::MergeGate>,
     pub timing: Timing,
     /// The operator secret file; `None` refuses every operator call.
     pub operator_secret: Option<std::path::PathBuf>,
@@ -88,6 +91,7 @@ impl std::fmt::Debug for Ports {
         formatter
             .debug_struct("Ports")
             .field("spawner", &self.spawner.describe())
+            .field("merge_gate", &self.merge_gate.describe())
             .field("timing", &self.timing)
             .field("operator_secret", &self.operator_secret)
             .finish()
