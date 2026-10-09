@@ -19,6 +19,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use restate_sdk::prelude::{HandlerError, RunRetryPolicy, TerminalError};
 
 use crate::config_store::{FactoryConfig, Thresholds};
+use crate::vendors::control::SessionVendor;
 use spawner::Spawner;
 
 /// HTTP-style codes on terminal errors, so a caller can tell a refusal from a defect.
@@ -103,6 +104,8 @@ impl Timing {
 #[derive(Clone)]
 pub struct Ports {
     pub spawner: Arc<dyn Spawner>,
+    /// The control session vendor that builds commands and addresses running sessions.
+    pub vendor: Arc<dyn SessionVendor>,
     pub merge_gate: Arc<dyn merge_gate::MergeGate>,
     pub timing: Timing,
     /// Routing tables and thresholds, with the content hashes a unit records at its start.
@@ -120,6 +123,7 @@ impl std::fmt::Debug for Ports {
         formatter
             .debug_struct("Ports")
             .field("spawner", &self.spawner.describe())
+            .field("vendor", &self.vendor.describe())
             .field("merge_gate", &self.merge_gate.describe())
             .field("timing", &self.timing)
             .field("config", &self.config.hashes())

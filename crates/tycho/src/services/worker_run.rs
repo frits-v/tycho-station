@@ -25,6 +25,7 @@ use crate::services::reconciler::ReconcilerClient;
 use crate::services::session::{
     KillRequest, SessionClient, SessionView, SpawnOutcome, SpawnRequest,
 };
+use crate::services::spawner::SpawnTerminal;
 use crate::services::workers::{
     worker_command, WorkerCommand, WorkerEvidence, WorkerPorts, WorkerTaskRequest,
 };
@@ -666,6 +667,8 @@ impl WorkerRun {
             secret: session_secret,
             inbox_socket: None,
             resume_handle: resume_handle.clone(),
+            terminal: SpawnTerminal::Files,
+            working_dir: None,
         };
         let spawned = workflow_context
             .object_client::<SessionClient>(session.to_string())
@@ -994,6 +997,8 @@ mod tests {
             handoff_present: false,
             scrollback: None,
             awaiting_reap: false,
+            last_instruction: None,
+            release_error: None,
         }
     }
 

@@ -26,9 +26,9 @@ use crate::config::{
 };
 use crate::launch_spec::CORE_UID_ENV;
 use crate::launcher::{
-    check_tier, check_vendor, HeartbeatTarget, LaunchSpec, AGENT_TELEMETRY_ENV,
-    HEARTBEAT_TARGET_ENV, LEASE_FRESH_MS, SPEC_SCHEMA_VERSION, TIER_FLAG,
-    VENDOR_SANDBOX_SETTINGS_ENV,
+    check_tier, check_vendor, HeartbeatTarget, LaunchSpec, VendorTerminal, AGENT_TELEMETRY_ENV,
+    HEARTBEAT_TARGET_ENV, LEASE_FRESH_MS, SPEC_SCHEMA_VERSION, TIER_FLAG, VENDOR_DIR_ENV,
+    VENDOR_SANDBOX_SETTINGS_ENV, VENDOR_TERMINAL_ENV,
 };
 use crate::private_dir;
 use crate::process::now_unix_ms;
@@ -121,6 +121,9 @@ pub struct SpawnRequest<'a> {
     pub vendor: &'a [String],
     pub agent_uid: u32,
     pub tier: Option<&'a str>,
+    pub terminal: VendorTerminal,
+    /// The vendor's working directory; `None` keeps the zmx session's.
+    pub vendor_dir: Option<&'a Path>,
 }
 
 /// Splits a trailing `--tier <tier>` off the port's argv: the vendor command and the tier.
@@ -221,6 +224,15 @@ pub fn launch_spec(request: &SpawnRequest<'_>) -> Result<LaunchSpec, SpawnerErro
     let telemetry = AGENT_TELEMETRY_ENV.map(|(name, value)| (name, value.to_string()));
     for (name, value) in fixed.into_iter().chain(telemetry) {
         environment.insert(name.to_string(), value);
+    }
+    if request.terminal != VendorTerminal::Files {
+        environment.insert(
+            VENDOR_TERMINAL_ENV.to_string(),
+            request.terminal.as_wire().to_string(),
+        );
+    }
+    if let Some(dir) = request.vendor_dir {
+        environment.insert(VENDOR_DIR_ENV.to_string(), dir.display().to_string());
     }
     let spec = LaunchSpec {
         schema_version: SPEC_SCHEMA_VERSION,
@@ -368,9 +380,15 @@ pub fn save_scrollback(
     Ok(path)
 }
 
-/// Types one line into the session; zmx delivers it to the pty's stdin.
+/// The bytes `send_line` types: the text and the carriage return zmx does not add.
+#[must_use]
+pub fn typed_line(text: &ShortText) -> String {
+    format!("{}\r", text.as_str())
+}
+
+/// Types one line into the session and submits it; zmx delivers it to the pty's stdin.
 pub fn send_line(zmx: &Zmx, session: &SessionName, text: &ShortText) -> Result<(), SpawnerError> {
-    zmx.send(&session.to_string(), text.as_str())
+    zmx.send(&session.to_string(), &typed_line(text))
         .map_err(transient)
 }
 
@@ -459,6 +477,8 @@ mod tests {
             vendor: &vendor,
             agent_uid: current_uid(),
             tier: Some("t2"),
+            terminal: VendorTerminal::Files,
+            vendor_dir: None,
         };
         let session = SessionName::parse(NAME).unwrap();
         write_durable(
@@ -504,6 +524,8 @@ mod tests {
             vendor,
             agent_uid: current_uid(),
             tier: Some("t2"),
+            terminal: VendorTerminal::Files,
+            vendor_dir: None,
         }
     }
 
@@ -587,6 +609,31 @@ mod tests {
         ];
         assert_eq!(split_tier(&argv), (&argv[..1], Some("t3")));
         assert_eq!(split_tier(&argv[..1]), (&argv[..1], None));
+    }
+
+    #[test]
+    fn an_interactive_spec_names_its_terminal_and_directory() {
+        let dirs = AgentDirs::new(PathBuf::from("/a")).unwrap();
+        let zmx = Zmx::agent(Path::new("/z"), &dirs.socket_dir);
+        let env = env();
+        let vendor = ["/bin/sh".to_string()];
+        let headless = launch_spec(&shared_request(&dirs, &zmx, &env, &vendor)).unwrap();
+        assert!(!headless.environment.contains_key(VENDOR_TERMINAL_ENV));
+        assert!(!headless.environment.contains_key(VENDOR_DIR_ENV));
+        let interactive = SpawnRequest {
+            terminal: VendorTerminal::Inherit,
+            vendor_dir: Some(Path::new("/work/wu03")),
+            ..shared_request(&dirs, &zmx, &env, &vendor)
+        };
+        let spec = launch_spec(&interactive).unwrap();
+        assert_eq!(spec.environment[VENDOR_TERMINAL_ENV], "inherit");
+        assert_eq!(spec.environment[VENDOR_DIR_ENV], "/work/wu03");
+    }
+
+    #[test]
+    fn a_typed_line_is_submitted_with_a_carriage_return() {
+        let text = ShortText::parse("status?").unwrap();
+        assert_eq!(typed_line(&text), "status?\r");
     }
 
     #[test]

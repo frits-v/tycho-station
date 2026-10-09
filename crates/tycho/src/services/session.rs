@@ -17,14 +17,17 @@ use tycho_types::task_packet::AbsolutePath;
 
 use crate::config::spine;
 use crate::services::reconciler::{fingerprint, ExpectRequest, ReconcilerClient};
-use crate::services::spawner::{LeaseRead, SpawnSpec, Spawner};
+use crate::services::spawner::{LeaseRead, SpawnSpec, SpawnTerminal, Spawner};
 use crate::services::{
     blocking, refuse, secret, spawner_failure, wall_clock_unix_ms, Ports, Timing, CODE_BAD_REQUEST,
     CODE_CANCELLED, CODE_CONFLICT, CODE_FORBIDDEN, CODE_INTERNAL, CODE_NOT_FOUND,
 };
+use crate::vendors::control::{AddressTarget, Delivery, SessionVendor, VendorSessionId};
 
 const STATE_KEY: &str = "session";
 const SECRET_KEY: &str = "secret";
+/// Instructions remembered per session for deduplication by key; the oldest is dropped.
+pub const INSTRUCTIONS_KEPT_MAX: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +59,101 @@ pub struct SessionState {
     pub scrollback: Option<ShortText>,
     /// A lost session's zmx name still needs killing by name; its pid is never trusted.
     pub awaiting_reap: bool,
+    /// The last instructions, newest last, so a repeated key is answered without a re-post.
+    #[serde(default)]
+    pub instructions: Vec<InstructionRecord>,
+    /// Why the vendor port could not remove what it kept for the session once it ended.
+    #[serde(default)]
+    pub release_error: Option<String>,
+}
+
+/// Which way an instruction reached the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionPath {
+    /// Written to the vendor's per-session inbox socket.
+    Socket,
+    /// Left for the session's launcher, which posts it to the socket as the vendor user.
+    Relay,
+    /// Neither the socket nor the relay took it; instructions are never typed.
+    Refused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstructionRecord {
+    pub key: ShortText,
+    pub path: InstructionPath,
+    pub delivery: Delivery,
+}
+
+/// An instruction from a service: the session secret, an idempotency key, and the text.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InstructRequest {
+    pub secret: String,
+    pub key: ShortText,
+    pub text: ShortText,
+}
+
+impl fmt::Debug for InstructRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("InstructRequest")
+            .field("secret", &"redacted")
+            .field("key", &self.key)
+            .field("text", &self.text)
+            .finish()
+    }
+}
+
+#[must_use]
+pub const fn path_for(delivery: &Delivery) -> InstructionPath {
+    match delivery {
+        Delivery::Relayed { .. } => InstructionPath::Relay,
+        written if written.written() => InstructionPath::Socket,
+        _ => InstructionPath::Refused,
+    }
+}
+
+/// The record already kept for this key, if any.
+#[must_use]
+pub fn kept_instruction<'a>(
+    state: &'a SessionState,
+    key: &ShortText,
+) -> Option<&'a InstructionRecord> {
+    state.instructions.iter().find(|record| &record.key == key)
+}
+
+/// The state with the record kept, the oldest dropped, and the last socket observed.
+#[must_use]
+pub fn remember(state: &SessionState, record: InstructionRecord) -> SessionState {
+    let mut next = state.clone();
+    if let Delivery::Posted { socket } | Delivery::PostedUnclosed { socket } = &record.delivery {
+        if let Ok(path) = AbsolutePath::parse(socket) {
+            next.inbox_socket = Some(path);
+        }
+    }
+    next.instructions.push(record);
+    let excess = next
+        .instructions
+        .len()
+        .saturating_sub(INSTRUCTIONS_KEPT_MAX);
+    next.instructions.drain(..excess);
+    next
+}
+
+pub fn check_instruct(
+    state: &SessionState,
+    stored_secret: &str,
+    request: &InstructRequest,
+) -> Result<(), SessionError> {
+    if !secret::matches(stored_secret, &request.secret) {
+        return Err(SessionError::Secret);
+    }
+    if state.phase != SessionPhase::Running {
+        return Err(SessionError::Ended);
+    }
+    Ok(())
 }
 
 /// What `status` answers: no secret and no capability, so no awaitable id and no note content.
@@ -74,6 +172,10 @@ pub struct SessionView {
     pub handoff_present: bool,
     pub scrollback: Option<ShortText>,
     pub awaiting_reap: bool,
+    /// The last instruction's key, path and delivery, a refusal included.
+    pub last_instruction: Option<InstructionRecord>,
+    #[serde(default)]
+    pub release_error: Option<String>,
 }
 
 impl From<&SessionState> for SessionView {
@@ -92,6 +194,8 @@ impl From<&SessionState> for SessionView {
             handoff_present: state.handoff.is_some(),
             scrollback: state.scrollback.clone(),
             awaiting_reap: state.awaiting_reap,
+            last_instruction: state.instructions.last().cloned(),
+            release_error: state.release_error.clone(),
         }
     }
 }
@@ -127,6 +231,10 @@ pub struct SpawnRequest {
     pub secret: String,
     pub inbox_socket: Option<AbsolutePath>,
     pub resume_handle: Option<ShortText>,
+    #[serde(default)]
+    pub terminal: SpawnTerminal,
+    #[serde(default)]
+    pub working_dir: Option<AbsolutePath>,
 }
 
 impl fmt::Debug for SpawnRequest {
@@ -138,6 +246,8 @@ impl fmt::Debug for SpawnRequest {
             .field("secret", &"redacted")
             .field("inbox_socket", &self.inbox_socket)
             .field("resume_handle", &self.resume_handle)
+            .field("terminal", &self.terminal)
+            .field("working_dir", &self.working_dir)
             .finish()
     }
 }
@@ -302,6 +412,7 @@ struct LeaseObservation {
 
 pub struct Session {
     spawner: Arc<dyn Spawner>,
+    vendor: Arc<dyn SessionVendor>,
     timing: Timing,
 }
 
@@ -310,6 +421,7 @@ impl Session {
     pub fn new(ports: &Ports) -> Self {
         Self {
             spawner: Arc::clone(&ports.spawner),
+            vendor: Arc::clone(&ports.vendor),
             timing: ports.timing,
         }
     }
@@ -320,6 +432,7 @@ impl fmt::Debug for Session {
         formatter
             .debug_struct("Session")
             .field("spawner", &self.spawner.describe())
+            .field("vendor", &self.vendor.describe())
             .field("timing", &self.timing)
             .finish()
     }
@@ -430,6 +543,32 @@ impl Session {
         Ok(())
     }
 
+    /// Posts to the inbox or the relay and records the path; a repeated key returns its record.
+    #[handler(ingress_private)]
+    async fn instruct(
+        &self,
+        object_context: ObjectContext<'_>,
+        request: Json<InstructRequest>,
+    ) -> HandlerResult<Json<InstructionRecord>> {
+        let name = parse_key(object_context.key()).map_err(|error| terminal(&error))?;
+        let request = request.into_inner();
+        let (state, stored_secret) = load(&object_context).await?;
+        check_instruct(&state, &stored_secret, &request).map_err(|error| terminal(&error))?;
+        if let Some(record) = kept_instruction(&state, &request.key) {
+            return Ok(Json(record.clone()));
+        }
+        let delivery = self
+            .post_instruction(&object_context, &state, name, &request)
+            .await?;
+        let record = InstructionRecord {
+            key: request.key,
+            path: path_for(&delivery),
+            delivery,
+        };
+        object_context.set(STATE_KEY, Json(remember(&state, record.clone())));
+        Ok(Json(record))
+    }
+
     #[handler]
     async fn handoff(
         &self,
@@ -467,6 +606,7 @@ impl Session {
             .name("kill")
             .retry_policy(self.timing.port_retry())
             .await?;
+        state.release_error = self.release(&object_context, &name).await?;
         state.phase = SessionPhase::Killed;
         state.scrollback.clone_from(&scrollback);
         object_context.set(STATE_KEY, Json(state));
@@ -508,15 +648,17 @@ impl Session {
         let Some(state) = object_context.get::<Json<SessionState>>(STATE_KEY).await? else {
             return Ok(false);
         };
-        let Some(next) = reaped(&state.into_inner()) else {
+        let Some(mut next) = reaped(&state.into_inner()) else {
             return Ok(false);
         };
         let spawner = Arc::clone(&self.spawner);
+        let target = name.clone();
         object_context
-            .run(|| blocking(move || spawner.kill_by_name(&name).map_err(spawner_failure)))
+            .run(|| blocking(move || spawner.kill_by_name(&target).map_err(spawner_failure)))
             .name("reap")
             .retry_policy(self.timing.port_retry())
             .await?;
+        next.release_error = self.release(&object_context, &name).await?;
         object_context.set(STATE_KEY, Json(next));
         Ok(true)
     }
@@ -566,6 +708,8 @@ impl Session {
             SessionSecret::parse(&request.secret).map_err(|_| terminal(&SessionError::Secret))?;
         let spec = SpawnSpec {
             session: name.clone(),
+            terminal: request.terminal,
+            working_dir: request.working_dir.clone(),
             argv: request.argv.clone(),
             environment: LauncherEnv {
                 awaitable_id: request.awaitable_id.clone(),
@@ -585,6 +729,52 @@ impl Session {
             }
             HandlerError::from(error)
         })
+    }
+
+    /// One journaled post with one attempt: a second write could deliver the line twice.
+    async fn post_instruction(
+        &self,
+        object_context: &ObjectContext<'_>,
+        state: &SessionState,
+        session: SessionName,
+        request: &InstructRequest,
+    ) -> Result<Delivery, HandlerError> {
+        let Some(vendor_session) = state
+            .resume_handle
+            .as_ref()
+            .and_then(|handle| VendorSessionId::parse(handle.as_str()).ok())
+        else {
+            return Ok(Delivery::NoSession);
+        };
+        let vendor = Arc::clone(&self.vendor);
+        let target = AddressTarget {
+            session,
+            vendor_session,
+        };
+        let (key, text) = (request.key.clone(), request.text.clone());
+        let delivery = object_context
+            .run(|| blocking(move || Ok(Json(vendor.address(&target, &key, &text)))))
+            .name("instruct over the inbox")
+            .retry_policy(RunRetryPolicy::new().max_attempts(1))
+            .await?;
+        Ok(delivery.into_inner())
+    }
+
+    /// Removes the vendor port's files for the ended session; a failure is kept on the state
+    /// and never undoes the kill.
+    async fn release(
+        &self,
+        object_context: &ObjectContext<'_>,
+        name: &SessionName,
+    ) -> Result<Option<String>, HandlerError> {
+        let vendor = Arc::clone(&self.vendor);
+        let target = name.clone();
+        let released = object_context
+            .run(|| blocking(move || Ok(Json(vendor.release(&target).err()))))
+            .name("release")
+            .retry_policy(self.timing.port_retry())
+            .await?;
+        Ok(released.into_inner())
     }
 
     async fn save_scrollback(
@@ -635,6 +825,8 @@ pub fn spawn_record(
         handoff: None,
         scrollback: None,
         awaiting_reap: false,
+        instructions: Vec::new(),
+        release_error: None,
     };
     let expectation = ExpectRequest {
         session: name.clone(),
@@ -711,6 +903,8 @@ mod tests {
             handoff: None,
             scrollback: None,
             awaiting_reap: false,
+            instructions: Vec::new(),
+            release_error: None,
         }
     }
 
@@ -868,7 +1062,119 @@ mod tests {
             secret: the_secret(),
             inbox_socket: None,
             resume_handle: None,
+            terminal: SpawnTerminal::Files,
+            working_dir: None,
         }
+    }
+
+    fn instruct_request(secret: String, key: &str) -> InstructRequest {
+        InstructRequest {
+            secret,
+            key: ShortText::parse(key).unwrap(),
+            text: ShortText::parse("Task packet sha256:ab").unwrap(),
+        }
+    }
+
+    fn record(key: &str, delivery: Delivery) -> InstructionRecord {
+        InstructionRecord {
+            key: ShortText::parse(key).unwrap(),
+            path: path_for(&delivery),
+            delivery,
+        }
+    }
+
+    #[test]
+    fn an_instruction_needs_the_secret_and_a_running_session() {
+        let request = instruct_request(the_secret(), "wu03:packet:1");
+        assert_eq!(check_instruct(&running(), &the_secret(), &request), Ok(()));
+        let wrong = instruct_request("t".repeat(40), "wu03:packet:1");
+        assert_eq!(
+            check_instruct(&running(), &the_secret(), &wrong),
+            Err(SessionError::Secret)
+        );
+        let mut killed = running();
+        killed.phase = SessionPhase::Killed;
+        assert_eq!(
+            check_instruct(&killed, &the_secret(), &request),
+            Err(SessionError::Ended)
+        );
+        assert!(!format!("{request:?}").contains(&the_secret()));
+    }
+
+    #[test]
+    fn an_instruction_takes_the_socket_or_the_relay_and_is_never_typed() {
+        let socket = "/tmp/cc-socks/7.sock".to_string();
+        assert_eq!(
+            path_for(&Delivery::Posted {
+                socket: socket.clone()
+            }),
+            InstructionPath::Socket
+        );
+        assert_eq!(
+            path_for(&Delivery::Replied {
+                socket: socket.clone(),
+                reply: "?".to_string()
+            }),
+            InstructionPath::Socket
+        );
+        assert_eq!(
+            path_for(&Delivery::WriteInterrupted {
+                socket: socket.clone(),
+                sent: 3,
+                reason: "reset".to_string()
+            }),
+            InstructionPath::Socket
+        );
+        assert_eq!(
+            path_for(&Delivery::Relayed {
+                file: "a.json".to_string()
+            }),
+            InstructionPath::Relay
+        );
+        for unwritten in [
+            Delivery::NoSession,
+            Delivery::Denied {
+                socket: socket.clone(),
+            },
+            Delivery::Refused { socket },
+            Delivery::RelayFailed {
+                reason: "r".to_string(),
+            },
+        ] {
+            assert_eq!(path_for(&unwritten), InstructionPath::Refused);
+        }
+    }
+
+    #[test]
+    fn a_repeated_key_is_answered_from_the_record_and_the_kept_list_is_bounded() {
+        let socket = "/tmp/cc-socks/7.sock".to_string();
+        let posted = record(
+            "k0",
+            Delivery::Posted {
+                socket: socket.clone(),
+            },
+        );
+        let state = remember(&running(), posted.clone());
+        assert_eq!(kept_instruction(&state, &posted.key), Some(&posted));
+        assert_eq!(
+            state.inbox_socket.as_ref().map(AbsolutePath::as_str),
+            Some(socket.as_str())
+        );
+        let mut many = state;
+        for index in 1..=INSTRUCTIONS_KEPT_MAX {
+            many = remember(&many, record(&format!("k{index}"), Delivery::NoSession));
+        }
+        assert_eq!(many.instructions.len(), INSTRUCTIONS_KEPT_MAX);
+        assert_eq!(
+            kept_instruction(&many, &posted.key),
+            None,
+            "the oldest is dropped"
+        );
+        assert_eq!(
+            many.inbox_socket.as_ref().map(AbsolutePath::as_str),
+            Some(socket.as_str()),
+            "a refusal keeps the last observed socket"
+        );
     }
 
     #[test]

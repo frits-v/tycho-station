@@ -16,6 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal;
+use nix::unistd::{tcsetpgrp, Pid};
 use serde::{Deserialize, Serialize};
 use tycho_types::agent_call::{HeartbeatCall, CONTEXT_TOKENS_MAX};
 use tycho_types::exit::ExitState;
@@ -33,20 +34,25 @@ use crate::exit_decode::{
 };
 pub use crate::launch_spec::{
     check_tier, check_vendor, core_uid_from_environment, take_spec, HeartbeatTarget, LaunchSpec,
-    LauncherSettings, SettingsError, AGENT_TELEMETRY_ENV, HEARTBEAT_TARGET_ENV,
-    SPEC_SCHEMA_VERSION, TIER_FLAG, VENDOR_SANDBOX_SETTINGS_ENV,
+    LauncherSettings, SettingsError, VendorTerminal, AGENT_TELEMETRY_ENV, HEARTBEAT_TARGET_ENV,
+    SPEC_SCHEMA_VERSION, TIER_FLAG, VENDOR_DIR_ENV, VENDOR_SANDBOX_SETTINGS_ENV,
+    VENDOR_TERMINAL_ENV,
 };
 use crate::process::{now_unix_ms, send};
+use crate::relay::{relay_dir, relay_once};
 use crate::spool::{
     spool_then_deliver, write_spool, Ack, Delivery, HeartbeatSend, Ingress, SpoolRecord,
     SPOOL_FILE, SPOOL_SCHEMA_VERSION,
 };
+use crate::vendors::claude_control::socket_of_pid;
 use crate::zmx::Zmx;
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// Three missed heartbeats make a lease stale.
 pub const LEASE_FRESH_MS: u64 = 30_000;
 pub const SUPERVISE_POLL: Duration = Duration::from_millis(250);
+/// Supervise polls between relay polls: one relay poll a second, ten per heartbeat interval.
+pub const RELAY_POLL_EVERY: u32 = 4;
 pub const LOG_FILE_MAX_BYTES: u64 = 1024 * 1024;
 const SEQUENCE_FILE_MAX_BYTES: usize = 32;
 const TERM_GRACE_POLLS_MAX: u32 = 20;
@@ -375,15 +381,27 @@ impl<I: Ingress> Run<'_, I> {
         let environment = self
             .settings
             .vendor_environment(&self.files.progress, &self.files.result);
-        let mut command =
-            vendor_command(self.settings.session_leader.as_deref(), program, arguments);
-        let child = command
-            .env_clear()
-            .envs(environment)
-            .stdin(Stdio::null())
-            .stdout(create_new(&self.files.stdout)?)
-            .stderr(create_new(&self.files.stderr)?)
-            .spawn()?;
+        // An interactive vendor keeps the pty as its controlling terminal, which a new
+        // session would drop, so it runs in its own process group instead.
+        let leader = match self.settings.terminal {
+            VendorTerminal::Files => self.settings.session_leader.as_deref(),
+            VendorTerminal::Inherit => None,
+        };
+        let mut command = vendor_command(leader, program, arguments);
+        command.env_clear().envs(environment);
+        if let Some(dir) = &self.settings.vendor_dir {
+            command.current_dir(dir);
+        }
+        if self.settings.terminal == VendorTerminal::Files {
+            command
+                .stdin(Stdio::null())
+                .stdout(create_new(&self.files.stdout)?)
+                .stderr(create_new(&self.files.stderr)?);
+        }
+        let child = command.spawn()?;
+        if self.settings.terminal == VendorTerminal::Inherit {
+            self.hand_over_terminal(child.id());
+        }
         let record = VendorRecord {
             pid: child.id(),
             started_unix_ms: now_unix_ms(),
@@ -402,8 +420,58 @@ impl<I: Ingress> Run<'_, I> {
         Ok(child)
     }
 
+    /// Posts the instructions the core left in the relay directory to the vendor's inbox.
+    fn relay(&mut self, vendor_pid: u32) {
+        let (VendorTerminal::Inherit, Some(core_uid)) =
+            (self.settings.terminal, self.settings.core_uid)
+        else {
+            return;
+        };
+        let dir = relay_dir(&self.settings.dirs, &self.settings.env.session_name);
+        if !dir.exists() {
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME") else {
+            self.log.line("relay: HOME is not set");
+            return;
+        };
+        let config_dir = PathBuf::from(home).join(".claude");
+        let outcome = match socket_of_pid(&config_dir, vendor_pid) {
+            Ok(Some(socket)) => {
+                relay_once(&dir, core_uid, &self.settings.env.session_name, &socket)
+            }
+            Ok(None) => Ok(Vec::new()),
+            Err(reason) => Err(reason),
+        };
+        match outcome {
+            Ok(deliveries) => {
+                for delivery in deliveries {
+                    self.log.line(&format!("relay: {delivery:?}"));
+                }
+            }
+            Err(reason) => self.log.line(&format!("relay: {reason}")),
+        }
+    }
+
+    /// Makes the vendor's group the pty's foreground group so its reads are not stopped.
+    fn hand_over_terminal(&mut self, pid: u32) {
+        let Ok(raw) = i32::try_from(pid) else {
+            self.log.line(&format!("vendor pid {pid} is not a pid"));
+            return;
+        };
+        if let Err(error) = tcsetpgrp(io::stdin(), Pid::from_raw(raw)) {
+            self.log
+                .line(&format!("terminal not handed to the vendor: {error}"));
+        }
+        // A read that raced the hand-over was stopped with SIGTTIN.
+        if let Err(error) = send(pid, true, Signal::SIGCONT) {
+            self.log.line(&error);
+        }
+    }
+
     fn supervise(&mut self, child: &mut Child, stop_flag: &AtomicBool) -> (ChildEnd, Stop) {
         let mut last_beat: Option<Instant> = None;
+        let mut polls: u32 = 0;
         let started = Instant::now();
         let deadline = started
             .checked_add(self.settings.wall_clock)
@@ -429,6 +497,10 @@ impl<I: Ingress> Run<'_, I> {
             if last_beat.is_none_or(|beat| beat.elapsed() >= HEARTBEAT_INTERVAL) {
                 self.beat();
                 last_beat = Some(Instant::now());
+            }
+            polls = polls.wrapping_add(1);
+            if polls.is_multiple_of(RELAY_POLL_EVERY) {
+                self.relay(child.id());
             }
             thread::sleep(SUPERVISE_POLL);
         }

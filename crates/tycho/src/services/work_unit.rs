@@ -22,6 +22,7 @@ use crate::packets::{self, Blocker, PacketContext, PacketError};
 use crate::repositories::{pin_ref, unit_branch, RepositoryError, Worktree};
 use crate::services::epic::EpicClient;
 use crate::services::merge_gate::{Claim, GateError, GateVerdict, MergeGate, VerifyRequest};
+use crate::services::session::{InstructionPath, InstructionRecord};
 use crate::services::worker_run::{
     worker_key, WorkerRunClient, WorkerRunOutcome, WorkerRunRequest,
 };
@@ -33,6 +34,11 @@ use crate::services::{
     blocking, refuse, secret, Ports, Timing, CODE_BAD_REQUEST, CODE_CANCELLED, CODE_CONFLICT,
     CODE_FORBIDDEN, CODE_INTERNAL, CODE_NOT_FOUND,
 };
+use crate::vendors::control::SessionVendor;
+
+mod control;
+
+pub use control::ControlStart;
 
 const VIEW_KEY: &str = "view";
 const SECRET_KEY: &str = "control_secret";
@@ -159,6 +165,9 @@ pub struct WorkUnitRequest {
     pub epic: EpicId,
     pub control_vendor: Vendor,
     pub plan: Vec<PlannedTask>,
+    /// Set, the unit starts and instructs its control session; the plan still comes from here.
+    #[serde(default)]
+    pub control: Option<ControlStart>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,6 +202,9 @@ pub struct WorkUnitView {
     pub index: Vec<IndexRecord>,
     #[serde(default)]
     pub checkpoints: Vec<Checkpoint>,
+    /// How the task packet reference reached the control session, when the unit started one.
+    #[serde(default)]
+    pub control_delivery: Option<InstructionRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,12 +356,31 @@ pub fn backoff(timing: &Timing, attempt: Attempt) -> Duration {
         .min(timing.retry_backoff_max)
 }
 
-pub fn check_plan(request: &WorkUnitRequest) -> Result<(), String> {
+/// Why the unit cannot dispatch: no instruction reached its control session, so nothing
+/// would advise the run.
+#[must_use]
+pub fn control_refusal(record: &InstructionRecord) -> Option<String> {
+    (record.path == InstructionPath::Refused).then(|| {
+        format!(
+            "the control session did not receive the task packet: {:?}",
+            record.delivery
+        )
+    })
+}
+
+pub fn check_plan(request: &WorkUnitRequest, vendor: &dyn SessionVendor) -> Result<(), String> {
     let count = request.plan.len();
     if count == 0 || count > spine::PLAN_TASKS_MAX {
         return Err(format!(
             "the plan has {count} tasks; expected 1..={}",
             spine::PLAN_TASKS_MAX
+        ));
+    }
+    if request.control.is_some() && !vendor.serves(request.control_vendor) {
+        return Err(format!(
+            "{} does not run {:?} control sessions",
+            vendor.describe(),
+            request.control_vendor
         ));
     }
     Ok(())
@@ -433,6 +464,7 @@ fn failure(code: u16, message: impl Into<String>) -> TerminalError {
 
 pub struct WorkUnit {
     merge_gate: Arc<dyn MergeGate>,
+    vendor: Arc<dyn SessionVendor>,
     timing: Timing,
     config: Arc<FactoryConfig>,
     packet_dir: Option<PathBuf>,
@@ -444,6 +476,7 @@ impl WorkUnit {
     pub fn new(ports: &Ports) -> Self {
         Self {
             merge_gate: Arc::clone(&ports.merge_gate),
+            vendor: Arc::clone(&ports.vendor),
             timing: ports.timing,
             config: Arc::clone(&ports.config),
             packet_dir: ports.packet_dir.clone(),
@@ -457,6 +490,7 @@ impl fmt::Debug for WorkUnit {
         formatter
             .debug_struct("WorkUnit")
             .field("merge_gate", &self.merge_gate.describe())
+            .field("vendor", &self.vendor.describe())
             .field("timing", &self.timing)
             .field("config", &self.config.hashes())
             .field("packet_dir", &self.packet_dir)
@@ -507,7 +541,8 @@ impl WorkUnit {
         request: Json<WorkUnitRequest>,
     ) -> HandlerResult<Json<WorkUnitView>> {
         let request = request.into_inner();
-        check_plan(&request).map_err(|error| refuse(CODE_BAD_REQUEST, error))?;
+        check_plan(&request, self.vendor.as_ref())
+            .map_err(|error| refuse(CODE_BAD_REQUEST, error))?;
         let unit_id = WorkUnitId::parse(workflow_context.key())
             .map_err(|error| refuse(CODE_BAD_REQUEST, error.to_string()))?;
         let listed = workflow_context
@@ -664,6 +699,7 @@ impl WorkUnit {
                 worktree: None,
                 index: Vec::new(),
                 checkpoints: Vec::new(),
+                control_delivery: None,
             },
             timing: start.timing,
         };
@@ -680,6 +716,12 @@ impl WorkUnit {
         let cap = Attempt::new(unit.view.config.unit_attempt_cap)
             .map_err(|error| failure(CODE_INTERNAL, error.to_string()))?;
         let mut attempt = Attempt::FIRST;
+        if let Some(start) = &request.control {
+            if let Some(reason) = self.start_control(unit, unit_id, start).await? {
+                unit.view.reason = Some(reason);
+                return unit.step(Event::TerminalFailure);
+            }
+        }
         unit.step(Event::ChildClaimsLease)?;
         unit.step(Event::FirstStatus)?;
         for _ in 0..spine::UNIT_ROUNDS_MAX {
@@ -714,6 +756,29 @@ impl WorkUnit {
                 .map_err(|error| failure(CODE_BAD_REQUEST, error.to_string()))?;
         }
         Err(failure(CODE_INTERNAL, "the unit ran out of rounds"))
+    }
+
+    /// Starts and instructs the control session; `Some` is why the unit cannot dispatch.
+    async fn start_control(
+        &self,
+        unit: &mut Unit<'_>,
+        unit_id: &WorkUnitId,
+        start: &ControlStart,
+    ) -> Result<Option<String>, TerminalError> {
+        let session = SessionName::parse(&unit.view.control_session)
+            .map_err(|error| failure(CODE_INTERNAL, error.to_string()))?;
+        let record = control::start_control(
+            unit.workflow_context,
+            &self.vendor,
+            unit_id,
+            &session,
+            start,
+        )
+        .await?;
+        let refusal = control_refusal(&record);
+        unit.view.control_delivery = Some(record);
+        unit.save();
+        Ok(refusal)
     }
 
     fn after_criteria(
@@ -1386,18 +1451,44 @@ mod tests {
         }
     }
 
+    use crate::vendors::claude_control::ClaudeControl;
+    use crate::vendors::control::NoVendor;
+
     #[test]
     fn the_plan_is_bounded() {
         let mut request = WorkUnitRequest {
             epic: EpicId::parse("cf7a").unwrap(),
             control_vendor: Vendor::Codex,
             plan: Vec::new(),
+            control: None,
         };
-        assert!(check_plan(&request).is_err());
+        assert!(check_plan(&request, &NoVendor).is_err());
         request.plan = vec![planned(); spine::PLAN_TASKS_MAX];
-        assert!(check_plan(&request).is_ok());
+        assert!(check_plan(&request, &NoVendor).is_ok());
         request.plan.push(planned());
-        assert!(check_plan(&request).is_err());
+        assert!(check_plan(&request, &NoVendor).is_err());
+    }
+
+    #[test]
+    fn a_control_start_needs_a_port_that_runs_the_control_vendor() {
+        let mut request = WorkUnitRequest {
+            epic: EpicId::parse("cf7a").unwrap(),
+            control_vendor: Vendor::Codex,
+            plan: vec![planned()],
+            control: Some(
+                serde_json::from_str(r#"{"task_packet":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","model":"haiku","effort":"low","permission":"dont_ask","working_dir":"/w"}"#)
+                    .unwrap(),
+            ),
+        };
+        let claude = ClaudeControl::new("/c".into(), "/h".into());
+        let refused = check_plan(&request, &NoVendor).unwrap_err();
+        assert!(refused.contains("no vendor"), "{refused}");
+        assert!(
+            check_plan(&request, &claude).is_err(),
+            "claude does not run codex"
+        );
+        request.control_vendor = Vendor::Claude;
+        assert!(check_plan(&request, &claude).is_ok());
     }
 
     #[test]
@@ -1426,6 +1517,7 @@ mod tests {
             worktree: None,
             index: Vec::new(),
             checkpoints: Vec::new(),
+            control_delivery: None,
         }
     }
 
@@ -1503,6 +1595,30 @@ mod tests {
                 attempt: 3,
                 question: Question::Absent
             }
+        );
+    }
+
+    #[test]
+    fn only_a_refused_control_instruction_stops_the_unit() {
+        use crate::services::session::path_for;
+        use crate::vendors::control::Delivery;
+        let record = |delivery: Delivery| InstructionRecord {
+            key: ShortText::parse("wu01:task_packet:1").unwrap(),
+            path: path_for(&delivery),
+            delivery,
+        };
+        let socket = "/tmp/i.sock".to_string();
+        let refused = control_refusal(&record(Delivery::Refused {
+            socket: socket.clone(),
+        }));
+        assert!(refused.is_some_and(|reason| reason.contains("did not receive the task packet")));
+        assert!(control_refusal(&record(Delivery::NoSession)).is_some());
+        assert_eq!(control_refusal(&record(Delivery::Posted { socket })), None);
+        assert_eq!(
+            control_refusal(&record(Delivery::Relayed {
+                file: "a.json".to_string()
+            })),
+            None
         );
     }
 }

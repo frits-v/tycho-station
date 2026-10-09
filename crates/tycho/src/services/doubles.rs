@@ -1,13 +1,19 @@
-//! Test doubles for the spawner and merge gate ports, shared by unit and integration tests.
+//! Test doubles for the spawner, merge gate and control vendor ports, shared by unit and
+//! integration tests.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tycho_types::envelope::ShortText;
-use tycho_types::session::SessionName;
+use tycho_types::session::{SessionName, Vendor};
 
+use crate::launch_spec::VendorTerminal;
 use crate::services::merge_gate::{GateError, GateVerdict, MergeGate, VerifyRequest};
 use crate::services::spawner::{LeaseRead, SpawnSpec, Spawner, SpawnerError};
+use crate::vendors::control::{
+    AddressTarget, ContextReport, ControlCommand, ControlLaunch, Delivery, Observation,
+    SessionVendor, VendorError, VendorSessionId,
+};
 
 /// Called on every spawn with the spec and the pid it was given.
 pub type SpawnHook = Arc<dyn Fn(&SpawnSpec, u32) + Send + Sync>;
@@ -126,6 +132,121 @@ impl Spawner for RecordingSpawner {
     }
 }
 
+/// One `address` call the vendor double saw, with how many spawns the spawner had made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressCall {
+    pub session: String,
+    pub key: String,
+    pub instruction: String,
+    pub spawns_before: usize,
+}
+
+/// A Claude control vendor that records every address and answers it as posted, or as
+/// refused when built with `refusing`.
+#[derive(Clone)]
+pub struct RecordingVendor {
+    spawner: RecordingSpawner,
+    calls: Arc<Mutex<Vec<AddressCall>>>,
+    refuse: bool,
+}
+
+impl std::fmt::Debug for RecordingVendor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("RecordingVendor")
+    }
+}
+
+pub const DOUBLE_SOCKET: &str = "/tmp/cc-socks/double.sock";
+
+impl RecordingVendor {
+    #[must_use]
+    pub fn new(spawner: &RecordingSpawner) -> Self {
+        Self {
+            spawner: spawner.clone(),
+            calls: Arc::default(),
+            refuse: false,
+        }
+    }
+
+    #[must_use]
+    pub fn refusing(spawner: &RecordingSpawner) -> Self {
+        Self {
+            refuse: true,
+            ..Self::new(spawner)
+        }
+    }
+
+    #[must_use]
+    pub fn calls(&self) -> Vec<AddressCall> {
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl SessionVendor for RecordingVendor {
+    fn describe(&self) -> String {
+        "recording vendor double".to_string()
+    }
+
+    fn serves(&self, vendor: Vendor) -> bool {
+        vendor == Vendor::Claude
+    }
+
+    fn control_command(&self, launch: &ControlLaunch) -> Result<ControlCommand, VendorError> {
+        Ok(ControlCommand {
+            argv: vec![
+                "claude-double".to_string(),
+                "--session-id".to_string(),
+                launch.vendor_session.as_str().to_string(),
+            ],
+            terminal: VendorTerminal::Inherit,
+            working_dir: launch.working_dir.as_str().into(),
+        })
+    }
+
+    fn address(
+        &self,
+        target: &AddressTarget,
+        key: &ShortText,
+        instruction: &ShortText,
+    ) -> Delivery {
+        let call = AddressCall {
+            session: target.session.to_string(),
+            key: key.to_string(),
+            instruction: instruction.to_string(),
+            spawns_before: self.spawner.log().spawned.len(),
+        };
+        self.calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(call);
+        let socket = DOUBLE_SOCKET.to_string();
+        if self.refuse {
+            Delivery::Refused { socket }
+        } else {
+            Delivery::Posted { socket }
+        }
+    }
+
+    fn observe(&self, _session: &VendorSessionId) -> Observation {
+        Observation::Idle { pid: FIRST_PID }
+    }
+
+    fn resume_handle(&self, session: &VendorSessionId) -> Result<ShortText, VendorError> {
+        ShortText::parse(session.as_str()).map_err(|error| VendorError::Argument(error.to_string()))
+    }
+
+    fn context_size(&self, _session: &VendorSessionId) -> ContextReport {
+        ContextReport::NoTurnYet
+    }
+
+    fn release(&self, _session: &SessionName) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 /// Answers every verify with the same verdict and records the requests.
 #[derive(Debug, Clone)]
 pub struct FixedGate {
@@ -168,6 +289,7 @@ impl MergeGate for FixedGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::spawner::SpawnTerminal;
     use std::sync::atomic::{AtomicU32, Ordering};
     use tycho_types::envelope::{BranchName, CommitSha};
     use tycho_types::launcher::{AwaitableId, LauncherEnv, SessionSecret};
@@ -186,6 +308,8 @@ mod tests {
                 session_secret: SessionSecret::parse(&"s".repeat(40)).unwrap(),
                 session_name: session(),
             },
+            terminal: SpawnTerminal::Files,
+            working_dir: None,
         }
     }
 

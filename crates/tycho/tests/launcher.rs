@@ -31,7 +31,7 @@ use tycho::health::{self, Health};
 use tycho::http::Http;
 use tycho::kill::{kill_session, KillRefusal, KillRequest, KillVerdict};
 use tycho::launch_probe::{LaunchProbe, REJECTED_PREFIX, RESOLVED_PREFIX};
-use tycho::launcher::HeartbeatTarget;
+use tycho::launcher::{HeartbeatTarget, VendorTerminal};
 use tycho::launcher::{SessionFiles, VendorRecord, HEARTBEAT_INTERVAL, LEASE_FRESH_MS};
 use tycho::process::now_unix_ms;
 use tycho::services::spawner::LeaseRead;
@@ -199,6 +199,8 @@ impl Harness {
             vendor: &vendor,
             agent_uid: current_uid(),
             tier: Some("t1"),
+            terminal: VendorTerminal::Files,
+            vendor_dir: None,
         })
         .unwrap();
         println!("evidence: spawn_session({name}) -> {outcome:?}");
