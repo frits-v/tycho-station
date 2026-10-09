@@ -11,7 +11,8 @@ use tycho_types::session::Vendor;
 use tycho_types::task_packet::Effort;
 
 use crate::vendors::worker::{
-    vendor_word, Stream, VendorEnd, VersionState, WorkerError, WorkerTask, WorkerVendor,
+    vendor_word, CommandRefusal, Stream, VendorEnd, VersionState, WorkerError, WorkerTask,
+    WorkerVendor,
 };
 
 pub const CODEX_PINNED_VERSION: &str = "0.160.1";
@@ -148,11 +149,14 @@ impl WorkerVendor for CodexWorker {
         CODEX_PINNED_VERSION
     }
 
-    /// `codex exec` has no turn cap, so a task that names one is refused rather than run
-    /// uncapped; the brief arrives on stdin through the `-` prompt.
+    /// `codex exec` has no turn cap and cannot commit under its sandbox, so a task that names a
+    /// cap or needs a commit is refused; the brief arrives on stdin through the `-` prompt.
     fn command(&self, binary: &Path, task: &WorkerTask) -> Result<Vec<String>, WorkerError> {
+        if task.requires_commit {
+            return Err(WorkerError::Unsupported(CommandRefusal::CannotCommit));
+        }
         if task.max_turns.is_some() {
-            return Err(WorkerError::Unsupported("codex exec has no turn cap"));
+            return Err(WorkerError::Unsupported(CommandRefusal::NoTurnCap));
         }
         let effort = format!("model_reasoning_effort=\"{}\"", effort_value(task.effort));
         Ok([
@@ -243,6 +247,7 @@ mod tests {
             model: ModelName::parse("gpt-5-codex-mini").unwrap(),
             effort: Effort::Max,
             max_turns: max_turns.and_then(NonZeroU16::new),
+            requires_commit: false,
             session_id: VendorSessionId::parse("3f0c6c1e-6b1a-4a51-9a0e-2a8c5d0c1a10").unwrap(),
             settings: "{}".to_string(),
             output_schema: PathBuf::from("/spool/output-schema.json"),
@@ -266,7 +271,19 @@ mod tests {
     fn a_turn_cap_is_refused_not_dropped() {
         assert_eq!(
             CodexWorker.command(Path::new("/c"), &task(Some(6))),
-            Err(WorkerError::Unsupported("codex exec has no turn cap"))
+            Err(WorkerError::Unsupported(CommandRefusal::NoTurnCap))
+        );
+    }
+
+    #[test]
+    fn a_task_that_must_commit_is_refused() {
+        let committing = WorkerTask {
+            requires_commit: true,
+            ..task(None)
+        };
+        assert_eq!(
+            CodexWorker.command(Path::new("/c"), &committing),
+            Err(WorkerError::Unsupported(CommandRefusal::CannotCommit))
         );
     }
 

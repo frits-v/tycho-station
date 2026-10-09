@@ -30,10 +30,32 @@ pub const WORD_LOGIN_REQUIRED: &str = "vendor_login_required";
 pub const WORD_NO_RESULT: &str = "vendor_no_result";
 pub const WORD_RESULT_PREFIX: &str = "vendor_result_";
 
+/// Why an adapter will not build a command for a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandRefusal {
+    /// `codex exec` has no turn cap; a capped task would run uncapped.
+    NoTurnCap,
+    /// `codex exec --sandbox workspace-write` leaves `.git` read-only, so the worker cannot
+    /// commit; the factory does not commit on its behalf.
+    CannotCommit,
+    /// No headless adapter exists for the vendor.
+    NoAdapter,
+}
+
+impl fmt::Display for CommandRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NoTurnCap => "codex exec has no turn cap",
+            Self::CannotCommit => "codex exec cannot commit under its workspace-write sandbox",
+            Self::NoAdapter => "no headless adapter for this vendor",
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerError {
     Argument(String),
-    Unsupported(&'static str),
+    Unsupported(CommandRefusal),
 }
 
 impl fmt::Display for WorkerError {
@@ -171,6 +193,8 @@ pub struct WorkerTask {
     pub model: ModelName,
     pub effort: Effort,
     pub max_turns: Option<NonZeroU16>,
+    /// Whether the task's result is a commit on the worktree's branch.
+    pub requires_commit: bool,
     pub session_id: VendorSessionId,
     /// The sandbox settings JSON the launcher hands the vendor.
     pub settings: String,

@@ -28,8 +28,8 @@ use crate::process::{now_unix_ms, send};
 use crate::vendors::claude_worker::ClaudeWorker;
 use crate::vendors::codex_worker::{CodexWorker, CODEX_OUTPUT_SCHEMA};
 use crate::vendors::worker::{
-    outcome, state_word, Refusal, Stream, VersionState, WorkerArgs, WorkerError, WorkerTask,
-    WorkerVendor, EVENT_LINE_MAX_BYTES, WORD_VERSION_MISMATCH,
+    outcome, state_word, CommandRefusal, Refusal, Stream, VersionState, WorkerArgs, WorkerError,
+    WorkerTask, WorkerVendor, EVENT_LINE_MAX_BYTES, WORD_VERSION_MISMATCH,
 };
 
 /// Event lines one run may produce; the launcher's output cap usually ends it first.
@@ -316,9 +316,7 @@ pub fn run(
     let parsed = WorkerArgs::parse(words).and_then(|args| {
         adapter(args.vendor)
             .map(|vendor| (args, vendor))
-            .ok_or(WorkerError::Unsupported(
-                "no headless adapter for this vendor",
-            ))
+            .ok_or(WorkerError::Unsupported(CommandRefusal::NoAdapter))
     });
     let (args, vendor) = match parsed {
         Ok(parsed) => parsed,
@@ -370,6 +368,8 @@ fn prepare_command(vendor: &dyn WorkerVendor, run: &Prepared<'_>) -> Result<Vec<
         model: run.args.model.clone(),
         effort: run.args.effort,
         max_turns: run.args.max_turns,
+        // The result is the branch head, so every headless task commits.
+        requires_commit: true,
         session_id: run.args.session_id.clone(),
         settings: run.environment.settings.clone(),
         output_schema: schema,
