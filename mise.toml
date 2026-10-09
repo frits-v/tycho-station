@@ -21,6 +21,10 @@ run = "cargo run -q -p xtask -- ci"
 description = "Render figures/ with cue and stencil into docs/figures and the design page"
 run = "cargo run -q -p xtask -- render-figures"
 
+[tasks.config-export]
+description = "Vet the CUE configuration and schemas, then write config/export"
+run = "cargo run -q -p xtask -- config-export"
+
 [tasks.check-commit]
 description = "Check one commit message file against the conventional commit grammar"
 run = "cargo run -q -p xtask -- check-commit-msg"

@@ -1195,7 +1195,7 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
   <li>Slot counters per level on the epic object, starting at two control sessions and two workers each, plus a cap on concurrent sessions per seat account. One serialized build-and-verify lane per work unit. Each unit has a cost and wall-clock budget that hard-stops it; the budget is settled on every exit, including cancel and T2 kill, at the larger of the reservation and the observed usage, and each vendor account carries its own spend limit as the outer wall.</li>
   <li>Two ledgers: seat capacity and metered dollars. Metered vendors are a routing target with their own ceiling, not an overflow that happens by accident when a seat runs dry.</li>
   <li>Retry backoff starts at ten seconds doubling to a five-minute cap, set as the step's retry policy, which covers the spawn only; agent retries are workflow logic with a per-class attempt cap. First stall timer at five minutes of silence. All numbers are placeholders until the harness sets them.</li>
-  <li>Prompts, routing tables and hook definitions are content-hashed files that a journaled step reads at the start of a unit, so a unit keeps the versions it started with and a prompt edit does not require a new deployment. Service code changes still deploy as a new Restate version, with the old endpoint kept running under zmx until its invocations drain.</li>
+  <li>Prompts, routing tables and hook definitions are content-hashed files that a journaled step reads at the start of a unit, so a unit keeps the versions it started with and a prompt edit does not require a new deployment. Service code changes still deploy as a new Restate version, with the old endpoint kept running under zmx until its invocations drain. The routing tables and thresholds are authored in CUE under <code>config/</code> and read from the exports in <code>config/export</code>, each beside its SHA-256.</li>
 </ul>
 
 <h3>Merge gate</h3>
@@ -1820,7 +1820,7 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
 </table></div>
 
 <h3 id="mandate-map">Mandate articles and their mechanisms</h3>
-<p>Article 13.2 requires every mechanism to name the article it enforces, and every article without one to be listed in the design until a mechanism closes it. The map is authored in CUE with the rest of the configuration (<a href="#s17">section 17</a>).</p>
+<p>Article 13.2 requires every mechanism to name the article it enforces, and every article without one to be listed in the design until a mechanism closes it. The map is authored in CUE with the rest of the configuration (<a href="#s17">section 17</a>): <code>config/mandate.cue</code> is the source, which derives each clause's status and record from the mechanism table, and the tables below are its rendering, regenerated from the export by a later change.</p>
 <ul>
   <li>A mechanism is listed when something runs it on the default branch, or an open pull request adds it, and it refuses or reports a breach of the clause's text. Code that only tests call is a building block: the gap list names it, and it does not count.</li>
   <li>Partial means the mechanism covers part of the clause, or covers it for this repository only; the rest stays in the gap list. Pending means the mechanism is in an open pull request.</li>

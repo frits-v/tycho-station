@@ -1,0 +1,291 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+        "AbsolutePath": {
+            "type": "string",
+            "$ref": "#/$defs/Text",
+            "maxLength": 1024,
+            "not": {
+                "pattern": "//|/$|/\\.\\.?(/|$)"
+            },
+            "pattern": "^/"
+        },
+        "Boundaries": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "branch": {
+                    "$ref": "#/$defs/BranchName"
+                },
+                "forbidden_actions": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/ShortText"
+                    },
+                    "maxItems": 64
+                },
+                "worktree": {
+                    "$ref": "#/$defs/AbsolutePath"
+                },
+                "writable_paths": {
+                    "type": "array",
+                    "items": {
+                        "$ref": "#/$defs/RelativePath"
+                    },
+                    "maxItems": 64
+                }
+            },
+            "required": [
+                "branch",
+                "forbidden_actions",
+                "worktree",
+                "writable_paths"
+            ]
+        },
+        "BranchName": {
+            "type": "string",
+            "description": "A portable subset of git check-ref-format: no leading dash, no trailing dot, no `..`,\nno empty component, no component starting with a dot or ending in `.lock`.",
+            "maxLength": 128,
+            "not": {
+                "pattern": "^-|\\.$|\\.\\.|^/|//|/$|(^|/)\\.|\\.[lL][oO][cC][kK](/|$)"
+            },
+            "pattern": "^[A-Za-z0-9._/-]+$"
+        },
+        "Budget": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "tokens_max": {
+                    "allOf": [
+                        {
+                            "type": "number"
+                        },
+                        {
+                            "type": "integer",
+                            "maximum": 5E+7,
+                            "minimum": 1
+                        }
+                    ]
+                },
+                "wall_clock_max_ms": {
+                    "allOf": [
+                        {
+                            "type": "number"
+                        },
+                        {
+                            "type": "integer",
+                            "maximum": 8.64E+7,
+                            "minimum": 1
+                        }
+                    ]
+                }
+            },
+            "required": [
+                "tokens_max",
+                "wall_clock_max_ms"
+            ]
+        },
+        "ContentRef": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "DoneCriterion": {
+            "anyOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "command": {
+                            "$ref": "#/$defs/ShortText"
+                        },
+                        "expected_exit": {
+                            "$ref": "#/$defs/U8"
+                        },
+                        "kind": {
+                            "const": "command"
+                        }
+                    },
+                    "required": [
+                        "command",
+                        "expected_exit",
+                        "kind"
+                    ]
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "kind": {
+                            "const": "file_present"
+                        },
+                        "path": {
+                            "$ref": "#/$defs/RelativePath"
+                        }
+                    },
+                    "required": [
+                        "kind",
+                        "path"
+                    ]
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "kind": {
+                            "const": "file_absent"
+                        },
+                        "path": {
+                            "$ref": "#/$defs/RelativePath"
+                        }
+                    },
+                    "required": [
+                        "kind",
+                        "path"
+                    ]
+                }
+            ]
+        },
+        "Effort": {
+            "enum": [
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "max"
+            ]
+        },
+        "RelativePath": {
+            "type": "string",
+            "$ref": "#/$defs/Text",
+            "maxLength": 1024,
+            "not": {
+                "pattern": "^[/-]|//|/$|(^|/)\\.\\.?(/|$)"
+            }
+        },
+        "Routing": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "binding": {
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/Vendor"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "class": {
+                    "$ref": "#/$defs/RoutingName"
+                },
+                "effort": {
+                    "$ref": "#/$defs/Effort"
+                },
+                "fallback_tier": {
+                    "anyOf": [
+                        {
+                            "$ref": "#/$defs/RoutingName"
+                        },
+                        {
+                            "type": "null"
+                        }
+                    ]
+                },
+                "rationale": {
+                    "$ref": "#/$defs/ShortText"
+                },
+                "tier": {
+                    "$ref": "#/$defs/RoutingName"
+                }
+            },
+            "required": [
+                "class",
+                "effort",
+                "rationale",
+                "tier"
+            ]
+        },
+        "RoutingName": {
+            "$ref": "#/$defs/Slug32"
+        },
+        "ShortText": {
+            "type": "string",
+            "$ref": "#/$defs/Text",
+            "maxLength": 512
+        },
+        "Slug32": {
+            "type": "string",
+            "maxLength": 32,
+            "pattern": "^[a-z0-9][a-z0-9-]*$"
+        },
+        "Text": {
+            "type": "string",
+            "description": "No control characters (Unicode category Cc), so text cannot carry terminal escapes.",
+            "pattern": "^[^\\x00-\\x1f\\x7f-\\x9f]+$"
+        },
+        "U8": {
+            "allOf": [
+                {
+                    "type": "number"
+                },
+                {
+                    "type": "integer",
+                    "maximum": 255,
+                    "minimum": 0
+                }
+            ]
+        },
+        "Vendor": {
+            "enum": [
+                "claude",
+                "codex",
+                "antigravity",
+                "amp",
+                "opencode"
+            ]
+        }
+    },
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+        "boundaries": {
+            "$ref": "#/$defs/Boundaries"
+        },
+        "budget": {
+            "$ref": "#/$defs/Budget"
+        },
+        "done_criteria": {
+            "type": "array",
+            "items": {
+                "$ref": "#/$defs/DoneCriterion"
+            },
+            "maxItems": 64
+        },
+        "inputs": {
+            "type": "array",
+            "items": {
+                "$ref": "#/$defs/ContentRef"
+            },
+            "maxItems": 64
+        },
+        "objective": {
+            "$ref": "#/$defs/ContentRef"
+        },
+        "result_schema": {
+            "$ref": "#/$defs/ContentRef"
+        },
+        "routing": {
+            "$ref": "#/$defs/Routing"
+        }
+    },
+    "required": [
+        "boundaries",
+        "budget",
+        "done_criteria",
+        "inputs",
+        "objective",
+        "result_schema",
+        "routing"
+    ]
+}

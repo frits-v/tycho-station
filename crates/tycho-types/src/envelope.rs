@@ -494,6 +494,8 @@ mod tests {
     use super::*;
     use crate::task_packet::{BUDGET_TOKENS_MAX_COUNT, BUDGET_WALL_CLOCK_MAX_MS, PATHS_MAX_ITEMS};
 
+    mod schema;
+
     fn digest(fill: char) -> String {
         format!("sha256:{}", fill.to_string().repeat(64))
     }
