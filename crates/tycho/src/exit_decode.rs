@@ -35,6 +35,7 @@ pub struct ProgressFile {
     pub context_tokens: Option<u64>,
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    pub cost_micro_dollars: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +103,8 @@ pub fn status_payload(
         usage: Usage {
             input_tokens: file.input_tokens.unwrap_or(0),
             output_tokens: file.output_tokens.unwrap_or(0),
+            // A seat-billed vendor reports no cost, so an absent field is zero spend.
+            cost_micro_dollars: file.cost_micro_dollars.unwrap_or(0),
         },
         blockers: Vec::new(),
     };

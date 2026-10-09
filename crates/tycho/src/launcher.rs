@@ -4,7 +4,6 @@
 //! bounded files, heartbeats, decodes the exit, spools the result, delivers it, and ends its
 //! own zmx session.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -19,26 +18,27 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::Signal;
 use serde::{Deserialize, Serialize};
 use tycho_types::agent_call::{HeartbeatCall, CONTEXT_TOKENS_MAX};
-use tycho_types::launcher::{
-    EnvError, IdempotencyKey, LauncherEnv, ENV_AWAITABLE_ID, ENV_SESSION_SECRET,
-    ENV_VALUE_MAX_BYTES, SEQUENCE_MAX,
-};
+use tycho_types::exit::ExitState;
+use tycho_types::launcher::{AwaitableDigest, IdempotencyKey, SEQUENCE_MAX};
 use tycho_types::lease::Lease;
-use tycho_types::service::Service;
 use tycho_types::session::SessionName;
 
 use crate::agent_files::{
     create_new, current_uid, ensure_private_dir, open_append, read_checked, write_durable,
 };
-use crate::config::{AgentDirs, AGENT_DIR_ENV, ZMX_ENV};
+use crate::config::AgentDirs;
 use crate::exit_decode::{
     decode_exit, read_progress, read_result_file, status_payload, ChildEnd, Decoded, Stop,
 };
-use crate::launch_probe::LAUNCH_PROBE_SERVICE;
+pub use crate::launch_spec::{
+    check_tier, check_vendor, core_uid_from_environment, take_spec, HeartbeatTarget, LaunchSpec,
+    LauncherSettings, SettingsError, AGENT_TELEMETRY_ENV, HEARTBEAT_TARGET_ENV,
+    SPEC_SCHEMA_VERSION, TIER_FLAG, VENDOR_SANDBOX_SETTINGS_ENV,
+};
 use crate::process::{now_unix_ms, send};
 use crate::spool::{
-    spool_then_deliver, Ack, Delivery, HeartbeatSend, Ingress, SpoolRecord, SPOOL_FILE,
-    SPOOL_SCHEMA_VERSION,
+    spool_then_deliver, write_spool, Ack, Delivery, HeartbeatSend, Ingress, SpoolRecord,
+    SPOOL_FILE, SPOOL_SCHEMA_VERSION,
 };
 use crate::zmx::Zmx;
 
@@ -46,211 +46,12 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 /// Three missed heartbeats make a lease stale.
 pub const LEASE_FRESH_MS: u64 = 30_000;
 pub const SUPERVISE_POLL: Duration = Duration::from_millis(250);
-pub const WALL_CLOCK_MAX: Duration = Duration::from_secs(86_400);
-const SUPERVISE_POLLS_MAX: u64 = 345_600;
-pub const OUTPUT_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const LOG_FILE_MAX_BYTES: u64 = 1024 * 1024;
 const SEQUENCE_FILE_MAX_BYTES: usize = 32;
 const TERM_GRACE_POLLS_MAX: u32 = 20;
-pub const HEARTBEAT_TARGET_ENV: &str = "TYCHO_HEARTBEAT_TARGET";
-pub const PROGRESS_FILE_ENV: &str = "TYCHO_PROGRESS_FILE";
-pub const RESULT_FILE_ENV: &str = "TYCHO_RESULT_FILE";
-pub const SPOOL_DIR_ENV: &str = "TYCHO_SPOOL_DIR";
-pub const VENDOR_ARGS_MAX: usize = 64;
-pub const VENDOR_ARG_MAX_BYTES: usize = 4096;
 pub const EXIT_ACKNOWLEDGED: i32 = 0;
 pub const EXIT_UNDELIVERED: i32 = 1;
 pub const EXIT_REFUSED_TO_START: i32 = 2;
-
-/// Where heartbeats go; anything other than these two names is refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HeartbeatTarget {
-    Session,
-    /// The launcher tests' stand-in, bound in the endpoint beside the services.
-    LaunchProbe,
-}
-
-impl HeartbeatTarget {
-    #[must_use]
-    pub const fn as_wire(self) -> &'static str {
-        match self {
-            Self::Session => "session",
-            Self::LaunchProbe => "launch_probe",
-        }
-    }
-
-    #[must_use]
-    pub const fn service(self) -> &'static str {
-        match self {
-            Self::Session => Service::Session.name(),
-            Self::LaunchProbe => LAUNCH_PROBE_SERVICE,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum SettingsError {
-    Env(EnvError),
-    Missing(&'static str),
-    TooLong(&'static str),
-    NotAbsolute(&'static str),
-    HeartbeatTarget,
-    VendorArguments(String),
-    Spec(String),
-}
-
-impl fmt::Display for SettingsError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Env(error) => write!(formatter, "{error}"),
-            Self::Missing(name) => write!(formatter, "{name} is not set"),
-            Self::TooLong(name) => {
-                write!(formatter, "{name} exceeds {ENV_VALUE_MAX_BYTES} bytes")
-            }
-            Self::NotAbsolute(name) => write!(formatter, "{name} is not an absolute path"),
-            Self::HeartbeatTarget => write!(
-                formatter,
-                "{HEARTBEAT_TARGET_ENV} is neither `session` nor `launch_probe`"
-            ),
-            Self::VendorArguments(reason) => write!(formatter, "vendor command: {reason}"),
-            Self::Spec(reason) => write!(formatter, "launch spec: {reason}"),
-        }
-    }
-}
-
-/// Everything the launcher reads from its environment, parsed before anything runs.
-#[derive(Debug, Clone)]
-pub struct LauncherSettings {
-    pub env: LauncherEnv,
-    pub dirs: AgentDirs,
-    pub zmx: PathBuf,
-    pub heartbeat: HeartbeatTarget,
-    /// Every pair besides the awaitable id and the secret, which the vendor never sees.
-    pub vendor_env: Vec<(String, String)>,
-}
-
-fn absolute(
-    environment: &BTreeMap<String, String>,
-    name: &'static str,
-) -> Result<PathBuf, SettingsError> {
-    let value = environment.get(name).ok_or(SettingsError::Missing(name))?;
-    if value.len() > ENV_VALUE_MAX_BYTES {
-        return Err(SettingsError::TooLong(name));
-    }
-    let path = PathBuf::from(value);
-    if !path.is_absolute() {
-        return Err(SettingsError::NotAbsolute(name));
-    }
-    Ok(path)
-}
-
-impl LauncherSettings {
-    pub fn from_map(environment: &BTreeMap<String, String>) -> Result<Self, SettingsError> {
-        let env = LauncherEnv::from_map(environment).map_err(SettingsError::Env)?;
-        let dirs = AgentDirs::new(absolute(environment, AGENT_DIR_ENV)?)
-            .map_err(|_| SettingsError::NotAbsolute(AGENT_DIR_ENV))?;
-        let zmx = absolute(environment, ZMX_ENV)?;
-        let heartbeat = match environment.get(HEARTBEAT_TARGET_ENV).map(String::as_str) {
-            None | Some("session") => HeartbeatTarget::Session,
-            Some("launch_probe") => HeartbeatTarget::LaunchProbe,
-            Some(_) => return Err(SettingsError::HeartbeatTarget),
-        };
-        let vendor_env = environment
-            .iter()
-            .filter(|(name, _)| *name != ENV_AWAITABLE_ID && *name != ENV_SESSION_SECRET)
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
-        Ok(Self {
-            env,
-            dirs,
-            zmx,
-            heartbeat,
-            vendor_env,
-        })
-    }
-}
-
-pub const SPEC_FILE_MAX_BYTES: usize = 65_536;
-pub const SPEC_ENV_MAX: usize = 64;
-pub const SPEC_SCHEMA_VERSION: u32 = 1;
-
-/// What a spawn step hands the launcher through a private file.
-///
-/// Not the typed command line: a pty in canonical mode truncates a typed line at 1024 bytes,
-/// and the scrollback keeps whatever was typed, the session secret included.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LaunchSpec {
-    pub schema_version: u32,
-    pub environment: BTreeMap<String, String>,
-    pub vendor: Vec<String>,
-}
-
-impl fmt::Debug for LaunchSpec {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("LaunchSpec")
-            .field("environment", &self.environment.keys().collect::<Vec<_>>())
-            .field("vendor", &self.vendor)
-            .finish_non_exhaustive()
-    }
-}
-
-impl LaunchSpec {
-    /// Checks every bound and parses the settings; the spec file is never trusted unchecked.
-    pub fn settings(&self) -> Result<LauncherSettings, SettingsError> {
-        if self.schema_version != SPEC_SCHEMA_VERSION {
-            return Err(SettingsError::Spec(format!(
-                "schema version {}",
-                self.schema_version
-            )));
-        }
-        if self.environment.len() > SPEC_ENV_MAX {
-            return Err(SettingsError::Spec(format!(
-                "{} environment entries; maximum is {SPEC_ENV_MAX}",
-                self.environment.len()
-            )));
-        }
-        if let Some((name, _)) = self.environment.iter().find(|(name, value)| {
-            name.len() > ENV_VALUE_MAX_BYTES || value.len() > ENV_VALUE_MAX_BYTES
-        }) {
-            return Err(SettingsError::Spec(format!(
-                "{name} exceeds {ENV_VALUE_MAX_BYTES} bytes"
-            )));
-        }
-        check_vendor(&self.vendor)?;
-        LauncherSettings::from_map(&self.environment)
-    }
-}
-
-/// Reads and checks the spec, then removes it so the secret does not outlive the read.
-pub fn take_spec(path: &Path) -> Result<(LauncherSettings, Vec<String>), SettingsError> {
-    let bytes = read_checked(path, SPEC_FILE_MAX_BYTES, None)
-        .map_err(|error| SettingsError::Spec(format!("{}: {error}", path.display())))?
-        .ok_or_else(|| SettingsError::Spec(format!("{} does not exist", path.display())))?;
-    let spec: LaunchSpec =
-        serde_json::from_slice(&bytes).map_err(|error| SettingsError::Spec(error.to_string()))?;
-    let settings = spec.settings()?;
-    fs::remove_file(path)
-        .map_err(|error| SettingsError::Spec(format!("{}: {error}", path.display())))?;
-    Ok((settings, spec.vendor))
-}
-
-pub fn check_vendor(vendor: &[String]) -> Result<(), SettingsError> {
-    if vendor.is_empty() || vendor.len() > VENDOR_ARGS_MAX {
-        return Err(SettingsError::VendorArguments(format!(
-            "{} arguments; expected 1..={VENDOR_ARGS_MAX}",
-            vendor.len()
-        )));
-    }
-    if let Some(long) = vendor.iter().find(|word| word.len() > VENDOR_ARG_MAX_BYTES) {
-        return Err(SettingsError::VendorArguments(format!(
-            "an argument of {} bytes exceeds {VENDOR_ARG_MAX_BYTES}",
-            long.len()
-        )));
-    }
-    Ok(())
-}
 
 /// The files of one session under its spool directory.
 #[derive(Debug, Clone)]
@@ -338,36 +139,45 @@ pub fn next_sequence(path: &Path) -> Result<u64, SequenceError> {
 pub struct LaunchLog {
     file: Option<File>,
     written: u64,
+    cap: u64,
 }
 
 impl LaunchLog {
     #[must_use]
     pub fn open(path: &Path) -> Self {
+        Self::with_cap(path, LOG_FILE_MAX_BYTES)
+    }
+
+    #[must_use]
+    pub fn with_cap(path: &Path, cap: u64) -> Self {
         let file = open_append(path).ok();
-        Self { file, written: 0 }
+        Self {
+            file,
+            written: 0,
+            cap,
+        }
     }
 
     pub fn line(&mut self, text: &str) {
-        if self.file.is_none() {
+        let Some(mut file) = self.file.take() else {
             return;
-        }
+        };
         let line = format!("{} {text}\n", now_unix_ms());
         let length = u64::try_from(line.len()).unwrap_or(u64::MAX);
         let next = self.written.saturating_add(length);
-        let line = if next > LOG_FILE_MAX_BYTES {
-            self.file = None;
-            "log limit reached\n".to_string()
-        } else {
-            self.written = next;
-            line
-        };
-        if let Some(file) = self.file.as_mut() {
-            if file.write_all(line.as_bytes()).is_err() {
-                self.file = None;
-            }
+        if next > self.cap {
+            // The marker is the last write; the file stays closed afterwards.
+            drop(file.write_all(LOG_LIMIT_MARKER.as_bytes()));
+            return;
+        }
+        self.written = next;
+        if file.write_all(line.as_bytes()).is_ok() {
+            self.file = Some(file);
         }
     }
 }
+
+const LOG_LIMIT_MARKER: &str = "log limit reached\n";
 
 /// Sets the flag on SIGTERM or SIGHUP; registered on the caller's thread before it returns.
 pub fn watch_signals() -> io::Result<Arc<AtomicBool>> {
@@ -401,6 +211,7 @@ pub fn watch_signals() -> io::Result<Arc<AtomicBool>> {
 pub struct LaunchEnd {
     pub state: String,
     pub delivery: Result<Delivery, String>,
+    pub spool_error: Option<String>,
 }
 
 impl LaunchEnd {
@@ -416,9 +227,17 @@ impl LaunchEnd {
 impl fmt::Display for LaunchEnd {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.delivery {
-            Ok(delivery) => write!(formatter, "exit state {}: {delivery:?}", self.state),
-            Err(error) => write!(formatter, "exit state {}: not spooled: {error}", self.state),
+            Ok(delivery) => write!(formatter, "exit state {}: {delivery:?}", self.state)?,
+            Err(error) => write!(
+                formatter,
+                "exit state {}: not delivered: {error}",
+                self.state
+            )?,
         }
+        if let Some(error) = &self.spool_error {
+            write!(formatter, "; spool: {error}")?;
+        }
+        Ok(())
     }
 }
 
@@ -429,6 +248,8 @@ struct Run<'a, I: Ingress> {
     lease: Lease,
     ingress: &'a I,
     log: LaunchLog,
+    /// Set once a record is on disk, so the exit trap delivers it rather than writing again.
+    spooled: bool,
 }
 
 /// Writes the lease before anything else runs, so a replayed spawn step sees it.
@@ -440,7 +261,7 @@ pub fn write_first_lease(
     let lease = Lease::new(
         settings.env.session_name.clone(),
         std::process::id(),
-        settings.env.awaitable_id.clone(),
+        AwaitableDigest::of(&settings.env.awaitable_id),
         now,
         now,
     )
@@ -457,6 +278,16 @@ pub fn launch(
     vendor: &[String],
     ingress: &impl Ingress,
 ) -> Result<LaunchEnd, String> {
+    launch_with_stop(settings, vendor, ingress, None)
+}
+
+/// `launch` with a caller's stop flag in place of the SIGTERM and SIGHUP watcher.
+pub fn launch_with_stop(
+    settings: &LauncherSettings,
+    vendor: &[String],
+    ingress: &impl Ingress,
+    stop: Option<Arc<AtomicBool>>,
+) -> Result<LaunchEnd, String> {
     let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
     let lease = write_first_lease(settings, &files)?;
     let spool_ready = ensure_private_dir(&files.spool_dir);
@@ -466,10 +297,11 @@ pub fn launch(
         files,
         lease,
         ingress,
+        spooled: false,
     };
     let decoded = match spool_ready
         .map_err(|error| error.to_string())
-        .and_then(|()| watch_signals().map_err(|error| error.to_string()))
+        .and_then(|()| stop.map_or_else(|| watch_signals().map_err(|error| error.to_string()), Ok))
     {
         Ok(stop_flag) => run.supervise_vendor(vendor, &stop_flag),
         Err(error) => {
@@ -507,19 +339,13 @@ impl<I: Ingress> Run<'_, I> {
         let (program, arguments) = vendor
             .split_first()
             .ok_or_else(|| io::Error::other("empty vendor command"))?;
+        let environment = self
+            .settings
+            .vendor_environment(&self.files.progress, &self.files.result);
         let child = Command::new(program)
             .args(arguments)
-            .env_remove(ENV_SESSION_SECRET)
-            .env_remove(ENV_AWAITABLE_ID)
-            .envs(
-                self.settings
-                    .vendor_env
-                    .iter()
-                    .map(|(name, value)| (name, value)),
-            )
-            .env(PROGRESS_FILE_ENV, &self.files.progress)
-            .env(RESULT_FILE_ENV, &self.files.result)
-            .env(SPOOL_DIR_ENV, &self.files.spool_dir)
+            .env_clear()
+            .envs(environment)
             .process_group(0)
             .stdin(Stdio::null())
             .stdout(create_new(&self.files.stdout)?)
@@ -545,7 +371,11 @@ impl<I: Ingress> Run<'_, I> {
 
     fn supervise(&mut self, child: &mut Child, stop_flag: &AtomicBool) -> (ChildEnd, Stop) {
         let mut last_beat: Option<Instant> = None;
-        for _ in 0..SUPERVISE_POLLS_MAX {
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(self.settings.wall_clock)
+            .unwrap_or(started);
+        while Instant::now() < deadline {
             match child.try_wait() {
                 Ok(Some(status)) => return (ChildEnd::from(status), Stop::None),
                 Ok(None) => {}
@@ -556,6 +386,8 @@ impl<I: Ingress> Run<'_, I> {
                 }
             }
             if stop_flag.load(Ordering::SeqCst) {
+                // zmx sends SIGKILL half a second after SIGHUP: spool before stopping the vendor.
+                self.spool_early(ExitState::Cancelled);
                 return (self.terminate(child), Stop::Cancelled);
             }
             if self.output_too_large() {
@@ -572,7 +404,7 @@ impl<I: Ingress> Run<'_, I> {
 
     fn output_too_large(&self) -> bool {
         [&self.files.stdout, &self.files.stderr].iter().any(|path| {
-            fs::metadata(path).is_ok_and(|metadata| metadata.len() > OUTPUT_FILE_MAX_BYTES)
+            fs::metadata(path).is_ok_and(|metadata| metadata.len() > self.settings.output_max_bytes)
         })
     }
 
@@ -646,27 +478,67 @@ impl<I: Ingress> Run<'_, I> {
         }))
     }
 
-    fn finish(&mut self, decoded: Decoded) -> LaunchEnd {
-        let state = String::from(decoded.state.clone());
-        let record = SpoolRecord {
+    fn record(&self, state: ExitState, envelope: Option<serde_json::Value>) -> SpoolRecord {
+        SpoolRecord {
             schema_version: SPOOL_SCHEMA_VERSION,
             session: self.settings.env.session_name.clone(),
             awaitable_id: self.settings.env.awaitable_id.clone(),
-            state: decoded.state,
-            envelope: decoded.envelope,
-        };
-        let spool = self.files.spool.clone();
-        let ingress = self.ingress;
-        let delivery = spool_then_deliver(ingress, &spool, &record, &mut |delay| {
-            self.wait_renewing(delay);
-        })
-        .map_err(|error| error.to_string());
-        self.log.line(&format!("exit state {state}: {delivery:?}"));
-        LaunchEnd { state, delivery }
+            state,
+            envelope,
+        }
     }
 
-    /// Sleeps in heartbeat-sized steps, renewing the lease, so a launcher still delivering
-    /// is adopted rather than re-queued.
+    /// Writes a failure record now, ahead of the exit trap.
+    fn spool_early(&mut self, state: ExitState) {
+        match write_spool(&self.files.spool, &self.record(state, None)) {
+            Ok(()) => self.spooled = true,
+            Err(error) => self.log.line(&format!("early spool not written: {error}")),
+        }
+    }
+
+    fn finish(&mut self, decoded: Decoded) -> LaunchEnd {
+        let state = String::from(decoded.state.clone());
+        let record = self.record(decoded.state, decoded.envelope);
+        let spool = self.files.spool.clone();
+        let ingress = self.ingress;
+        let already = self.spooled;
+        let delivered = spool_then_deliver(ingress, &spool, &record, already, &mut |delay| {
+            self.wait_renewing(delay);
+        });
+        let (delivery, spool_error) = match delivered {
+            Ok(delivered) => (Ok(delivered.delivery), delivered.spool_error),
+            Err(error) => (Err(error.to_string()), None),
+        };
+        if let Some(error) = &spool_error {
+            self.log.line(&format!("spool: {error}"));
+        }
+        if matches!(delivery, Ok(Delivery::Acknowledged { .. })) {
+            self.mark_ended();
+        }
+        self.log.line(&format!("exit state {state}: {delivery:?}"));
+        LaunchEnd {
+            state,
+            delivery,
+            spool_error,
+        }
+    }
+
+    /// Marks the lease ended once Restate acknowledged, so a replayed spawn adopts it at any age.
+    fn mark_ended(&mut self) {
+        let written = self
+            .lease
+            .ended(now_unix_ms())
+            .map_err(|error| error.to_string())
+            .and_then(|ended| ended.to_bytes().map_err(|error| error.to_string()))
+            .and_then(|bytes| {
+                write_durable(&self.files.lease, &bytes).map_err(|error| error.to_string())
+            });
+        if let Err(error) = written {
+            self.log.line(&format!("lease not marked ended: {error}"));
+        }
+    }
+
+    /// Sleeps in heartbeat-sized steps renewing the lease, so a delivering launcher is adopted.
     fn wait_renewing(&mut self, delay: Duration) {
         let started = Instant::now();
         let steps = delay
@@ -696,22 +568,10 @@ impl<I: Ingress> Run<'_, I> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::launch_spec::tests::{environment, NAME, SECRET};
     use crate::spool::{Resolution, ACKNOWLEDGED_SUFFIX};
     use std::cell::RefCell;
-    use tycho_types::launcher::{AwaitableId, ENV_SESSION_NAME};
-
-    const NAME: &str = "cf7a.wu03.wrk.claude.a1f3";
-    const SECRET: &str = "0123456789abcdef0123456789abcdef";
-
-    fn environment(agent_dir: &Path) -> BTreeMap<String, String> {
-        BTreeMap::from([
-            (ENV_AWAITABLE_ID.to_string(), "sign_1abc".to_string()),
-            (ENV_SESSION_SECRET.to_string(), SECRET.to_string()),
-            (ENV_SESSION_NAME.to_string(), NAME.to_string()),
-            (AGENT_DIR_ENV.to_string(), agent_dir.display().to_string()),
-            (ZMX_ENV.to_string(), "/usr/bin/true".to_string()),
-        ])
-    }
+    use tycho_types::launcher::AwaitableId;
 
     fn scratch(test: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tycho-launch-{test}-{}", std::process::id()));
@@ -721,92 +581,6 @@ mod tests {
         fs::create_dir_all(dir.join(crate::config::LEASE_DIR)).unwrap();
         fs::create_dir_all(dir.join(crate::config::SPOOL_DIR)).unwrap();
         dir
-    }
-
-    #[test]
-    fn settings_fail_closed() {
-        let dir = Path::new("/agent");
-        assert!(LauncherSettings::from_map(&environment(dir)).is_ok());
-        let mut missing = environment(dir);
-        missing.remove(AGENT_DIR_ENV);
-        assert!(matches!(
-            LauncherSettings::from_map(&missing),
-            Err(SettingsError::Missing(AGENT_DIR_ENV))
-        ));
-        let mut relative = environment(dir);
-        relative.insert(ZMX_ENV.to_string(), "zmx".to_string());
-        assert!(matches!(
-            LauncherSettings::from_map(&relative),
-            Err(SettingsError::NotAbsolute(ZMX_ENV))
-        ));
-        let mut long = environment(dir);
-        long.insert(
-            ZMX_ENV.to_string(),
-            format!("/{}", "z".repeat(ENV_VALUE_MAX_BYTES)),
-        );
-        assert!(matches!(
-            LauncherSettings::from_map(&long),
-            Err(SettingsError::TooLong(ZMX_ENV))
-        ));
-        let mut target = environment(dir);
-        target.insert(HEARTBEAT_TARGET_ENV.to_string(), "Session".to_string());
-        assert!(matches!(
-            LauncherSettings::from_map(&target),
-            Err(SettingsError::HeartbeatTarget)
-        ));
-        let mut secret = environment(dir);
-        secret.remove(ENV_SESSION_SECRET);
-        assert!(matches!(
-            LauncherSettings::from_map(&secret),
-            Err(SettingsError::Env(_))
-        ));
-        assert!(check_vendor(&[]).is_err());
-        assert!(check_vendor(&["x".repeat(VENDOR_ARG_MAX_BYTES + 1)]).is_err());
-        assert!(check_vendor(&vec!["x".to_string(); VENDOR_ARGS_MAX + 1]).is_err());
-    }
-
-    #[test]
-    fn a_spec_is_checked_then_removed() {
-        let dir = scratch("spec");
-        let path = dir.join("launch.json");
-        assert!(matches!(take_spec(&path), Err(SettingsError::Spec(_))));
-        let spec = LaunchSpec {
-            schema_version: SPEC_SCHEMA_VERSION,
-            environment: environment(&dir),
-            vendor: vec!["/bin/true".to_string()],
-        };
-        fs::write(&path, serde_json::to_vec(&spec).unwrap()).unwrap();
-        let (settings, vendor) = take_spec(&path).unwrap();
-        assert_eq!(vendor, spec.vendor);
-        assert!(!path.exists(), "the spec outlived its read");
-        assert!(settings
-            .vendor_env
-            .iter()
-            .all(|(name, _)| name != ENV_SESSION_SECRET && name != ENV_AWAITABLE_ID));
-        assert!(!format!("{spec:?}").contains(SECRET));
-        let mut wide = spec.clone();
-        for index in 0..=SPEC_ENV_MAX {
-            wide.environment
-                .insert(format!("EXTRA_{index}"), "x".to_string());
-        }
-        let mut versioned = spec.clone();
-        versioned.schema_version = 2;
-        let mut no_vendor = spec;
-        no_vendor.vendor.clear();
-        for refused in [wide, versioned, no_vendor] {
-            fs::write(&path, serde_json::to_vec(&refused).unwrap()).unwrap();
-            assert!(take_spec(&path).is_err());
-            assert!(path.exists(), "a refused spec is kept for the operator");
-        }
-        fs::write(&path, "x".repeat(SPEC_FILE_MAX_BYTES + 1)).unwrap();
-        assert!(take_spec(&path).is_err());
-        fs::write(
-            &path,
-            r#"{"schema_version":1,"environment":{},"vendor":["/bin/true"],"extra":1}"#,
-        )
-        .unwrap();
-        assert!(take_spec(&path).is_err());
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -896,8 +670,9 @@ mod tests {
         }
     }
 
-    fn vendor_script(lease: &Path, result: &str) -> Vec<String> {
-        let script = r#"test -f "$1" && echo seen > "$TYCHO_SPOOL_DIR/lease-seen"; sleep 0.4; printf '%s' "$2" > "$TYCHO_RESULT_FILE""#;
+    /// A vendor that records whether the lease existed and its environment in `marker_dir`.
+    fn vendor_script(lease: &Path, result: &str, marker_dir: &Path) -> Vec<String> {
+        let script = r#"test -f "$1" && echo seen > "$3/lease-seen"; /usr/bin/env > "$3/env"; sleep 0.4; printf '%s' "$2" > "$TYCHO_RESULT_FILE""#;
         vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -905,7 +680,19 @@ mod tests {
             "sh".to_string(),
             lease.display().to_string(),
             result.to_string(),
+            marker_dir.display().to_string(),
         ]
+    }
+
+    fn recorder(files: &SessionFiles) -> Recorder {
+        Recorder {
+            files: files.clone(),
+            events: RefCell::new(Vec::new()),
+        }
+    }
+
+    fn sh(script: &str) -> Vec<String> {
+        vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()]
     }
 
     #[test]
@@ -917,17 +704,20 @@ mod tests {
             "state": "completed",
             "envelope": crate::exit_decode::tests::envelope(NAME),
         });
-        let vendor = vendor_script(&files.lease, &result.to_string());
-        let recorder = Recorder {
-            files: files.clone(),
-            events: RefCell::new(Vec::new()),
-        };
+        let vendor = vendor_script(&files.lease, &result.to_string(), &dir);
+        let recorder = recorder(&files);
         let end = launch(&settings, &vendor, &recorder).unwrap();
         assert_eq!(end.state, "completed");
         assert_eq!(end.exit_code(), EXIT_ACKNOWLEDGED);
         assert!(
-            files.spool_dir.join("lease-seen").exists(),
+            dir.join("lease-seen").exists(),
             "the vendor ran before the lease existed"
+        );
+        let env = fs::read_to_string(dir.join("env")).unwrap();
+        assert!(!env.contains(SECRET) && !env.contains("sign_1abc"), "{env}");
+        assert!(
+            !env.contains("ZMX_DIR=") && !env.contains("TYCHO_AGENT_DIR="),
+            "{env}"
         );
         let events = recorder.events.borrow();
         assert_eq!(
@@ -941,6 +731,92 @@ mod tests {
         assert!(files.spool.with_extension(ACKNOWLEDGED_SUFFIX).exists());
         let lease = Lease::parse(&fs::read(&files.lease).unwrap()).unwrap();
         assert_eq!(lease.pid(), std::process::id());
+        assert!(
+            lease.ended_unix_ms().is_some(),
+            "an acknowledged launch ends its lease"
+        );
+        assert!(!String::from_utf8(fs::read(&files.lease).unwrap())
+            .unwrap()
+            .contains("sign_1abc"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_wall_clock_deadline_stops_the_vendor() {
+        let dir = scratch("wall-clock");
+        let mut settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
+        settings.wall_clock = Duration::from_millis(500);
+        let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
+        let started = Instant::now();
+        let end = launch(&settings, &sh("sleep 30"), &recorder(&files)).unwrap();
+        assert_eq!(end.state, "budget_exceeded");
+        assert!(started.elapsed() < Duration::from_secs(15));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn oversized_output_stops_the_vendor() {
+        let dir = scratch("output");
+        let mut settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
+        settings.output_max_bytes = 1024;
+        let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
+        let vendor = sh("head -c 4096 /dev/zero; sleep 30");
+        let started = Instant::now();
+        let end = launch(&settings, &vendor, &recorder(&files)).unwrap();
+        assert_eq!(end.state, "failed");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "the vendor was not stopped"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cancel_spools_before_the_vendor_is_stopped() {
+        let dir = scratch("cancel");
+        let settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
+        let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
+        let script = format!(
+            r#"trap 'test -f "{}" && echo spooled > "{}"; exit 0' TERM; sleep 30 & wait"#,
+            files.spool.display(),
+            dir.join("seen-at-term").display()
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&stop);
+        let timer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(700));
+            setter.store(true, Ordering::SeqCst);
+        });
+        let recorder = recorder(&files);
+        let end = launch_with_stop(&settings, &sh(&script), &recorder, Some(stop)).unwrap();
+        timer.join().unwrap();
+        assert_eq!(end.state, "cancelled");
+        assert!(
+            dir.join("seen-at-term").exists(),
+            "the spool was not on disk at SIGTERM"
+        );
+        assert_eq!(
+            recorder.events.borrow().last().map(String::as_str),
+            Some("deliver sign_1abc cancelled spooled=true")
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_log_stops_at_its_cap_with_one_marker() {
+        let dir = scratch("log");
+        let path = dir.join("launcher.log");
+        let mut log = LaunchLog::with_cap(&path, 64);
+        for _ in 0..10 {
+            log.line("twenty bytes of text");
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.len() <= 64 + "log limit reached\n".len(),
+            "{}",
+            text.len()
+        );
+        assert!(text.ends_with("log limit reached\n"), "{text}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -5,14 +5,15 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::launcher::AwaitableId;
+use crate::launcher::{AwaitableDigest, AwaitableId};
 use crate::session::SessionName;
 
-pub const LEASE_SCHEMA_VERSION: u32 = 1;
+pub const LEASE_SCHEMA_VERSION: u32 = 2;
 pub const LEASE_FILE_MAX_BYTES: usize = 4096;
 /// `pid_t` is signed and zero or a negative value addresses a process group.
 pub const PID_MAX: u32 = 0x7fff_ffff;
 
+/// Carries the awaitable's digest, never its id: the agent user can read the lease.
 /// Deserializes only through `LeaseWire` and `validate`, as `parse` does.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "LeaseWire")]
@@ -20,9 +21,11 @@ pub struct Lease {
     schema_version: u32,
     session: SessionName,
     pid: u32,
-    awaitable_id: AwaitableId,
+    awaitable_sha256: AwaitableDigest,
     started_unix_ms: u64,
     heartbeat_unix_ms: u64,
+    /// Set once the launcher's result was acknowledged; the session has ended.
+    ended_unix_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -31,9 +34,10 @@ struct LeaseWire {
     schema_version: u32,
     session: SessionName,
     pid: u32,
-    awaitable_id: AwaitableId,
+    awaitable_sha256: AwaitableDigest,
     started_unix_ms: u64,
     heartbeat_unix_ms: u64,
+    ended_unix_ms: Option<u64>,
 }
 
 impl TryFrom<LeaseWire> for Lease {
@@ -44,9 +48,10 @@ impl TryFrom<LeaseWire> for Lease {
             schema_version: wire.schema_version,
             session: wire.session,
             pid: wire.pid,
-            awaitable_id: wire.awaitable_id,
+            awaitable_sha256: wire.awaitable_sha256,
             started_unix_ms: wire.started_unix_ms,
             heartbeat_unix_ms: wire.heartbeat_unix_ms,
+            ended_unix_ms: wire.ended_unix_ms,
         };
         lease.validate()?;
         Ok(lease)
@@ -60,6 +65,7 @@ pub enum LeaseError {
     SchemaVersion(u32),
     Pid(u32),
     HeartbeatBeforeStart,
+    EndBeforeStart,
 }
 
 impl fmt::Display for LeaseError {
@@ -76,6 +82,7 @@ impl fmt::Display for LeaseError {
             ),
             Self::Pid(pid) => write!(formatter, "pid {pid} outside 1..={PID_MAX}"),
             Self::HeartbeatBeforeStart => write!(formatter, "heartbeat precedes start"),
+            Self::EndBeforeStart => write!(formatter, "end precedes start"),
         }
     }
 }
@@ -96,6 +103,9 @@ pub enum Freshness {
 pub enum SpawnDecision {
     /// A fresh lease from this spawn: await the same awaitable.
     Adopt,
+    /// This spawn's launcher ended after Restate acknowledged its result: the awaitable is
+    /// resolved or rejected, so awaiting it returns at once.
+    AdoptEnded,
     /// No lease: spawn under this name.
     Spawn,
     /// Any other lease: a new attempt under a new name; no pid from the lease is ever killed.
@@ -115,7 +125,7 @@ impl Lease {
     pub fn new(
         session: SessionName,
         pid: u32,
-        awaitable_id: AwaitableId,
+        awaitable_sha256: AwaitableDigest,
         started_unix_ms: u64,
         heartbeat_unix_ms: u64,
     ) -> Result<Self, LeaseError> {
@@ -123,9 +133,10 @@ impl Lease {
             schema_version: LEASE_SCHEMA_VERSION,
             session,
             pid,
-            awaitable_id,
+            awaitable_sha256,
             started_unix_ms,
             heartbeat_unix_ms,
+            ended_unix_ms: None,
         };
         lease.validate()?;
         Ok(lease)
@@ -149,6 +160,11 @@ impl Lease {
         if self.heartbeat_unix_ms < self.started_unix_ms {
             return Err(LeaseError::HeartbeatBeforeStart);
         }
+        if let Some(ended) = self.ended_unix_ms {
+            if ended < self.started_unix_ms {
+                return Err(LeaseError::EndBeforeStart);
+            }
+        }
         Ok(())
     }
 
@@ -156,6 +172,14 @@ impl Lease {
     pub fn renewed(&self, heartbeat_unix_ms: u64) -> Result<Self, LeaseError> {
         let mut lease = self.clone();
         lease.heartbeat_unix_ms = heartbeat_unix_ms;
+        lease.validate()?;
+        Ok(lease)
+    }
+
+    /// The same lease marked ended, refused if the end would precede the start.
+    pub fn ended(&self, ended_unix_ms: u64) -> Result<Self, LeaseError> {
+        let mut lease = self.clone();
+        lease.ended_unix_ms = Some(ended_unix_ms);
         lease.validate()?;
         Ok(lease)
     }
@@ -176,8 +200,8 @@ impl Lease {
     }
 
     #[must_use]
-    pub const fn awaitable_id(&self) -> &AwaitableId {
-        &self.awaitable_id
+    pub const fn awaitable_sha256(&self) -> &AwaitableDigest {
+        &self.awaitable_sha256
     }
 
     #[must_use]
@@ -188,6 +212,11 @@ impl Lease {
     #[must_use]
     pub const fn heartbeat_unix_ms(&self) -> u64 {
         self.heartbeat_unix_ms
+    }
+
+    #[must_use]
+    pub const fn ended_unix_ms(&self) -> Option<u64> {
+        self.ended_unix_ms
     }
 
     #[must_use]
@@ -202,7 +231,8 @@ impl Lease {
     }
 }
 
-/// Adopt only a fresh lease carrying both the expected session and the expected awaitable.
+/// Adopt only a lease carrying both the expected session and the expected awaitable's digest;
+/// an ended one is adopted whatever its age.
 #[must_use]
 pub fn spawn_decision(
     lease: Option<&Lease>,
@@ -217,8 +247,11 @@ pub fn spawn_decision(
     if lease.session != *expected_session {
         return SpawnDecision::Requeue(RequeueReason::OtherSession);
     }
-    if lease.awaitable_id != *expected_awaitable {
+    if lease.awaitable_sha256 != AwaitableDigest::of(expected_awaitable) {
         return SpawnDecision::Requeue(RequeueReason::OtherAwaitable);
+    }
+    if lease.ended_unix_ms.is_some() {
+        return SpawnDecision::AdoptEnded;
     }
     match lease.freshness(now_unix_ms, threshold_ms) {
         Freshness::Fresh => SpawnDecision::Adopt,
@@ -232,11 +265,16 @@ mod tests {
     use super::*;
 
     const THRESHOLD_MS: u64 = 30_000;
+
+    fn awaitable() -> AwaitableId {
+        AwaitableId::parse("sign_1abc").unwrap()
+    }
     const NOW_MS: u64 = 1_800_000_000_000;
 
     fn lease_json(pid: u32, heartbeat: u64) -> String {
         format!(
-            r#"{{"schema_version":1,"session":"cf7a.wu03.wrk.claude.a1f3","pid":{pid},"awaitable_id":"sign_1abc","started_unix_ms":{},"heartbeat_unix_ms":{heartbeat}}}"#,
+            r#"{{"schema_version":2,"session":"cf7a.wu03.wrk.claude.a1f3","pid":{pid},"awaitable_sha256":"{}","started_unix_ms":{},"heartbeat_unix_ms":{heartbeat}}}"#,
+            AwaitableDigest::of(&awaitable()),
             NOW_MS.saturating_sub(60_000)
         )
     }
@@ -287,10 +325,10 @@ mod tests {
             Lease::parse(unknown.as_bytes()),
             Err(LeaseError::Json(_))
         ));
-        let version = lease_json(1, NOW_MS).replace("\"schema_version\":1", "\"schema_version\":2");
+        let version = lease_json(1, NOW_MS).replace("\"schema_version\":2", "\"schema_version\":3");
         assert!(matches!(
             Lease::parse(version.as_bytes()),
-            Err(LeaseError::SchemaVersion(2))
+            Err(LeaseError::SchemaVersion(3))
         ));
         let bad_name = lease_json(1, NOW_MS).replace("cf7a.wu03.wrk", "cf7a.wu03.run");
         assert!(matches!(
@@ -328,7 +366,7 @@ mod tests {
     fn spawn_decision_enumerates_each_case() {
         let fresh = lease(NOW_MS);
         let session = fresh.session().clone();
-        let awaitable = fresh.awaitable_id().clone();
+        let awaitable = awaitable();
         let decide = |lease: Option<&Lease>, name: &SessionName, id: &AwaitableId| {
             spawn_decision(lease, name, id, NOW_MS, THRESHOLD_MS)
         };
@@ -352,7 +390,7 @@ mod tests {
     #[test]
     fn a_lease_for_another_session_or_awaitable_is_never_adopted() {
         let fresh = lease(NOW_MS);
-        let awaitable = fresh.awaitable_id().clone();
+        let awaitable = awaitable();
         let other = SessionName::parse("cf7a.wu03.wrk.claude.b2").unwrap();
         assert_eq!(
             spawn_decision(Some(&fresh), &other, &awaitable, NOW_MS, THRESHOLD_MS),
@@ -379,7 +417,7 @@ mod tests {
             lease_json(0, NOW_MS),
             lease_json(PID_MAX.saturating_add(1), NOW_MS),
             lease_json(1, NOW_MS.saturating_sub(120_000)),
-            lease_json(1, NOW_MS).replace("\"schema_version\":1", "\"schema_version\":2"),
+            lease_json(1, NOW_MS).replace("\"schema_version\":2", "\"schema_version\":3"),
             lease_json(1, NOW_MS).replace("\"pid\"", "\"extra\":1,\"pid\""),
         ] {
             let decoded: Result<Lease, _> = serde_json::from_str(&invalid);
@@ -390,7 +428,7 @@ mod tests {
     #[test]
     fn writer_cannot_build_a_lease_the_reader_rejects() {
         let session = SessionName::parse("cf7a.wu03.wrk.claude.a1f3").unwrap();
-        let awaitable = AwaitableId::parse("sign_1abc").unwrap();
+        let awaitable = AwaitableDigest::of(&awaitable());
         assert!(matches!(
             Lease::new(session.clone(), 0, awaitable.clone(), NOW_MS, NOW_MS),
             Err(LeaseError::Pid(0))
@@ -410,5 +448,46 @@ mod tests {
         let renewed = built.renewed(NOW_MS.saturating_add(5)).unwrap();
         assert_eq!(renewed.heartbeat_unix_ms(), NOW_MS.saturating_add(5));
         assert!(built.renewed(NOW_MS.saturating_sub(1)).is_err());
+        assert!(matches!(
+            built.ended(NOW_MS.saturating_sub(1)),
+            Err(LeaseError::EndBeforeStart)
+        ));
+    }
+
+    #[test]
+    fn the_lease_never_carries_the_awaitable_id() {
+        let bytes = lease(NOW_MS).to_bytes().unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("sign_1abc"), "{text}");
+        assert!(text.contains(AwaitableDigest::of(&awaitable()).as_str()));
+    }
+
+    #[test]
+    fn an_ended_lease_is_adopted_ended_at_any_age_and_only_for_its_own_awaitable() {
+        let ended = lease(NOW_MS.saturating_sub(THRESHOLD_MS).saturating_sub(1))
+            .ended(NOW_MS.saturating_sub(THRESHOLD_MS))
+            .unwrap();
+        let session = ended.session().clone();
+        let much_later = NOW_MS.saturating_add(86_400_000);
+        assert_eq!(
+            spawn_decision(
+                Some(&ended),
+                &session,
+                &awaitable(),
+                much_later,
+                THRESHOLD_MS
+            ),
+            SpawnDecision::AdoptEnded
+        );
+        let other = AwaitableId::parse("sign_1other").unwrap();
+        assert_eq!(
+            spawn_decision(Some(&ended), &session, &other, NOW_MS, THRESHOLD_MS),
+            SpawnDecision::Requeue(RequeueReason::OtherAwaitable)
+        );
+        let parsed = Lease::parse(&ended.to_bytes().unwrap()).unwrap();
+        assert_eq!(
+            parsed.ended_unix_ms(),
+            Some(NOW_MS.saturating_sub(THRESHOLD_MS))
+        );
     }
 }

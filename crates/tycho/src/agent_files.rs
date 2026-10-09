@@ -76,8 +76,7 @@ pub fn check_replaceable(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Stages a new file beside the target, syncs it, renames it over the checked target and
-/// syncs the directory, so a reader sees the old bytes or the new ones.
+/// Replaces the file atomically: stage new, sync, rename onto a checked target, sync the directory.
 pub fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let file_name = path
         .file_name()
@@ -122,32 +121,36 @@ pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Reads a regular file of `owner` (any owner when `None`) of at most `max_bytes`; a missing
-/// file is `None`, a symlink, another owner or a larger file an error.
+/// Reads a regular file of `owner` (any when `None`) up to `max_bytes`; missing is `None`.
 pub fn read_checked(
     path: &Path,
     max_bytes: usize,
     owner: Option<u32>,
 ) -> io::Result<Option<Vec<u8>>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
+    // O_NONBLOCK keeps a planted FIFO from blocking the open; fstat then refuses it.
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits())
+        .open(path)
+    {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+        Err(error) => return Err(refused(path, &format!("cannot open: {error}"))),
     };
+    let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(refused(path, "not a regular file"));
     }
-    if owner.is_some_and(|owner| owner != metadata.uid()) {
-        return Err(refused(path, "not owned by the expected user"));
+    if let Some(expected) = owner.filter(|expected| *expected != metadata.uid()) {
+        return Err(refused(
+            path,
+            &format!("owned by uid {}, expected uid {expected}", metadata.uid()),
+        ));
     }
     let limit = u64::try_from(max_bytes).unwrap_or(u64::MAX);
     if metadata.len() > limit {
         return Err(too_large(path, max_bytes));
     }
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(OFlag::O_NOFOLLOW.bits())
-        .open(path)?;
     let mut bytes = Vec::new();
     file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
     if bytes.len() > max_bytes {
@@ -155,6 +158,28 @@ pub fn read_checked(
     }
     Ok(Some(bytes))
 }
+
+/// Overwrites an existing regular file of this user with zeros, then removes it; best effort.
+pub fn shred(path: &Path) -> io::Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits())
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.uid() != current_uid() {
+        return Err(refused(path, "not a regular file of this user"));
+    }
+    let length = usize::try_from(metadata.len())
+        .unwrap_or(usize::MAX)
+        .min(SHRED_MAX_BYTES);
+    file.write_all(&vec![0_u8; length])?;
+    file.sync_all()?;
+    drop(file);
+    fs::remove_file(path)
+}
+
+/// Bounds the zeros written over a file before it is removed.
+const SHRED_MAX_BYTES: usize = 1024 * 1024;
 
 fn too_large(path: &Path, max_bytes: usize) -> io::Error {
     io::Error::new(
@@ -225,6 +250,39 @@ mod tests {
         fs::create_dir(&not_a_file).unwrap();
         assert!(write_durable(&not_a_file, b"x").is_err());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_planted_fifo_is_refused_without_blocking() {
+        let dir = scratch("fifo");
+        let fifo = dir.join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = fifo;
+        std::thread::spawn(move || {
+            if sender
+                .send(read_checked(&reader, 64, None).is_err())
+                .is_err()
+            {}
+        });
+        let refused = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        assert_eq!(refused, Ok(true), "a FIFO blocked the read or was accepted");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn shred_zeroes_and_removes_only_a_regular_file() {
+        let dir = scratch("shred");
+        let path = dir.join("spec");
+        fs::write(&path, "secret").unwrap();
+        shred(&path).unwrap();
+        assert!(!path.exists());
+        let victim = dir.join("victim");
+        fs::write(&victim, "untouched").unwrap();
+        symlink(&victim, &path).unwrap();
+        assert!(shred(&path).is_err());
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
         fs::remove_dir_all(&dir).unwrap();
     }
 

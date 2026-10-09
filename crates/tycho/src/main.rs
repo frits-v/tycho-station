@@ -36,7 +36,7 @@ const USAGE: &str = "usage: tycho <command>
   epic start <id> <goal>      start an epic through the operator service
   epic add-unit <id> <unit>   add a work unit to an epic through the operator service
   epic dispatch <id> <unit> <plan.json>   start a listed unit's run with a dispatch plan
-  launch --spec <spec file>       run a vendor session: lease, heartbeat, spool, resolve
+  launch --spec <spec file> [--tier <tier>]   run a vendor session: lease, heartbeat, spool, resolve
   launch --replay <spool file>    deliver a spooled result that was never acknowledged";
 
 fn main() {
@@ -83,7 +83,8 @@ fn main() {
                 .map_err(|error| error.to_string()),
         ),
         ["launch", "--replay", spool] => replay(spool),
-        ["launch", "--spec", spec] => launch(spec),
+        ["launch", "--spec", spec] => launch(spec, None),
+        ["launch", "--spec", spec, "--tier", tier] => launch(spec, Some(tier)),
         ["graph", "build", checkout, unit] => report_result(graph::build(checkout, unit)),
         ["graph", "query", checkout, kind, argument] => {
             report_result(graph::query(checkout, kind, argument))
@@ -106,8 +107,13 @@ fn launch_http() -> Result<Http, i32> {
 }
 
 /// Fails closed before anything runs: no lease, no vendor, no ingress call.
-fn launch(spec: &str) -> i32 {
-    let (settings, vendor) = match launcher::take_spec(Path::new(spec)) {
+fn launch(spec: &str, tier: Option<&str>) -> i32 {
+    let taken = launcher::core_uid_from_environment().and_then(|core_uid| {
+        let tier = tier.map(launcher::check_tier).transpose()?;
+        let (settings, vendor) = launcher::take_spec(Path::new(spec), core_uid)?;
+        Ok((launcher::LauncherSettings { tier, ..settings }, vendor))
+    });
+    let (settings, vendor) = match taken {
         Ok(taken) => taken,
         Err(error) => {
             eprintln!("tycho: launch refused: {error}");

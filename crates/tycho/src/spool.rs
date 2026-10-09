@@ -290,20 +290,39 @@ pub fn mark_acknowledged(path: &Path) -> io::Result<PathBuf> {
     Ok(done)
 }
 
-/// Spools first, then delivers; the order is what makes a core outage at exit lose nothing.
+/// A delivery and what went wrong with the spool file on the way, if anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivered {
+    pub delivery: Delivery,
+    pub spool_error: Option<String>,
+}
+
+/// Spools unless already spooled, then delivers; a failed spool write is reported, not fatal.
 pub fn spool_then_deliver(
     ingress: &impl Ingress,
     path: &Path,
     record: &SpoolRecord,
+    already_spooled: bool,
     wait: &mut dyn FnMut(Duration),
-) -> Result<Delivery, SpoolError> {
+) -> Result<Delivered, SpoolError> {
     let resolution = record.resolution()?;
-    write_spool(path, record)?;
+    let mut spool_error = if already_spooled {
+        None
+    } else {
+        write_spool(path, record)
+            .err()
+            .map(|error| error.to_string())
+    };
     let delivery = deliver_with_backoff(ingress, record, &resolution, DELIVERY_DEADLINE, wait);
-    if delivery.acknowledged() {
-        mark_acknowledged(path).map_err(|error| SpoolError::Io(path.to_path_buf(), error))?;
+    if delivery.acknowledged() && spool_error.is_none() {
+        spool_error = mark_acknowledged(path)
+            .err()
+            .map(|error| format!("{}: {error}", path.display()));
     }
-    Ok(delivery)
+    Ok(Delivered {
+        delivery,
+        spool_error,
+    })
 }
 
 /// Delivers a spool that was written but never acknowledged, if `owner` wrote it.
@@ -390,12 +409,18 @@ mod tests {
         let path = dir.join(SPOOL_FILE);
         let ingress = Recorder::new(&path, vec![Ack::Retry("down".into()), Ack::Acknowledged]);
         let mut waits = Vec::new();
-        let delivery =
-            spool_then_deliver(&ingress, &path, &record(ExitState::Killed), &mut |delay| {
+        let delivered = spool_then_deliver(
+            &ingress,
+            &path,
+            &record(ExitState::Killed),
+            false,
+            &mut |delay| {
                 waits.push(delay);
-            })
-            .unwrap();
-        assert_eq!(delivery, Delivery::Acknowledged { attempts: 2 });
+            },
+        )
+        .unwrap();
+        assert_eq!(delivered.delivery, Delivery::Acknowledged { attempts: 2 });
+        assert_eq!(delivered.spool_error, None);
         let seen = ingress.seen.borrow();
         assert!(seen.iter().all(|(spooled, _)| *spooled));
         assert_eq!(seen[0].1, Resolution::Reject("killed".to_string()));
@@ -421,6 +446,25 @@ mod tests {
             Err(SpoolError::Io(..))
         ));
         assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_spool_that_cannot_be_written_is_reported_and_the_result_still_delivered() {
+        let dir = scratch("unwritable");
+        let path = dir.join("missing-dir").join(SPOOL_FILE);
+        let ingress = Recorder::new(&path, vec![Ack::Acknowledged]);
+        let delivered = spool_then_deliver(
+            &ingress,
+            &path,
+            &record(ExitState::Failed),
+            false,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(delivered.delivery.acknowledged());
+        assert!(delivered.spool_error.is_some());
+        assert_eq!(ingress.seen.borrow().len(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 

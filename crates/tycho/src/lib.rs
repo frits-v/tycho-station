@@ -15,7 +15,7 @@ pub mod epic_command;
 pub mod exit_decode;
 pub mod health;
 pub mod http;
-pub mod launch_probe;
+pub mod launch_spec;
 pub mod launchd;
 pub mod launcher;
 pub mod private_dir;
