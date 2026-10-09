@@ -7,8 +7,6 @@ pub const SECONDS_MAX: u64 = 86_400;
 pub const SLOTS_MAX: u64 = 64;
 pub const ATTEMPT_CAP_MAX: u64 = 99;
 pub const PORT_STEP_ATTEMPTS_MAX: u64 = 100;
-pub const COUNT_THRESHOLD_MAX: u64 = 10_000;
-pub const PERIOD_DAYS_MAX: u64 = 3_650;
 
 fn within(name: &str, value: u64, max: u64) -> Result<(), String> {
     if value == 0 || value > max {
@@ -126,34 +124,6 @@ fn check_counts(thresholds: &Thresholds) -> Result<(), String> {
     for (name, value, max) in counts {
         within(name, value, max)?;
     }
-    let mandate = thresholds.mandate;
-    let optional = [
-        (
-            "mandate.convention_citations_min",
-            mandate.convention_citations_min,
-            COUNT_THRESHOLD_MAX,
-        ),
-        (
-            "mandate.petition_repeat_count",
-            mandate.petition_repeat_count,
-            COUNT_THRESHOLD_MAX,
-        ),
-        (
-            "mandate.convention_held_period_days",
-            mandate.convention_held_period_days,
-            PERIOD_DAYS_MAX,
-        ),
-        (
-            "mandate.review_period_days",
-            mandate.review_period_days,
-            PERIOD_DAYS_MAX,
-        ),
-    ];
-    for (name, value, max) in optional {
-        if let Some(value) = value {
-            within(name, u64::from(value), max)?;
-        }
-    }
     Ok(())
 }
 
@@ -247,20 +217,6 @@ mod tests {
                 assert!(check_thresholds(&edited).is_err(), "{field} = {value}");
             }
         }
-    }
-
-    #[test]
-    fn mandate_thresholds_are_bounded_when_set() {
-        let mut edited = thresholds();
-        edited.mandate.review_period_days = Some(3_650);
-        assert_eq!(check_thresholds(&edited), Ok(()));
-        for value in [0, 3_651] {
-            edited.mandate.review_period_days = Some(value);
-            assert!(check_thresholds(&edited).is_err(), "{value}");
-        }
-        let mut edited = thresholds();
-        edited.mandate.petition_repeat_count = Some(10_001);
-        assert!(check_thresholds(&edited).is_err());
     }
 
     #[test]

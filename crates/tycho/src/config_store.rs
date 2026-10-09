@@ -259,16 +259,6 @@ pub struct SessionTimes {
     pub rollover_fraction: f64,
 }
 
-/// Article 14.3 to 15.3 thresholds; `None` until the operator sets them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MandateThresholds {
-    pub convention_citations_min: Option<u32>,
-    pub petition_repeat_count: Option<u32>,
-    pub convention_held_period_days: Option<u32>,
-    pub review_period_days: Option<u32>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Thresholds {
@@ -276,7 +266,6 @@ pub struct Thresholds {
     pub slots: SlotCounts,
     pub retry: Retry,
     pub session: SessionTimes,
-    pub mandate: MandateThresholds,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

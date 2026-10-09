@@ -20,9 +20,12 @@
             ]
         },
         "PetitionState": {
+            "description": "open and amend count toward the open maximum and block a second petition with the same\nfingerprint; merged, closed and reject are terminal.",
             "enum": [
                 "open",
                 "amend",
+                "merged",
+                "closed",
                 "reject"
             ]
         },
@@ -60,6 +63,10 @@
         "article": {
             "$ref": "#/$defs/PetitionArticle"
         },
+        "baseline": {
+            "description": "The superseded rejection's baseline, when raised on new evidence.",
+            "$ref": "#/$defs/U32"
+        },
         "cases": {
             "type": "array",
             "items": {
@@ -74,8 +81,15 @@
             "$ref": "#/$defs/PetitionCounter"
         },
         "evidence": {
-            "description": "The counter's evidence value when the petition was raised.",
-            "$ref": "#/$defs/U32"
+            "description": "The counter's value when the petition was raised; null for an early petition.",
+            "anyOf": [
+                {
+                    "$ref": "#/$defs/U32"
+                },
+                {
+                    "type": "null"
+                }
+            ]
         },
         "fingerprint": {
             "type": "string",
@@ -84,6 +98,10 @@
         "key": {
             "description": "The counter key: question fingerprint and ruling digest, case id, article, clause or\nmechanism id, or escalation id.",
             "$ref": "#/$defs/ShortText"
+        },
+        "mandate": {
+            "description": "Content hash of the mandate copy the pass pinned.",
+            "$ref": "#/$defs/ContentRef"
         },
         "sequence": {
             "allOf": [
@@ -101,13 +119,16 @@
             "$ref": "#/$defs/PetitionState"
         },
         "supersedes": {
-            "description": "The silent-by-design case this petition overcomes with new evidence.",
+            "description": "The latest rejection case holding this fingerprint, when raised on new evidence.",
             "$ref": "#/$defs/RecordId"
         },
         "thresholds": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
+                "convention_citations_min": {
+                    "$ref": "#/$defs/U32"
+                },
                 "convention_hold_days": {
                     "$ref": "#/$defs/U32"
                 },
@@ -123,6 +144,7 @@
                 }
             },
             "required": [
+                "convention_citations_min",
                 "convention_hold_days",
                 "digest",
                 "repeated_ruling_count",
@@ -138,6 +160,7 @@
         "evidence",
         "fingerprint",
         "key",
+        "mandate",
         "sequence",
         "state",
         "thresholds"

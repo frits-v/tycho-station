@@ -4,6 +4,7 @@ package config
 
 petitions: #Petitions & {
 	repeated_ruling_count:       3
+	convention_citations_min:    5
 	convention_hold_days:        90
 	review_period_days:          90
 	open_max:                    3
