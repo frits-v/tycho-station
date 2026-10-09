@@ -138,18 +138,24 @@ pub fn read_credentials(
     Ok(AppCredentials { app_id, key })
 }
 
-/// `owner/name` from the Actions environment, bounded and limited to GitHub's name characters.
+/// `owner/name` from the Actions environment, bounded and limited to GitHub's name characters:
+/// an owner is letters, digits and `-`; a name adds `_` and `.` but is never `.` or `..`.
 pub fn read_repository(value: Option<String>) -> Result<Repository, String> {
     let value = value.unwrap_or_default();
-    let valid_part = |part: &str| {
-        !part.is_empty()
-            && part
+    let valid_owner = |owner: &str| {
+        !owner.is_empty() && owner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    let valid_name = |name: &str| {
+        !name.is_empty()
+            && name != "."
+            && name != ".."
+            && name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
     };
     match value.split_once('/') {
         Some((owner, name))
-            if value.len() <= REPOSITORY_MAX_CHARS && valid_part(owner) && valid_part(name) =>
+            if value.len() <= REPOSITORY_MAX_CHARS && valid_owner(owner) && valid_name(name) =>
         {
             Ok(Repository {
                 owner: owner.to_string(),
@@ -269,9 +275,9 @@ fn single_repository(value: &serde_json::Value, repository: &Repository) -> bool
     let names: Option<Vec<&str>> = value
         .get("repositories")
         .and_then(serde_json::Value::as_array)
-        .map(|list| {
+        .and_then(|list| {
             list.iter()
-                .filter_map(|entry| entry.get("name").and_then(serde_json::Value::as_str))
+                .map(|entry| entry.get("name").and_then(serde_json::Value::as_str))
                 .collect()
         });
     let selected = value
@@ -508,7 +514,21 @@ mod tests {
                 name: "tycho-station".into()
             }
         );
-        for bad in ["", "tycho-station", "/x", "x/", "a/b c", "a/b?x=1"] {
+        for bad in [
+            "",
+            "tycho-station",
+            "/x",
+            "x/",
+            "a/b c",
+            "a/b?x=1",
+            "a/..",
+            "a/.",
+            "../x",
+            "./x",
+            "a.b/x",
+            "a_b/x",
+            "a/b/c",
+        ] {
             assert!(read_repository(Some(bad.into())).is_err(), "{bad}");
         }
         assert!(read_repository(None).is_err());
@@ -552,11 +572,13 @@ mod tests {
         let narrower = r#"{"contents":"write","metadata":"read"}"#;
         let admin = r#"{"contents":"write","pull_requests":"write","metadata":"write"}"#;
         let two_repositories = r#"[{"name":"tycho-station"},{"name":"other"}]"#;
+        let unnamed_entry = r#"[{"name":"tycho-station"},{}]"#;
         for (permissions, repositories) in [
             (wider, one_repository),
             (narrower, one_repository),
             (admin, one_repository),
             (exact, two_repositories),
+            (exact, unnamed_entry),
             (exact, "[]"),
         ] {
             assert_eq!(
