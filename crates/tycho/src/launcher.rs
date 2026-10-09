@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,9 @@ use tycho_types::lease::Lease;
 use tycho_types::service::Service;
 use tycho_types::session::SessionName;
 
+use crate::agent_files::{
+    create_new, current_uid, ensure_private_dir, open_append, read_checked, write_durable,
+};
 use crate::config::{AgentDirs, AGENT_DIR_ENV, ZMX_ENV};
 use crate::exit_decode::{
     decode_exit, read_progress, read_result_file, status_payload, ChildEnd, Decoded, Stop,
@@ -34,8 +37,8 @@ use crate::exit_decode::{
 use crate::launch_probe::LAUNCH_PROBE_SERVICE;
 use crate::process::{now_unix_ms, send};
 use crate::spool::{
-    read_bounded, spool_then_deliver, write_durable, Ack, Delivery, HeartbeatSend, Ingress,
-    SpoolRecord, SPOOL_FILE, SPOOL_SCHEMA_VERSION,
+    spool_then_deliver, Ack, Delivery, HeartbeatSend, Ingress, SpoolRecord, SPOOL_FILE,
+    SPOOL_SCHEMA_VERSION,
 };
 use crate::zmx::Zmx;
 
@@ -167,8 +170,6 @@ impl LauncherSettings {
     }
 }
 
-/// The launch spec file name in the session's spool directory.
-pub const SPEC_FILE: &str = "launch.json";
 pub const SPEC_FILE_MAX_BYTES: usize = 65_536;
 pub const SPEC_ENV_MAX: usize = 64;
 pub const SPEC_SCHEMA_VERSION: u32 = 1;
@@ -224,7 +225,7 @@ impl LaunchSpec {
 
 /// Reads and checks the spec, then removes it so the secret does not outlive the read.
 pub fn take_spec(path: &Path) -> Result<(LauncherSettings, Vec<String>), SettingsError> {
-    let bytes = read_bounded(path, SPEC_FILE_MAX_BYTES)
+    let bytes = read_checked(path, SPEC_FILE_MAX_BYTES, None)
         .map_err(|error| SettingsError::Spec(format!("{}: {error}", path.display())))?
         .ok_or_else(|| SettingsError::Spec(format!("{} does not exist", path.display())))?;
     let spec: LaunchSpec =
@@ -340,7 +341,9 @@ impl fmt::Display for SequenceError {
 
 /// Advances the counter beside the lease and returns the new value; durable before it is used.
 pub fn next_sequence(path: &Path) -> Result<u64, SequenceError> {
-    let previous = match read_bounded(path, SEQUENCE_FILE_MAX_BYTES).map_err(SequenceError::Io)? {
+    let previous = match read_checked(path, SEQUENCE_FILE_MAX_BYTES, Some(current_uid()))
+        .map_err(SequenceError::Io)?
+    {
         None => 0,
         Some(bytes) => {
             let text = String::from_utf8_lossy(&bytes).trim().to_string();
@@ -366,7 +369,7 @@ pub struct LaunchLog {
 impl LaunchLog {
     #[must_use]
     pub fn open(path: &Path) -> Self {
-        let file = OpenOptions::new().create(true).append(true).open(path).ok();
+        let file = open_append(path).ok();
         Self { file, written: 0 }
     }
 
@@ -482,7 +485,7 @@ pub fn launch(
 ) -> Result<LaunchEnd, String> {
     let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
     let lease = write_first_lease(settings, &files)?;
-    let spool_ready = fs::create_dir_all(&files.spool_dir);
+    let spool_ready = ensure_private_dir(&files.spool_dir);
     let mut run = Run {
         settings,
         log: LaunchLog::open(&files.log),
@@ -545,8 +548,8 @@ impl<I: Ingress> Run<'_, I> {
             .env(SPOOL_DIR_ENV, &self.files.spool_dir)
             .process_group(0)
             .stdin(Stdio::null())
-            .stdout(File::create(&self.files.stdout)?)
-            .stderr(File::create(&self.files.stderr)?)
+            .stdout(create_new(&self.files.stdout)?)
+            .stderr(create_new(&self.files.stderr)?)
             .spawn()?;
         let record = VendorRecord {
             pid: child.id(),
@@ -742,6 +745,7 @@ mod tests {
             fs::remove_dir_all(&dir).unwrap();
         }
         fs::create_dir_all(dir.join(crate::config::LEASE_DIR)).unwrap();
+        fs::create_dir_all(dir.join(crate::config::SPOOL_DIR)).unwrap();
         dir
     }
 
@@ -790,7 +794,7 @@ mod tests {
     #[test]
     fn a_spec_is_checked_then_removed() {
         let dir = scratch("spec");
-        let path = dir.join(SPEC_FILE);
+        let path = dir.join("launch.json");
         assert!(matches!(take_spec(&path), Err(SettingsError::Spec(_))));
         let spec = LaunchSpec {
             schema_version: SPEC_SCHEMA_VERSION,

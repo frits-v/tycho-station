@@ -2,9 +2,8 @@
 //! ingress with backoff until Restate acknowledges, and replayable when it never did.
 
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -15,6 +14,7 @@ use tycho_types::launcher::{AwaitableId, IdempotencyKey};
 use tycho_types::service::handler::SESSION_HEARTBEAT;
 use tycho_types::session::SessionName;
 
+use crate::agent_files::{read_checked, write_new};
 use crate::config::ingress_url;
 use crate::http::{Http, Outcome};
 
@@ -116,67 +116,18 @@ impl SpoolRecord {
     }
 }
 
-/// Writes to a sibling, syncs it, renames it over the target and syncs the directory.
-pub fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_durable_mode(path, bytes, DURABLE_FILE_MODE)
-}
-
-/// `write_durable` readable by the owner only, for a file that carries a secret.
-pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_durable_mode(path, bytes, PRIVATE_FILE_MODE)
-}
-
-const DURABLE_FILE_MODE: u32 = 0o640;
-const PRIVATE_FILE_MODE: u32 = 0o600;
-
-fn write_durable_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("path has no parent directory"))?;
-    let staging = path.with_extension(format!("staging-{}", std::process::id()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(mode)
-        .open(&staging)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&staging, path)?;
-    File::open(parent)?.sync_all()
-}
-
-/// Reads at most `max_bytes`; a missing file is `None` and a larger one an error.
-pub fn read_bounded(path: &Path, max_bytes: usize) -> io::Result<Option<Vec<u8>>> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let limit = u64::try_from(max_bytes).unwrap_or(u64::MAX);
-    let mut bytes = Vec::new();
-    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
-    if bytes.len() > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} exceeds {max_bytes} bytes", path.display()),
-        ));
-    }
-    Ok(Some(bytes))
-}
-
 pub fn write_spool(path: &Path, record: &SpoolRecord) -> Result<(), SpoolError> {
     record.resolution()?;
     let bytes = serde_json::to_vec(record).map_err(SpoolError::Json)?;
     if bytes.len() > SPOOL_FILE_MAX_BYTES {
         return Err(SpoolError::TooLarge(bytes.len()));
     }
-    write_durable(path, &bytes).map_err(|error| SpoolError::Io(path.to_path_buf(), error))
+    write_new(path, &bytes).map_err(|error| SpoolError::Io(path.to_path_buf(), error))
 }
 
-pub fn read_spool(path: &Path) -> Result<SpoolRecord, SpoolError> {
-    let bytes = read_bounded(path, SPOOL_FILE_MAX_BYTES)
+/// Reads a spool only when it is a regular file of `owner` within the size cap.
+pub fn read_spool(path: &Path, owner: u32) -> Result<SpoolRecord, SpoolError> {
+    let bytes = read_checked(path, SPOOL_FILE_MAX_BYTES, Some(owner))
         .map_err(|error| match error.kind() {
             io::ErrorKind::InvalidData => SpoolError::TooLarge(SPOOL_FILE_MAX_BYTES + 1),
             _ => SpoolError::Io(path.to_path_buf(), error),
@@ -321,9 +272,20 @@ pub fn deliver_with_backoff(
     }
 }
 
-/// Renames an acknowledged spool so a replay of the same path is refused as missing.
+/// Renames an acknowledged spool onto a name that must not exist, so a replay of the same
+/// path is refused as missing.
 pub fn mark_acknowledged(path: &Path) -> io::Result<PathBuf> {
     let done = path.with_extension(ACKNOWLEDGED_SUFFIX);
+    match fs::symlink_metadata(&done) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists", done.display()),
+            ))
+        }
+    }
     fs::rename(path, &done)?;
     Ok(done)
 }
@@ -344,13 +306,14 @@ pub fn spool_then_deliver(
     Ok(delivery)
 }
 
-/// Delivers a spool that was written but never acknowledged.
+/// Delivers a spool that was written but never acknowledged, if `owner` wrote it.
 pub fn replay(
     ingress: &impl Ingress,
     path: &Path,
+    owner: u32,
     wait: &mut dyn FnMut(Duration),
 ) -> Result<Delivery, SpoolError> {
-    let record = read_spool(path)?;
+    let record = read_spool(path, owner)?;
     let resolution = record.resolution()?;
     let delivery = deliver_with_backoff(ingress, &record, &resolution, DELIVERY_DEADLINE, wait);
     if delivery.acknowledged() {
@@ -362,7 +325,9 @@ pub fn replay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_files::current_uid;
     use std::cell::RefCell;
+    use std::os::unix::fs::symlink;
 
     const SESSION: &str = "cf7a.wu03.wrk.claude.a1f3";
 
@@ -441,6 +406,25 @@ mod tests {
     }
 
     #[test]
+    fn a_symlink_at_the_spool_path_is_refused_on_write_and_read() {
+        let dir = scratch("symlink");
+        let victim = dir.join("victim");
+        fs::write(&victim, "untouched").unwrap();
+        let path = dir.join(SPOOL_FILE);
+        symlink(&victim, &path).unwrap();
+        assert!(matches!(
+            write_spool(&path, &record(ExitState::Failed)),
+            Err(SpoolError::Io(..))
+        ));
+        assert!(matches!(
+            read_spool(&path, current_uid()),
+            Err(SpoolError::Io(..))
+        ));
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn backoff_doubles_from_ten_seconds_to_the_cap() {
         let schedule: Vec<u64> = (0..7).map(|attempt| backoff(attempt).as_secs()).collect();
         assert_eq!(schedule, vec![10, 20, 40, 80, 160, 300, 300]);
@@ -511,11 +495,21 @@ mod tests {
         let path = dir.join(SPOOL_FILE);
         let ingress = Recorder::new(&path, vec![Ack::Acknowledged]);
         assert!(matches!(
-            replay(&ingress, &path, &mut |_| {}),
+            replay(&ingress, &path, current_uid(), &mut |_| {}),
             Err(SpoolError::Missing(_))
         ));
         fs::write(&path, "x".repeat(SPOOL_FILE_MAX_BYTES + 1)).unwrap();
-        assert!(matches!(read_spool(&path), Err(SpoolError::TooLarge(_))));
+        assert!(matches!(
+            read_spool(&path, current_uid()),
+            Err(SpoolError::TooLarge(_))
+        ));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_inconsistent_spool_is_never_written() {
+        let dir = scratch("inconsistent");
+        let path = dir.join(SPOOL_FILE);
         let mut completed = record(ExitState::Completed);
         assert!(matches!(
             write_spool(&path, &completed),
@@ -532,11 +526,33 @@ mod tests {
             write_spool(&path, &failed),
             Err(SpoolError::Inconsistent(_))
         ));
+        assert!(!path.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_spool_is_written_once_read_by_its_owner_and_replayed_once() {
+        let dir = scratch("once");
+        let path = dir.join(SPOOL_FILE);
+        let ingress = Recorder::new(&path, vec![Ack::Acknowledged]);
         write_spool(&path, &record(ExitState::Failed)).unwrap();
-        assert_eq!(read_spool(&path).unwrap(), record(ExitState::Failed));
-        assert!(replay(&ingress, &path, &mut |_| {}).unwrap().acknowledged());
+        assert_eq!(
+            read_spool(&path, current_uid()).unwrap(),
+            record(ExitState::Failed)
+        );
         assert!(matches!(
-            replay(&ingress, &path, &mut |_| {}),
+            read_spool(&path, current_uid().wrapping_add(1)),
+            Err(SpoolError::Io(..))
+        ));
+        assert!(matches!(
+            write_spool(&path, &record(ExitState::Failed)),
+            Err(SpoolError::Io(..))
+        ));
+        assert!(replay(&ingress, &path, current_uid(), &mut |_| {})
+            .unwrap()
+            .acknowledged());
+        assert!(matches!(
+            replay(&ingress, &path, current_uid(), &mut |_| {}),
             Err(SpoolError::Missing(_))
         ));
         fs::remove_dir_all(&dir).unwrap();

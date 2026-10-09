@@ -135,7 +135,14 @@ fn replay(spool: &str) -> i32 {
         Ok(http) => http,
         Err(code) => return code,
     };
-    match tycho::spool::replay(&http, Path::new(spool), &mut thread::sleep) {
+    let owner = match config::agent_uid() {
+        Ok(owner) => owner,
+        Err(error) => {
+            eprintln!("tycho: replay refused: {error}");
+            return launcher::EXIT_REFUSED_TO_START;
+        }
+    };
+    match tycho::spool::replay(&http, Path::new(spool), owner, &mut thread::sleep) {
         Ok(delivery) => {
             println!("{delivery:?}");
             i32::from(!delivery.acknowledged())

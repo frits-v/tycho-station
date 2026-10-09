@@ -55,10 +55,14 @@ pub const WATCHDOG_ITERATIONS_MAX: u32 = 120;
 pub const LIST_SESSIONS_MAX: usize = 256;
 
 pub const AGENT_DIR_ENV: &str = "TYCHO_AGENT_DIR";
+pub const AGENT_USER_ENV: &str = "TYCHO_AGENT_USER";
+/// The dedicated macOS user agents run as.
+pub const AGENT_USER_DEFAULT: &str = "tycho-agent";
 /// Shared with the developer's group so Ghostty can attach to agent sessions.
 pub const AGENT_SOCKET_DIR_DEFAULT: &str = "/Users/Shared/tycho-agent-zmx";
 pub const LEASE_DIR: &str = "leases";
 pub const SPOOL_DIR: &str = "spool";
+pub const SPEC_DIR: &str = "specs";
 
 pub const ENTIRE_GRAPH_ENV: &str = "TYCHO_ENTIRE_GRAPH";
 pub const GRAPH_INDEX_DIR: &str = "graph";
@@ -200,13 +204,34 @@ impl AgentDirs {
     }
 
     #[must_use]
+    pub fn spec_dir(&self) -> PathBuf {
+        self.socket_dir.join(SPEC_DIR)
+    }
+
+    /// Where the core leaves the launch spec; the launcher removes it once read.
+    #[must_use]
+    pub fn spec_path(&self, session: &SessionName) -> PathBuf {
+        self.spec_dir().join(format!("{session}.json"))
+    }
+
+    #[must_use]
     pub fn spool_dir(&self, session: &SessionName) -> PathBuf {
         self.spool_root().join(session.to_string())
     }
 }
 
+/// The agent user's uid: `TYCHO_AGENT_USER` when set, else the default name.
+pub fn agent_uid() -> Result<u32, ConfigError> {
+    let name = env::var(AGENT_USER_ENV).unwrap_or_else(|_| AGENT_USER_DEFAULT.to_string());
+    User::from_name(&name)
+        .map_err(|error| ConfigError::UserLookup(error.to_string()))?
+        .map(|user| user.uid.as_raw())
+        .ok_or(ConfigError::NoAgentUser(name))
+}
+
 #[derive(Debug)]
 pub enum ConfigError {
+    NoAgentUser(String),
     NoHome,
     UserLookup(String),
     HomeOutsideUserHome(PathBuf),
@@ -224,6 +249,9 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoHome => formatter.write_str("the current uid has no home directory"),
+            Self::NoAgentUser(name) => {
+                write!(formatter, "no user named {name} for {AGENT_USER_ENV}")
+            }
             Self::UserLookup(error) => {
                 write!(formatter, "cannot look up the current user: {error}")
             }

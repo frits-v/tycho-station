@@ -12,7 +12,8 @@ use tycho_types::envelope::{
 use tycho_types::exit::ExitState;
 use tycho_types::session::SessionName;
 
-use crate::spool::{check_result_envelope, read_bounded};
+use crate::agent_files::{current_uid, read_checked};
+use crate::spool::check_result_envelope;
 
 pub const PROGRESS_FILE_MAX_BYTES: usize = 4096;
 pub const RESULT_FILE_MAX_BYTES: usize = ENVELOPE_MAX_BYTES + 1024;
@@ -48,7 +49,7 @@ pub enum Progress {
 
 #[must_use]
 pub fn read_progress(path: &Path) -> Progress {
-    let bytes = match read_bounded(path, PROGRESS_FILE_MAX_BYTES) {
+    let bytes = match read_checked(path, PROGRESS_FILE_MAX_BYTES, Some(current_uid())) {
         Ok(Some(bytes)) => bytes,
         Ok(None) => return Progress::Absent,
         Err(error) => return Progress::Invalid(error.to_string()),
@@ -124,7 +125,7 @@ pub enum ResultFile {
 
 #[must_use]
 pub fn read_result_file(path: &Path) -> ResultFile {
-    match read_bounded(path, RESULT_FILE_MAX_BYTES) {
+    match read_checked(path, RESULT_FILE_MAX_BYTES, Some(current_uid())) {
         Ok(Some(bytes)) => serde_json::from_slice(&bytes).map_or_else(
             |error| ResultFile::Invalid(error.to_string()),
             ResultFile::Report,

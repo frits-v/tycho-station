@@ -4,6 +4,7 @@
     reason = "each error type is an enumerated state; its variants are the documentation"
 )]
 
+pub mod agent_files;
 pub mod code_graph;
 pub mod command;
 pub mod config;
