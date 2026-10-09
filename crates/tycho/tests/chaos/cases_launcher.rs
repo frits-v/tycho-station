@@ -445,7 +445,7 @@ fn kill_launcher(spawner: &LauncherSpawner, name: &str) {
 }
 
 /// The reap judged the recorded vendor and, with the agent user being the core's own user
-/// in this rig, refused to signal it, so the vendor is still running.
+/// in this rig, did not signal it, so the vendor is still running.
 fn assert_reap_refused_and_vendor_running(spawner: &LauncherSpawner, name: &str) {
     let verdicts: Vec<Option<KillVerdict>> = spawner
         .log()
