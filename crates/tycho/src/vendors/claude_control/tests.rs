@@ -14,6 +14,8 @@ use crate::vendors::control::AddressTarget;
 
 const REGISTRY_IDLE: &str = include_str!("../../fixtures/claude-registry-idle.json");
 const REGISTRY_WAITING: &str = include_str!("../../fixtures/claude-registry-waiting.json");
+// Captured from another session in the same directory: an SDK entrypoint of 2.1.239.
+const REGISTRY_NO_STATUS: &str = include_str!("../../fixtures/claude-registry-no-status.json");
 // Captured from 2.1.280: the peer turn as written, and an assistant line trimmed to its type,
 // ids, model and usage, with its content cut to one word.
 const TRANSCRIPT_TAIL: &str = include_str!("../../fixtures/claude-transcript-tail.jsonl");
@@ -156,7 +158,7 @@ fn registry_files_decode_to_every_observed_state() {
     );
     // Synthetic: `busy` was observed in `claude agents --json`, not captured in a registry file.
     let mut busy = idle.clone();
-    busy.status = "busy".to_string();
+    busy.status = Some("busy".to_string());
     assert_eq!(observation_of(&busy), Observation::Busy { pid: 69821 });
     let mut other_wait = waiting;
     other_wait.waiting_for = Some("plan approval".to_string());
@@ -167,8 +169,14 @@ fn registry_files_decode_to_every_observed_state() {
             ..
         }
     ));
+    let no_status = decode_registry(REGISTRY_NO_STATUS.as_bytes()).unwrap();
+    assert_eq!(no_status.pid, 19793);
+    assert!(matches!(
+        observation_of(&no_status),
+        Observation::Unrecognised { .. }
+    ));
     let mut unknown = idle;
-    unknown.status = "sleeping".to_string();
+    unknown.status = Some("sleeping".to_string());
     assert!(matches!(
         observation_of(&unknown),
         Observation::Unrecognised { .. }
@@ -178,6 +186,7 @@ fn registry_files_decode_to_every_observed_state() {
         "not json",
         "[1]",
         r#"{"pid":0,"sessionId":"x","cwd":"/","kind":"interactive","status":"idle"}"#,
+        r#"{"sessionId":"x","status":"idle"}"#,
     ] {
         assert!(decode_registry(garbage.as_bytes()).is_err(), "{garbage:?}");
     }

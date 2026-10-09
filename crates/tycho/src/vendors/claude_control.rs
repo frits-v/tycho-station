@@ -61,15 +61,15 @@ pub struct ClaudeControl {
     pub relay_mode: RelayMode,
 }
 
-/// One registry file, decoded; fields the adapter does not use are ignored.
+/// One registry file; only pid and session id are required, as other versions share the files.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegistryEntry {
     pub pid: u32,
     pub session_id: String,
-    pub cwd: String,
-    pub kind: String,
-    pub status: String,
+    pub cwd: Option<String>,
+    pub kind: Option<String>,
+    pub status: Option<String>,
     pub waiting_for: Option<String>,
     pub messaging_socket_path: Option<String>,
 }
@@ -178,7 +178,12 @@ pub fn decode_registry(bytes: &[u8]) -> Result<RegistryEntry, String> {
 #[must_use]
 pub fn observation_of(entry: &RegistryEntry) -> Observation {
     let pid = entry.pid;
-    match (entry.status.as_str(), entry.waiting_for.as_deref()) {
+    let Some(status) = entry.status.as_deref() else {
+        return Observation::Unrecognised {
+            reason: "the registry entry carries no status".to_string(),
+        };
+    };
+    match (status, entry.waiting_for.as_deref()) {
         ("idle", _) => Observation::Idle { pid },
         ("busy", _) => Observation::Busy { pid },
         ("waiting", Some(STATUS_PERMISSION_PROMPT)) => Observation::Waiting {
@@ -457,10 +462,14 @@ impl ClaudeControl {
     }
 
     fn transcript_tail(&self, entry: &RegistryEntry) -> Result<Option<String>, String> {
+        let cwd = entry
+            .cwd
+            .as_deref()
+            .ok_or_else(|| "the registry entry names no working directory".to_string())?;
         let path = self
             .config_dir
             .join("projects")
-            .join(project_slug(&entry.cwd))
+            .join(project_slug(cwd))
             .join(format!("{}.jsonl", entry.session_id));
         let mut file = match fs::File::open(&path) {
             Ok(file) => file,
