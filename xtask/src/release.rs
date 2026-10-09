@@ -29,7 +29,7 @@ const LINUX_TARGETS: [&str; 1] = ["x86_64-unknown-linux-gnu"];
 
 /// How a bounded child process ended.
 #[derive(Debug, PartialEq, Eq)]
-enum Exit {
+pub enum Exit {
     Code(i32),
     Signal,
     TimedOut,
@@ -39,9 +39,9 @@ enum Exit {
 }
 
 #[derive(Debug)]
-struct Captured {
-    exit: Exit,
-    stdout: String,
+pub struct Captured {
+    pub exit: Exit,
+    pub stdout: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -91,7 +91,7 @@ enum UploadOutcome {
 }
 
 /// Runs a command with stdin closed, stderr inherited and stdout captured up to the cap.
-fn run_bounded(command: &mut Command, timeout: Duration) -> Captured {
+pub fn run_bounded(command: &mut Command, timeout: Duration) -> Captured {
     println!("xtask: {}", describe(command));
     let spawned = command
         .stdin(Stdio::null())

@@ -1,5 +1,5 @@
 <title>Tycho Station</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Public+Sans:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Inter:wght@400;600;700;800&family=Public+Sans:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap">
 <style>
 :root{
   --ground:#F6F8F7;--surface:#FFFFFF;--surface-2:#EEF2F0;--ink:#16201F;--muted:#5B6866;--line:#D8DFDD;--line-strong:#B9C3C0;
@@ -69,21 +69,11 @@ td code{white-space:nowrap}
 figure{margin:20px 0}
 figcaption{font-size:13px;color:var(--muted);margin-top:8px;max-width:72ch}
 .diagram{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:12px;overflow-x:auto}
-.diagram svg{display:block;width:100%;height:auto;min-width:560px;font-family:"Public Sans",system-ui,sans-serif}
-svg .box{fill:var(--surface-2);stroke:var(--line-strong);stroke-width:1}
-svg .box.accent{fill:var(--accent-soft);stroke:var(--accent)}
-svg .box.ghost{fill:none;stroke:var(--line-strong);stroke-dasharray:4 3}
-svg .box.store{fill:var(--surface);stroke:var(--line-strong)}
-svg .t{fill:var(--ink);font-size:12.5px}
-svg .t.b{font-weight:600;font-family:Archivo,sans-serif}
-svg .t.m{fill:var(--muted);font-size:11px}
-svg .t.mono{font-family:"JetBrains Mono",monospace;font-size:11px}
-svg .ln{stroke:var(--line-strong);stroke-width:1.2;fill:none}
-svg .ln.acc{stroke:var(--accent);stroke-width:1.6}
-svg .ln.bad{stroke:var(--blocks);stroke-width:1.4}
-svg .lbl{fill:var(--muted);font-size:10.5px}
-svg .lbl.acc{fill:var(--accent-ink)}
-svg .lbl.bad{fill:var(--blocks)}
+.diagram svg{display:block;width:100%;height:auto;min-width:560px}
+.diagram svg.fig-dark{display:none}
+:root[data-theme="dark"] .diagram svg.fig-light{display:none}
+:root[data-theme="dark"] .diagram svg.fig-dark{display:block}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]) .diagram svg.fig-light{display:none}:root:not([data-theme="light"]) .diagram svg.fig-dark{display:block}}
 .pill{display:inline-block;font-family:Archivo,sans-serif;font-size:11px;font-weight:600;letter-spacing:.05em;text-transform:uppercase;padding:2px 8px;border-radius:999px;border:1px solid transparent}
 .pill.blocks{background:var(--blocks-soft);color:var(--blocks)}
 .pill.fyi{background:var(--fyi-soft);color:var(--fyi)}
@@ -236,51 +226,8 @@ html{scroll-behavior:smooth}
 <h2 id="s4"><span class="num">4</span>Topology</h2>
 <figure>
 <div class="diagram">
-<svg viewBox="0 0 960 520" role="img" aria-label="Topology: human surfaces attach to zmx sessions; root, control and worker sessions under zmx; a factory store outside every repo; GitHub as the merge gate">
-  <!-- human surfaces -->
-  <rect class="box ghost" x="20" y="20" width="920" height="86" rx="8"/>
-  <text class="t m" x="34" y="40">HUMAN SURFACES, DISPOSABLE READERS</text>
-  <rect class="box" x="40" y="50" width="200" height="42" rx="6"/><text class="t b" x="60" y="76">Ghostty</text><text class="t m" x="130" y="76">tabs via AppleScript</text>
-  <rect class="box" x="260" y="50" width="200" height="42" rx="6"/><text class="t b" x="280" y="76">TUI</text><text class="t m" x="320" y="76">inbox, feed, focus</text>
-  <rect class="box" x="480" y="50" width="200" height="42" rx="6"/><text class="t b" x="500" y="76">Web view</text><text class="t m" x="580" y="76">localhost, SSE</text>
-  <rect class="box" x="700" y="50" width="220" height="42" rx="6"/><text class="t b" x="720" y="76">Notifications</text><text class="t m" x="830" y="76">link to web</text>
-  <!-- zmx layer -->
-  <rect class="box ghost" x="20" y="130" width="640" height="330" rx="8"/>
-  <text class="t m" x="34" y="150">ZMX: ONE DAEMON PER SESSION, OWNS THE PTY</text>
-  <rect class="box accent" x="40" y="166" width="600" height="46" rx="6"/>
-  <text class="t b" x="60" y="186">Root control session</text><text class="t mono" x="60" y="203">cf7a.root.claude</text>
-  <text class="t m" x="330" y="194">orchestrator of orchestrators; never edits</text>
-  <rect class="box accent" x="40" y="246" width="280" height="46" rx="6"/>
-  <text class="t b" x="58" y="266">Control session, work unit 03</text><text class="t mono" x="58" y="283">cf7a.wu03.ctl.codex</text>
-  <rect class="box accent" x="360" y="246" width="280" height="46" rx="6"/>
-  <text class="t b" x="378" y="266">Control session, work unit 04</text><text class="t mono" x="378" y="283">cf7a.wu04.ctl.claude</text>
-  <rect class="box" x="40" y="326" width="130" height="40" rx="6"/><text class="t mono" x="52" y="350">wu03.wrk.claude.a1f3</text>
-  <rect class="box" x="190" y="326" width="130" height="40" rx="6"/><text class="t mono" x="202" y="350">wu03.wrk.codex.b77e</text>
-  <rect class="box" x="360" y="326" width="130" height="40" rx="6"/><text class="t mono" x="372" y="350">wu04.wrk.claude.c201</text>
-  <rect class="box" x="510" y="326" width="130" height="40" rx="6"/><text class="t mono" x="522" y="350">wu04.wrk.agy.d9c4</text>
-  <text class="t m" x="40" y="392">workers: headless, stream-json, one task each, exit when done</text>
-  <rect class="box" x="40" y="408" width="600" height="36" rx="6"/><text class="t b" x="60" y="431">Reader binary</text><text class="t m" x="170" y="431">serves TUI and web view from the store; restartable at any time</text>
-  <!-- store -->
-  <rect class="box ghost" x="680" y="130" width="260" height="330" rx="8"/>
-  <text class="t m" x="694" y="150">DURABLE CORE, OUTSIDE EVERY REPO</text>
-  <rect class="box store" x="700" y="166" width="220" height="54" rx="6"/><text class="t b" x="716" y="186">Restate server</text><text class="t m" x="716" y="204">one binary under zmx: journal, state, timers</text>
-  <rect class="box store" x="700" y="232" width="220" height="54" rx="6"/><text class="t b" x="716" y="252">Factory services</text><text class="t m" x="716" y="270">Rust endpoint: epic, work unit, escalation, packet</text>
-  <rect class="box store" x="700" y="298" width="220" height="54" rx="6"/><text class="t b" x="716" y="318">Read model</text><text class="t m" x="716" y="336">SQLite graph, rebuilt from handlers</text>
-  <rect class="box store" x="700" y="364" width="220" height="54" rx="6"/><text class="t b" x="716" y="384">Case law and blobs</text><text class="t m" x="716" y="402">JSON per case, content-addressed artifacts</text>
-  <!-- canonical repo -->
-  <rect class="box" x="20" y="480" width="920" height="30" rx="6"/>
-  <text class="t b" x="40" y="500">Canonical repo</text><text class="t m" x="160" y="500">core-owned bare repo; children write only to worktrees; the core verifies, fast-forwards default, then syncs to any remote</text>
-  <!-- lines -->
-  <path class="ln" d="M340 189 L340 246"/>
-  <path class="ln" d="M500 189 L500 246"/>
-  <path class="ln" d="M105 292 L105 326"/><path class="ln" d="M255 292 L255 326"/>
-  <path class="ln" d="M425 292 L425 326"/><path class="ln" d="M575 292 L575 326"/>
-  <path class="ln acc" d="M640 189 L700 189"/><path class="ln acc" d="M640 269 L700 259"/>
-  <path class="ln" d="M140 92 L140 130"/><text class="lbl" x="146" y="120">zmx attach</text>
-  <path class="ln" d="M360 92 L360 130"/><path class="ln" d="M580 92 L580 130"/>
-  <text class="lbl" x="366" y="120">reads store via reader</text>
-  <path class="ln" d="M810 92 L810 130"/><text class="lbl" x="816" y="120">read only</text>
-</svg>
+<!-- figure:topology -->
+<!-- /figure:topology -->
 </div>
 <figcaption>Every long-lived process is a zmx session named by epic, work unit, level and vendor. Surfaces attach or read; none owns a process. Orchestration state is Restate's journal and keyed state; the SQLite graph is a read model. All of it lives in a home-directory tree, never inside a target repo.</figcaption>
 </figure>
@@ -387,40 +334,8 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
 <h3>Work unit lifecycle</h3>
 <figure>
 <div class="diagram">
-<svg viewBox="0 0 960 400" role="img" aria-label="Work unit state machine from queued through claimed, running, stalled, escalated, verifying, merging, merged and done">
-  <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--line-strong)"/></marker>
-  <marker id="ahb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--blocks)"/></marker>
-  <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--accent)"/></marker></defs>
-  <g>
-    <rect class="box" x="20" y="60" width="110" height="36" rx="18"/><text class="t b" x="48" y="83">queued</text>
-    <rect class="box" x="180" y="60" width="110" height="36" rx="18"/><text class="t b" x="206" y="83">claimed</text>
-    <rect class="box accent" x="340" y="60" width="110" height="36" rx="18"/><text class="t b" x="368" y="83">running</text>
-    <rect class="box" x="340" y="180" width="110" height="36" rx="18"/><text class="t b" x="372" y="203">stalled</text>
-    <rect class="box" x="520" y="180" width="120" height="36" rx="18"/><text class="t b" x="543" y="203">escalated</text>
-    <rect class="box" x="180" y="300" width="130" height="36" rx="18"/><text class="t b" x="196" y="323">retry queued</text>
-    <rect class="box" x="520" y="60" width="110" height="36" rx="18"/><text class="t b" x="545" y="83">verifying</text>
-    <rect class="box" x="680" y="60" width="110" height="36" rx="18"/><text class="t b" x="700" y="83">fast-forward</text>
-    <rect class="box" x="840" y="60" width="100" height="36" rx="18"/><text class="t b" x="865" y="83">merged</text>
-    <rect class="box" x="840" y="180" width="100" height="36" rx="18"/><text class="t b" x="873" y="203">done</text>
-    <rect class="box" x="680" y="300" width="130" height="36" rx="18"/><text class="t b" x="704" y="323">abandoned</text>
-  </g>
-  <path class="ln" marker-end="url(#ah)" d="M130 78 L180 78"/><text class="lbl" x="128" y="52">child claims lease</text>
-  <path class="ln" marker-end="url(#ah)" d="M290 78 L340 78"/><text class="lbl" x="286" y="52">first status</text>
-  <path class="ln" marker-end="url(#ah)" d="M450 78 L520 78"/><text class="lbl" x="440" y="52">result: done</text>
-  <path class="ln" marker-end="url(#ah)" d="M630 78 L680 78"/><text class="lbl" x="606" y="52">fresh checkout, criteria pass</text>
-  <path class="ln" marker-end="url(#ah)" d="M790 78 L840 78"/><text class="lbl" x="796" y="52">default advanced</text>
-  <path class="ln" marker-end="url(#ah)" d="M890 96 L890 180"/><text class="lbl" x="898" y="140">prune, checkpoint</text>
-  <path class="ln" marker-end="url(#ah)" d="M395 96 L395 180"/><text class="lbl" x="402" y="140">silence &gt; T1</text>
-  <path class="ln acc" marker-end="url(#aha)" d="M380 180 L380 96"/><text class="lbl acc" x="300" y="150">nudge answered</text>
-  <path class="ln" marker-end="url(#ah)" d="M450 78 C480 120 480 150 520 190"/><text class="lbl" x="470" y="130">give-up rule hit</text>
-  <path class="ln acc" marker-end="url(#aha)" d="M520 198 C470 150 460 120 450 90"/><text class="lbl acc" x="455" y="170">verdict</text>
-  <path class="ln bad" marker-end="url(#ahb)" d="M395 216 C330 260 300 280 280 300"/><text class="lbl bad" x="296" y="262">no progress &gt; T2: kill, attempt+1</text>
-  <path class="ln" marker-end="url(#ah)" d="M200 300 C150 240 150 120 220 96"/><text class="lbl" x="60" y="230">backoff done</text>
-  <path class="ln" marker-end="url(#ah)" d="M310 318 C420 318 480 250 540 216"/><text class="lbl" x="420" y="300">attempt &gt; max</text>
-  <path class="ln" marker-end="url(#ah)" d="M600 216 C640 260 660 290 700 300"/><text class="lbl" x="620" y="262">verdict: abandon</text>
-  <path class="ln bad" marker-end="url(#ahb)" d="M560 96 C560 130 480 140 450 110"/><text class="lbl bad" x="500" y="150">criteria fail: findings, attempt+1</text>
-  <path class="ln bad" marker-end="url(#ahb)" d="M345 96 C315 170 285 250 260 300"/><text class="lbl bad" x="214" y="214">worker gave up</text>
-</svg>
+<!-- figure:lifecycle -->
+<!-- /figure:lifecycle -->
 </div>
 <figcaption>This is the WorkUnit workflow's run handler. Each box is a stretch of the handler between awaits; each arrow is a resolved promise, a fired timer or a completed step. Only the core moves a unit past verifying, and only the core can advance the default branch. A loop on the same failing test is caught because T2 keys on the progress marker, not on activity. A terminal error other than a cancel abandons the unit from any unfinished state, with the reason recorded.</figcaption>
 </figure>
@@ -461,29 +376,8 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
 <p>Every question is sorted before anything else. A question a script or test can answer is dispatched as a probe and ruled on by the result. A question above the arbiter's authority goes straight up. Only judgment calls reach a council.</p>
 <figure>
 <div class="diagram">
-<svg viewBox="0 0 960 440" role="img" aria-label="Escalation ladder from worker to control session to parent to human, with the give-up rule at each rung">
-  <defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--line-strong)"/></marker></defs>
-  <rect class="box" x="20" y="360" width="300" height="56" rx="6"/><text class="t b" x="36" y="384">Worker</text><text class="t m" x="36" y="402">implements; may not rule</text>
-  <rect class="box accent" x="20" y="250" width="300" height="56" rx="6"/><text class="t b" x="36" y="274">Control session, arbiter L1</text><text class="t m" x="36" y="292">rules alone or convenes a council</text>
-  <rect class="box accent" x="20" y="140" width="300" height="56" rx="6"/><text class="t b" x="36" y="164">Parent control, arbiter L2 .. root</text><text class="t m" x="36" y="182">same steps, wider scope</text>
-  <rect class="box" x="20" y="30" width="300" height="56" rx="6"/><text class="t b" x="36" y="54">Human</text><text class="t m" x="36" y="72">decision packet in; binding case out</text>
-  <path class="ln" marker-end="url(#ah2)" d="M170 360 L170 306"/>
-  <path class="ln" marker-end="url(#ah2)" d="M170 250 L170 196"/>
-  <path class="ln" marker-end="url(#ah2)" d="M170 140 L170 86"/>
-  <text class="t m" x="350" y="54">GIVE-UP RULE TO REACH THIS RUNG</text>
-  <text class="t" x="350" y="76">Council failed, or authority reserved to the human: spend, external</text>
-  <text class="t" x="350" y="94">commitments, data deletion, epic scope, hook-marked human-only, or the</text>
-  <text class="t" x="350" y="112">ruling would overrule a human case.</text>
-  <text class="t" x="350" y="164">Council failed (no quorum, or an unrefuted blocking dissent), or the</text>
-  <text class="t" x="350" y="182">question crosses the work unit boundary: other worktrees, shared</text>
-  <text class="t" x="350" y="200">interfaces, epic acceptance criteria, budget.</text>
-  <text class="t" x="350" y="274">Blocker reproduced; at least two distinct attempts logged with outcomes;</text>
-  <text class="t" x="350" y="292">case law queried; question typed with options. Immediate if outside</text>
-  <text class="t" x="350" y="310">worker authority: scope, interface, irreversible action, security.</text>
-  <text class="t m" x="350" y="384">AT EVERY ARBITER</text>
-  <text class="t" x="350" y="402">1 empirical: probe   2 fresh binding precedent: cite   3 no council trigger: rule alone   4 else council</text>
-  <text class="t m" x="350" y="424">An escalation with no proposed ruling is sent back down. Unpicked escalations move up after a timeout, with a cap.</text>
-</svg>
+<!-- figure:escalation -->
+<!-- /figure:escalation -->
 </div>
 <figcaption>An escalation is a certified question: one typed question, the options, the lower level's proposed ruling, evidence, a context fingerprint and the precedents it checked.</figcaption>
 </figure>
@@ -629,17 +523,8 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
 <h3>Deep links</h3>
 <figure>
 <div class="diagram">
-<svg viewBox="0 0 960 190" role="img" aria-label="Deep link flow from a notification through the web view to the terminal app pane">
-  <defs><marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="var(--line-strong)"/></marker></defs>
-  <rect class="box" x="20" y="60" width="170" height="60" rx="6"/><text class="t b" x="36" y="86">Notification</text><text class="t m" x="36" y="104">Slack, mail, macOS</text>
-  <rect class="box" x="250" y="60" width="170" height="60" rx="6"/><text class="t b" x="266" y="86">Web view</text><text class="t m" x="266" y="104">localhost/inbox/pkt-0142</text>
-  <rect class="box" x="480" y="60" width="170" height="60" rx="6"/><text class="t b" x="496" y="86">Reader binary</text><text class="t m" x="496" y="104">resolves pane ref</text>
-  <rect class="box accent" x="710" y="60" width="230" height="60" rx="6"/><text class="t b" x="726" y="86">Ghostty tab</text><text class="t mono" x="726" y="104">focus by terminal id, or new tab: zmx attach S</text>
-  <path class="ln" marker-end="url(#ah3)" d="M190 90 L250 90"/><text class="lbl" x="196" y="54">http link survives</text>
-  <path class="ln" marker-end="url(#ah3)" d="M420 90 L480 90"/><text class="lbl" x="426" y="54">GET /open/S</text>
-  <path class="ln" marker-end="url(#ah3)" d="M650 90 L710 90"/><text class="lbl" x="656" y="54">AppleScript</text>
-  <text class="t m" x="20" y="160">Chat tools strip custom URL schemes, so the notification carries a localhost link. The reader keeps the Ghostty terminal id it last opened for each session; it focuses that, or opens a tab running the attach.</text>
-</svg>
+<!-- figure:deep-links -->
+<!-- /figure:deep-links -->
 </div>
 </figure>
 <p>Item lifecycle is a projection over the event log: new, claimed, answered, expired, superseded. Claim and answer are appended events, so a TUI and a web view open side by side converge. Expiry pauses the work unit rather than choosing a default. A council can still resolve the condition while a human is reading, which moves the item to superseded.</p>
@@ -943,7 +828,7 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
   <li>Git hooks run through lefthook: commit messages are checked by the xtask against the conventional commit grammar, formatting and lints run before commit.</li>
   <li>Commits are signed; the default branch advances only by squash or rebase merges of pull requests whose titles are conventional commits; history is linear, enforced by the host's ruleset with no bypass.</li>
   <li>Strictly typed over everything else: CUE before JSON before YAML. Configuration, routing tables, thresholds and the article-to-mechanism map are authored in CUE with CUE as the gate; the runtime reads exported, content-hashed JSON; JSON Schema is generated from CUE, never written by hand; YAML only where a tool forces it, TOML only for mise.</li>
-  <li>Figures are stencil documents: structure authored in CUE, validated by its schema, rendered to SVG and PNG by the xtask, and checked in CI so a figure that drifts fails the build. The design's diagrams move to a tycho grammar.</li>
+  <li>Figures are stencil documents: structure authored in CUE, validated by its schema, rendered to SVG and PNG by the xtask, and checked in CI so a figure that drifts fails the build. The design's diagrams use a tycho grammar.</li>
   <li>Batteries included: the station ships as one binary with its assets, grammars, schemas and themes embedded; nothing is fetched at run time.</li>
 </ul>
 <h4>Slice zero: the spine</h4>

@@ -30,4 +30,5 @@
   <path class="ln" marker-end="url(#ah)" d="M310 318 C420 318 480 250 540 216"/><text class="lbl" x="420" y="300">attempt &gt; max</text>
   <path class="ln" marker-end="url(#ah)" d="M600 216 C640 260 660 290 700 300"/><text class="lbl" x="620" y="262">verdict: abandon</text>
   <path class="ln bad" marker-end="url(#ahb)" d="M560 96 C560 130 480 140 450 110"/><text class="lbl bad" x="500" y="150">criteria fail: findings, attempt+1</text>
+  <path class="ln bad" marker-end="url(#ahb)" d="M345 96 C315 170 285 250 260 300"/><text class="lbl bad" x="214" y="214">worker gave up</text>
 </svg>

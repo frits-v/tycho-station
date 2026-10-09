@@ -1,0 +1,64 @@
+<svg class="fig-light" role="img" aria-label="Deep links: A notification carries a localhost link that the reader resolves to a Ghostty tab attached to the session." xmlns="http://www.w3.org/2000/svg" width="1160" height="177.7" viewBox="0 0 1160 177.7">
+  <rect x="0" y="0" width="1160" height="177.7" fill="#FFFFFF"/>
+  <defs>
+    <marker id="deep-links-light-arrow-clear-gray" viewBox="0 0 10 8" refX="10" refY="4" markerWidth="10" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#5B6472"/></marker>
+  </defs>
+  <g data-id="" data-tag="Page">
+    <g data-id="/body" data-tag="Body">
+      <g data-id="/body/0" data-tag="Col">
+        <g data-id="/body/0/children/0" data-tag="Row">
+          <g data-id="/body/0/children/0/children/0" data-tag="Pcard">
+            <rect x="20.5" y="20.5" width="131.34" height="59.4" rx="7.5" fill="#EEF2F0" stroke="#B9C3C0" stroke-width="1"/>
+            <text x="31.5" y="47.23" xml:space="preserve" font-family="Inter" font-size="13" font-weight="700" fill="#1A1E24">Notification</text>
+            <text x="31.5" y="62.87" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#4B5361">Slack, mail, macOS</text>
+          </g>
+          <g data-id="/body/0/children/0/children/1" data-tag="Pipe" data-kind="gray">
+            <circle cx="164.34" cy="50.2" r="4" fill="#5B6472"/>
+            <line x1="168.34" y1="50.2" x2="182.34" y2="50.2" stroke="#5B6472" stroke-width="2"/>
+            <rect x="183.09" y="35.65" width="118.38" height="29.1" rx="5.25" fill="#FFFFFF" stroke="#AEB6C1" stroke-width="1.5"/>
+            <line x1="302.22" y1="50.2" x2="314.22" y2="50.2" stroke="#5B6472" stroke-width="2"/>
+            <line x1="314.22" y1="50.2" x2="324.22" y2="50.2" stroke="none" marker-end="url(#deep-links-light-arrow-clear-gray)"/>
+            <text x="191.84" y="54.57" xml:space="preserve" font-family="Inter" font-size="12" font-weight="700" fill="#1A1E24">http link survives</text>
+          </g>
+          <g data-id="/body/0/children/0/children/2" data-tag="Pcard">
+            <rect x="332.72" y="20.5" width="167.79" height="59.4" rx="7.5" fill="#EEF2F0" stroke="#B9C3C0" stroke-width="1"/>
+            <text x="343.72" y="47.23" xml:space="preserve" font-family="Inter" font-size="13" font-weight="700" fill="#1A1E24">Web view</text>
+            <text x="343.72" y="62.87" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#4B5361">localhost/inbox/pkt-0142</text>
+          </g>
+          <g data-id="/body/0/children/0/children/3" data-tag="Pipe" data-kind="gray">
+            <circle cx="513" cy="50.2" r="4" fill="#5B6472"/>
+            <line x1="517" y1="50.2" x2="531" y2="50.2" stroke="#5B6472" stroke-width="2"/>
+            <rect x="531.75" y="35.65" width="91.36" height="29.1" rx="5.25" fill="#FFFFFF" stroke="#AEB6C1" stroke-width="1.5"/>
+            <line x1="623.87" y1="50.2" x2="635.87" y2="50.2" stroke="#5B6472" stroke-width="2"/>
+            <line x1="635.87" y1="50.2" x2="645.87" y2="50.2" stroke="none" marker-end="url(#deep-links-light-arrow-clear-gray)"/>
+            <text x="540.5" y="54.57" xml:space="preserve" font-family="Inter" font-size="12" font-weight="700" fill="#1A1E24">GET /open/S</text>
+          </g>
+          <g data-id="/body/0/children/0/children/4" data-tag="Pcard">
+            <rect x="654.37" y="20.5" width="131.34" height="59.4" rx="7.5" fill="#EEF2F0" stroke="#B9C3C0" stroke-width="1"/>
+            <text x="665.37" y="47.23" xml:space="preserve" font-family="Inter" font-size="13" font-weight="700" fill="#1A1E24">Reader binary</text>
+            <text x="665.37" y="62.87" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#4B5361">resolves pane ref</text>
+          </g>
+          <g data-id="/body/0/children/0/children/5" data-tag="Pipe" data-kind="gray">
+            <circle cx="798.21" cy="50.2" r="4" fill="#5B6472"/>
+            <line x1="802.21" y1="50.2" x2="816.21" y2="50.2" stroke="#5B6472" stroke-width="2"/>
+            <rect x="816.96" y="35.65" width="87.06" height="29.1" rx="5.25" fill="#FFFFFF" stroke="#AEB6C1" stroke-width="1.5"/>
+            <line x1="904.76" y1="50.2" x2="916.76" y2="50.2" stroke="#5B6472" stroke-width="2"/>
+            <line x1="916.76" y1="50.2" x2="926.76" y2="50.2" stroke="none" marker-end="url(#deep-links-light-arrow-clear-gray)"/>
+            <text x="825.71" y="54.57" xml:space="preserve" font-family="Inter" font-size="12" font-weight="700" fill="#1A1E24">AppleScript</text>
+          </g>
+          <g data-id="/body/0/children/0/children/6" data-tag="Pcard">
+            <rect x="935.26" y="20.5" width="204.24" height="59.4" rx="7.5" fill="#EEF2F0" stroke="#B9C3C0" stroke-width="1"/>
+            <text x="946.26" y="40.03" xml:space="preserve" font-family="Inter" font-size="13" font-weight="700" fill="#1A1E24">Ghostty tab</text>
+            <text x="946.26" y="55.67" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#4B5361">focus by terminal id, or new tab:</text>
+            <text x="946.26" y="70.07" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#4B5361">zmx attach S</text>
+          </g>
+        </g>
+        <g data-id="/body/0/children/1" data-tag="Text">
+          <rect x="20.63" y="97.03" width="1118.75" height="60.05" rx="7.38" fill="#EEF2F0" stroke="#B9C3C0" stroke-width="1.25"/>
+          <text x="33.25" y="122.72" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#1A1E24">Chat tools strip custom URL schemes, so the notification carries a localhost link. The reader keeps the Ghostty terminal id it last opened for each session; it focuses that, or opens a tab running</text>
+          <text x="33.25" y="140.12" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#1A1E24">the attach.</text>
+        </g>
+      </g>
+    </g>
+  </g>
+</svg>

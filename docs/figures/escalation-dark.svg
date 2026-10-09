@@ -1,0 +1,80 @@
+<svg class="fig-dark" role="img" aria-label="Escalation ladder: A question climbs from the worker to its control session, the parent control and the human, and each rung has a give-up rule." xmlns="http://www.w3.org/2000/svg" width="1000" height="504.3" viewBox="0 0 1000 504.3">
+  <rect x="0" y="0" width="1000" height="504.3" fill="#161C1B"/>
+  <defs>
+    <marker id="escalation-dark-arrow-clear-dark-solid-3" viewBox="0 0 10 8" refX="10" refY="4" markerWidth="10" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto"><path d="M 0 0 L 10 4 L 0 8 Z" fill="#6CECDB"/></marker>
+  </defs>
+  <g data-id="" data-tag="Page">
+    <g data-id="/body" data-tag="Body">
+      <g data-id="/body/0" data-tag="Col">
+        <g data-id="/body/0/children/0" data-tag="Row">
+          <g data-id="/body/0/children/0/children/0" data-tag="Pcard">
+            <rect x="20.5" y="20.5" width="314.83" height="81.9" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+            <text x="31.5" y="58.48" xml:space="preserve" font-family="Inter" font-size="13" font-weight="700" fill="#E9EDF2">Human</text>
+            <text x="31.5" y="74.12" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#A8B1BD">decision packet in; binding case out</text>
+          </g>
+          <g data-id="/body/0/children/0/children/1" data-tag="Text">
+            <rect x="368.46" y="20.63" width="610.92" height="81.65" rx="7.38" fill="#1D2524" stroke="#3A4644" stroke-width="1.25"/>
+            <text x="381.08" y="45.78" xml:space="preserve" font-family="Inter" font-size="13" font-weight="700" fill="#E9EDF2">GIVE-UP RULE TO REACH THIS RUNG</text>
+            <text x="381.08" y="67.92" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#E9EDF2">Council failed, or authority reserved to the human: spend, external commitments, data deletion, epic</text>
+            <text x="381.08" y="85.32" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#E9EDF2">scope, hook-marked human-only, or the ruling would overrule a human case.</text>
+          </g>
+        </g>
+        <g data-id="/body/0/children/1" data-tag="Row">
+          <g data-id="/body/0/children/1/children/0" data-tag="Pcard">
+            <rect x="20.5" y="143.4" width="314.83" height="60.3" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+            <text x="31.5" y="170.58" xml:space="preserve" font-family="Inter" font-size="13" font-weight="700" fill="#E9EDF2">Parent control, arbiter L2 .. root</text>
+            <text x="31.5" y="186.22" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#A8B1BD">same steps, wider scope</text>
+          </g>
+          <g data-id="/body/0/children/1/children/1" data-tag="Text">
+            <rect x="368.46" y="143.52" width="610.92" height="60.05" rx="7.38" fill="#1D2524" stroke="#3A4644" stroke-width="1.25"/>
+            <text x="381.08" y="169.22" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#E9EDF2">Council failed (no quorum, or an unrefuted blocking dissent), or the question crosses the work unit</text>
+            <text x="381.08" y="186.62" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#E9EDF2">boundary: other worktrees, shared interfaces, epic acceptance criteria, budget.</text>
+          </g>
+        </g>
+        <g data-id="/body/0/children/2" data-tag="Row">
+          <g data-id="/body/0/children/2/children/0" data-tag="Pcard">
+            <rect x="20.5" y="244.7" width="314.83" height="60.3" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+            <text x="31.5" y="271.88" xml:space="preserve" font-family="Inter" font-size="13" font-weight="700" fill="#E9EDF2">Control session, arbiter L1</text>
+            <text x="31.5" y="287.52" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#A8B1BD">rules alone or convenes a council</text>
+          </g>
+          <g data-id="/body/0/children/2/children/1" data-tag="Text">
+            <rect x="368.46" y="244.83" width="610.92" height="60.05" rx="7.38" fill="#1D2524" stroke="#3A4644" stroke-width="1.25"/>
+            <text x="381.08" y="270.52" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#E9EDF2">Blocker reproduced; at least two distinct attempts logged with outcomes; case law queried; question</text>
+            <text x="381.08" y="287.92" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#E9EDF2">typed with options. Immediate if outside worker authority: scope, interface, irreversible action, security.</text>
+          </g>
+        </g>
+        <g data-id="/body/0/children/3" data-tag="Row">
+          <g data-id="/body/0/children/3/children/0" data-tag="Pcard">
+            <rect x="20.5" y="346" width="323.67" height="137.8" rx="7.5" fill="#1D2524" stroke="#3A4644" stroke-width="1"/>
+            <text x="31.5" y="411.93" xml:space="preserve" font-family="Inter" font-size="13" font-weight="700" fill="#E9EDF2">Worker</text>
+            <text x="31.5" y="427.57" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#A8B1BD">implements; may not rule</text>
+          </g>
+          <g data-id="/body/0/children/3/children/1" data-tag="Col">
+            <g data-id="/body/0/children/3/children/1/children/0" data-tag="Text">
+              <rect x="377.29" y="346.13" width="602.08" height="64.25" rx="7.38" fill="#1D2524" stroke="#3A4644" stroke-width="1.25"/>
+              <text x="389.92" y="371.28" xml:space="preserve" font-family="Inter" font-size="13" font-weight="700" fill="#E9EDF2">AT EVERY ARBITER</text>
+              <text x="389.92" y="393.42" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#E9EDF2">1 empirical: probe   2 fresh binding precedent: cite   3 no council trigger: rule alone   4 else council</text>
+            </g>
+            <g data-id="/body/0/children/3/children/1/children/1" data-tag="Text">
+              <rect x="377.29" y="423.63" width="602.08" height="60.05" rx="7.38" fill="#1D2524" stroke="#3A4644" stroke-width="1.25"/>
+              <text x="389.92" y="449.32" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#E9EDF2">An escalation with no proposed ruling is sent back down. Unpicked escalations move up after a</text>
+              <text x="389.92" y="466.72" xml:space="preserve" font-family="Inter" font-size="12" font-weight="400" fill="#E9EDF2">timeout, with a cap.</text>
+            </g>
+          </g>
+        </g>
+      </g>
+    </g>
+  </g>
+  <g data-id="/links/0" data-tag="Link" data-kind="solid-3">
+    <path d="M 182.33 345.5 L 182.33 313.5 L 177.92 313.5 L 177.92 313.5" fill="none" stroke="#6CECDB" stroke-width="2" stroke-linejoin="round"/>
+    <line x1="177.92" y1="315.5" x2="177.92" y2="305.5" stroke="none" marker-end="url(#escalation-dark-arrow-clear-dark-solid-3)"/>
+  </g>
+  <g data-id="/links/1" data-tag="Link" data-kind="solid-3">
+    <path d="M 177.92 244.2 L 177.92 214.2" fill="none" stroke="#6CECDB" stroke-width="2" stroke-linejoin="round"/>
+    <line x1="177.92" y1="214.2" x2="177.92" y2="204.2" stroke="none" marker-end="url(#escalation-dark-arrow-clear-dark-solid-3)"/>
+  </g>
+  <g data-id="/links/2" data-tag="Link" data-kind="solid-3">
+    <path d="M 177.92 142.9 L 177.92 112.9" fill="none" stroke="#6CECDB" stroke-width="2" stroke-linejoin="round"/>
+    <line x1="177.92" y1="112.9" x2="177.92" y2="102.9" stroke="none" marker-end="url(#escalation-dark-arrow-clear-dark-solid-3)"/>
+  </g>
+</svg>

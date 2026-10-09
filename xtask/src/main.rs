@@ -12,6 +12,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitStatus, Output};
 
+mod figures;
 mod release;
 
 const TYPES: [&str; 11] = [
@@ -26,7 +27,7 @@ const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
 const DOC_DIRS: [&str; 1] = ["docs"];
 const RULES_DIR: &str = ".claude/rules";
 const RULE_MAX_LINES: usize = 24;
-const COMMANDS: [(&str, &str); 10] = [
+const COMMANDS: [(&str, &str); 12] = [
     (
         "ci",
         "format check, clippy, tests, the repository checks, workflow lints, PR title",
@@ -47,6 +48,14 @@ const COMMANDS: [(&str, &str); 10] = [
     (
         "check-rules",
         "rule files carry paths frontmatter and stay short",
+    ),
+    (
+        "render-figures",
+        "export figures/ with cue, render with stencil into docs/figures",
+    ),
+    (
+        "check-figures",
+        "re-render the figures; fail when docs/figures or the design drift",
     ),
     (
         "release-pr [--dry-run]",
@@ -232,7 +241,12 @@ fn ci() -> i32 {
             return 1;
         }
     }
-    for check in [check_names, check_comments, check_rules] {
+    for check in [
+        check_names,
+        check_comments,
+        check_rules,
+        figures::check_figures,
+    ] {
         if check() != 0 {
             return 1;
         }
@@ -495,6 +509,10 @@ fn hook_post_tool_use() -> i32 {
     let extension = Path::new(&path).extension().and_then(OsStr::to_str);
     match extension {
         Some("rs") => hook_rust(&path),
+        Some("cue") => {
+            figures::check_figures();
+            0
+        }
         Some("md") => {
             check_comments();
             check_rules();
@@ -560,6 +578,8 @@ fn main() {
         Some("check-names") => check_names(),
         Some("check-comments") => check_comments(),
         Some("check-rules") => check_rules(),
+        Some("render-figures") => figures::render_figures(),
+        Some("check-figures") => figures::check_figures(),
         Some("release-pr") => match args.get(1).map(String::as_str) {
             None => release::release_pr(false),
             Some("--dry-run") => release::release_pr(true),
