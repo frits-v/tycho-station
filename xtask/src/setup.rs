@@ -1124,11 +1124,16 @@ const AGENT_GROUP_HINT: &str = "create the group, then make it the agent's prima
 
 fn primary_gid(lookup: &DsclLookup, record: &str) -> Result<u32, Status> {
     match lookup {
-        DsclLookup::Found(stdout) => dscl_value(stdout, "PrimaryGroupID")
-            .and_then(|value| value.parse().ok())
-            .ok_or_else(|| Status::Unreachable {
-                why: format!("PrimaryGroupID missing from the {record} record"),
-            }),
+        DsclLookup::Found(stdout) => {
+            let Some(value) = dscl_value(stdout, "PrimaryGroupID") else {
+                return Err(Status::Unreachable {
+                    why: format!("PrimaryGroupID missing from the {record} record"),
+                });
+            };
+            value.parse().map_err(|_| Status::Unreachable {
+                why: format!("unrecognised PrimaryGroupID {value:?} in the {record} record"),
+            })
+        }
         DsclLookup::NotFound => Err(Status::Missing),
         DsclLookup::Unreachable(why) => Err(Status::Unreachable { why: why.clone() }),
     }
@@ -2020,6 +2025,23 @@ mod tests {
             primary_group_status(&other_user, &unreachable),
             Status::Unreachable { .. }
         ));
+        assert!(matches!(
+            primary_group_status(&unreachable, &agent_group),
+            Status::Unreachable { .. }
+        ));
+        assert_eq!(
+            primary_group_status(&other_user, &no_attribute),
+            Status::Unreachable {
+                why: "PrimaryGroupID missing from the tycho-agent record".to_string()
+            }
+        );
+        let not_numeric = DsclLookup::Found("PrimaryGroupID: staff\n".to_string());
+        assert_eq!(
+            primary_group_status(&not_numeric, &agent_group),
+            Status::Unreachable {
+                why: "unrecognised PrimaryGroupID \"staff\" in the agent user record".to_string()
+            }
+        );
     }
 
     #[test]
