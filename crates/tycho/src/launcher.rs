@@ -332,6 +332,11 @@ impl<I: Ingress> Run<'_, I> {
         };
         self.log
             .line(&format!("vendor ended: {end:?}, stop: {stop:?}"));
+        if stop == Stop::None && end != ChildEnd::NotStarted {
+            // The vendor's last progress, its final context size included, reaches the
+            // session before the result does; a run shorter than one interval has no other beat.
+            self.beat();
+        }
         decode_exit(stop, end, read_result_file(&self.files.result), &session)
     }
 
@@ -642,6 +647,7 @@ mod tests {
     struct Recorder {
         files: SessionFiles,
         events: RefCell<Vec<String>>,
+        context_tokens: RefCell<Vec<u64>>,
     }
 
     impl Ingress for Recorder {
@@ -659,6 +665,7 @@ mod tests {
 
         fn heartbeat(&self, call: &HeartbeatSend<'_>) -> Ack {
             let body: HeartbeatCall = serde_json::from_str(&call.body).unwrap();
+            self.context_tokens.borrow_mut().push(body.context_tokens);
             self.events.borrow_mut().push(format!(
                 "heartbeat {} {} {} lease={}",
                 call.service,
@@ -688,6 +695,7 @@ mod tests {
         Recorder {
             files: files.clone(),
             events: RefCell::new(Vec::new()),
+            context_tokens: RefCell::new(Vec::new()),
         }
     }
 
@@ -738,6 +746,29 @@ mod tests {
         assert!(!String::from_utf8(fs::read(&files.lease).unwrap())
             .unwrap()
             .contains("sign_1abc"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_last_heartbeat_carries_the_final_context_size_before_the_result() {
+        let dir = scratch("last-beat");
+        let settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
+        let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
+        let script = r#"sleep 0.3; printf '{"context_tokens":33390}' > "$TYCHO_PROGRESS_FILE"; printf '{"state":"failed","envelope":null}' > "$TYCHO_RESULT_FILE""#;
+        let recorder = recorder(&files);
+        let end = launch(&settings, &sh(script), &recorder).unwrap();
+        assert_eq!(end.state, "failed");
+        let events = recorder.events.borrow();
+        let beats = events
+            .iter()
+            .filter(|event| event.starts_with("heartbeat"))
+            .count();
+        assert_eq!(beats, 2, "{events:?}");
+        assert!(
+            events[events.len() - 2].starts_with("heartbeat"),
+            "{events:?}"
+        );
+        assert_eq!(recorder.context_tokens.borrow().last(), Some(&33_390));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -825,10 +856,7 @@ mod tests {
         let dir = scratch("no-result");
         let settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
         let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
-        let recorder = Recorder {
-            files,
-            events: RefCell::new(Vec::new()),
-        };
+        let recorder = recorder(&files);
         let vendor = vec![
             "/bin/sh".to_string(),
             "-c".to_string(),
@@ -849,10 +877,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
         let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
-        let recorder = Recorder {
-            files,
-            events: RefCell::new(Vec::new()),
-        };
+        let recorder = recorder(&files);
         let vendor = vec![
             "/usr/bin/touch".to_string(),
             dir.join("ran").display().to_string(),

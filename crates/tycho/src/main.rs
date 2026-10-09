@@ -43,21 +43,15 @@ const USAGE: &str = "usage: tycho <command>
   epic add-unit <id> <unit>   add a work unit to an epic through the operator service
   epic dispatch <id> <unit> <plan.json>   start a listed unit's run with a dispatch plan
   launch --spec <spec file> [--tier <tier>]   run a vendor session: lease, heartbeat, spool, resolve
-  launch --replay <spool file>    deliver a spooled result that was never acknowledged";
+  launch --replay <spool file>    deliver a spooled result that was never acknowledged
+  worker --vendor <vendor> ...    run one headless worker inside a launcher session";
 
 fn main() {
     let arguments: Vec<String> = env::args().skip(1).collect();
     let words: Vec<&str> = arguments.iter().map(String::as_str).collect();
     let code = match words.as_slice() {
         ["endpoint"] => serve_endpoint(),
-        ["core", "start"] => with_config(|config, supervisor| {
-            if let Err(error) = factory_config(Some(&config.home)) {
-                eprintln!("tycho: refusing to start: {error}");
-                return 2;
-            }
-            let report = core::start(supervisor, config);
-            finish(&report, report.succeeded(), config)
-        }),
+        ["core", "start"] => with_config(start_core),
         ["core", "stop"] => with_config(|config, supervisor| {
             let report = core::stop(supervisor);
             finish(&report, report.succeeded(), config)
@@ -96,6 +90,7 @@ fn main() {
         ["launch", "--replay", spool] => replay(spool),
         ["launch", "--spec", spec] => launch(spec, None),
         ["launch", "--spec", spec, "--tier", tier] => launch(spec, Some(tier)),
+        ["worker", ..] => worker(arguments.get(1..).unwrap_or_default()),
         ["graph", "build", checkout, unit] => report_result(graph::build(checkout, unit)),
         ["graph", "query", checkout, kind, argument] => {
             report_result(graph::query(checkout, kind, argument))
@@ -143,6 +138,19 @@ fn launch(spec: &str, tier: Option<&str>) -> i32 {
         Err(error) => {
             eprintln!("tycho: launch: lease not written: {error}");
             launcher::EXIT_REFUSED_TO_START
+        }
+    }
+}
+
+/// The launcher's vendor command for a headless worker; the event stream goes to stdout.
+fn worker(words: &[String]) -> i32 {
+    let environment = env::vars().collect();
+    let mut stdout = std::io::stdout();
+    match tycho::vendors::worker_process::run(words, &environment, &mut stdout) {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("tycho: worker refused: {error}");
+            tycho::vendors::worker_process::EXIT_REFUSED
         }
     }
 }
@@ -210,6 +218,15 @@ fn serve_endpoint() -> i32 {
             1
         }
     }
+}
+
+fn start_core(config: &CoreConfig, supervisor: &Supervisor) -> i32 {
+    if let Err(error) = factory_config(Some(&config.home)) {
+        eprintln!("tycho: refusing to start: {error}");
+        return 2;
+    }
+    let report = core::start(supervisor, config);
+    finish(&report, report.succeeded(), config)
 }
 
 fn with_config(action: impl FnOnce(&CoreConfig, &Supervisor) -> i32) -> i32 {
