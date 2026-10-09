@@ -11,6 +11,7 @@ use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tycho_types::envelope::{Outcome, ResultPayload, ShortText, Usage};
 use tycho_types::exit::{Disposition, ExitState};
+use tycho_types::rejection::{decode_rejection, Question};
 use tycho_types::service::{Attempt, EpicId, TaskId, WorkUnitId, RECONCILER_KEY};
 use tycho_types::session::{SessionKind, SessionName, Suffix, Vendor};
 use tycho_types::task_packet::{Effort, RoutingName};
@@ -67,12 +68,29 @@ struct Started {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum WorkerRunOutcome {
-    Completed { attempt: u16, result: ResultPayload },
-    Escalated { attempt: u16 },
-    Replan { attempt: u16 },
-    Stopped { attempt: u16, state: String },
-    Inbox { attempt: u16, state: String },
-    Exhausted { attempts: u16 },
+    Completed {
+        attempt: u16,
+        result: ResultPayload,
+    },
+    Escalated {
+        attempt: u16,
+        #[serde(default)]
+        question: Question,
+    },
+    Replan {
+        attempt: u16,
+    },
+    Stopped {
+        attempt: u16,
+        state: String,
+    },
+    Inbox {
+        attempt: u16,
+        state: String,
+    },
+    Exhausted {
+        attempts: u16,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +114,7 @@ pub enum AfterAttempt {
 pub fn after_attempt(
     exit: &ExitState,
     result: Option<ResultPayload>,
+    question: Question,
     attempt: Attempt,
     cap: Attempt,
 ) -> AfterAttempt {
@@ -112,9 +131,10 @@ pub fn after_attempt(
                 AfterAttempt::Finish(WorkerRunOutcome::Exhausted { attempts: number })
             }
         }
-        (Disposition::Escalate, _) => {
-            AfterAttempt::Finish(WorkerRunOutcome::Escalated { attempt: number })
-        }
+        (Disposition::Escalate, _) => AfterAttempt::Finish(WorkerRunOutcome::Escalated {
+            attempt: number,
+            question,
+        }),
         (Disposition::Replan, _) => {
             AfterAttempt::Finish(WorkerRunOutcome::Replan { attempt: number })
         }
@@ -307,6 +327,8 @@ type WakeFuture<'run> = Pin<Box<dyn DurableFuture<Output = Wake> + Send + 'run>>
 struct AttemptEnd {
     exit: ExitState,
     result: Option<ResultPayload>,
+    /// The certified question an `escalated` rejection carried.
+    question: Question,
     /// Set when the run stops for a reason no exit state names, such as a refused spawn.
     stop: Option<String>,
     spawned: bool,
@@ -317,6 +339,7 @@ impl AttemptEnd {
         Self {
             exit,
             result: None,
+            question: Question::Absent,
             stop: None,
             spawned,
         }
@@ -381,7 +404,7 @@ impl WorkerRun {
                     attempt: attempt.get(),
                     state: reason,
                 }),
-                None => after_attempt(&end.exit, end.result, attempt, cap),
+                None => after_attempt(&end.exit, end.result, end.question, attempt, cap),
             };
             match next {
                 AfterAttempt::Finish(outcome) => {
@@ -619,9 +642,7 @@ impl WorkerRun {
                 forget(workflow_context, session);
                 return Ok(match completion {
                     Ok(result) => completed(result.into_inner()),
-                    Err(rejected) => {
-                        AttemptEnd::exit(ExitState::from_wire(rejected.message()), true)
-                    }
+                    Err(rejected) => rejection(rejected.message()),
                 });
             }
             let (step, now) = self
@@ -671,10 +692,19 @@ fn timer<'run>(workflow_context: &'run WorkflowContext<'_>, wait: Duration) -> W
     Box::pin(workflow_context.sleep(wait).map(|_| Wake::Timer))
 }
 
+fn rejection(message: &str) -> AttemptEnd {
+    let (exit, question) = decode_rejection(message);
+    AttemptEnd {
+        question,
+        ..AttemptEnd::exit(exit, true)
+    }
+}
+
 const fn completed(result: ResultPayload) -> AttemptEnd {
     AttemptEnd {
         exit: decode_result(&result),
         result: Some(result),
+        question: Question::Absent,
         stop: None,
         spawned: true,
     }
@@ -795,7 +825,13 @@ mod tests {
         let cap = attempt(3);
         let done = result(Outcome::Done);
         assert_eq!(
-            after_attempt(&ExitState::Completed, Some(done.clone()), attempt(1), cap),
+            after_attempt(
+                &ExitState::Completed,
+                Some(done.clone()),
+                Question::Absent,
+                attempt(1),
+                cap
+            ),
             AfterAttempt::Finish(WorkerRunOutcome::Completed {
                 attempt: 1,
                 result: done
@@ -808,40 +844,80 @@ mod tests {
             ExitState::Failed,
         ] {
             assert_eq!(
-                after_attempt(&requeue, None, attempt(1), cap),
+                after_attempt(&requeue, None, Question::Absent, attempt(1), cap),
                 AfterAttempt::Next
             );
         }
         assert_eq!(
-            after_attempt(&ExitState::Escalated, None, attempt(2), cap),
-            AfterAttempt::Finish(WorkerRunOutcome::Escalated { attempt: 2 })
+            after_attempt(
+                &ExitState::Escalated,
+                None,
+                Question::Absent,
+                attempt(2),
+                cap
+            ),
+            AfterAttempt::Finish(WorkerRunOutcome::Escalated {
+                attempt: 2,
+                question: Question::Absent
+            })
         );
         assert_eq!(
-            after_attempt(&ExitState::TooLarge, None, attempt(1), cap),
+            after_attempt(
+                &ExitState::TooLarge,
+                None,
+                Question::Absent,
+                attempt(1),
+                cap
+            ),
             AfterAttempt::Finish(WorkerRunOutcome::Replan { attempt: 1 })
         );
         for stop in [ExitState::Cancelled, ExitState::BudgetExceeded] {
             assert!(matches!(
-                after_attempt(&stop, None, attempt(1), cap),
+                after_attempt(&stop, None, Question::Absent, attempt(1), cap),
                 AfterAttempt::Finish(WorkerRunOutcome::Stopped { attempt: 1, .. })
             ));
         }
         let unknown = ExitState::from_wire("exploded");
         assert!(matches!(
-            after_attempt(&unknown, None, attempt(1), cap),
+            after_attempt(&unknown, None, Question::Absent, attempt(1), cap),
             AfterAttempt::Finish(WorkerRunOutcome::Inbox { attempt: 1, .. })
         ));
+    }
+
+    #[test]
+    fn a_certified_question_reaches_the_escalated_outcome() {
+        let payload: tycho_types::envelope::EscalationPayload = serde_json::from_str(&format!(
+            r#"{{"level_reached":"worker","give_up_reason":"policy","question":"sha256:{}","question_type":"authority","options":[],"proposed_ruling":null,"evidence":[],"cases_consulted":[],"blocking":true}}"#,
+            "a".repeat(64)
+        ))
+        .unwrap();
+        let message = tycho_types::rejection::encode_escalation(&payload).unwrap();
+        let end = rejection(&message);
+        assert_eq!(end.exit, ExitState::Escalated);
+        assert_eq!(
+            after_attempt(&end.exit, None, end.question, attempt(1), attempt(3)),
+            AfterAttempt::Finish(WorkerRunOutcome::Escalated {
+                attempt: 1,
+                question: Question::Certified { payload }
+            })
+        );
     }
 
     #[test]
     fn the_attempt_cap_ends_the_retry_loop() {
         let cap = attempt(3);
         assert_eq!(
-            after_attempt(&ExitState::Stalled, None, attempt(3), cap),
+            after_attempt(&ExitState::Stalled, None, Question::Absent, attempt(3), cap),
             AfterAttempt::Finish(WorkerRunOutcome::Exhausted { attempts: 3 })
         );
         assert_eq!(
-            after_attempt(&ExitState::Completed, None, attempt(2), cap),
+            after_attempt(
+                &ExitState::Completed,
+                None,
+                Question::Absent,
+                attempt(2),
+                cap
+            ),
             AfterAttempt::Next
         );
     }

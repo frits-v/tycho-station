@@ -34,6 +34,11 @@ pub const RESTATE_DATA_DIR: &str = "restate";
 pub const LOG_DIR: &str = "logs";
 pub const STOP_FILE: &str = "watchdog.stop";
 pub const OPERATOR_SECRET_FILE: &str = "operator.secret";
+/// Decision packets and the verdict files typed beside them, one directory per epic.
+pub const PACKET_DIR: &str = "packets";
+/// Passes one `tycho verdicts run` makes before it exits for launchd to restart it.
+pub const VERDICT_ITERATIONS_MAX: u32 = 720;
+pub const VERDICT_INTERVAL: Duration = Duration::from_secs(5);
 
 pub const LAUNCHD_LABEL: &str = "dev.tycho.watchdog";
 pub const LAUNCHD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -94,6 +99,8 @@ pub mod spine {
     pub const PLAN_TASKS_MAX: usize = 16;
     /// Attempts and rulings one unit run goes through before it is abandoned.
     pub const UNIT_ROUNDS_MAX: u32 = 16;
+    /// Times an escalated unit writes a failed packet again, one retry backoff maximum apart.
+    pub const PACKET_RETRIES_MAX: u32 = 288;
     /// Ledger limits `tycho epic start` gives a new epic: seat tokens and metered micro-dollars.
     pub const EPIC_SEAT_LIMIT_DEFAULT: u64 = 50_000_000;
     pub const EPIC_METERED_LIMIT_DEFAULT: u64 = 0;
@@ -379,6 +386,11 @@ impl CoreConfig {
     #[must_use]
     pub fn operator_secret_file(&self) -> PathBuf {
         self.home.join(OPERATOR_SECRET_FILE)
+    }
+
+    #[must_use]
+    pub fn packet_dir(&self) -> PathBuf {
+        self.home.join(PACKET_DIR)
     }
 
     /// The command line typed into the role's zmx session; `exec` makes the session end

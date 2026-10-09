@@ -58,6 +58,7 @@ mod tests {
             timing: Timing::default(),
             config: Arc::new(crate::config_store::FactoryConfig::embedded().unwrap()),
             operator_secret: None,
+            packet_dir: None,
         };
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
