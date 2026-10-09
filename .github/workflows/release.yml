@@ -7,7 +7,9 @@ jobs:
   release:
     name: release
     runs-on: ubuntu-latest
-    # A group per commit: a queued release is never cancelled by a later push.
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
+    # Deduplicates runs of one commit; runs of different commits never cancel each other.
     concurrency:
       group: release-${{ github.sha }}
       cancel-in-progress: false
@@ -24,6 +26,7 @@ jobs:
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           cache: false
+          install_args: rust release-plz
       - id: release
         run: mise run release
         env:
@@ -36,6 +39,8 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
     concurrency:
       group: binaries-${{ github.sha }}-${{ matrix.os }}
       cancel-in-progress: false
@@ -48,6 +53,7 @@ jobs:
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           cache: false
+          install_args: rust cargo-dist gh
       - run: mise run release-binaries
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -55,6 +61,8 @@ jobs:
   release-pr:
     name: release-pr
     runs-on: ubuntu-latest
+    env:
+      MISE_TASK_RUN_AUTO_INSTALL: "false"
     permissions:
       contents: read
     concurrency:
@@ -68,6 +76,7 @@ jobs:
       - uses: jdx/mise-action@2d8d4cafcbd33be2ea37d2b6f5ad595363d1f1ca # v5.1.1
         with:
           cache: false
+          install_args: rust release-plz
       - run: mise run release-pr
         env:
           RELEASE_PLZ_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

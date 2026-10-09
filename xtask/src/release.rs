@@ -13,6 +13,7 @@ const RELEASE_PLZ_TIMEOUT: Duration = Duration::from_secs(600);
 const DIST_TIMEOUT: Duration = Duration::from_secs(1800);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+const RUSTUP_TIMEOUT: Duration = Duration::from_secs(600);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_MAX_BYTES: u64 = 4 << 20;
@@ -74,6 +75,15 @@ enum DistOutcome {
     Unrecognised(String),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum HeadTag {
+    Tagged(String),
+    Untagged,
+    Failed(Exit),
+    Unrecognised(String),
+}
+
+/// The exit code fully partitions the states: zero uploaded every file, anything else failed.
 #[derive(Debug, PartialEq, Eq)]
 enum UploadOutcome {
     Uploaded(usize),
@@ -144,16 +154,23 @@ fn wait_with_deadline(child: &mut std::process::Child, timeout: Duration) -> Exi
         match child.try_wait() {
             Ok(Some(status)) => return status.code().map_or(Exit::Signal, Exit::Code),
             Ok(None) => thread::sleep(POLL_INTERVAL),
-            Err(error) => return Exit::NotStarted(error.to_string()),
+            Err(error) => {
+                stop(child);
+                return Exit::NotStarted(error.to_string());
+            }
         }
     }
+    stop(child);
+    Exit::TimedOut
+}
+
+fn stop(child: &mut std::process::Child) {
     if let Err(error) = child.kill() {
         eprintln!("xtask: could not kill the timed out process: {error}");
     }
     if let Err(error) = child.wait() {
         eprintln!("xtask: could not reap the timed out process: {error}");
     }
-    Exit::TimedOut
 }
 
 /// The program and its arguments; environment values, where tokens live, are never shown.
@@ -296,6 +313,22 @@ fn decode_upload(exit: Exit, count: usize) -> UploadOutcome {
     }
 }
 
+fn decode_head_tags(exit: Exit, stdout: &str) -> HeadTag {
+    if exit != Exit::Code(0) {
+        return HeadTag::Failed(exit);
+    }
+    let versions: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|t| valid_tag(t))
+        .collect();
+    match versions.as_slice() {
+        [] => HeadTag::Untagged,
+        [tag] => HeadTag::Tagged((*tag).to_string()),
+        _ => HeadTag::Unrecognised(format!("several version tags at HEAD: {versions:?}")),
+    }
+}
+
 /// A release tag is `v` and a semantic version of digits and dots, bounded in length.
 fn valid_tag(tag: &str) -> bool {
     let Some(version) = tag.strip_prefix('v') else {
@@ -316,7 +349,7 @@ fn release_pr_token(value: Option<String>) -> Result<String, String> {
             "{RELEASE_TOKEN_VARIABLE} is not set. The release pull request needs a token whose \
              pull requests trigger ci: create a fine-grained token for this repository with \
              Contents and Pull requests read and write, and store it as the repository secret \
-             {RELEASE_TOKEN_VARIABLE}"
+             {RELEASE_TOKEN_VARIABLE} (Releases in docs/process.md)"
         )),
     }
 }
@@ -360,18 +393,29 @@ fn git_in(dir: &Path, args: &[&str]) -> Captured {
     run_bounded(Command::new("git").current_dir(dir).args(args), GIT_TIMEOUT)
 }
 
-fn remove_dry_run_worktree(root: &Path) {
+fn remove_dry_run_worktree(root: &Path) -> bool {
     let scratch = root.join(DRY_RUN_DIR);
-    if scratch.exists() {
-        let path = scratch.to_string_lossy().into_owned();
-        git_in(root, &["worktree", "remove", "--force", &path]);
+    if !scratch.exists() {
+        return true;
     }
+    let path = scratch.to_string_lossy().into_owned();
+    let removed = git_in(root, &["worktree", "remove", "--force", &path]);
+    if removed.exit != Exit::Code(0) {
+        eprintln!(
+            "xtask release-pr --dry-run: could not remove {path}: {:?}",
+            removed.exit
+        );
+        return false;
+    }
+    true
 }
 
 /// Runs `release-plz update` in a detached scratch worktree at HEAD and shows what it would change.
 fn release_pr_dry_run() -> i32 {
     let root = PathBuf::from(".");
-    remove_dry_run_worktree(&root);
+    if !remove_dry_run_worktree(&root) {
+        return 1;
+    }
     let added = git_in(
         &root,
         &[
@@ -392,8 +436,11 @@ fn release_pr_dry_run() -> i32 {
     }
     let scratch = root.join(DRY_RUN_DIR);
     let code = dry_run_in(&scratch);
-    remove_dry_run_worktree(&root);
-    code
+    if remove_dry_run_worktree(&root) {
+        code
+    } else {
+        1
+    }
 }
 
 fn dry_run_in(scratch: &Path) -> i32 {
@@ -405,18 +452,12 @@ fn dry_run_in(scratch: &Path) -> i32 {
     }
     let updated = run_bounded(&mut update, RELEASE_PLZ_TIMEOUT);
     print_capped(&updated.stdout);
-    let exit = if updated.exit == Exit::Code(0) {
-        git_in(scratch, &["add", "--intent-to-add", "--all"]);
-        let status = git_in(scratch, &["status", "--porcelain"]);
-        let outcome = decode_dry_run(status.exit, &status.stdout);
-        if let DryRunOutcome::Proposed(_) = outcome {
-            print_capped(&git_in(scratch, &["diff"]).stdout);
-        }
-        outcome
+    let outcome = if updated.exit == Exit::Code(0) {
+        proposed_changes(scratch)
     } else {
         DryRunOutcome::Failed(updated.exit)
     };
-    match exit {
+    match outcome {
         DryRunOutcome::Proposed(files) => {
             println!(
                 "xtask release-pr --dry-run: would change {} files",
@@ -433,6 +474,23 @@ fn dry_run_in(scratch: &Path) -> i32 {
             1
         }
     }
+}
+
+fn proposed_changes(scratch: &Path) -> DryRunOutcome {
+    let staged = git_in(scratch, &["add", "--intent-to-add", "--all"]);
+    if staged.exit != Exit::Code(0) {
+        return DryRunOutcome::Failed(staged.exit);
+    }
+    let status = git_in(scratch, &["status", "--porcelain"]);
+    let outcome = decode_dry_run(status.exit, &status.stdout);
+    if let DryRunOutcome::Proposed(_) = outcome {
+        let diff = git_in(scratch, &["diff"]);
+        if diff.exit != Exit::Code(0) {
+            return DryRunOutcome::Failed(diff.exit);
+        }
+        print_capped(&diff.stdout);
+    }
+    outcome
 }
 
 /// `xtask release`: tags a merged release pull request and creates its GitHub release.
@@ -457,13 +515,29 @@ pub fn release() -> i32 {
             println!("xtask release: released {RELEASED_PACKAGE} {version} as {tag}");
             write_step_output("tag", &tag)
         }
-        ReleaseOutcome::NothingToRelease => {
+        ReleaseOutcome::NothingToRelease => existing_release_at_head(),
+        outcome => {
+            eprintln!("xtask release: {outcome:?}");
+            print_capped(&captured.stdout);
+            1
+        }
+    }
+}
+
+/// A rerun of a release commit finds its tag already made; the binaries are rebuilt for it.
+fn existing_release_at_head() -> i32 {
+    let tags = git_in(Path::new("."), &["tag", "--points-at", "HEAD"]);
+    match decode_head_tags(tags.exit, &tags.stdout) {
+        HeadTag::Tagged(tag) => {
+            println!("xtask release: {tag} already points at this commit; binaries rebuild for it");
+            write_step_output("tag", &tag)
+        }
+        HeadTag::Untagged => {
             println!("xtask release: this commit is not a merged release pull request");
             0
         }
         outcome => {
-            eprintln!("xtask release: {outcome:?}");
-            print_capped(&captured.stdout);
+            eprintln!("xtask release: tags at HEAD {outcome:?}");
             1
         }
     }
@@ -504,6 +578,9 @@ pub fn release_binaries(tag: Option<String>) -> i32 {
             return 2;
         }
     };
+    if !add_host_targets() {
+        return 1;
+    }
     let mut dist = Command::new("dist");
     dist.args([
         "build",
@@ -526,6 +603,23 @@ pub fn release_binaries(tag: Option<String>) -> i32 {
         }
     };
     upload(&tag, &names)
+}
+
+fn add_host_targets() -> bool {
+    for target in host_targets() {
+        let added = run_bounded(
+            Command::new("rustup").args(["target", "add", target]),
+            RUSTUP_TIMEOUT,
+        );
+        if added.exit != Exit::Code(0) {
+            eprintln!(
+                "xtask release-binaries: rustup target add {target} ended {:?}",
+                added.exit
+            );
+            return false;
+        }
+    }
+    true
 }
 
 fn upload(tag: &str, names: &[String]) -> i32 {
@@ -694,6 +788,31 @@ mod tests {
             decode_upload(Exit::Code(1), 4),
             UploadOutcome::Failed(Exit::Code(1))
         );
+    }
+
+    #[test]
+    fn head_tag_decoder_picks_the_single_version_tag() {
+        assert_eq!(
+            decode_head_tags(Exit::Code(0), "v0.1.0\n"),
+            HeadTag::Tagged("v0.1.0".into())
+        );
+        assert_eq!(
+            decode_head_tags(Exit::Code(0), "checkpoint-1\nv0.2.0\n"),
+            HeadTag::Tagged("v0.2.0".into())
+        );
+        assert_eq!(decode_head_tags(Exit::Code(0), ""), HeadTag::Untagged);
+        assert_eq!(
+            decode_head_tags(Exit::Code(0), "not-a-version\n"),
+            HeadTag::Untagged
+        );
+        assert_eq!(
+            decode_head_tags(Exit::Code(128), ""),
+            HeadTag::Failed(Exit::Code(128))
+        );
+        assert!(matches!(
+            decode_head_tags(Exit::Code(0), "v0.1.0\nv0.1.1\n"),
+            HeadTag::Unrecognised(_)
+        ));
     }
 
     #[test]
