@@ -10,8 +10,9 @@ The design is `docs/design.html`. Section numbers below refer to it.
 
 These need a human with sudo or an account login and are not automated:
 
-- A dedicated macOS user for agents (design section 7, trust boundaries). No credentials
-  of any kind in that account. The core runs as the developer.
+- A dedicated macOS user for agents with its own primary group, not `staff` (design
+  section 7, trust boundaries). No credentials of any kind in that account. The core
+  runs as the developer.
 - Vendor logins for that user, done once from a terminal: Claude Code (subscription),
   Codex (ChatGPT plan). Antigravity is optional in slice zero.
 - A group shared by the developer and the agent user, for the zmx socket directory.

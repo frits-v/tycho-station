@@ -78,3 +78,7 @@ run = "cargo test -p tycho --test control -- --ignored --test-threads=1 --nocapt
 [tasks.chaos-tests]
 description = "Run a work unit through the operator while the terminal app, the restate server, the endpoint and the launcher are killed; record the slice zero baselines (macOS)"
 run = "cargo test -p tycho --test chaos -- --ignored --test-threads=1 --nocapture"
+
+[tasks.setup]
+description = "Check the operator preconditions for running the factory on this machine"
+run = "cargo run -q -p xtask -- setup"
