@@ -26,6 +26,10 @@ gh = "2.102.0"
 description = "Format check, lints, tests, and the pull request title check when run in CI"
 run = "cargo run -q -p xtask -- ci"
 
+[tasks.opengrep]
+description = "Test the opengrep rules against their fixtures, then scan the repository with them"
+run = "cargo run -q -p xtask -- opengrep"
+
 [tasks.cache-trim]
 description = "Collect the mbx store down to the size CI saves"
 run = "mbx gc --max-size 3GiB"

@@ -16,8 +16,10 @@ mod app_token;
 mod config;
 mod credentials;
 mod figures;
+mod opengrep;
 mod process;
 mod release;
+mod sarif;
 mod setup;
 
 const TYPES: [&str; 11] = [
@@ -32,10 +34,14 @@ const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
 const DOC_DIRS: [&str; 1] = ["docs"];
 const RULES_DIR: &str = ".claude/rules";
 const RULE_MAX_LINES: usize = 24;
-const COMMANDS: [(&str, &str); 16] = [
+const COMMANDS: [(&str, &str); 17] = [
     (
         "ci",
         "format check, clippy, tests, the repository checks, workflow lints, PR title",
+    ),
+    (
+        "opengrep",
+        "the opengrep rules against their fixtures, then over the Rust sources",
     ),
     (
         "check-commit-msg <file>",
@@ -108,6 +114,9 @@ const NARRATION_MARKERS: [&str; 10] = [
     "now does",
     "legacy",
 ];
+/// Markers that opengrep's `rust-history-trace-comment` rule covers in Rust comments; this
+/// check still applies them to documents.
+const MARKERS_IN_OPENGREP: [&str; 3] = ["previously", "used to ", "now does"];
 
 #[derive(Debug, PartialEq, Eq)]
 enum Verdict {
@@ -265,6 +274,7 @@ fn ci() -> i32 {
         }
     }
     for check in [
+        opengrep::opengrep,
         check_names,
         check_comments,
         check_rules,
@@ -397,6 +407,7 @@ fn comment_text(line: &str) -> Option<&str> {
     None
 }
 
+/// In Rust sources (`comments_only`) the markers opengrep covers are left to it.
 fn narration_defects(path: &Path, text: &str, comments_only: bool) -> Vec<String> {
     let mut defects = Vec::new();
     for (index, line) in text.lines().enumerate() {
@@ -410,6 +421,9 @@ fn narration_defects(path: &Path, text: &str, comments_only: bool) -> Vec<String
         };
         let lower = scanned.to_ascii_lowercase();
         for marker in NARRATION_MARKERS {
+            if comments_only && MARKERS_IN_OPENGREP.contains(&marker) {
+                continue;
+            }
             if lower.contains(marker) {
                 defects.push(format!(
                     "{}:{}: `{marker}`",
@@ -607,6 +621,7 @@ fn main() {
         ),
         Some("check-pr-title") => check_pr_title(args.get(1).cloned().or_else(pr_title_from_event)),
         Some("ci") => ci(),
+        Some("opengrep") => opengrep::opengrep(),
         Some("check-names") => check_names(),
         Some("check-comments") => check_comments(),
         Some("check-rules") => check_rules(),
@@ -693,7 +708,7 @@ mod tests {
 
     #[test]
     fn flags_narration_in_comments_only_for_sources() {
-        let text = "// previously this looped\nlet previously = 1;\n";
+        let text = "// we tried this loop\nlet legacy = 1;\n";
         assert_eq!(narration_defects(Path::new("a.rs"), text, true).len(), 1);
         assert_eq!(narration_defects(Path::new("a.md"), text, false).len(), 2);
     }
