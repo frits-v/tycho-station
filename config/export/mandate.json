@@ -31,7 +31,7 @@
             "pending": false
         },
         "setup": {
-            "what": "xtask setup checks, on the agent user's side, that no credential file exists, that no keychain item exists for a forbidden service, and that the agent's settings and shell startup files are core-owned and read-only.",
+            "what": "xtask setup checks, on the agent user's side, that the agent user's primary group is tycho-agent and not staff, that no credential file exists, and that no keychain item exists for a forbidden service.",
             "runs": "on demand, once per side",
             "record": "not_recorded",
             "pending": true
