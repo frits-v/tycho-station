@@ -1070,9 +1070,14 @@ fn lookup_status(lookup: &DsclLookup) -> Status {
 
 fn group_gid(lookup: &DsclLookup) -> Result<u32, String> {
     match lookup {
-        DsclLookup::Found(stdout) => dscl_value(stdout, "PrimaryGroupID")
-            .and_then(|value| value.parse().ok())
-            .ok_or_else(|| "PrimaryGroupID missing from the group record".to_string()),
+        DsclLookup::Found(stdout) => {
+            let Some(value) = dscl_value(stdout, "PrimaryGroupID") else {
+                return Err("PrimaryGroupID missing from the group record".to_string());
+            };
+            value
+                .parse()
+                .map_err(|_| format!("unrecognised PrimaryGroupID {value:?} in the group record"))
+        }
         DsclLookup::NotFound => Err(format!("group {SHARED_GROUP_NAME} does not exist")),
         DsclLookup::Unreachable(why) => Err(why.clone()),
     }
@@ -2350,6 +2355,26 @@ mod tests {
             std::ffi::OsStr::new("MISE_OFFLINE"),
             Some(std::ffi::OsStr::new("1"))
         )));
+    }
+
+    #[test]
+    fn group_gid_tells_a_missing_attribute_from_an_unparsable_one() {
+        let found = DsclLookup::Found("PrimaryGroupID: 701\n".to_string());
+        assert_eq!(group_gid(&found), Ok(701));
+        let absent = DsclLookup::Found("RecordName: tycho-zmx\n".to_string());
+        assert_eq!(
+            group_gid(&absent),
+            Err("PrimaryGroupID missing from the group record".to_string())
+        );
+        let not_numeric = DsclLookup::Found("PrimaryGroupID: zmx\n".to_string());
+        assert_eq!(
+            group_gid(&not_numeric),
+            Err("unrecognised PrimaryGroupID \"zmx\" in the group record".to_string())
+        );
+        assert_eq!(
+            group_gid(&DsclLookup::NotFound),
+            Err("group tycho-zmx does not exist".to_string())
+        );
     }
 
     #[test]
