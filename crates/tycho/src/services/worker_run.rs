@@ -9,7 +9,7 @@ use std::time::Duration;
 use restate_sdk::context::DurableFuture;
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
-use tycho_types::envelope::{Outcome, ResultPayload, ShortText, Usage};
+use tycho_types::envelope::{Envelope, Outcome, Payload, ResultPayload, ShortText, Usage};
 use tycho_types::exit::{Disposition, ExitState};
 use tycho_types::rejection::{decode_rejection, Question};
 use tycho_types::service::{Attempt, EpicId, TaskId, WorkUnitId, RECONCILER_KEY};
@@ -25,10 +25,14 @@ use crate::services::reconciler::ReconcilerClient;
 use crate::services::session::{
     KillRequest, SessionClient, SessionView, SpawnOutcome, SpawnRequest,
 };
+use crate::services::workers::{
+    worker_command, WorkerCommand, WorkerEvidence, WorkerPorts, WorkerTaskRequest,
+};
 use crate::services::{
-    refuse, secret, wall_clock_unix_ms, Ports, Timing, CODE_BAD_REQUEST, CODE_CANCELLED,
+    blocking, refuse, secret, wall_clock_unix_ms, Ports, Timing, CODE_BAD_REQUEST, CODE_CANCELLED,
     CODE_INTERNAL,
 };
+use crate::vendors::worker::VendorSessionId;
 
 const VIEW_KEY: &str = "view";
 const TIER_FLAG: &str = "--tier";
@@ -45,6 +49,9 @@ pub struct WorkerRunRequest {
     pub ledger: LedgerKind,
     /// Budget reserved per attempt, in the ledger's unit.
     pub reservation: u64,
+    /// A headless worker task; with it the run builds the vendor command and `argv` is unused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<WorkerTaskRequest>,
 }
 
 /// The run's class and starting tier; the fallback tiers come from the routing table.
@@ -71,6 +78,8 @@ pub enum WorkerRunOutcome {
     Completed {
         attempt: u16,
         result: ResultPayload,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<WorkerEvidence>,
     },
     Escalated {
         attempt: u16,
@@ -103,6 +112,10 @@ pub struct WorkerRunView {
 
 /// What the run does after an attempt ends.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one value per attempt, moved once; a box buys nothing"
+)]
 pub enum AfterAttempt {
     /// Re-queue under the next attempt, one tier up when the routing names a fallback.
     Next,
@@ -123,6 +136,7 @@ pub fn after_attempt(
         (Disposition::Verify, Some(result)) => AfterAttempt::Finish(WorkerRunOutcome::Completed {
             attempt: number,
             result,
+            evidence: None,
         }),
         (Disposition::Requeue, _) | (Disposition::Verify, None) => {
             if attempt < cap {
@@ -146,6 +160,35 @@ pub fn after_attempt(
             attempt: number,
             state: String::from(exit.clone()),
         }),
+    }
+}
+
+/// A stop the exit table does not name ends the run; otherwise the disposition decides.
+fn decide(end: AttemptEnd, attempt: Attempt, cap: Attempt) -> AfterAttempt {
+    match end.stop {
+        Some(reason) => AfterAttempt::Finish(WorkerRunOutcome::Stopped {
+            attempt: attempt.get(),
+            state: reason,
+        }),
+        None => attach(
+            after_attempt(&end.exit, end.result, end.question, attempt, cap),
+            end.evidence,
+        ),
+    }
+}
+
+/// Adds a completed attempt's session evidence to its outcome.
+#[must_use]
+pub fn attach(next: AfterAttempt, evidence: Option<WorkerEvidence>) -> AfterAttempt {
+    match next {
+        AfterAttempt::Finish(WorkerRunOutcome::Completed {
+            attempt, result, ..
+        }) => AfterAttempt::Finish(WorkerRunOutcome::Completed {
+            attempt,
+            result,
+            evidence,
+        }),
+        other => other,
     }
 }
 
@@ -228,9 +271,11 @@ impl fmt::Display for RequestError {
     }
 }
 
+/// A headless task builds its own command, so only a request without one needs an argv.
 pub const fn check_request(request: &WorkerRunRequest) -> Result<(), RequestError> {
     let count = request.argv.len();
-    if count == 0 || count > spine::SPAWN_ARGV_MAX_ITEMS.saturating_sub(2) {
+    let empty = count == 0 && request.task.is_none();
+    if empty || count > spine::SPAWN_ARGV_MAX_ITEMS.saturating_sub(2) {
         return Err(RequestError::Argv(count));
     }
     Ok(())
@@ -317,8 +362,38 @@ fn argv_with_tier(
     Ok(argv)
 }
 
+fn short_texts(words: &[String]) -> Result<Vec<ShortText>, TerminalError> {
+    words
+        .iter()
+        .map(|word| ShortText::parse(word).map_err(|error| TerminalError::new(error.to_string())))
+        .collect()
+}
+
+/// The tier's model for the vendor, from the routing table the endpoint loaded.
+fn model_for(
+    config: &FactoryConfig,
+    tier: &RoutingName,
+    vendor: Vendor,
+) -> Result<String, TerminalError> {
+    let models = &config
+        .routing
+        .value
+        .tiers
+        .get(tier)
+        .ok_or_else(|| TerminalError::new(format!("tier {tier} is not in the routing table")))?
+        .models;
+    match vendor {
+        Vendor::Claude => Ok(models.claude.clone()),
+        Vendor::Codex => Ok(models.codex.clone()),
+        Vendor::Antigravity | Vendor::Amp | Vendor::OpenCode => Err(TerminalError::new(format!(
+            "the routing table names no {} model",
+            vendor.as_str()
+        ))),
+    }
+}
+
 enum Wake {
-    Result(Result<Json<ResultPayload>, TerminalError>),
+    Result(Result<Json<serde_json::Value>, TerminalError>),
     Timer,
 }
 
@@ -329,6 +404,7 @@ struct AttemptEnd {
     result: Option<ResultPayload>,
     /// The certified question an `escalated` rejection carried.
     question: Question,
+    evidence: Option<WorkerEvidence>,
     /// Set when the run stops for a reason no exit state names, such as a refused spawn.
     stop: Option<String>,
     spawned: bool,
@@ -340,6 +416,7 @@ impl AttemptEnd {
             exit,
             result: None,
             question: Question::Absent,
+            evidence: None,
             stop: None,
             spawned,
         }
@@ -349,6 +426,7 @@ impl AttemptEnd {
 pub struct WorkerRun {
     timing: Timing,
     config: Arc<FactoryConfig>,
+    workers: Option<Arc<WorkerPorts>>,
 }
 
 impl WorkerRun {
@@ -357,6 +435,7 @@ impl WorkerRun {
         Self {
             timing: ports.timing,
             config: Arc::clone(&ports.config),
+            workers: ports.workers.clone(),
         }
     }
 }
@@ -367,6 +446,7 @@ impl fmt::Debug for WorkerRun {
             .debug_struct("WorkerRun")
             .field("timing", &self.timing)
             .field("config", &self.config.hashes())
+            .field("workers", &self.workers)
             .finish()
     }
 }
@@ -399,14 +479,7 @@ impl WorkerRun {
             let end = self
                 .attempt(&workflow_context, &run, attempt, &tier)
                 .await?;
-            let next = match end.stop {
-                Some(reason) => AfterAttempt::Finish(WorkerRunOutcome::Stopped {
-                    attempt: attempt.get(),
-                    state: reason,
-                }),
-                None => after_attempt(&end.exit, end.result, end.question, attempt, cap),
-            };
-            match next {
+            match decide(end, attempt, cap) {
                 AfterAttempt::Finish(outcome) => {
                     record(
                         &workflow_context,
@@ -574,7 +647,9 @@ impl WorkerRun {
         session: &SessionName,
         tier: &RoutingName,
     ) -> Result<AttemptEnd, TerminalError> {
-        let argv = argv_with_tier(run.request, tier)?;
+        let (argv, resume_handle) = self
+            .attempt_command(workflow_context, run, session, tier)
+            .await?;
         let session_secret = workflow_context
             .run(|| async {
                 secret::generate()
@@ -583,14 +658,14 @@ impl WorkerRun {
             })
             .name("session secret")
             .await?;
-        let (awaitable_id, awaitable) = workflow_context.awakeable::<Json<ResultPayload>>();
+        let (awaitable_id, awaitable) = workflow_context.awakeable::<Json<serde_json::Value>>();
         let spawn = SpawnRequest {
             argv,
             awaitable_id: tycho_types::launcher::AwaitableId::parse(&awaitable_id)
                 .map_err(|error| TerminalError::new(error.to_string()))?,
             secret: session_secret,
             inbox_socket: None,
-            resume_handle: None,
+            resume_handle: resume_handle.clone(),
         };
         let spawned = workflow_context
             .object_client::<SessionClient>(session.to_string())
@@ -606,7 +681,7 @@ impl WorkerRun {
                 if watched.is_err() {
                     kill(workflow_context, session, false).await;
                 }
-                watched
+                with_evidence(workflow_context, session, resume_handle, watched?).await
             }
             Ok(SpawnOutcome::Requeue { .. }) => Ok(AttemptEnd::exit(ExitState::Failed, false)),
             Err(error) => match spawn_refusal(error.code()) {
@@ -620,6 +695,59 @@ impl WorkerRun {
                 }),
             },
         }
+    }
+
+    /// The launcher's argv with the tier flag, and the vendor session id a headless task
+    /// pre-assigns as its resume handle.
+    async fn attempt_command(
+        &self,
+        workflow_context: &WorkflowContext<'_>,
+        run: &Run<'_>,
+        session: &SessionName,
+        tier: &RoutingName,
+    ) -> Result<(Vec<ShortText>, Option<ShortText>), TerminalError> {
+        let (Some(task), Some(workers)) = (&run.request.task, &self.workers) else {
+            return Ok((argv_with_tier(run.request, tier)?, None));
+        };
+        let model = model_for(&self.config, tier, run.request.vendor)?;
+        let workers = Arc::clone(workers);
+        let task = task.clone();
+        let (vendor, effort, name) = (
+            run.request.vendor,
+            run.request.routing.effort,
+            session.clone(),
+        );
+        let (words, session_id) = workflow_context
+            .run(|| {
+                blocking(move || {
+                    let session_id =
+                        secret::generate()
+                            .map_err(HandlerError::from)
+                            .and_then(|generated| {
+                                VendorSessionId::from_hex(generated.expose())
+                                    .map_err(|error| refuse(CODE_INTERNAL, error.to_string()))
+                            })?;
+                    let command = WorkerCommand {
+                        task: &task,
+                        vendor,
+                        session: &name,
+                        model: &model,
+                        effort,
+                        session_id: &session_id,
+                    };
+                    worker_command(&workers, &command)
+                        .map(|words| Json((words, session_id.as_str().to_string())))
+                        .map_err(|error| refuse(CODE_INTERNAL, error))
+                })
+            })
+            .name("worker command")
+            .await?
+            .into_inner();
+        let mut argv = short_texts(&words)?;
+        argv.extend(short_texts(&[TIER_FLAG.to_string(), tier.to_string()])?);
+        let handle =
+            ShortText::parse(&session_id).map_err(|error| TerminalError::new(error.to_string()))?;
+        Ok((argv, Some(handle)))
     }
 
     /// Any error here, a cancel or a failed check, leaves the kill to the caller.
@@ -641,7 +769,10 @@ impl WorkerRun {
             if let Wake::Result(completion) = woke {
                 forget(workflow_context, session);
                 return Ok(match completion {
-                    Ok(result) => completed(result.into_inner()),
+                    Ok(value) => result_from_envelope(&value.into_inner(), session).map_or_else(
+                        |_| AttemptEnd::exit(ExitState::from_wire(RAW_RESULT_INVALID), true),
+                        completed,
+                    ),
                     Err(rejected) => rejection(rejected.message()),
                 });
             }
@@ -688,6 +819,33 @@ impl WorkerRun {
     }
 }
 
+/// A completed attempt reads the session's last context size, which the launcher's final
+/// heartbeat wrote before it delivered the result.
+async fn with_evidence(
+    workflow_context: &WorkflowContext<'_>,
+    session: &SessionName,
+    resume_handle: Option<ShortText>,
+    end: AttemptEnd,
+) -> Result<AttemptEnd, TerminalError> {
+    if end.result.is_none() {
+        return Ok(end);
+    }
+    let view = workflow_context
+        .object_client::<SessionClient>(session.to_string())
+        .status()
+        .call()
+        .await?
+        .into_inner();
+    Ok(AttemptEnd {
+        evidence: Some(WorkerEvidence {
+            session: session.clone(),
+            resume_handle: resume_handle.map(|handle| handle.as_str().to_string()),
+            context_tokens: view.map(|view| view.context_tokens),
+        }),
+        ..end
+    })
+}
+
 fn timer<'run>(workflow_context: &'run WorkflowContext<'_>, wait: Duration) -> WakeFuture<'run> {
     Box::pin(workflow_context.sleep(wait).map(|_| Wake::Timer))
 }
@@ -700,11 +858,33 @@ fn rejection(message: &str) -> AttemptEnd {
     }
 }
 
+/// Wire text of the state a resolved awaitable takes when its value is not this attempt's
+/// result envelope; it decodes as unrecognised and blocks in the inbox.
+pub const RAW_RESULT_INVALID: &str = "result_envelope_invalid";
+
+/// The launcher resolves with the result envelope; only a result from this attempt's
+/// session counts.
+pub fn result_from_envelope(
+    value: &serde_json::Value,
+    session: &SessionName,
+) -> Result<ResultPayload, String> {
+    let bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+    let envelope = Envelope::parse(&bytes).map_err(|error| error.to_string())?;
+    if envelope.from != *session {
+        return Err(format!("envelope from {} not {session}", envelope.from));
+    }
+    match envelope.payload {
+        Payload::Result(result) => Ok(result),
+        _ => Err("envelope payload is not a result".to_string()),
+    }
+}
+
 const fn completed(result: ResultPayload) -> AttemptEnd {
     AttemptEnd {
         exit: decode_result(&result),
         result: Some(result),
         question: Question::Absent,
+        evidence: None,
         stop: None,
         spawned: true,
     }
@@ -821,7 +1001,22 @@ mod tests {
     const T2: u64 = 900_000;
 
     #[test]
-    fn every_disposition_decides() {
+    fn only_a_result_envelope_from_the_attempts_session_resolves() {
+        let session = SessionName::parse(crate::exit_decode::tests::SESSION).unwrap();
+        let envelope = crate::exit_decode::tests::envelope(crate::exit_decode::tests::SESSION);
+        let result = result_from_envelope(&envelope, &session).unwrap();
+        assert_eq!(result.outcome, Outcome::Done);
+        let other = SessionName::parse("cf7a.wu03.wrk.claude.b2c4").unwrap();
+        assert!(result_from_envelope(&envelope, &other).is_err());
+        assert!(result_from_envelope(&envelope["payload"], &session).is_err());
+        assert_eq!(
+            ExitState::from_wire(RAW_RESULT_INVALID).disposition(),
+            Disposition::Inbox
+        );
+    }
+
+    #[test]
+    fn evidence_is_attached_only_to_a_completed_outcome() {
         let cap = attempt(3);
         let done = result(Outcome::Done);
         assert_eq!(
@@ -834,9 +1029,41 @@ mod tests {
             ),
             AfterAttempt::Finish(WorkerRunOutcome::Completed {
                 attempt: 1,
-                result: done
+                result: done.clone(),
+                evidence: None,
             })
         );
+        let evidence = WorkerEvidence {
+            session: SessionName::parse("cf7a.wu03.wrk.claude.a1f3").unwrap(),
+            resume_handle: Some("3f0c6c1e-6b1a-4a51-9a0e-2a8c5d0c1a10".to_string()),
+            context_tokens: Some(33_390),
+        };
+        assert_eq!(
+            attach(
+                after_attempt(
+                    &ExitState::Completed,
+                    Some(done.clone()),
+                    Question::Absent,
+                    attempt(1),
+                    cap
+                ),
+                Some(evidence.clone())
+            ),
+            AfterAttempt::Finish(WorkerRunOutcome::Completed {
+                attempt: 1,
+                result: done,
+                evidence: Some(evidence.clone()),
+            })
+        );
+        assert_eq!(
+            attach(AfterAttempt::Next, Some(evidence)),
+            AfterAttempt::Next
+        );
+    }
+
+    #[test]
+    fn every_disposition_decides() {
+        let cap = attempt(3);
         for requeue in [
             ExitState::Stalled,
             ExitState::Killed,
@@ -995,6 +1222,7 @@ mod tests {
             routing: routing(),
             ledger: LedgerKind::Seat,
             reservation: 10,
+            task: None,
         }
     }
 
@@ -1002,6 +1230,16 @@ mod tests {
     fn argv_is_bounded_with_room_for_the_tier_flag() {
         assert_eq!(check_request(&request(1)), Ok(()));
         assert_eq!(check_request(&request(0)), Err(RequestError::Argv(0)));
+        let headless = WorkerRunRequest {
+            task: Some(WorkerTaskRequest {
+                brief: crate::services::workers::Brief::parse("Make widget::answer return 42.")
+                    .unwrap(),
+                max_turns: std::num::NonZeroU16::new(8),
+                placement: None,
+            }),
+            ..request(0)
+        };
+        assert_eq!(check_request(&headless), Ok(()));
         let over = spine::SPAWN_ARGV_MAX_ITEMS.saturating_sub(1);
         assert_eq!(check_request(&request(over)), Err(RequestError::Argv(over)));
     }

@@ -66,3 +66,7 @@ run = "cargo test -p tycho --test spine -- --ignored --test-threads=1 --nocaptur
 [tasks.launcher-tests]
 description = "Spawn launchers under zmx against a throwaway core, then kill the launcher and the restate server at the named moments (macOS)"
 run = "cargo test -p tycho --test launcher -- --ignored --test-threads=1 --nocapture"
+
+[tasks.worker-tests]
+description = "Dispatch the synthetic epic's trivial unit to a real headless claude worker through a throwaway core; needs a Claude login and `mise run graph-plugin` first (macOS)"
+run = "cargo test -p tycho --test worker -- --ignored --test-threads=1 --nocapture"

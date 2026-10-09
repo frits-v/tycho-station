@@ -510,8 +510,8 @@ impl From<InputError> for GraphError {
     }
 }
 
-/// Builds and queries the code graph of one checkout.
-pub trait CodeGraph {
+/// Builds and queries the code graph of one checkout; services hold it across threads.
+pub trait CodeGraph: Send + Sync {
     /// After a worktree clone.
     fn build(
         &self,

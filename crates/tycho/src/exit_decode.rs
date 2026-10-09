@@ -13,7 +13,7 @@ use tycho_types::exit::ExitState;
 use tycho_types::session::SessionName;
 
 use crate::agent_files::{current_uid, read_checked};
-use crate::spool::check_result_envelope;
+use crate::spool::{check_result_envelope, escalation_rejection};
 
 pub const PROGRESS_FILE_MAX_BYTES: usize = 4096;
 pub const RESULT_FILE_MAX_BYTES: usize = ENVELOPE_MAX_BYTES + 1024;
@@ -117,6 +117,9 @@ pub fn status_payload(
 pub struct ResultReport {
     pub state: String,
     pub envelope: Option<serde_json::Value>,
+    /// Why the vendor adapter chose this state, for the launcher's log; never decoded.
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +223,13 @@ fn decode_report(report: ResultReport, end: ChildEnd, session: &SessionName) -> 
             }
             _ => Decoded::failure(ExitState::from_wire(RAW_COMPLETED_WITHOUT_RESULT)),
         },
+        ExitState::Escalated => match report.envelope {
+            Some(envelope) if escalation_rejection(&envelope, session).is_ok() => Decoded {
+                state: ExitState::Escalated,
+                envelope: Some(envelope),
+            },
+            _ => Decoded::failure(ExitState::Escalated),
+        },
         other => Decoded::failure(other),
     }
 }
@@ -263,6 +273,7 @@ pub mod tests {
         ResultFile::Report(ResultReport {
             state: state.to_string(),
             envelope,
+            detail: None,
         })
     }
 

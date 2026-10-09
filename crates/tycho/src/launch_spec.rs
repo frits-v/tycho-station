@@ -95,6 +95,7 @@ pub enum SettingsError {
     Spec(String),
     Tier(String),
     CoreUid,
+    CurrentExe(std::io::Error),
 }
 
 impl fmt::Display for SettingsError {
@@ -114,6 +115,7 @@ impl fmt::Display for SettingsError {
                 "tier {tier:?} is not 1..={TIER_MAX_BYTES} bytes of [A-Za-z0-9._-]"
             ),
             Self::CoreUid => write!(formatter, "{CORE_UID_ENV} is not a uid"),
+            Self::CurrentExe(error) => write!(formatter, "cannot find the tycho binary: {error}"),
         }
     }
 }
@@ -131,6 +133,9 @@ pub struct LauncherSettings {
     pub tier: Option<String>,
     pub wall_clock: Duration,
     pub output_max_bytes: u64,
+    /// The `tycho` binary that runs the vendor as the leader of a session with no controlling
+    /// terminal; `None` only in tests, where the vendor gets its own process group instead.
+    pub session_leader: Option<PathBuf>,
 }
 
 /// A tier is 1 to 32 bytes of letters, digits, `.`, `_` and `-`.
@@ -195,6 +200,7 @@ impl LauncherSettings {
             tier: None,
             wall_clock: WALL_CLOCK_MAX,
             output_max_bytes: OUTPUT_FILE_MAX_BYTES,
+            session_leader: None,
         })
     }
 
