@@ -1,0 +1,200 @@
+//! Runs an external program with a timeout and a cap on the output it may produce.
+
+use std::fmt;
+use std::io::{self, Read};
+use std::path::Path;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crate::config::{COMMAND_OUTPUT_MAX_BYTES, POLL_INTERVAL};
+
+#[derive(Debug)]
+pub enum CommandError {
+    Spawn(String, io::Error),
+    Wait(io::Error),
+    TimedOut(String, Duration),
+    OutputTooLarge(String),
+    NotUtf8(String),
+    Failed(String, ExitStatus, String),
+}
+
+impl fmt::Display for CommandError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Spawn(program, error) => write!(formatter, "cannot start {program}: {error}"),
+            Self::Wait(error) => write!(formatter, "cannot wait for a child: {error}"),
+            Self::TimedOut(program, limit) => {
+                write!(formatter, "{program} did not finish within {limit:?}")
+            }
+            Self::OutputTooLarge(program) => write!(
+                formatter,
+                "{program} wrote more than {COMMAND_OUTPUT_MAX_BYTES} bytes"
+            ),
+            Self::NotUtf8(program) => write!(formatter, "{program} wrote output that is not UTF-8"),
+            Self::Failed(program, status, stderr) => {
+                write!(
+                    formatter,
+                    "{program} exited with {status}: {}",
+                    stderr.trim()
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Captured {
+    pub status: ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// Runs to completion and fails on a non-zero exit.
+pub fn run_captured(
+    program: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<Captured, CommandError> {
+    let captured = run_status(program, arguments, environment, timeout)?;
+    if !captured.status.success() {
+        return Err(CommandError::Failed(
+            program.display().to_string(),
+            captured.status,
+            captured.stderr,
+        ));
+    }
+    Ok(captured)
+}
+
+/// Runs to completion and returns the exit status whatever it is.
+pub fn run_status(
+    program: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<Captured, CommandError> {
+    let name = program.display().to_string();
+    let mut child = Command::new(program)
+        .args(arguments)
+        .envs(environment.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| CommandError::Spawn(name.clone(), error))?;
+    let stdout = child.stdout.take().map(bounded_reader);
+    let stderr = child.stderr.take().map(bounded_reader);
+    let status = wait_bounded(&mut child, &name, timeout)?;
+    let stdout = collect(stdout, &name)?;
+    let stderr = collect(stderr, &name)?;
+    Ok(Captured {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Runs with no pipes, for a program that leaves a daemon behind holding its descriptors.
+pub fn run_detached(
+    program: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<ExitStatus, CommandError> {
+    let name = program.display().to_string();
+    let mut child = Command::new(program)
+        .args(arguments)
+        .envs(environment.iter().copied())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| CommandError::Spawn(name.clone(), error))?;
+    wait_bounded(&mut child, &name, timeout)
+}
+
+fn wait_bounded(
+    child: &mut Child,
+    name: &str,
+    timeout: Duration,
+) -> Result<ExitStatus, CommandError> {
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        if let Some(status) = child.try_wait().map_err(CommandError::Wait)? {
+            return Ok(status);
+        }
+        thread::sleep(POLL_INTERVAL.min(timeout));
+    }
+    child.kill().map_err(CommandError::Wait)?;
+    child.wait().map_err(CommandError::Wait)?;
+    Err(CommandError::TimedOut(name.to_string(), timeout))
+}
+
+type Reader = thread::JoinHandle<io::Result<Vec<u8>>>;
+
+fn bounded_reader(source: impl Read + Send + 'static) -> Reader {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let limit = u64::try_from(COMMAND_OUTPUT_MAX_BYTES).unwrap_or(u64::MAX);
+        source
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+}
+
+fn collect(reader: Option<Reader>, name: &str) -> Result<String, CommandError> {
+    let Some(reader) = reader else {
+        return Ok(String::new());
+    };
+    let bytes = reader
+        .join()
+        .map_err(|_| CommandError::Wait(io::Error::other("output reader thread panicked")))?
+        .map_err(CommandError::Wait)?;
+    if bytes.len() > COMMAND_OUTPUT_MAX_BYTES {
+        return Err(CommandError::OutputTooLarge(name.to_string()));
+    }
+    String::from_utf8(bytes).map_err(|_| CommandError::NotUtf8(name.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captures_stdout() {
+        let captured = run_captured(
+            Path::new("/bin/echo"),
+            &["hello"],
+            &[],
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(captured.stdout, "hello\n");
+    }
+
+    #[test]
+    fn times_out_a_slow_program() {
+        let result = run_captured(
+            Path::new("/bin/sleep"),
+            &["5"],
+            &[],
+            Duration::from_millis(300),
+        );
+        assert!(matches!(result, Err(CommandError::TimedOut(_, _))));
+    }
+
+    #[test]
+    fn rejects_output_over_the_cap() {
+        let count = (COMMAND_OUTPUT_MAX_BYTES + 1).to_string();
+        let result = run_captured(
+            Path::new("/usr/bin/head"),
+            &["-c", &count, "/dev/zero"],
+            &[],
+            Duration::from_secs(5),
+        );
+        assert!(matches!(result, Err(CommandError::OutputTooLarge(_))));
+    }
+}

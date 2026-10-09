@@ -22,3 +22,7 @@ run = "cargo run -q -p xtask -- check-commit-msg"
 [tasks.hooks]
 description = "Install the git hooks"
 run = "lefthook install"
+
+[tasks.kill-tests]
+description = "Kill the restate server, the endpoint and the watchdog in turn and watch each return (macOS)"
+run = "cargo test -p tycho --test kill -- --ignored --test-threads=1 --nocapture"

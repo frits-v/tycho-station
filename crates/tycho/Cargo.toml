@@ -1,0 +1,19 @@
+[package]
+name = "tycho"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The Tycho Station binary: Restate service endpoint, core supervision and the launchd watchdog"
+
+[dependencies]
+restate-sdk = { version = "=0.12.1", default-features = false, features = ["http_server"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["blocking", "http2"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "signal", "time"] }
+tycho-types = { path = "../tycho-types" }
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true
