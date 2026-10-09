@@ -834,6 +834,17 @@ const CODEX_LOGIN: LoginProbe = LoginProbe {
     login_hint: "log in once from a terminal: codex login",
 };
 
+/// Claude and entire answer on stdout and codex on stderr, so both first lines are shown.
+fn unrecognised_login(probe: &LoginProbe, code: Option<i32>, stdout: &str, stderr: &str) -> String {
+    format!(
+        "unrecognised {} {} result (exit {code:?}): stdout {:?}, stderr {:?}",
+        probe.tool,
+        probe.args.join(" "),
+        first_line(stdout),
+        first_line(stderr)
+    )
+}
+
 fn login_finding(probe: &LoginProbe, ls: &MiseLs) -> Finding {
     if let Some(gated) = installed_gate(probe.check, probe.tool, ls) {
         return gated;
@@ -855,12 +866,7 @@ fn login_finding(probe: &LoginProbe, ls: &MiseLs) -> Finding {
             }
             AuthStatus::Unrecognised => Finding::unreachable(
                 probe.check,
-                format!(
-                    "unrecognised {} {} result (exit {code:?}): {:?}",
-                    probe.tool,
-                    probe.args.join(" "),
-                    first_line(&stderr)
-                ),
+                unrecognised_login(probe, code, &stdout, &stderr),
             ),
         },
     }
@@ -1932,6 +1938,20 @@ mod tests {
         assert_eq!(
             decode_codex_login_status(Some(1), "", "error: something else\n"),
             AuthStatus::Unrecognised
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_login_names_both_first_lines() {
+        let message = unrecognised_login(
+            &CLAUDE_LOGIN,
+            Some(2),
+            "{\"error\": true}\nmore\n",
+            "warning\n",
+        );
+        assert_eq!(
+            message,
+            "unrecognised claude auth status --json result (exit Some(2)): stdout \"{\\\"error\\\": true}\", stderr \"warning\""
         );
     }
 
