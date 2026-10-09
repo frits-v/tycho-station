@@ -30,6 +30,11 @@ conventional commit grammar, checked by the xtask. Commits are signed, history i
 linear, and the default branch advances only by squash or rebase merges of pull
 requests.
 
+Strictly typed over everything else: CUE before JSON before YAML. Configuration,
+schemas and thresholds are authored in CUE and validated by it; the runtime reads the
+exported JSON. Figures are stencil documents authored in CUE and rendered in the build.
+The station ships as one binary with everything it needs embedded.
+
 ## Decisions in force
 
 Rust throughout; Restate for durable execution; zmx owns every long-lived process;

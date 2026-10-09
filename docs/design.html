@@ -785,7 +785,10 @@ zmx history cf7a.wu03.wrk.claude.a1f3 --html   # scrollback as evidence, no atta
   <li>Logic lives in typed code. Build, check and release tasks are a Rust xtask; there are no bash scripts and no logic in workflow YAML.</li>
   <li>Continuous integration is one workflow of the repository's own that checks out, sets up mise and runs the xtask; no reusable workflows and no marketplace actions beyond that setup.</li>
   <li>Git hooks run through lefthook: commit messages are checked by the xtask against the conventional commit grammar, formatting and lints run before commit.</li>
-  <li>Commits are signed; the default branch advances only by squash or rebase merges of pull requests whose titles are conventional commits; history is linear. The ruleset that enforces this on the host is staged and applies once the repository qualifies.</li>
+  <li>Commits are signed; the default branch advances only by squash or rebase merges of pull requests whose titles are conventional commits; history is linear, enforced by the host's ruleset with no bypass.</li>
+  <li>Strictly typed over everything else: CUE before JSON before YAML. Configuration, routing tables, thresholds and the article-to-mechanism map are authored in CUE with CUE as the gate; the runtime reads exported, content-hashed JSON; JSON Schema is generated from CUE, never written by hand; YAML only where a tool forces it, TOML only for mise.</li>
+  <li>Figures are stencil documents: structure authored in CUE, validated by its schema, rendered to SVG and PNG by the xtask, and checked in CI so a figure that drifts fails the build. The design's diagrams move to a tycho grammar.</li>
+  <li>Batteries included: the station ships as one binary with its assets, grammars, schemas and themes embedded; nothing is fetched at run time.</li>
 </ul>
 <h4>Slice zero: the spine</h4>
 <ol>

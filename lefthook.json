@@ -1,0 +1,19 @@
+{
+  "commit-msg": {
+    "commands": {
+      "conventional": { "run": "cargo run -q -p xtask -- check-commit-msg {1}" }
+    }
+  },
+  "pre-commit": {
+    "commands": {
+      "fmt": { "run": "cargo fmt --all -- --check" }
+    }
+  },
+  "pre-push": {
+    "commands": {
+      "clippy": { "run": "cargo clippy --workspace --all-targets -- -D warnings" },
+      "test": { "run": "cargo test --workspace" },
+      "workflows": { "run": "zizmor --pedantic --no-progress .github/workflows && actionlint" }
+    }
+  }
+}
