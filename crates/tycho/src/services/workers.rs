@@ -12,7 +12,6 @@ use tycho_types::service::{Attempt, WorkUnitId};
 use tycho_types::session::{SessionName, Vendor};
 use tycho_types::task_packet::Effort;
 
-use crate::agent_files::write_durable;
 use crate::code_graph::{BuildReport, Checkout, CodeGraph, GraphError, StepKey};
 use crate::repositories::{ProjectName, Repositories, Worktree};
 use crate::vendors::worker::{ModelName, VendorSessionId, WorkerArgs};
@@ -205,16 +204,20 @@ pub fn graph_key(unit: &WorkUnitId, attempt: Attempt, what: &str) -> Result<Step
 }
 
 /// Builds the index of a fresh clone, or rebuilds it after a commit; never fails the step.
+/// The worktree is the core's own path, checked level by level just before the graph runs.
 #[must_use]
 pub fn index(
     graph: &dyn CodeGraph,
+    repositories: &Repositories,
     kind: IndexKind,
     key: &StepKey,
     unit: &WorkUnitId,
     worktree: &Path,
 ) -> IndexRecord {
-    let built = Checkout::parse(worktree)
-        .map_err(GraphError::from)
+    let built = repositories
+        .check_worktree(worktree)
+        .map_err(|error| GraphError::CannotPrepare(worktree.to_path_buf(), error.to_string()))
+        .and_then(|()| Checkout::parse(worktree).map_err(GraphError::from))
         .and_then(|checkout| match kind {
             IndexKind::Build => graph.build(key, unit, &checkout),
             IndexKind::Rebuild => graph.rebuild(key, unit, &checkout),
@@ -246,13 +249,10 @@ pub fn worker_command(
     let binary = ports
         .binary(command.vendor)
         .ok_or_else(|| format!("no headless binary for {}", command.vendor.as_str()))?;
-    ports
+    let brief = ports
         .repositories
-        .ensure_briefs_dir()
+        .write_brief(command.session, command.task.brief.as_str().as_bytes())
         .map_err(|error| error.to_string())?;
-    let brief = ports.repositories.brief_path(command.session);
-    write_durable(&brief, command.task.brief.as_str().as_bytes())
-        .map_err(|error| format!("{}: {error}", brief.display()))?;
     let args = WorkerArgs {
         vendor: command.vendor,
         binary: binary.to_path_buf(),
@@ -379,16 +379,31 @@ mod tests {
             .clone_worktree(&project, &path, &branch)
             .unwrap();
         let key = graph_key(&unit(), Attempt::FIRST, "build").unwrap();
-        let built = index(&graph, IndexKind::Build, &key, &unit(), &worktree.path);
+        let built = index(
+            &graph,
+            &repositories,
+            IndexKind::Build,
+            &key,
+            &unit(),
+            &worktree.path,
+        );
         assert_eq!(built.step_key, "wu01.a1.build");
         assert_eq!(built.wall_clock_ms, Some(1500));
         assert_eq!(built.failure, None);
         let rekey = graph_key(&unit(), Attempt::FIRST, "rebuild.1").unwrap();
-        let rebuilt = index(&graph, IndexKind::Rebuild, &rekey, &unit(), &worktree.path);
+        let rebuilt = index(
+            &graph,
+            &repositories,
+            IndexKind::Rebuild,
+            &rekey,
+            &unit(),
+            &worktree.path,
+        );
         assert_eq!(rebuilt.kind, IndexKind::Rebuild);
         assert!(rebuilt.failure.is_some());
         let missing = index(
             &graph,
+            &repositories,
             IndexKind::Build,
             &key,
             &unit(),
@@ -402,6 +417,38 @@ mod tests {
                 format!("rebuild wu01.a1.rebuild.1 {}", path.display()),
             ]
         );
+    }
+
+    #[test]
+    fn the_index_refuses_a_worktree_swapped_for_a_link() {
+        let scratch = Scratch::new("index-link");
+        let (repositories, project) = fixture(&scratch);
+        let graph = RecordingGraph::default();
+        let path = scratch.0.join("worktrees/cf7a/wu01/a1");
+        let branch = unit_branch(&unit(), Attempt::FIRST).unwrap();
+        let worktree = repositories
+            .clone_worktree(&project, &path, &branch)
+            .unwrap();
+        let elsewhere = scratch.0.join("elsewhere");
+        std::fs::rename(&path, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        let key = graph_key(&unit(), Attempt::FIRST, "build").unwrap();
+        let built = index(
+            &graph,
+            &repositories,
+            IndexKind::Build,
+            &key,
+            &unit(),
+            &worktree.path,
+        );
+        assert!(
+            built
+                .failure
+                .as_ref()
+                .is_some_and(|failure| failure.contains("is a symlink")),
+            "{built:?}"
+        );
+        assert!(graph.calls.lock().unwrap().is_empty());
     }
 
     fn ports(repositories: Repositories, project: ProjectName) -> WorkerPorts {
@@ -455,6 +502,19 @@ mod tests {
         assert_eq!(parsed.worktree, worktree.path);
         assert_eq!(parsed.base, worktree.base);
         assert_eq!(parsed.brief, brief);
+        let victim = scratch.0.join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        let briefs = scratch.0.join("worktrees/briefs");
+        std::fs::remove_dir_all(&briefs).unwrap();
+        std::os::unix::fs::symlink(&victim, &briefs).unwrap();
+        let swapped = worker_command(&ports, &command);
+        assert!(
+            swapped
+                .as_ref()
+                .is_err_and(|error| error.contains("is a symlink")),
+            "{swapped:?}"
+        );
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
         let unplaced = WorkerTaskRequest {
             placement: None,
             ..task.clone()

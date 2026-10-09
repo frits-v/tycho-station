@@ -6,26 +6,30 @@
 
 use std::ffi::{CStr, CString, OsStr};
 use std::fmt;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nix::dir::{Dir, Type};
 use nix::errno::Errno;
-use nix::fcntl::{open, openat, AtFlags, OFlag};
+use nix::fcntl::{open, openat, renameat, AtFlags, OFlag};
 use nix::sys::stat::{fstat, fstatat, mkdirat, FileStat, Mode, SFlag};
-use nix::unistd::{unlinkat, UnlinkatFlags};
+use nix::unistd::{fsync, unlinkat, UnlinkatFlags};
 use nix::NixPath;
 
 /// Names listed per pass over a directory; a pass removes what it listed, then lists again.
 const SWEEP_BATCH: usize = 4096;
 
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TreeRefusal {
     Symlink,
     NotADirectory,
+    NotARegularFile,
     OwnedBy(u32),
     OutsideRoot,
     TooDeep(usize),
@@ -37,6 +41,7 @@ impl fmt::Display for TreeRefusal {
         match self {
             Self::Symlink => formatter.write_str("is a symlink"),
             Self::NotADirectory => formatter.write_str("is not a directory"),
+            Self::NotARegularFile => formatter.write_str("is not a regular file"),
             Self::OwnedBy(uid) => write!(formatter, "is owned by uid {uid}"),
             Self::OutsideRoot => formatter.write_str("is not below the root"),
             Self::TooDeep(depth) => write!(formatter, "is nested deeper than {depth} levels"),
@@ -180,18 +185,83 @@ fn open_child<N: ?Sized + NixPath>(
 
 /// Opens every level from `root` down to `path`, creating missing ones one at a time.
 pub fn ensure_dirs(root: &Path, path: &Path, owners: Owners) -> Result<OwnedFd, TreeError> {
+    walk(root, path, owners, true)
+}
+
+/// Opens every level from `root` down to `path`, all of which must exist.
+pub fn open_dirs(root: &Path, path: &Path, owners: Owners) -> Result<OwnedFd, TreeError> {
+    walk(root, path, owners, false)
+}
+
+fn walk(root: &Path, path: &Path, owners: Owners, create: bool) -> Result<OwnedFd, TreeError> {
     let names = relative_names(root, path)?;
     let mut current = open_root(root, owners)?;
     let mut reached = root.to_path_buf();
     for name in names {
         reached.push(name);
-        match mkdirat(current.as_fd(), name, directory_mode()) {
-            Ok(()) | Err(Errno::EEXIST) => {}
-            Err(errno) => return Err(failed(&reached, errno)),
+        if create {
+            match mkdirat(current.as_fd(), name, directory_mode()) {
+                Ok(()) | Err(Errno::EEXIST) => {}
+                Err(errno) => return Err(failed(&reached, errno)),
+            }
         }
         current = open_child(current.as_fd(), name, &reached, owners)?;
     }
     Ok(current)
+}
+
+/// Replaces `name` in `directory` with a 0600 file of `bytes`: staged new, synced, then renamed
+/// onto a target that is absent or a regular file, and the directory synced.
+pub fn replace_file(
+    directory: &OwnedFd,
+    directory_path: &Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), TreeError> {
+    let path = directory_path.join(name);
+    let count = STAGING_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let staging = format!(".{name}.staging-{}-{count}", std::process::id());
+    let flags =
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let created = openat(
+        directory,
+        staging.as_str(),
+        flags,
+        Mode::S_IRUSR | Mode::S_IWUSR,
+    )
+    .map_err(|errno| failed(&directory_path.join(&staging), errno))?;
+    let mut file = File::from(created);
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| failed(&path, error));
+    drop(file);
+    let renamed = written
+        .and_then(|()| check_replaceable(directory, name, &path))
+        .and_then(|()| {
+            renameat(directory, staging.as_str(), directory, name)
+                .map_err(|errno| failed(&path, errno))
+        });
+    if let Err(error) = renamed {
+        // The rename's error is the one reported; a staging name left behind is harmless.
+        let _staging_left =
+            unlinkat(directory, staging.as_str(), UnlinkatFlags::NoRemoveDir).is_err();
+        return Err(error);
+    }
+    fsync(directory).map_err(|errno| failed(directory_path, errno))
+}
+
+/// Absent or a regular file: the only targets a rename may replace.
+fn check_replaceable(directory: &OwnedFd, name: &str, path: &Path) -> Result<(), TreeError> {
+    match fstatat(directory, name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Err(Errno::ENOENT) => Ok(()),
+        Err(errno) => Err(failed(path, errno)),
+        Ok(stat) if kind(&stat) == SFlag::S_IFLNK => Err(refused(path, TreeRefusal::Symlink)),
+        Ok(stat) if kind(&stat) != SFlag::S_IFREG => {
+            Err(refused(path, TreeRefusal::NotARegularFile))
+        }
+        Ok(_) => Ok(()),
+    }
 }
 
 /// Removes the directory `name` in `parent` and everything in it; absent is fine.
@@ -501,6 +571,41 @@ mod tests {
             agent: current_uid(),
         };
         assert!(ensure_dirs(&root, &root.join("a1"), agent_only).is_ok());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_file_is_replaced_only_through_its_directory_and_never_onto_a_link() {
+        let root = scratch("replace");
+        let briefs = root.join("briefs");
+        let directory = ensure_dirs(&root, &briefs, me()).unwrap();
+        replace_file(&directory, &briefs, "one.md", b"first").unwrap();
+        replace_file(&directory, &briefs, "one.md", b"second").unwrap();
+        assert_eq!(fs::read_to_string(briefs.join("one.md")).unwrap(), "second");
+        let victim = root.join("victim");
+        fs::write(&victim, "untouched").unwrap();
+        symlink(&victim, briefs.join("two.md")).unwrap();
+        assert_eq!(
+            replace_file(&directory, &briefs, "two.md", b"x"),
+            Err(TreeError::Refused(
+                briefs.join("two.md"),
+                TreeRefusal::Symlink
+            ))
+        );
+        fs::create_dir(briefs.join("three.md")).unwrap();
+        assert_eq!(
+            replace_file(&directory, &briefs, "three.md", b"x"),
+            Err(TreeError::Refused(
+                briefs.join("three.md"),
+                TreeRefusal::NotARegularFile
+            ))
+        );
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
+        assert_eq!(
+            fs::read_dir(&briefs).unwrap().count(),
+            3,
+            "no staging file left"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 

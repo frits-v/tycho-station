@@ -273,15 +273,33 @@ impl Repositories {
             .join(format!("{session}.md"))
     }
 
-    /// Creates the briefs directory under the worktree root, refusing a symlink at any level.
-    pub fn ensure_briefs_dir(&self) -> Result<PathBuf, RepositoryError> {
+    /// Writes the session's brief through the briefs directory's descriptor; returns its path.
+    pub fn write_brief(
+        &self,
+        session: &SessionName,
+        brief: &[u8],
+    ) -> Result<PathBuf, RepositoryError> {
         let dir = self.worktree_root.join(BRIEFS_DIR);
-        drop(agent_tree::ensure_dirs(
+        let directory = agent_tree::ensure_dirs(&self.worktree_root, &dir, self.owners)?;
+        agent_tree::replace_file(&directory, &dir, &format!("{session}.md"), brief)?;
+        Ok(self.brief_path(session))
+    }
+
+    /// Checks that every level from the root down to the worktree is a real directory of the
+    /// core or the agent user, opened without following a symlink.
+    pub fn check_worktree(&self, path: &Path) -> Result<(), RepositoryError> {
+        if path == self.worktree_root {
+            return Err(RepositoryError::Refused(
+                text(path),
+                TreeRefusal::OutsideRoot,
+            ));
+        }
+        drop(agent_tree::open_dirs(
             &self.worktree_root,
-            &dir,
+            path,
             self.owners,
         )?);
-        Ok(dir)
+        Ok(())
     }
 
     /// Runs git and returns whatever exit status it ends with.
@@ -726,7 +744,10 @@ pub(crate) mod tests {
         let briefs = scratch.0.join("worktrees/briefs");
         std::os::unix::fs::symlink(&elsewhere, &briefs).unwrap();
         assert_eq!(
-            repositories.ensure_briefs_dir(),
+            repositories.write_brief(
+                &SessionName::parse("cf7a.wu01.wrk.claude.a1f3").unwrap(),
+                b"x"
+            ),
             Err(RepositoryError::Refused(
                 text(&briefs),
                 TreeRefusal::Symlink
