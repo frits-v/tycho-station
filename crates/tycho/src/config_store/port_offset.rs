@@ -7,7 +7,7 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-/// Set by a test suite to the offset of its test home; never set for the production core.
+/// Set by a test suite to the offset of its test home; refused for the default core home.
 pub const PORT_OFFSET_ENV: &str = "TYCHO_PORT_OFFSET";
 /// No two production ports differ by a multiple of the stride, so cores whose offsets differ
 /// by one never share a port; `config` tests it over the whole range.
@@ -15,15 +15,20 @@ pub const PORT_OFFSET_STRIDE: u16 = 16;
 /// The lowest test offset, a multiple of the stride.
 pub const PORT_OFFSET_BASE: u16 = 1024;
 pub const PORT_OFFSET_SLOTS: u16 = 1800;
-/// `PORT_OFFSET_BASE` plus 1799 strides; the highest shifted port stays below 49152, where the
-/// macOS ephemeral range starts.
+/// Where the macOS ephemeral range starts (`net.inet.ip.portrange.first`).
+pub const MACOS_EPHEMERAL_PORT_FIRST: u16 = 49_152;
+/// `PORT_OFFSET_BASE` plus 1799 strides.
+///
+/// The highest shifted port, 48889, stays below `MACOS_EPHEMERAL_PORT_FIRST`. Linux starts its
+/// ephemeral range at 32768, so there the upper offsets overlap it; the live suites run on
+/// macOS only and the Linux ci runs unit tests.
 pub const PORT_OFFSET_MAX: u16 = 29_808;
 /// Five decimal digits hold every `u16`.
 pub const PORT_OFFSET_TEXT_MAX_BYTES: usize = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PortOffsetError {
-    /// The variable is set while no test home is.
+    /// The variable is set for the default core home.
     NoTestHome,
     NotDecimal(String),
     OutOfRange(u32),
@@ -35,7 +40,7 @@ impl fmt::Display for PortOffsetError {
         match self {
             Self::NoTestHome => write!(
                 formatter,
-                "{PORT_OFFSET_ENV} is set without a test home; the production core keeps its ports"
+                "{PORT_OFFSET_ENV} is set for the default core home, whose core keeps its ports"
             ),
             Self::NotDecimal(text) => write!(
                 formatter,
@@ -116,6 +121,23 @@ impl PortOffset {
         Self::new(value)
     }
 
+    /// The slot of a test offset; the production offset has none.
+    #[must_use]
+    pub fn slot(self) -> Option<u16> {
+        if self.is_production() {
+            return None;
+        }
+        self.0
+            .checked_sub(PORT_OFFSET_BASE)
+            .and_then(|above| above.checked_div(PORT_OFFSET_STRIDE))
+    }
+
+    /// The offset of `slot` modulo `PORT_OFFSET_SLOTS`.
+    #[must_use]
+    pub fn for_slot(slot: u32) -> Self {
+        Self::for_hash(u64::from(slot))
+    }
+
     #[must_use]
     pub const fn get(self) -> u16 {
         self.0
@@ -150,9 +172,14 @@ pub fn resolve_port_offset(
     if !test_home {
         return Err(PortOffsetError::NoTestHome);
     }
-    let text = variable
-        .into_string()
-        .map_err(|raw| PortOffsetError::NotDecimal(raw.to_string_lossy().into_owned()))?;
+    let text = variable.into_string().map_err(|raw| {
+        PortOffsetError::NotDecimal(
+            raw.to_string_lossy()
+                .chars()
+                .take(PORT_OFFSET_TEXT_MAX_BYTES)
+                .collect(),
+        )
+    })?;
     PortOffset::parse(&text)
 }
 
@@ -265,6 +292,28 @@ mod tests {
             resolve_port_offset(Some(OsString::from("1024")), true).map(PortOffset::get),
             Ok(1024)
         );
+    }
+
+    #[test]
+    fn a_slot_maps_back_to_its_offset_and_production_has_none() {
+        assert_eq!(PortOffset::PRODUCTION.slot(), None);
+        for slot in [0, 1, PORT_OFFSET_SLOTS - 1] {
+            assert_eq!(PortOffset::for_slot(u32::from(slot)).slot(), Some(slot));
+        }
+        assert_eq!(
+            PortOffset::for_slot(u32::from(PORT_OFFSET_SLOTS)).slot(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_variable_that_is_not_unicode_is_echoed_cut_to_the_text_bound() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = OsString::from_vec(vec![0xff; 64]);
+        let Err(PortOffsetError::NotDecimal(echo)) = resolve_port_offset(Some(raw), true) else {
+            panic!("a non-unicode variable must be refused as not decimal");
+        };
+        assert_eq!(echo.chars().count(), PORT_OFFSET_TEXT_MAX_BYTES);
     }
 
     #[test]

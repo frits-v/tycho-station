@@ -32,10 +32,10 @@ use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tycho::agent_files::current_uid;
 use tycho::config::{
-    AgentDirs, CoreConfig, CorePorts, AGENT_USER_ENV, HOME_ENV, MISE_NO_INSTALL,
+    AgentDirs, CoreConfig, CorePorts, PortClaim, AGENT_USER_ENV, HOME_ENV, MISE_NO_INSTALL,
     RESTATE_SERVER_ENV, ZMX_ENV,
 };
-use tycho::config_store::{FactoryConfig, PortOffset};
+use tycho::config_store::FactoryConfig;
 use tycho::kill::{kill_session, KillRequest};
 use tycho::launch_probe::LaunchProbe;
 use tycho::launcher::{HeartbeatTarget, SessionFiles, VendorRecord, VendorTerminal};
@@ -58,7 +58,7 @@ use tycho::vendors::control::{
     AddressTarget, ContextReport, ControlCommand, ControlLaunch, Delivery, Observation,
     PermissionMode, SessionVendor, VendorError, VendorSessionId, WaitingFor,
 };
-use tycho::zmx::{ListEntry, Zmx};
+use tycho::zmx::Zmx;
 use tycho_types::envelope::ShortText;
 use tycho_types::launcher::AwaitableId;
 use tycho_types::session::{SessionName, Vendor};
@@ -329,12 +329,15 @@ struct Harness {
     force_relay: Arc<AtomicBool>,
     work: PathBuf,
     controls: Vec<Control>,
+    /// Held until the core is stopped, after the teardown in `drop`.
+    _port_claim: PortClaim,
 }
 
 impl Harness {
     fn new(tag: &str) -> Self {
         let pid = std::process::id();
         let home = user_home().join(format!(".tycho-test-control-{tag}-{pid}"));
+        let claim = claim_ports(&home);
         let agent = user_home().join(format!(".tcc-{tag}-{pid}"));
         for dir in [&home, &agent] {
             if dir.exists() {
@@ -350,12 +353,7 @@ impl Harness {
             PathBuf::from(TYCHO),
         )
         .unwrap()
-        .with_port_offset(PortOffset::for_test_home(&home));
-        let offset = config.ports.offset;
-        println!("evidence: {} at port offset {offset}", home.display());
-        if let Some(taken) = config.ports.first_taken() {
-            panic!("port collision: {taken}");
-        }
+        .with_port_offset(claim.ports.offset);
         // No pid in the name, so the vendor's per-directory entries stay one per case.
         let work = user_home().join(format!(".tycho-test-control-work-{tag}"));
         if work.exists() {
@@ -366,6 +364,7 @@ impl Harness {
             ClaudeControl::new(claude_binary(), user_home().join(".claude"), current_uid());
         let force_relay = Arc::new(AtomicBool::new(false));
         let harness = Self {
+            _port_claim: claim,
             endpoint: None,
             environment: vec![
                 (HOME_ENV, home.display().to_string()),
@@ -670,25 +669,27 @@ fn start_wait(core_ports: CorePorts, key: &str) -> String {
 }
 
 /// Kills every session left in a socket directory by pid and by name; returns how many remain.
+/// Ends what a socket directory still lists; a pid is signalled only while `ps` shows it
+/// running restate-server, the endpoint or a launcher.
 fn clear_sessions(zmx: &Zmx, label: &str) -> usize {
-    let Ok(entries) = zmx.list() else {
-        println!("teardown: {label} zmx list failed");
-        return usize::MAX;
-    };
-    for entry in &entries {
-        if let ListEntry::Running { name, pid, .. } | ListEntry::Ended { name, pid, .. } = entry {
-            println!("teardown: {label} session {name} left; killing pid {pid}");
-            drop(
-                Command::new("/bin/kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .status(),
-            );
-            drop(zmx.kill(name));
+    let programs = vec![
+        mise_which("restate-server").display().to_string(),
+        format!("{TYCHO} endpoint"),
+        format!("{TYCHO} launch"),
+    ];
+    match zmx.clear(&programs) {
+        Ok(report) => {
+            for line in &report.lines {
+                println!("teardown: {label} {line}");
+            }
+            println!("teardown: {label} sessions left: {}", report.remaining);
+            report.remaining
+        }
+        Err(error) => {
+            println!("teardown: {label} zmx: {error}");
+            usize::MAX
         }
     }
-    let left = zmx.list().map_or(usize::MAX, |entries| entries.len());
-    println!("teardown: {label} sessions left: {left}");
-    left
 }
 
 /// Kills a vendor the core declines to signal as its own user; true when one was running.
@@ -1053,4 +1054,12 @@ fn a_killed_session_resumes_under_its_id_with_the_settings_passed_again() {
     let content = file_appears(&harness.file("control-five.txt"));
     println!("evidence: control-five.txt holds {content:?}");
     harness.kill(&resumed);
+}
+
+/// Claims a port slot for the home, held until the core is stopped; a port another process
+/// holds fails the test as a port collision.
+fn claim_ports(home: &Path) -> PortClaim {
+    let claim = CorePorts::claim(home).unwrap_or_else(|error| panic!("{error}"));
+    println!("evidence: {claim}");
+    claim
 }

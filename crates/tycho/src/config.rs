@@ -12,6 +12,10 @@ use std::time::Duration;
 use nix::unistd::{Uid, User};
 use tycho_types::session::{SessionName, SOCKET_PATH_MAX_BYTES};
 
+mod port_claim;
+
+pub use port_claim::{claim_in, ClaimError, PortClaim, PORT_SLOT_DIR};
+
 use crate::command::{self, CommandError};
 use crate::config_store::{
     resolve_port_offset, PortOffset, PortOffsetError, CONFIG_DIR_ENV, PORT_OFFSET_ENV,
@@ -221,13 +225,21 @@ impl CorePorts {
     }
 }
 
-/// `TYCHO_PORT_OFFSET`, honoured only beside `TYCHO_HOME`; unset, the production ports.
+/// `TYCHO_PORT_OFFSET`, honoured only for a core home other than the default.
+///
+/// Unset, the production ports. The production plist and endpoint session set `TYCHO_HOME`
+/// too, so its presence alone does not make a test home.
 pub fn port_offset_from_environment() -> Result<PortOffset, ConfigError> {
-    resolve_port_offset(
-        env::var_os(PORT_OFFSET_ENV),
-        env::var_os(HOME_ENV).is_some(),
-    )
-    .map_err(ConfigError::PortOffset)
+    let Some(variable) = env::var_os(PORT_OFFSET_ENV) else {
+        return Ok(PortOffset::PRODUCTION);
+    };
+    let test_home = is_test_home(&core_home()?, &user_home()?);
+    resolve_port_offset(Some(variable), test_home).map_err(ConfigError::PortOffset)
+}
+
+#[must_use]
+pub fn is_test_home(home: &Path, user_home: &Path) -> bool {
+    home != user_home.join(HOME_DEFAULT_DIR)
 }
 
 /// The agent socket directory and the lease and spool directories under it.
@@ -780,6 +792,16 @@ mod tests {
     }
 
     #[test]
+    fn only_a_home_other_than_the_default_is_a_test_home() {
+        let user_home = Path::new("/Users/someone");
+        assert!(!is_test_home(Path::new("/Users/someone/.tycho"), user_home));
+        assert!(is_test_home(
+            Path::new("/Users/someone/.tycho-spine-unit-42"),
+            user_home
+        ));
+    }
+
+    #[test]
     fn no_two_cores_in_the_range_share_a_port() {
         let mut seen = std::collections::BTreeMap::new();
         let offsets = std::iter::once(PortOffset::PRODUCTION).chain(
@@ -796,7 +818,7 @@ mod tests {
                     );
                 }
                 assert!(
-                    address.port() < 49_152,
+                    address.port() < crate::config_store::MACOS_EPHEMERAL_PORT_FIRST,
                     "{address} is in the ephemeral range"
                 );
             }

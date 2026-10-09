@@ -2,7 +2,7 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 use std::thread;
@@ -10,17 +10,16 @@ use std::time::{Duration, Instant};
 
 use restate_sdk::prelude::HttpServer;
 use tycho::config::{
-    CoreConfig, CorePorts, HOME_ENV, MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
+    CoreConfig, CorePorts, PortClaim, HOME_ENV, MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
-use tycho::config_store::PortOffset;
 use tycho::endpoint;
 use tycho::http::Http;
 use tycho::services::merge_gate::MergeGate;
 use tycho::services::spawner::Spawner;
 use tycho::services::{Ports, Timing};
 use tycho::vendors::control::NoVendor;
-use tycho::zmx::{ListEntry, Zmx};
+use tycho::zmx::Zmx;
 
 pub const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
 pub const WAIT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -31,6 +30,8 @@ const EVIDENCE_MAX_CHARS: usize = 600;
 pub struct Core {
     pub config: CoreConfig,
     pub environment: Vec<(&'static str, String)>,
+    /// Held until the core is stopped, after the teardown in `drop`.
+    _port_claim: PortClaim,
 }
 
 pub fn mise_which(tool: &str) -> PathBuf {
@@ -52,14 +53,22 @@ pub fn test_home(test: &str) -> PathBuf {
     user_home.join(format!(".tycho-chaos-{test}-{}", std::process::id()))
 }
 
-/// The ports `Core::new(test)` binds, for a double that is built before the core starts.
-pub fn test_ports(test: &str) -> CorePorts {
-    CorePorts::at(PortOffset::for_test_home(&test_home(test)))
+/// A port slot claim for the test's home, taken before any double is built from its ports.
+pub fn test_claim(test: &str) -> PortClaim {
+    claim_ports(&test_home(test))
+}
+
+/// Claims a port slot for the home, held until the core is stopped; a port another process
+/// holds fails the test as a port collision.
+pub fn claim_ports(home: &Path) -> PortClaim {
+    let claim = CorePorts::claim(home).unwrap_or_else(|error| panic!("{error}"));
+    println!("evidence: {claim}");
+    claim
 }
 
 impl Core {
-    pub fn new(test: &str) -> Self {
-        let home = test_home(test);
+    pub fn new(claim: PortClaim) -> Self {
+        let home = claim.home.clone();
         if home.exists() {
             fs::remove_dir_all(&home).unwrap();
         }
@@ -72,12 +81,7 @@ impl Core {
             PathBuf::from(TYCHO),
         )
         .unwrap()
-        .with_port_offset(PortOffset::for_test_home(&home));
-        let offset = config.ports.offset;
-        println!("evidence: {} at port offset {offset}", home.display());
-        if let Some(taken) = config.ports.first_taken() {
-            panic!("port collision: {taken}");
-        }
+        .with_port_offset(claim.ports.offset);
         let environment = vec![
             (HOME_ENV, home.display().to_string()),
             (ZMX_ENV, zmx.display().to_string()),
@@ -87,6 +91,7 @@ impl Core {
         .chain(config.port_offset_pair())
         .collect();
         Self {
+            _port_claim: claim,
             config,
             environment,
         }
@@ -136,25 +141,27 @@ pub fn start_once<T>(core: &Core, start: impl FnOnce(&Core) -> Option<T>) -> T {
 }
 
 /// Kills every session left in a socket directory by pid and by name; returns how many remain.
+/// Ends what a socket directory still lists; a pid is signalled only while `ps` shows it
+/// running restate-server, the endpoint or a launcher.
 pub fn clear_sessions(zmx: &Zmx, label: &str) -> usize {
-    let Ok(entries) = zmx.list() else {
-        println!("teardown: {label} zmx list failed");
-        return usize::MAX;
-    };
-    for entry in &entries {
-        if let ListEntry::Running { name, pid, .. } | ListEntry::Ended { name, pid, .. } = entry {
-            println!("teardown: {label} session {name} left; killing pid {pid}");
-            drop(
-                Command::new("/bin/kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .status(),
-            );
-            drop(zmx.kill(name));
+    let programs = vec![
+        mise_which("restate-server").display().to_string(),
+        format!("{TYCHO} endpoint"),
+        format!("{TYCHO} launch"),
+    ];
+    match zmx.clear(&programs) {
+        Ok(report) => {
+            for line in &report.lines {
+                println!("teardown: {label} {line}");
+            }
+            println!("teardown: {label} sessions left: {}", report.remaining);
+            report.remaining
+        }
+        Err(error) => {
+            println!("teardown: {label} zmx: {error}");
+            usize::MAX
         }
     }
-    let left = zmx.list().map_or(usize::MAX, |entries| entries.len());
-    println!("teardown: {label} sessions left: {left}");
-    left
 }
 
 impl Drop for Core {
@@ -323,11 +330,11 @@ pub fn test_timing() -> Timing {
 
 /// Starts the core through `tycho core start` and an in-process endpoint with the given ports.
 pub fn start_core(
-    test: &str,
+    claim: PortClaim,
     spawner: Arc<dyn Spawner>,
     merge_gate: Arc<dyn MergeGate>,
 ) -> (Core, DoublesEndpoint, Ports) {
-    let core = Core::new(test);
+    let core = Core::new(claim);
     start_once(&core, |core| {
         core.tycho(&["core", "start"])
             .status

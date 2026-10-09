@@ -31,10 +31,9 @@ use std::time::{Duration, Instant};
 
 use restate_sdk::prelude::HttpServer;
 use tycho::config::{
-    CoreConfig, CorePorts, HOME_ENV, MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
+    CoreConfig, CorePorts, PortClaim, HOME_ENV, MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
-use tycho::config_store::PortOffset;
 use tycho::endpoint;
 use tycho::services::doubles::{FixedGate, RecordingSpawner, RecordingVendor, DOUBLE_SOCKET};
 use tycho::services::merge_gate::{GateVerdict, MergeGate, NoGate};
@@ -43,7 +42,7 @@ use tycho::services::spawner::{SpawnSpec, Spawner};
 use tycho::services::{Ports, Timing};
 use tycho::spool::check_result_envelope;
 use tycho::vendors::control::NoVendor;
-use tycho::zmx::{ListEntry, Zmx};
+use tycho::zmx::Zmx;
 use tycho_types::envelope::{
     CommitSha, EscalationOption, EscalationPayload, QuestionType, Reversibility, ShortText,
 };
@@ -58,6 +57,8 @@ const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 struct Core {
     config: CoreConfig,
     environment: Vec<(&'static str, String)>,
+    /// Held until the core is stopped, after the teardown in `drop`.
+    _port_claim: PortClaim,
 }
 
 fn test_home(test: &str) -> PathBuf {
@@ -65,14 +66,22 @@ fn test_home(test: &str) -> PathBuf {
     user_home.join(format!(".tycho-spine-{test}-{}", std::process::id()))
 }
 
-/// The ports `Core::new(test)` binds, for a double that is built before the core starts.
-fn test_ports(test: &str) -> CorePorts {
-    CorePorts::at(PortOffset::for_test_home(&test_home(test)))
+/// A port slot claim for the test's home, taken before any double is built from its ports.
+fn test_claim(test: &str) -> PortClaim {
+    claim_ports(&test_home(test))
+}
+
+/// Claims a port slot for the home, held until the core is stopped; a port another process
+/// holds fails the test as a port collision.
+fn claim_ports(home: &Path) -> PortClaim {
+    let claim = CorePorts::claim(home).unwrap_or_else(|error| panic!("{error}"));
+    println!("evidence: {claim}");
+    claim
 }
 
 impl Core {
-    fn new(test: &str) -> Self {
-        let home = test_home(test);
+    fn new(claim: PortClaim) -> Self {
+        let home = claim.home.clone();
         if home.exists() {
             fs::remove_dir_all(&home).unwrap();
         }
@@ -85,12 +94,7 @@ impl Core {
             PathBuf::from(TYCHO),
         )
         .unwrap()
-        .with_port_offset(PortOffset::for_test_home(&home));
-        let offset = config.ports.offset;
-        println!("evidence: {} at port offset {offset}", home.display());
-        if let Some(taken) = config.ports.first_taken() {
-            panic!("port collision: {taken}");
-        }
+        .with_port_offset(claim.ports.offset);
         let environment = vec![
             (HOME_ENV, home.display().to_string()),
             (ZMX_ENV, zmx.display().to_string()),
@@ -100,6 +104,7 @@ impl Core {
         .chain(config.port_offset_pair())
         .collect();
         Self {
+            _port_claim: claim,
             config,
             environment,
         }
@@ -126,34 +131,12 @@ impl Core {
     }
 
     fn clear_sessions(&self) -> Result<(), String> {
-        let zmx = Zmx::new(&self.config.zmx, &self.config.socket_dir());
-        let entries = zmx.list().map_err(|error| error.to_string())?;
-        for entry in &entries {
-            match entry {
-                ListEntry::Running { name, pid, .. } | ListEntry::Ended { name, pid, .. } => {
-                    println!("teardown: {name} survived core stop; killing pid {pid}");
-                    let killed = Command::new("/bin/kill")
-                        .args(["-KILL", &pid.to_string()])
-                        .status();
-                    println!(
-                        "teardown: kill {pid}: {killed:?}; zmx kill: {:?}",
-                        zmx.kill(name)
-                    );
-                }
-                ListEntry::Unrecognised(line) => {
-                    return Err(format!("unrecognised zmx line {line:?}"))
-                }
-            }
-        }
-        let remaining = zmx.list().map_err(|error| error.to_string())?;
-        println!(
-            "teardown: sessions left in the core socket directory: {}",
-            remaining.len()
-        );
-        if remaining.is_empty() {
-            Ok(())
-        } else {
-            Err(format!("{} sessions remain", remaining.len()))
+        match clear_sessions(
+            &Zmx::new(&self.config.zmx, &self.config.socket_dir()),
+            "core",
+        ) {
+            0 => Ok(()),
+            left => Err(format!("{left} sessions remain")),
         }
     }
 }
@@ -296,8 +279,11 @@ fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
     panic!("{what} did not happen within {WAIT_TIMEOUT:?}");
 }
 
-fn start_core_with_doubles(test: &str, spawner: &RecordingSpawner) -> (Core, DoublesEndpoint) {
-    let (core, doubles, _) = start_core_with(test, spawner, Arc::new(NoGate), test_timing());
+fn start_core_with_doubles(
+    claim: PortClaim,
+    spawner: &RecordingSpawner,
+) -> (Core, DoublesEndpoint) {
+    let (core, doubles, _) = start_core_with(claim, spawner, Arc::new(NoGate), test_timing());
     (core, doubles)
 }
 
@@ -318,13 +304,13 @@ fn test_config() -> FactoryConfig {
 }
 
 fn start_core_with(
-    test: &str,
+    claim: PortClaim,
     spawner: &RecordingSpawner,
     merge_gate: Arc<dyn MergeGate>,
     timing: Timing,
 ) -> (Core, DoublesEndpoint, Ports) {
     start_core_with_spawner(
-        test,
+        claim,
         Arc::new(spawner.clone()),
         merge_gate,
         timing,
@@ -332,15 +318,21 @@ fn start_core_with(
     )
 }
 
-/// `adjust` sees the ports before the endpoint starts, with the core for its paths.
+/// `adjust` sees the ports before the endpoint starts, with the core for its paths. The
+/// doubles the caller built read the claim's ports, so the core must listen on exactly those.
 fn start_core_with_spawner(
-    test: &str,
+    claim: PortClaim,
     spawner: Arc<dyn Spawner>,
     merge_gate: Arc<dyn MergeGate>,
     timing: Timing,
     adjust: &dyn Fn(&mut Ports, &Core),
 ) -> (Core, DoublesEndpoint, Ports) {
-    let core = Core::new(test);
+    let expected = claim.ports;
+    let core = Core::new(claim);
+    assert_eq!(
+        core.config.ports, expected,
+        "the doubles answer another core"
+    );
     let started = core.tycho(&["core", "start"]);
     assert!(started.status.success());
     let report = String::from_utf8_lossy(&started.stdout).to_string();
@@ -394,9 +386,10 @@ fn epic_status(core_ports: CorePorts) -> serde_json::Value {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn epic_starts_and_adds_units_only_through_the_operator() {
-    let core_ports = test_ports("epic");
+    let claim = test_claim("epic");
+    let core_ports = claim.ports;
     let spawner = RecordingSpawner::new();
-    let (core, _doubles) = start_core_with_doubles("epic", &spawner);
+    let (core, _doubles) = start_core_with_doubles(claim, &spawner);
     let handlers = [
         handler::EPIC_START,
         handler::EPIC_ADD_UNIT,
@@ -451,9 +444,10 @@ fn epic_starts_and_adds_units_only_through_the_operator() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn session_and_reconciler_refuse_agents_outside_their_scope() {
-    let core_ports = test_ports("session");
+    let claim = test_claim("session");
+    let core_ports = claim.ports;
     let spawner = RecordingSpawner::new();
-    let (_core, _doubles) = start_core_with_doubles("session", &spawner);
+    let (_core, _doubles) = start_core_with_doubles(claim, &spawner);
     let name = "cf7a.wu01.wrk.claude.a1";
     let session_handlers = [
         handler::SESSION_SPAWN,
@@ -710,7 +704,8 @@ fn assert_unit_handlers_private(core_ports: CorePorts) {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
-    let core_ports = test_ports("unit");
+    let claim = test_claim("unit");
+    let core_ports = claim.ports;
     let spawner = launcher_double(
         core_ports,
         Launcher::Resolve("a1", Duration::from_millis(500)),
@@ -719,7 +714,7 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
         default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
     });
     let (core, _doubles, ports) =
-        start_core_with("unit", &spawner, Arc::new(gate.clone()), test_timing());
+        start_core_with(claim, &spawner, Arc::new(gate.clone()), test_timing());
     assert_unit_handlers_private(core_ports);
     let unlisted = format!(
         r#"{{"secret":"{}","unit":"wu09","request":{{"epic":"cf7a","control_vendor":"codex","plan":[{{"task":"t","worker":{}}}]}}}}"#,
@@ -772,7 +767,8 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_silent_worker_is_nudged_at_t1_killed_at_t2_and_requeued_as_attempt_two() {
-    let core_ports = test_ports("stall");
+    let claim = test_claim("stall");
+    let core_ports = claim.ports;
     let spawner = launcher_double(
         core_ports,
         Launcher::Resolve("a2", Duration::from_millis(500)),
@@ -785,7 +781,7 @@ fn a_silent_worker_is_nudged_at_t1_killed_at_t2_and_requeued_as_attempt_two() {
     let gate = FixedGate::new(GateVerdict::Merged {
         default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
     });
-    let (core, _doubles, _) = start_core_with("stall", &spawner, Arc::new(gate), timing);
+    let (core, _doubles, _) = start_core_with(claim, &spawner, Arc::new(gate), timing);
     let started = Instant::now();
     let invocation = dispatch(&core, &["wu01-t9"]);
     let (status, body) = attach(core_ports, &invocation);
@@ -825,12 +821,13 @@ fn a_silent_worker_is_nudged_at_t1_killed_at_t2_and_requeued_as_attempt_two() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn an_endpoint_killed_mid_run_replays_to_the_same_state() {
-    let core_ports = test_ports("replay");
+    let claim = test_claim("replay");
+    let core_ports = claim.ports;
     let spawner = launcher_double(core_ports, Launcher::Resolve("a1", Duration::from_secs(6)));
     let gate = FixedGate::new(GateVerdict::Merged {
         default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
     });
-    let (core, doubles, ports) = start_core_with("replay", &spawner, Arc::new(gate), test_timing());
+    let (core, doubles, ports) = start_core_with(claim, &spawner, Arc::new(gate), test_timing());
     let invocation = dispatch(&core, &["wu01-t5"]);
     wait_until("the worker session spawned", || {
         spawner.log().spawned.len() == 1
@@ -855,10 +852,10 @@ fn an_endpoint_killed_mid_run_replays_to_the_same_state() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_cancel_during_spawn_kills_settles_and_starts_no_second_attempt() {
-    let core_ports = test_ports("cancel-spawn");
+    let claim = test_claim("cancel-spawn");
+    let core_ports = claim.ports;
     let spawner = launcher_double(core_ports, Launcher::HoldSpawn(Duration::from_secs(4)));
-    let (core, _doubles, _) =
-        start_core_with("cancel-spawn", &spawner, Arc::new(NoGate), test_timing());
+    let (core, _doubles, _) = start_core_with(claim, &spawner, Arc::new(NoGate), test_timing());
     let invocation = dispatch(&core, &["wu01-t3"]);
     wait_until("the spawn step started", || {
         spawner.log().spawned.len() == 1
@@ -895,10 +892,10 @@ fn a_cancel_during_spawn_kills_settles_and_starts_no_second_attempt() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn an_error_while_watching_kills_the_session_before_settling() {
-    let core_ports = test_ports("cancel-watch");
+    let claim = test_claim("cancel-watch");
+    let core_ports = claim.ports;
     let spawner = launcher_double(core_ports, Launcher::Silent);
-    let (core, _doubles, _) =
-        start_core_with("cancel-watch", &spawner, Arc::new(NoGate), test_timing());
+    let (core, _doubles, _) = start_core_with(claim, &spawner, Arc::new(NoGate), test_timing());
     let invocation = dispatch(&core, &["wu01-t4"]);
     wait_until("the worker session spawned", || {
         spawner.log().spawned.len() == 1
@@ -935,12 +932,13 @@ fn an_error_while_watching_kills_the_session_before_settling() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn an_escalated_unit_waits_for_a_ruling_through_the_operator() {
-    let core_ports = test_ports("rule");
+    let claim = test_claim("rule");
+    let core_ports = claim.ports;
     let spawner = launcher_double(
         core_ports,
         Launcher::Reject("escalated", Duration::from_millis(500)),
     );
-    let (core, _doubles, _) = start_core_with("rule", &spawner, Arc::new(NoGate), test_timing());
+    let (core, _doubles, _) = start_core_with(claim, &spawner, Arc::new(NoGate), test_timing());
     let invocation = dispatch(&core, &["wu01-t6"]);
     wait_until("the unit escalated", || {
         unit_status(core_ports)["lifecycle"] == "escalated"
@@ -985,12 +983,13 @@ fn an_escalated_unit_waits_for_a_ruling_through_the_operator() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_terminal_error_abandons_the_unit_with_its_reason() {
-    let core_ports = test_ports("abandon");
+    let claim = test_claim("abandon");
+    let core_ports = claim.ports;
     let spawner = launcher_double(
         core_ports,
         Launcher::Resolve("a1", Duration::from_millis(500)),
     );
-    let (core, _doubles, _) = start_core_with("abandon", &spawner, Arc::new(NoGate), test_timing());
+    let (core, _doubles, _) = start_core_with(claim, &spawner, Arc::new(NoGate), test_timing());
     let invocation = dispatch(&core, &["wu01-t7"]);
     let (status, body) = attach(core_ports, &invocation);
     assert_eq!(status, 200, "{body}");
@@ -1061,11 +1060,11 @@ fn escalating_double(core_ports: CorePorts) -> RecordingSpawner {
     }))
 }
 
-fn start_escalating(test: &str, spawner: &RecordingSpawner) -> (Core, DoublesEndpoint) {
+fn start_escalating(claim: PortClaim, spawner: &RecordingSpawner) -> (Core, DoublesEndpoint) {
     let gate = FixedGate::new(GateVerdict::Merged {
         default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
     });
-    let (core, doubles, _) = start_core_with(test, spawner, Arc::new(gate), test_timing());
+    let (core, doubles, _) = start_core_with(claim, spawner, Arc::new(gate), test_timing());
     (core, doubles)
 }
 
@@ -1129,9 +1128,10 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_certified_question_lands_as_a_packet_and_continue_resumes_the_unit() {
-    let core_ports = test_ports("packet-continue");
+    let claim = test_claim("packet-continue");
+    let core_ports = claim.ports;
     let spawner = escalating_double(core_ports);
-    let (core, _doubles) = start_escalating("packet-continue", &spawner);
+    let (core, _doubles) = start_escalating(claim, &spawner);
     let invocation = dispatch(&core, &["wu01-t8"]);
     let packet = wait_for_packet(core_ports);
     assert_packet(&core, &packet);
@@ -1159,9 +1159,10 @@ fn a_certified_question_lands_as_a_packet_and_continue_resumes_the_unit() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn an_abandon_verdict_ends_the_unit_with_its_rationale() {
-    let core_ports = test_ports("packet-abandon");
+    let claim = test_claim("packet-abandon");
+    let core_ports = claim.ports;
     let spawner = escalating_double(core_ports);
-    let (core, _doubles) = start_escalating("packet-abandon", &spawner);
+    let (core, _doubles) = start_escalating(claim, &spawner);
     let invocation = dispatch(&core, &["wu01-t8"]);
     let packet = wait_for_packet(core_ports);
     let rationale = "POLICY.md reserves a ceiling change for a council ruling";
@@ -1180,9 +1181,10 @@ fn an_abandon_verdict_ends_the_unit_with_its_rationale() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_malformed_or_stale_verdict_is_rejected_and_the_unit_stays_escalated() {
-    let core_ports = test_ports("packet-malformed");
+    let claim = test_claim("packet-malformed");
+    let core_ports = claim.ports;
     let spawner = escalating_double(core_ports);
-    let (core, _doubles) = start_escalating("packet-malformed", &spawner);
+    let (core, _doubles) = start_escalating(claim, &spawner);
     dispatch(&core, &["wu01-t8"]);
     let packet = wait_for_packet(core_ports);
     let verdict = packet.with_extension("verdict");
@@ -1235,8 +1237,13 @@ fn a_headless_worker_rejects_on_the_planted_contradiction(
     spawner: Arc<dyn Spawner>,
 ) {
     let gate = Arc::new(NoGate);
-    let (core, _doubles, _) =
-        start_core_with_spawner("packet-headless", spawner, gate, test_timing(), &|_, _| {});
+    let (core, _doubles, _) = start_core_with_spawner(
+        test_claim("packet-headless"),
+        spawner,
+        gate,
+        test_timing(),
+        &|_, _| {},
+    );
     let invocation = dispatch(&core, &["wu01-t8"]);
     let packet = wait_for_packet(core_ports);
     let text = fs::read_to_string(&packet).unwrap();
@@ -1260,22 +1267,18 @@ fn config_with_unit_cap(cap: u16) -> FactoryConfig {
 
 /// A unit with cap 1 whose only attempt ends without a merge escalates on its own give-up rule.
 fn assert_cap_packet(
-    core_ports: CorePorts,
-    core_name: &str,
+    claim: PortClaim,
     spawner: &RecordingSpawner,
     gate: Arc<dyn MergeGate>,
     why: &str,
 ) {
+    let core_ports = claim.ports;
     let (core, _doubles, _) = start_core_with_spawner(
-        core_name,
+        claim,
         Arc::new(spawner.clone()),
         gate,
         test_timing(),
         &|ports, _| ports.config = Arc::new(config_with_unit_cap(1)),
-    );
-    assert_eq!(
-        core.config.ports, core_ports,
-        "the double answers another core"
     );
     dispatch(&core, &["wu01-t9"]);
     let packet = wait_for_packet(core_ports);
@@ -1294,7 +1297,8 @@ fn assert_cap_packet(
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn criteria_failing_at_the_unit_cap_write_a_continue_or_abandon_packet() {
-    let core_ports = test_ports("cap-criteria");
+    let claim = test_claim("cap-criteria");
+    let core_ports = claim.ports;
     let spawner = launcher_double(
         core_ports,
         Launcher::Resolve("a1", Duration::from_millis(500)),
@@ -1303,8 +1307,7 @@ fn criteria_failing_at_the_unit_cap_write_a_continue_or_abandon_packet() {
         findings: vec![ShortText::parse("criterion 0 failed").unwrap()],
     });
     assert_cap_packet(
-        core_ports,
-        "cap-criteria",
+        claim,
         &spawner,
         Arc::new(gate),
         "the done criteria failed on the last attempt the cap allows",
@@ -1314,14 +1317,14 @@ fn criteria_failing_at_the_unit_cap_write_a_continue_or_abandon_packet() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_worker_giving_up_at_the_unit_cap_writes_a_continue_or_abandon_packet() {
-    let core_ports = test_ports("cap-attempts");
+    let claim = test_claim("cap-attempts");
+    let core_ports = claim.ports;
     let spawner = launcher_double(
         core_ports,
         Launcher::Reject("cancelled", Duration::from_millis(500)),
     );
     assert_cap_packet(
-        core_ports,
-        "cap-attempts",
+        claim,
         &spawner,
         Arc::new(NoGate),
         "the worker runs gave up on the last attempt the cap allows",
@@ -1331,10 +1334,11 @@ fn a_worker_giving_up_at_the_unit_cap_writes_a_continue_or_abandon_packet() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn an_escalation_without_a_packet_directory_abandons_the_unit_with_the_reason() {
-    let core_ports = test_ports("packet-none");
+    let claim = test_claim("packet-none");
+    let core_ports = claim.ports;
     let spawner = escalating_double(core_ports);
     let (core, _doubles, _) = start_core_with_spawner(
-        "packet-none",
+        claim,
         Arc::new(spawner),
         Arc::new(NoGate),
         test_timing(),
@@ -1355,7 +1359,8 @@ fn an_escalation_without_a_packet_directory_abandons_the_unit_with_the_reason() 
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_packet_that_cannot_be_written_stays_on_the_view_and_is_written_on_the_next_try() {
-    let core_ports = test_ports("packet-retry");
+    let claim = test_claim("packet-retry");
+    let core_ports = claim.ports;
     let spawner = escalating_double(core_ports);
     let timing = Timing {
         retry_backoff_initial: Duration::from_millis(100),
@@ -1364,7 +1369,7 @@ fn a_packet_that_cannot_be_written_stays_on_the_view_and_is_written_on_the_next_
         ..test_timing()
     };
     let (core, _doubles, _) = start_core_with_spawner(
-        "packet-retry",
+        claim,
         Arc::new(spawner),
         Arc::new(FixedGate::new(GateVerdict::Merged {
             default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
@@ -1425,7 +1430,8 @@ fn control_plan_file(core: &Core) -> PathBuf {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_unit_with_a_control_start_spawns_and_instructs_its_control_session_before_dispatch() {
-    let core_ports = test_ports("control");
+    let claim = test_claim("control");
+    let core_ports = claim.ports;
     let spawner = launcher_double(
         core_ports,
         Launcher::Resolve("a1", Duration::from_millis(500)),
@@ -1436,7 +1442,7 @@ fn a_unit_with_a_control_start_spawns_and_instructs_its_control_session_before_d
     });
     let ports_vendor = vendor.clone();
     let (core, _doubles, _ports) = start_core_with_spawner(
-        "control",
+        claim,
         Arc::new(spawner.clone()),
         Arc::new(gate),
         test_timing(),
@@ -1480,7 +1486,8 @@ fn a_unit_with_a_control_start_spawns_and_instructs_its_control_session_before_d
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_unit_whose_control_instruction_is_refused_is_abandoned_without_dispatch() {
-    let core_ports = test_ports("refused");
+    let claim = test_claim("refused");
+    let core_ports = claim.ports;
     let spawner = launcher_double(
         core_ports,
         Launcher::Resolve("a1", Duration::from_millis(500)),
@@ -1488,7 +1495,7 @@ fn a_unit_whose_control_instruction_is_refused_is_abandoned_without_dispatch() {
     let vendor = RecordingVendor::refusing(&spawner);
     let ports_vendor = vendor.clone();
     let (core, _doubles, _ports) = start_core_with_spawner(
-        "refused",
+        claim,
         Arc::new(spawner.clone()),
         Arc::new(NoGate),
         test_timing(),
@@ -1520,4 +1527,27 @@ fn a_unit_whose_control_instruction_is_refused_is_abandoned_without_dispatch() {
         "the control session only; no worker was dispatched"
     );
     assert_eq!(vendor.calls().len(), 1);
+}
+
+/// Ends what a socket directory still lists; a pid is signalled only while `ps` shows it
+/// running restate-server, the endpoint or a launcher.
+fn clear_sessions(zmx: &Zmx, label: &str) -> usize {
+    let programs = vec![
+        mise_which("restate-server").display().to_string(),
+        format!("{TYCHO} endpoint"),
+        format!("{TYCHO} launch"),
+    ];
+    match zmx.clear(&programs) {
+        Ok(report) => {
+            for line in &report.lines {
+                println!("teardown: {label} {line}");
+            }
+            println!("teardown: {label} sessions left: {}", report.remaining);
+            report.remaining
+        }
+        Err(error) => {
+            println!("teardown: {label} zmx: {error}");
+            usize::MAX
+        }
+    }
 }

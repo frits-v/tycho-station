@@ -19,20 +19,19 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tycho::config::{
-    CoreConfig, CorePorts, CoreRole, HOME_ENV, LAUNCHD_LABEL, MISE_NO_INSTALL, RESTATE_SERVER_ENV,
-    ZMX_ENV,
+    CoreConfig, CorePorts, CoreRole, PortClaim, HOME_ENV, LAUNCHD_LABEL, MISE_NO_INSTALL,
+    RESTATE_SERVER_ENV, ZMX_ENV,
 };
-use tycho::config_store::PortOffset;
 use tycho::health::{self, Health};
 use tycho::http::Http;
 use tycho::launchd::{Agent, AgentState, THROTTLE_SECONDS};
-use tycho::zmx::{count_named, presence, ListEntry, Presence, Zmx};
+use tycho::zmx::{count_named, presence, Presence, Zmx};
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(120);
@@ -42,12 +41,15 @@ struct Core {
     config: CoreConfig,
     environment: Vec<(&'static str, String)>,
     launchd: Option<Agent>,
+    /// Held until the core is stopped, after the teardown in `drop`.
+    _port_claim: PortClaim,
 }
 
 impl Core {
     fn new(test: &str) -> Self {
         let user_home = PathBuf::from(env::var_os("HOME").unwrap());
         let home = user_home.join(format!(".tycho-test-{test}-{}", std::process::id()));
+        let claim = claim_ports(&home);
         if home.exists() {
             fs::remove_dir_all(&home).unwrap();
         }
@@ -60,7 +62,7 @@ impl Core {
             PathBuf::from(TYCHO),
         )
         .unwrap()
-        .with_port_offset(PortOffset::for_test_home(&home));
+        .with_port_offset(claim.ports.offset);
         let environment = vec![
             (HOME_ENV, home.display().to_string()),
             (ZMX_ENV, zmx.display().to_string()),
@@ -69,12 +71,8 @@ impl Core {
         .into_iter()
         .chain(config.port_offset_pair())
         .collect();
-        let offset = config.ports.offset;
-        println!("evidence: {} at port offset {offset}", home.display());
-        if let Some(taken) = config.ports.first_taken() {
-            panic!("port collision: {taken}");
-        }
         Self {
+            _port_claim: claim,
             config,
             environment,
             launchd: None,
@@ -123,39 +121,11 @@ impl Core {
 }
 
 impl Core {
-    /// Kills whatever `core stop` left by recorded pid and by name, then re-lists.
+    /// Ends whatever `core stop` left, then re-lists.
     fn clear_sessions(&self) -> Result<(), String> {
-        let zmx = self.zmx();
-        let entries = zmx.list().map_err(|error| error.to_string())?;
-        for entry in &entries {
-            match entry {
-                ListEntry::Running { name, pid, .. } | ListEntry::Ended { name, pid, .. } => {
-                    println!("teardown: {name} survived core stop; killing pid {pid}");
-                    let killed = Command::new("/bin/kill")
-                        .args(["-KILL", &pid.to_string()])
-                        .status();
-                    println!(
-                        "teardown: kill {pid}: {killed:?}; zmx kill {name}: {:?}",
-                        zmx.kill(name)
-                    );
-                }
-                ListEntry::Unrecognised(line) => {
-                    return Err(format!("unrecognised zmx line {line:?}"))
-                }
-            }
-        }
-        let remaining = zmx.list().map_err(|error| error.to_string())?;
-        println!(
-            "teardown: sessions left in the core socket directory: {}",
-            remaining.len()
-        );
-        if remaining.is_empty() {
-            Ok(())
-        } else {
-            Err(format!(
-                "{} sessions remain: {remaining:?}",
-                remaining.len()
-            ))
+        match clear_sessions(&self.zmx(), "core") {
+            0 => Ok(()),
+            left => Err(format!("{left} sessions remain")),
         }
     }
 }
@@ -378,4 +348,35 @@ fn watchdog_killed_is_restarted_by_launchd_without_duplicates() {
     core.assert_one_session_each();
     assert!(core.tycho(&["watchdog", "once"]).status.success());
     core.assert_one_session_each();
+}
+
+/// Ends what a socket directory still lists; a pid is signalled only while `ps` shows it
+/// running restate-server, the endpoint or a launcher.
+fn clear_sessions(zmx: &Zmx, label: &str) -> usize {
+    let programs = vec![
+        mise_which("restate-server").display().to_string(),
+        format!("{TYCHO} endpoint"),
+        format!("{TYCHO} launch"),
+    ];
+    match zmx.clear(&programs) {
+        Ok(report) => {
+            for line in &report.lines {
+                println!("teardown: {label} {line}");
+            }
+            println!("teardown: {label} sessions left: {}", report.remaining);
+            report.remaining
+        }
+        Err(error) => {
+            println!("teardown: {label} zmx: {error}");
+            usize::MAX
+        }
+    }
+}
+
+/// Claims a port slot for the home, held until the core is stopped; a port another process
+/// holds fails the test as a port collision.
+fn claim_ports(home: &Path) -> PortClaim {
+    let claim = CorePorts::claim(home).unwrap_or_else(|error| panic!("{error}"));
+    println!("evidence: {claim}");
+    claim
 }

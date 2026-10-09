@@ -31,9 +31,10 @@ use restate_sdk::prelude::HttpServer;
 use serde_json::{json, Value};
 use tycho::agent_files::current_uid;
 use tycho::config::{
-    self, AgentDirs, CoreConfig, CorePorts, HOME_ENV, MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
+    self, AgentDirs, CoreConfig, CorePorts, PortClaim, HOME_ENV, MISE_NO_INSTALL,
+    RESTATE_SERVER_ENV, ZMX_ENV,
 };
-use tycho::config_store::{FactoryConfig, PortOffset};
+use tycho::config_store::FactoryConfig;
 use tycho::endpoint;
 use tycho::entire_graph::EntireGraph;
 use tycho::launch_spec::HeartbeatTarget;
@@ -46,7 +47,7 @@ use tycho::services::operator::read_secret_file;
 use tycho::services::workers::WorkerPorts;
 use tycho::services::{Ports, Timing};
 use tycho::spool::ACKNOWLEDGED_SUFFIX;
-use tycho::zmx::{ListEntry, Zmx};
+use tycho::zmx::Zmx;
 use tycho_types::envelope::CommitSha;
 use tycho_types::service::handler;
 use tycho_types::session::SessionName;
@@ -63,6 +64,8 @@ struct Core {
     config: CoreConfig,
     environment: Vec<(&'static str, String)>,
     agent: PathBuf,
+    /// Held until the core is stopped, after the teardown in `drop`.
+    _port_claim: PortClaim,
 }
 
 fn test_home(test: &str) -> PathBuf {
@@ -70,14 +73,22 @@ fn test_home(test: &str) -> PathBuf {
     user_home.join(format!(".tycho-worker-{test}-{}", std::process::id()))
 }
 
-/// The ports `Core::new(test)` binds.
-fn test_ports(test: &str) -> CorePorts {
-    CorePorts::at(PortOffset::for_test_home(&test_home(test)))
+/// A port slot claim for the test's home, taken before any double is built from its ports.
+fn test_claim(test: &str) -> PortClaim {
+    claim_ports(&test_home(test))
+}
+
+/// Claims a port slot for the home, held until the core is stopped; a port another process
+/// holds fails the test as a port collision.
+fn claim_ports(home: &Path) -> PortClaim {
+    let claim = CorePorts::claim(home).unwrap_or_else(|error| panic!("{error}"));
+    println!("evidence: {claim}");
+    claim
 }
 
 impl Core {
-    fn new(test: &str) -> Self {
-        let home = test_home(test);
+    fn new(claim: PortClaim) -> Self {
+        let home = claim.home.clone();
         if home.exists() {
             fs::remove_dir_all(&home).unwrap();
         }
@@ -90,12 +101,7 @@ impl Core {
             PathBuf::from(TYCHO),
         )
         .unwrap()
-        .with_port_offset(PortOffset::for_test_home(&home));
-        let offset = config.ports.offset;
-        println!("evidence: {} at port offset {offset}", home.display());
-        if let Some(taken) = config.ports.first_taken() {
-            panic!("port collision: {taken}");
-        }
+        .with_port_offset(claim.ports.offset);
         let environment = vec![
             (HOME_ENV, home.display().to_string()),
             (ZMX_ENV, zmx.display().to_string()),
@@ -105,6 +111,7 @@ impl Core {
         .chain(config.port_offset_pair())
         .collect();
         Self {
+            _port_claim: claim,
             agent: home.join("agent"),
             config,
             environment,
@@ -137,24 +144,27 @@ impl Core {
 }
 
 /// Kills what zmx still lists in a socket directory and reports how many remain.
-fn clear_sessions(zmx: &Zmx, what: &str) -> Result<usize, String> {
-    for entry in zmx.list().map_err(|error| error.to_string())? {
-        match entry {
-            ListEntry::Running { name, pid, .. } | ListEntry::Ended { name, pid, .. } => {
-                println!("teardown: {what} session {name} (pid {pid}) survived; killing it");
-                drop(
-                    Command::new("/bin/kill")
-                        .args(["-KILL", &pid.to_string()])
-                        .status(),
-                );
-                drop(zmx.kill(&name));
+/// Ends what a socket directory still lists; a pid is signalled only while `ps` shows it
+/// running restate-server, the endpoint or a launcher.
+fn clear_sessions(zmx: &Zmx, label: &str) -> usize {
+    let programs = vec![
+        mise_which("restate-server").display().to_string(),
+        format!("{TYCHO} endpoint"),
+        format!("{TYCHO} launch"),
+    ];
+    match zmx.clear(&programs) {
+        Ok(report) => {
+            for line in &report.lines {
+                println!("teardown: {label} {line}");
             }
-            ListEntry::Unrecognised(line) => return Err(format!("unrecognised zmx line {line:?}")),
+            println!("teardown: {label} sessions left: {}", report.remaining);
+            report.remaining
+        }
+        Err(error) => {
+            println!("teardown: {label} zmx: {error}");
+            usize::MAX
         }
     }
-    let remaining = zmx.list().map_err(|error| error.to_string())?.len();
-    println!("teardown: {what} sessions left: {remaining}");
-    Ok(remaining)
 }
 
 /// The directory the Claude CLI keeps a worktree's transcripts in, named after its path.
@@ -181,15 +191,11 @@ impl Drop for Core {
         self.tycho(&["core", "stop"]);
         let core_zmx = Zmx::new(&self.config.zmx, &self.config.socket_dir());
         let agent_zmx = Zmx::agent(&self.config.zmx, &self.agent);
-        let mut outcome = clear_sessions(&core_zmx, "core")
-            .and_then(|core| {
-                clear_sessions(&agent_zmx, "agent").map(|agent| core.saturating_add(agent))
-            })
-            .and_then(|left| {
-                (left == 0)
-                    .then_some(())
-                    .ok_or_else(|| format!("{left} sessions remain"))
-            });
+        let left =
+            clear_sessions(&core_zmx, "core").saturating_add(clear_sessions(&agent_zmx, "agent"));
+        let mut outcome = (left == 0)
+            .then_some(())
+            .ok_or_else(|| format!("{left} sessions remain"));
         for transcripts in transcript_dir(&self.worktree_root()) {
             println!(
                 "teardown: removing worker transcripts {}",
@@ -348,8 +354,8 @@ fn worker_ports(core: &Core) -> (Arc<WorkerPorts>, CommitSha) {
     (Arc::new(ports), head)
 }
 
-fn start(test: &str) -> (Core, TestEndpoint, Arc<WorkerPorts>) {
-    let core = Core::new(test);
+fn start(claim: PortClaim) -> (Core, TestEndpoint, Arc<WorkerPorts>) {
+    let core = Core::new(claim);
     assert!(
         core.tycho(&["core", "start"]).status.success(),
         "the core did not start"
@@ -568,8 +574,9 @@ fn assert_cloned_and_indexed(core: &Core, view: &Value, workers: &WorkerPorts) -
 #[test]
 #[ignore = "runs a real claude worker; run with mise run worker-tests"]
 fn a_headless_worker_commits_in_a_cloned_worktree_and_leaves_a_checkpoint() {
-    let core_ports = test_ports("trivial");
-    let (core, _endpoint, workers) = start("trivial");
+    let claim = test_claim("trivial");
+    let core_ports = claim.ports;
+    let (core, _endpoint, workers) = start(claim);
     let invocation = dispatch(&core, &trivial_brief(), 30);
     let view = attach(&core, &invocation);
     assert_eq!(view["lifecycle"], "done", "{view}");
@@ -624,8 +631,9 @@ fn a_headless_worker_commits_in_a_cloned_worktree_and_leaves_a_checkpoint() {
 #[test]
 #[ignore = "runs a real claude worker; run with mise run worker-tests"]
 fn a_worker_over_its_turn_cap_returns_as_too_large() {
-    let core_ports = test_ports("turn-cap");
-    let (core, _endpoint, _workers) = start("turn-cap");
+    let claim = test_claim("turn-cap");
+    let core_ports = claim.ports;
+    let (core, _endpoint, _workers) = start(claim);
     let brief = "First run `git log --oneline` and report it, then read src/lib.rs, then make \
                  widget::answer return 42, then run `git status`. Commit the change with git.";
     let invocation = dispatch(&core, brief, 1);
@@ -698,8 +706,9 @@ fn forced_escalation_brief() -> String {
 #[test]
 #[ignore = "runs a real claude worker; run with mise run worker-tests"]
 fn a_headless_worker_rejects_on_the_planted_contradiction() {
-    let core_ports = test_ports("escalation");
-    let (core, _endpoint, workers) = start("escalation");
+    let claim = test_claim("escalation");
+    let core_ports = claim.ports;
+    let (core, _endpoint, workers) = start(claim);
     let invocation = dispatch(&core, &forced_escalation_brief(), 30);
     let mut packet = None;
     wait_until("the unit escalated with a packet", || {

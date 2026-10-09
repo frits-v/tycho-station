@@ -25,7 +25,7 @@ use crate::support::{
     admin_query, attach, await_unit_end, client, dispatch, lifecycle_and_attempt, session_status,
     start_core, wait_until, worker_run_status, DoublesEndpoint,
 };
-use crate::support::{running_before_the_kill, test_ports};
+use crate::support::{running_before_the_kill, test_claim};
 
 const DEFAULT_SHA: &str = "2222222222222222222222222222222222222222";
 const HEAD_SHA: &str = "1111111111111111111111111111111111111111";
@@ -92,15 +92,13 @@ fn merged_gate(default_sha: &str) -> FixedGate {
 #[test]
 #[ignore = "starts real processes; run with mise run chaos-tests"]
 fn endpoint_killed_between_tasks_replays_without_dispatching_twice() {
-    let core_ports = test_ports("endpoint");
+    let claim = test_claim("endpoint");
+    let core_ports = claim.ports;
     let acks: Acks = Arc::default();
     let spawner = first_task_late(core_ports, &acks);
     let gate = merged_gate(DEFAULT_SHA);
-    let (core, endpoint, ports) = start_core(
-        "endpoint",
-        Arc::new(spawner.clone()),
-        Arc::new(gate.clone()),
-    );
+    let (core, endpoint, ports) =
+        start_core(claim, Arc::new(spawner.clone()), Arc::new(gate.clone()));
     let invocation = dispatch(&core, &["wu01-t1", "wu01-t2"]);
     wait_until("task 1 spawned", || spawner.log().spawned.len() == 1);
     let first = spawner.log().spawned[0].0.clone();
@@ -287,7 +285,8 @@ fn index_build_time(checkout: &Path, index: &Path) -> u128 {
 #[test]
 #[ignore = "starts real processes; run with mise run chaos-tests"]
 fn a_unit_merges_end_to_end_and_records_the_baselines() {
-    let core_ports = test_ports("merge");
+    let claim = test_claim("merge");
+    let core_ports = claim.ports;
     let scratch = Scratch::new();
     let repository = scratch.0.join("synthetic");
     fs::create_dir_all(&repository).unwrap();
@@ -298,8 +297,7 @@ fn a_unit_merges_end_to_end_and_records_the_baselines() {
     let gate = FixedGate::new(GateVerdict::Merged {
         default_sha: built.head_sha,
     });
-    let (core, _endpoint, _) =
-        start_core("merge", Arc::new(spawner.clone()), Arc::new(gate.clone()));
+    let (core, _endpoint, _) = start_core(claim, Arc::new(spawner.clone()), Arc::new(gate.clone()));
     let invocation = dispatch(&core, &["wu01-t1"]);
     await_unit_end(core_ports, "first merge", &("queued".to_string(), 1));
     let (status, body) = attach(core_ports, &invocation);

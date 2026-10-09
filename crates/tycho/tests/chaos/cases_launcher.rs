@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tycho::config::{CorePorts, CoreRole, AGENT_USER_ENV};
+use tycho::config::{CorePorts, CoreRole, PortClaim, AGENT_USER_ENV};
 use tycho::health::{self, Health};
 use tycho::kill::{KillRefusal, KillVerdict};
 use tycho::launcher::HEARTBEAT_INTERVAL;
@@ -29,7 +29,7 @@ use crate::support::{
     attach, await_unit_end, dispatch, http, lifecycle_and_attempt, session_status, start_endpoint,
     start_once, wait_until, worker_run_status, Core, DoublesEndpoint, TYCHO,
 };
-use crate::support::{running_before_the_kill, test_ports};
+use crate::support::{running_before_the_kill, test_claim};
 
 const DEFAULT_SHA: &str = "2222222222222222222222222222222222222222";
 
@@ -83,8 +83,8 @@ fn rig(core: Core, tag: &str, plan: VendorPlan) -> Rig {
     }
 }
 
-fn started_core(test: &str) -> Core {
-    let core = Core::new(test);
+fn started_core(claim: PortClaim) -> Core {
+    let core = Core::new(claim);
     start_once(&core, |core| {
         core.tycho(&["core", "start"])
             .status
@@ -324,8 +324,9 @@ fn core_sessions_listed_once(core: &Core) {
 #[test]
 #[ignore = "starts real processes; run with mise run chaos-tests"]
 fn terminal_app_killed_leaves_the_session_core_and_unit_running() {
-    let core_ports = test_ports("terminal");
-    let core = Core::new("terminal");
+    let claim = test_claim("terminal");
+    let core_ports = claim.ports;
+    let core = Core::new(claim);
     let mut shell = core_from_shell(&core);
     let rig = rig(core, "term", every_attempt(25));
     let invocation = dispatch(&rig.core, &["wu01-t1"]);
@@ -382,8 +383,9 @@ fn kill_restate(core: &Core) {
 #[test]
 #[ignore = "starts real processes; run with mise run chaos-tests"]
 fn restate_killed_between_worker_exit_and_resolve_resolves_on_the_same_attempt() {
-    let core_ports = test_ports("restate");
-    let rig = rig(started_core("restate"), "rest", every_attempt(8));
+    let claim = test_claim("restate");
+    let core_ports = claim.ports;
+    let rig = rig(started_core(claim), "rest", every_attempt(8));
     let invocation = dispatch(&rig.core, &["wu01-t1"]);
     let name = spawned(&rig, 0);
     wait_for_heartbeat(core_ports, &name);
@@ -503,8 +505,9 @@ fn assert_nothing_spooled(rig: &Rig, name: &str) {
 #[test]
 #[ignore = "starts real processes; run with mise run chaos-tests"]
 fn launcher_killed_before_its_trap_requeues_as_attempt_two() {
-    let core_ports = test_ports("trap");
-    let rig = rig(started_core("trap"), "trap", first_attempt_hangs());
+    let claim = test_claim("trap");
+    let core_ports = claim.ports;
+    let rig = rig(started_core(claim), "trap", first_attempt_hangs());
     let invocation = dispatch(&rig.core, &["wu01-t1"]);
     let first = spawned(&rig, 0);
     wait_for_heartbeat(core_ports, &first);

@@ -28,10 +28,9 @@ use std::time::{Duration, Instant};
 use restate_sdk::prelude::{Endpoint, HttpServer};
 use tycho::agent_files::current_uid;
 use tycho::config::{
-    AgentDirs, CoreConfig, CorePorts, CoreRole, AGENT_USER_ENV, HOME_ENV, MISE_NO_INSTALL,
-    RESTATE_SERVER_ENV, ZMX_ENV,
+    AgentDirs, CoreConfig, CorePorts, CoreRole, PortClaim, AGENT_USER_ENV, HOME_ENV,
+    MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
 };
-use tycho::config_store::PortOffset;
 use tycho::health::{self, Health};
 use tycho::http::Http;
 use tycho::kill::{kill_session, KillRefusal, KillRequest, KillVerdict};
@@ -42,7 +41,7 @@ use tycho::process::now_unix_ms;
 use tycho::services::spawner::LeaseRead;
 use tycho::spawn::{read_lease, save_scrollback, spawn_session, SpawnOutcome, SpawnRequest};
 use tycho::spool::ACKNOWLEDGED_SUFFIX;
-use tycho::zmx::{count_named, presence, ListEntry, Presence, Zmx};
+use tycho::zmx::{count_named, presence, Presence, Zmx};
 use tycho_types::launcher::{LauncherEnv, ENV_AWAITABLE_ID, ENV_SESSION_NAME, ENV_SESSION_SECRET};
 use tycho_types::lease::{Freshness, RequeueReason};
 use tycho_types::session::SessionName;
@@ -70,6 +69,8 @@ struct Harness {
     zmx: Zmx,
     fixture: PathBuf,
     names: Vec<SessionName>,
+    /// Held until the core is stopped, after the teardown in `drop`.
+    _port_claim: PortClaim,
 }
 
 fn mise_which(tool: &str) -> PathBuf {
@@ -91,6 +92,7 @@ impl Harness {
         let user_home = PathBuf::from(env::var_os("HOME").unwrap());
         let pid = std::process::id();
         let home = user_home.join(format!(".tycho-test-launch-{tag}-{pid}"));
+        let claim = claim_ports(&home);
         let agent = user_home.join(format!(".tla-{tag}-{pid}"));
         for dir in [&home, &agent] {
             if dir.exists() {
@@ -106,14 +108,10 @@ impl Harness {
             PathBuf::from(TYCHO),
         )
         .unwrap()
-        .with_port_offset(PortOffset::for_test_home(&home));
-        let offset = config.ports.offset;
-        println!("evidence: {} at port offset {offset}", home.display());
-        if let Some(taken) = config.ports.first_taken() {
-            panic!("port collision: {taken}");
-        }
+        .with_port_offset(claim.ports.offset);
         let dirs = AgentDirs::new(agent.clone()).unwrap();
         let mut harness = Self {
+            _port_claim: claim,
             probe_endpoint: None,
             environment: vec![
                 (HOME_ENV, home.display().to_string()),
@@ -245,25 +243,27 @@ impl Harness {
 }
 
 /// Kills every session left in a socket directory by pid and by name; returns how many remain.
+/// Ends what a socket directory still lists; a pid is signalled only while `ps` shows it
+/// running restate-server, the endpoint or a launcher.
 fn clear_sessions(zmx: &Zmx, label: &str) -> usize {
-    let Ok(entries) = zmx.list() else {
-        println!("teardown: {label} zmx list failed");
-        return usize::MAX;
-    };
-    for entry in &entries {
-        if let ListEntry::Running { name, pid, .. } | ListEntry::Ended { name, pid, .. } = entry {
-            println!("teardown: {label} session {name} left; killing pid {pid}");
-            drop(
-                Command::new("/bin/kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .status(),
-            );
-            drop(zmx.kill(name));
+    let programs = vec![
+        mise_which("restate-server").display().to_string(),
+        format!("{TYCHO} endpoint"),
+        format!("{TYCHO} launch"),
+    ];
+    match zmx.clear(&programs) {
+        Ok(report) => {
+            for line in &report.lines {
+                println!("teardown: {label} {line}");
+            }
+            println!("teardown: {label} sessions left: {}", report.remaining);
+            report.remaining
+        }
+        Err(error) => {
+            println!("teardown: {label} zmx: {error}");
+            usize::MAX
         }
     }
-    let left = zmx.list().map_or(usize::MAX, |entries| entries.len());
-    println!("teardown: {label} sessions left: {left}");
-    left
 }
 
 impl Drop for Harness {
@@ -661,4 +661,12 @@ fn restate_killed_between_vendor_exit_and_resolve() {
         "{after:?}"
     );
     assert_eq!(harness.sessions_named(&name), 0);
+}
+
+/// Claims a port slot for the home, held until the core is stopped; a port another process
+/// holds fails the test as a port collision.
+fn claim_ports(home: &Path) -> PortClaim {
+    let claim = CorePorts::claim(home).unwrap_or_else(|error| panic!("{error}"));
+    println!("evidence: {claim}");
+    claim
 }
