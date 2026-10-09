@@ -1266,16 +1266,21 @@ fn decode_credential_helpers(code: Option<i32>, stdout: &str, stderr: &str) -> C
     }
 }
 
+/// Runs from `/` with only `PATH` and the given `HOME`, so no repository config or inherited `GIT_*` variable changes what git reads.
+fn scope_to_home(command: &mut Command, home: &str) {
+    command.current_dir("/").env_clear().env("HOME", home);
+    if let Some(path) = std::env::var_os("PATH") {
+        command.env("PATH", path);
+    }
+}
+
 /// Every file git reads for the agent: the home files, the system file, includes, and the gitconfig that ships with Apple's git, which `--system` does not read.
 fn credential_helper_command(home: &str) -> Command {
     let mut command = plain_command(
         "git",
         &["config", "--show-scope", "--get-all", "credential.helper"],
     );
-    command.current_dir("/").env_clear().env("HOME", home);
-    if let Some(path) = std::env::var_os("PATH") {
-        command.env("PATH", path);
-    }
+    scope_to_home(&mut command, home);
     command
 }
 
@@ -2056,15 +2061,24 @@ mod tests {
     fn credential_helper_command_runs_from_root_with_only_home_and_path() {
         let command = credential_helper_command("/Users/tycho-agent");
         assert_eq!(command.get_current_dir(), Some(Path::new("/")));
-        let envs: Vec<_> = command.get_envs().collect();
-        assert!(envs.contains(&(
-            std::ffi::OsStr::new("HOME"),
-            Some(std::ffi::OsStr::new("/Users/tycho-agent"))
-        )));
-        assert!(envs
-            .iter()
-            .all(|(name, _)| *name == "HOME" || *name == "PATH"));
         assert!(command.get_args().all(|arg| arg != "--system"));
+
+        let mut env_command = plain_command("env", &[]);
+        scope_to_home(&mut env_command, "/Users/tycho-agent");
+        let capture = run_bounded(env_command);
+        let Capture::Ran {
+            success: true,
+            stdout,
+            ..
+        } = capture
+        else {
+            panic!("env did not run: {capture:?}");
+        };
+        let mut lines: Vec<&str> = stdout.lines().collect();
+        lines.sort_unstable();
+        assert_eq!(lines.len(), 2, "env printed {stdout:?}");
+        assert_eq!(lines.first(), Some(&"HOME=/Users/tycho-agent"));
+        assert!(lines.get(1).is_some_and(|line| line.starts_with("PATH=")));
     }
 
     #[test]
