@@ -743,6 +743,26 @@ mod tests {
     }
 
     #[test]
+    fn the_step_holding_the_app_key_runs_a_built_binary_not_a_build() {
+        let workflow = include_str!("../../.github/workflows/release.yml");
+        let lines: Vec<&str> = workflow.lines().collect();
+        let key_lines: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains(&format!("secrets.{APP_KEY_VARIABLE}")))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(key_lines.len(), 1, "{key_lines:?}");
+        let step_run = key_lines
+            .first()
+            .and_then(|key| lines.get(..*key))
+            .and_then(|before| before.iter().rev().find(|line| line.contains("run:")))
+            .map(|line| line.trim());
+        assert_eq!(step_run, Some("- run: target/debug/xtask release-pr"));
+        assert!(workflow.contains("- run: cargo build --locked -p xtask"));
+    }
+
+    #[test]
     fn tags_are_versions_only() {
         assert!(valid_tag("v0.1.0"));
         assert!(valid_tag("v12.0.31"));
