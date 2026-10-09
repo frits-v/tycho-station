@@ -437,7 +437,7 @@ impl Harness {
         self.spawner
             .zmx
             .history(&name.to_string(), 4 * 1024 * 1024)
-            .unwrap_or_default()
+            .unwrap_or_else(|error| format!("<zmx history failed: {error:?}>"))
     }
 
     fn kill(&self, control: &Control) {
@@ -852,6 +852,14 @@ fn a_killed_session_resumes_under_its_id_with_the_settings_passed_again() {
     let mut harness = Harness::new("resume");
     let first = new_control("r1");
     let first_pid = harness.spawn(&first, PermissionMode::AcceptEdits, false);
+    // The vendor writes the transcript with the first turn; a session without one has no
+    // conversation to resume.
+    instruct(
+        &first,
+        "wu01:task_packet:1",
+        "Use the Write tool to create control-four.txt in the current directory containing the word four. Do nothing else.",
+    );
+    file_appears(&harness.file("control-four.txt"));
     harness.kill(&first);
     let resumed = Control {
         name: session_name("r2"),
@@ -870,13 +878,13 @@ fn a_killed_session_resumes_under_its_id_with_the_settings_passed_again() {
     let record = instruct(
         &resumed,
         "wu01:task_packet:2",
-        "Use the Write tool to create control-four.txt in the current directory containing the word four. Do nothing else.",
+        "Use the Write tool to create control-five.txt in the current directory containing the word five. Do nothing else.",
     );
     assert!(
         matches!(&record.delivery, Delivery::Posted { socket } if socket.ends_with(&format!("{resumed_pid}.sock"))),
         "{record:?}"
     );
-    let content = file_appears(&harness.file("control-four.txt"));
-    println!("evidence: control-four.txt holds {content:?}");
+    let content = file_appears(&harness.file("control-five.txt"));
+    println!("evidence: control-five.txt holds {content:?}");
     harness.kill(&resumed);
 }
