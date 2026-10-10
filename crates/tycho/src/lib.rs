@@ -31,6 +31,8 @@ pub mod repositories;
 pub mod services;
 pub mod spawn;
 pub mod spool;
+#[cfg(test)]
+mod test_sockets;
 pub mod vendors;
 pub mod verdicts;
 pub mod watchdog;

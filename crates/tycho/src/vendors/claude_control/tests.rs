@@ -5,20 +5,19 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 use std::thread;
 
-use nix::sys::socket::{bind, socket, AddressFamily, SockFlag, SockType, UnixAddr};
-
 use tycho_types::session::SessionName;
 use tycho_types::task_packet::AbsolutePath;
 
 use super::*;
 use crate::spawn::CLAUDE_SANDBOX_SETTINGS;
+use crate::test_sockets::{bound_without_listener, listener};
 use crate::vendors::control::AddressTarget;
 
 const REGISTRY_IDLE: &str = include_str!("../../fixtures/claude-registry-idle.json");
@@ -249,38 +248,6 @@ fn the_instruction_line_is_one_json_user_message() {
         instruction_line(&text),
         "{\"message\":{\"content\":\"Task packet sha256:ab: \\\"plan\\\" it\",\"role\":\"user\"},\"type\":\"user\"}\n"
     );
-}
-
-/// A listener that reads to the client's half-close, answers with `reply`, and returns what it read.
-///
-/// Reading to the half-close keeps the listener from hanging up before the client's half-close.
-/// Its own half-close, not the drop, ends the reply: on macOS a child spawned by another test
-/// can inherit the accepted descriptor before its close-on-exec flag is set, and that copy
-/// would hold a dropped connection open.
-fn listener(path: &Path, reply: &'static [u8]) -> thread::JoinHandle<String> {
-    let listener = UnixListener::bind(path).unwrap();
-    thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut received = String::new();
-        stream.read_to_string(&mut received).unwrap();
-        stream.write_all(reply).unwrap();
-        stream.shutdown(std::net::Shutdown::Write).unwrap();
-        received
-    })
-}
-
-/// A socket file nothing listens on: bound and never listening, so a connect is refused even
-/// while a child holds an inherited copy of the descriptor, which a dropped listener is not.
-fn bound_without_listener(path: &Path) -> OwnedFd {
-    let bound = socket(
-        AddressFamily::Unix,
-        SockType::Stream,
-        SockFlag::empty(),
-        None,
-    )
-    .unwrap();
-    bind(bound.as_raw_fd(), &UnixAddr::new(path).unwrap()).unwrap();
-    bound
 }
 
 #[test]
