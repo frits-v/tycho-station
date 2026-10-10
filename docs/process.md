@@ -35,6 +35,23 @@ check is green. A claim of done without that run says so explicitly, with the re
 run was not possible. Tests that fail are reported with their output, not summarised
 away. A step that was skipped is named as skipped.
 
+`xtask ci` refuses to start unless the checkout it was built from (the nearest `.git` above
+its `CARGO_MANIFEST_DIR`) is the current directory's, so a worktree under `.worktrees/` and
+the checkout above it are never confused; the refusal names both paths. The test step runs
+every test binary (`--no-fail-fast`, no colour) and prints each one's resolved path and
+counts. The run closes with
+`xtask ci: N steps passed, S skipped (<names>), M tests passed, F failed, in <checkout> at <commit>`,
+with the failed steps in place of the first part when any failed, and `with K uncommitted
+changes` after the commit when the tree differs from it, counted before and after the
+steps with the larger count reported. A step with nothing to check, such
+as the title check outside a pull request, counts as skipped, not passed. The exit code is 0
+exactly when no step failed. A log is evidence for a branch only when that line names its
+checkout and a commit with no uncommitted changes.
+
+The developer shell sets `noclobber`: `mise run ci > ci.log` onto an existing `ci.log`
+fails with "file exists" before mise starts, and a following `echo $? >> ci.log` appends
+`1` to whatever an earlier run left there. Write a log with `>|` or under a new name.
+
 ## Reporting
 
 A report leads with the outcome. It states what was verified and how, what was not and
@@ -73,6 +90,15 @@ so release builds use rustup's cargo.
 - Locally the store grows under the platform cache directory (`mbx doctor` names it) and
   collects itself; `mise run cache-trim` trims it to the size ci saves, and `mbx stats`
   shows what it holds.
+- Each checkout gets its own managed target directory: `target` is a link to
+  `<cache>/targets/v1/<key>`, and `<key>.json` beside it records the checkout as
+  `workspace_root`. Checkouts share compiled units from the store, never a target
+  directory, so one tree's artefacts never stand in for another's, and the xtask sets no
+  `CARGO_TARGET_DIR`. A unit that reads `env!("CARGO_MANIFEST_DIR")` holds its own
+  checkout's path even when an identical source was compiled in another checkout first.
+- A test binary's file name (`xtask-<hash>`) does not depend on the checkout, so the same
+  name in two logs says nothing about which tree built it; the resolved path the test step
+  prints, under `targets/v1/<key>`, does.
 
 ## Code scanning
 

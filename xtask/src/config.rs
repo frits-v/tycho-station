@@ -394,6 +394,7 @@ mod tests {
             Exit::TimedOut,
             Exit::OutputTooLarge,
             Exit::OutputUnreadable,
+            Exit::OutputStillOpen,
         ] {
             let outcome = decode(&exit, DEF_EXIT_STATE.to_string());
             assert!(

@@ -546,6 +546,9 @@ fn decode_command(program: &str, captured: &Captured) -> CommandOutcome {
         }
         Exit::OutputTooLarge => CommandOutcome::NotFinished("output over the cap".to_string()),
         Exit::OutputUnreadable => CommandOutcome::NotFinished("output unreadable".to_string()),
+        Exit::OutputStillOpen => {
+            CommandOutcome::NotFinished("output still open after it exited".to_string())
+        }
         Exit::NotStarted(why) => CommandOutcome::NotFinished(format!("did not start: {why}")),
     }
 }
@@ -1501,6 +1504,7 @@ mod tests {
             Exit::TimedOut,
             Exit::OutputTooLarge,
             Exit::OutputUnreadable,
+            Exit::OutputStillOpen,
             Exit::NotStarted("no such file".to_string()),
         ] {
             assert!(matches!(
