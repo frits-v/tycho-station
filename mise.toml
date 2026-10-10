@@ -100,3 +100,7 @@ run = "cargo test -p tycho --test chaos -- --ignored --test-threads=1 --nocaptur
 [tasks.setup]
 description = "Check the operator preconditions for running the factory on this machine"
 run = "cargo run -q -p xtask -- setup"
+
+[tasks.provision-agent]
+description = "Create the agent user, its group, the shared group and the socket directories, asking for sudo per step; --print shows the plan and runs nothing"
+run = "cargo run -q -p xtask -- provision-agent"
