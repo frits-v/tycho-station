@@ -128,12 +128,15 @@ GitHub App installation token that the xtask mints for each run:
   repository, and requests an installation token limited to this repository and to
   Contents and Pull requests write. A token whose grant is wider, or whose grant the
   response does not state, it refuses and revokes. The token reaches release-plz as
-  `GIT_TOKEN` in its environment and is revoked when release-plz exits. The key, the JWT
-  and the token never appear in arguments, output, errors or child environments: gh runs
-  in a new empty private directory that is also its `GH_CONFIG_DIR`, with `PATH`,
-  `TMPDIR` and the locale from the job, telemetry off and the credential in `GH_TOKEN`;
-  release-plz and the processes it starts get the job's environment without the App's
-  ids and key.
+  `GIT_TOKEN` in its environment and is revoked when release-plz exits. The xtask makes
+  the lookup, the token request and the revocation itself, over HTTPS (rustls on
+  aws-lc-rs, the webpki roots compiled in, no proxy, no redirects), sending the JWT or
+  the token as `Authorization: Bearer`; GitHub reads an App JWT only under that scheme.
+  The key, the JWT and the token never appear in arguments, output, errors or child
+  environments: no child process sees the JWT, release-plz sees the token only as
+  `GIT_TOKEN`, and release-plz and the processes it starts get the job's environment
+  without the App's ids and key. An error names GitHub's status and its message when the
+  message reads as plain text.
 - The workflow builds the xtask in a step without the key, then runs the built binary in
   the step that holds it, so no build script or proc-macro inherits the key. A build
   script in the build step can still write `$GITHUB_ENV` or replace `target/debug/xtask`,

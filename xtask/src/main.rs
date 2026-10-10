@@ -18,6 +18,7 @@ mod code_scanning;
 mod config;
 mod credentials;
 mod figures;
+mod github_api;
 mod opengrep;
 mod process;
 mod release;
