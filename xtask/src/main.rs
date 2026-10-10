@@ -21,6 +21,7 @@ mod figures;
 mod github_api;
 mod opengrep;
 mod process;
+mod provision;
 mod release;
 mod sarif;
 mod setup;
@@ -40,7 +41,7 @@ const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
 const DOC_DIRS: [&str; 1] = ["docs"];
 const RULES_DIR: &str = ".claude/rules";
 const RULE_MAX_LINES: usize = 24;
-const COMMANDS: [(&str, &str); 19] = [
+const COMMANDS: [(&str, &str); 20] = [
     (
         "ci",
         "format check, clippy, tests, workflow audits, opengrep, repository checks, PR title",
@@ -113,6 +114,10 @@ const COMMANDS: [(&str, &str); 19] = [
     (
         "setup",
         "operator preconditions for running the factory on this machine",
+    ),
+    (
+        "provision-agent [--print]",
+        "create the agent user, groups and socket directories setup checks",
     ),
 ];
 const ABBREVIATIONS: [&str; 5] = ["tmp", "ctx", "obj", "arr", "cfg"];
@@ -768,6 +773,7 @@ fn main() {
             2
         }
         Some("setup") => setup::run(),
+        Some("provision-agent") => provision::run(args.get(1..).unwrap_or_default()),
         Some("help") | None => help(),
         _ => {
             help();

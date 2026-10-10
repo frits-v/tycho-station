@@ -1,5 +1,5 @@
-//! Child processes run with a deadline, stdin closed, stdout captured up to a cap, and stderr
-//! inherited or captured up to the same cap.
+//! Child processes run with a deadline, stdin closed or inherited, stdout captured up to a cap,
+//! and stderr inherited or captured up to the same cap.
 
 use std::io::Read;
 use std::process::{ChildStderr, ChildStdout, Command, Stdio};
@@ -32,17 +32,28 @@ pub struct Captured {
 
 /// Runs a command with stdin closed, stderr inherited and stdout captured up to the cap.
 pub fn run_bounded(command: &mut Command, timeout: Duration) -> Captured {
-    run_with(command, timeout, false)
+    run_with(command, timeout, Stdio::null(), false)
 }
 
 /// Runs a command with stdin closed and both stdout and stderr captured up to the cap.
 pub fn run_bounded_capturing_stderr(command: &mut Command, timeout: Duration) -> Captured {
-    run_with(command, timeout, true)
+    run_with(command, timeout, Stdio::null(), true)
+}
+
+/// Runs a command with this process's stdin, so a prompt the child reads from the terminal
+/// reaches the operator, and both stdout and stderr captured up to the cap.
+pub fn run_bounded_with_terminal_input(command: &mut Command, timeout: Duration) -> Captured {
+    run_with(command, timeout, Stdio::inherit(), true)
 }
 
 type ReaderResult = mpsc::Receiver<(Vec<u8>, Option<Exit>)>;
 
-fn run_with(command: &mut Command, timeout: Duration, capture_stderr: bool) -> Captured {
+fn run_with(
+    command: &mut Command,
+    timeout: Duration,
+    stdin_mode: Stdio,
+    capture_stderr: bool,
+) -> Captured {
     println!("xtask: {}", describe(command));
     let stderr_mode = if capture_stderr {
         Stdio::piped()
@@ -50,7 +61,7 @@ fn run_with(command: &mut Command, timeout: Duration, capture_stderr: bool) -> C
         Stdio::inherit()
     };
     let spawned = command
-        .stdin(Stdio::null())
+        .stdin(stdin_mode)
         .stdout(Stdio::piped())
         .stderr(stderr_mode)
         .spawn();
@@ -223,5 +234,16 @@ mod tests {
             QUICK_TIMEOUT,
         );
         assert!(inherited.stderr.is_empty());
+    }
+
+    #[test]
+    fn terminal_input_run_captures_stdout_and_stderr_apart() {
+        let both = run_bounded_with_terminal_input(
+            Command::new("sh").args(["-c", "echo out; echo err >&2; exit 3"]),
+            QUICK_TIMEOUT,
+        );
+        assert_eq!(both.exit, Exit::Code(3));
+        assert_eq!(both.stdout.trim(), "out");
+        assert_eq!(both.stderr.trim(), "err");
     }
 }

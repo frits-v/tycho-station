@@ -26,8 +26,8 @@ const STAFF_GID: u32 = 20;
 pub const SHARED_GROUP_NAME: &str = "tycho-zmx";
 pub const AGENT_SOCKET_DIR: &str = "/Users/Shared/tycho-agent-zmx";
 const CORE_SOCKET_DIR_RELATIVE: &str = ".tycho/zmx";
-const AGENT_SOCKET_DIR_MODE: u32 = 0o2770;
-const CORE_SOCKET_DIR_MODE: u32 = 0o0700;
+pub const AGENT_SOCKET_DIR_MODE: u32 = 0o2770;
+pub const CORE_SOCKET_DIR_MODE: u32 = 0o0700;
 /// What a socket path leaves for the directory once the name and separator are in it.
 const SOCKET_DIR_MAX_BYTES: usize = SOCKET_PATH_MAX_BYTES
     .saturating_sub(1)
@@ -54,7 +54,7 @@ fn workspace_root() -> &'static Path {
 
 /// Who a check can be performed as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Side {
+pub enum Side {
     Developer,
     Agent,
 }
@@ -91,7 +91,8 @@ fn mode_for(username: &str) -> Side {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Check {
+pub enum Check {
+    AgentGroupExists,
     AgentUserExists,
     SharedGroupExists,
     DeveloperInSharedGroup,
@@ -141,7 +142,12 @@ const fn spec(check: Check, name: &'static str, side: Side) -> CheckSpec {
 }
 
 /// Every check, in print order; each one runs on exactly one side.
-const CATALOGUE: [CheckSpec; 35] = [
+const CATALOGUE: [CheckSpec; 36] = [
+    spec(
+        Check::AgentGroupExists,
+        "agent group exists",
+        Side::Developer,
+    ),
     spec(Check::AgentUserExists, "agent user exists", Side::Developer),
     spec(
         Check::SharedGroupExists,
@@ -315,7 +321,7 @@ const CATALOGUE: [CheckSpec; 35] = [
     ),
 ];
 
-fn check_name(check: Check) -> &'static str {
+pub fn check_name(check: Check) -> &'static str {
     CATALOGUE
         .iter()
         .find(|entry| entry.check == check)
@@ -323,7 +329,7 @@ fn check_name(check: Check) -> &'static str {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Status {
+pub enum Status {
     Present,
     Missing,
     Wrong { found: String, wanted: String },
@@ -332,7 +338,7 @@ enum Status {
 }
 
 impl Status {
-    const fn is_pass(&self) -> bool {
+    pub const fn is_pass(&self) -> bool {
         matches!(self, Self::Present)
     }
 
@@ -356,14 +362,14 @@ impl fmt::Display for Status {
 }
 
 #[derive(Debug, Clone)]
-struct Finding {
-    check: Check,
-    status: Status,
-    hint: Option<String>,
+pub struct Finding {
+    pub check: Check,
+    pub status: Status,
+    pub hint: Option<String>,
 }
 
 impl Finding {
-    const fn new(check: Check, status: Status) -> Self {
+    pub const fn new(check: Check, status: Status) -> Self {
         Self {
             check,
             status,
@@ -949,9 +955,9 @@ fn keychain_findings() -> Vec<Finding> {
 
 /// From `id -u`/`id -un`, never `$HOME`/`$USER`, so this is whoever is actually running.
 #[derive(Debug, Clone)]
-struct Identity {
-    uid: u32,
-    username: String,
+pub struct Identity {
+    pub uid: u32,
+    pub username: String,
 }
 
 fn decode_id_output(stdout: &str) -> Option<String> {
@@ -980,7 +986,7 @@ fn id_output(args: &[&str]) -> Result<String, String> {
     }
 }
 
-fn current_identity() -> Result<Identity, String> {
+pub fn current_identity() -> Result<Identity, String> {
     let uid_text = id_output(&["-u"])?;
     let uid: u32 = uid_text
         .parse()
@@ -1089,7 +1095,7 @@ fn group_gid(lookup: &DsclLookup) -> Result<u32, String> {
     }
 }
 
-fn resolve_home(username: &str) -> Result<String, String> {
+pub fn resolve_home(username: &str) -> Result<String, String> {
     match dscl_read(&format!("/Users/{username}"), Some("NFSHomeDirectory")) {
         DsclLookup::Found(stdout) => dscl_value(&stdout, "NFSHomeDirectory")
             .ok_or_else(|| "NFSHomeDirectory missing from the user record".to_string()),
@@ -1467,7 +1473,7 @@ fn agent_socket_dir_findings(group_gid: Result<u32, String>, developer_uid: u32)
     ]
 }
 
-fn core_socket_dir_path(home: &str) -> String {
+pub fn core_socket_dir_path(home: &str) -> String {
     format!("{home}/{CORE_SOCKET_DIR_RELATIVE}")
 }
 
@@ -1515,10 +1521,22 @@ fn core_socket_findings(identity: &Identity) -> Vec<Finding> {
 }
 
 /// Runs only checks the developer can perform: nothing here reads the agent's home or keychain.
-fn developer_findings(identity: &Identity) -> Vec<Finding> {
+pub fn developer_findings(identity: &Identity) -> Vec<Finding> {
+    let mut findings = record_findings(identity);
+    let ls = mise_ls();
+    findings.extend(vendor_findings(&ls));
+    findings.push(login_finding(&ENTIRE_LOGIN, &ls));
+    findings
+}
+
+/// The developer-side checks of directory records and socket directories, which read no
+/// tool and no network.
+pub fn record_findings(identity: &Identity) -> Vec<Finding> {
+    let agent_group_lookup = dscl_read(&format!("/Groups/{AGENT_GROUP_NAME}"), None);
     let agent_lookup = dscl_read(&format!("/Users/{AGENT_USER_NAME}"), Some("RecordName"));
     let group_lookup = dscl_read(&format!("/Groups/{SHARED_GROUP_NAME}"), None);
     let mut findings = vec![
+        Finding::new(Check::AgentGroupExists, lookup_status(&agent_group_lookup)),
         Finding::new(Check::AgentUserExists, lookup_status(&agent_lookup)),
         Finding::new(Check::SharedGroupExists, lookup_status(&group_lookup)),
         Finding::new(
@@ -1531,10 +1549,29 @@ fn developer_findings(identity: &Identity) -> Vec<Finding> {
         identity.uid,
     ));
     findings.extend(core_socket_findings(identity));
-    let ls = mise_ls();
-    findings.extend(vendor_findings(&ls));
-    findings.push(login_finding(&ENTIRE_LOGIN, &ls));
     findings
+}
+
+/// The agent's membership and primary group, read from directory services by name, which the
+/// developer can do as well as the agent.
+pub fn agent_record_findings() -> Vec<Finding> {
+    vec![
+        Finding::new(
+            Check::AgentInSharedGroup,
+            membership_status(AGENT_USER_NAME, SHARED_GROUP_NAME),
+        ),
+        primary_group_finding(AGENT_USER_NAME),
+    ]
+}
+
+/// A group's gid; `Ok(None)` when the group does not exist.
+pub fn group_id(group: &str) -> Result<Option<u32>, String> {
+    let lookup = dscl_read(&format!("/Groups/{group}"), Some("PrimaryGroupID"));
+    match primary_gid(&lookup, group) {
+        Ok(gid) => Ok(Some(gid)),
+        Err(Status::Missing) => Ok(None),
+        Err(status) => Err(status.to_string()),
+    }
 }
 
 /// Runs only checks the agent can perform on itself: nothing here resolves the developer's home, the core directory or the developer's logins.
@@ -1554,7 +1591,7 @@ fn agent_findings(identity: &Identity) -> Vec<Finding> {
 }
 
 /// One finding per catalogue entry: the produced result, `Deferred` for the other side, `Unreachable` for a gap.
-fn assemble(mode: Side, produced: &[Finding]) -> Vec<Finding> {
+pub fn assemble(mode: Side, produced: &[Finding]) -> Vec<Finding> {
     let mut findings: Vec<Finding> = CATALOGUE
         .iter()
         .map(|entry| {
@@ -1596,7 +1633,7 @@ fn unknown_mode_findings(why: &str) -> Vec<Finding> {
         .collect()
 }
 
-fn print_findings(findings: &[Finding]) {
+pub fn print_findings(findings: &[Finding]) {
     for finding in findings {
         let label = if finding.status.is_pass() {
             "ok"
@@ -1616,7 +1653,7 @@ fn print_findings(findings: &[Finding]) {
 }
 
 /// Exit 0 when every check on this run's side passed; deferred checks count on their own line only.
-fn summarize(mode: Option<Side>, findings: &[Finding]) -> i32 {
+pub fn summarize(mode: Option<Side>, findings: &[Finding]) -> i32 {
     let examined = findings
         .iter()
         .filter(|finding| !finding.status.is_deferred())
@@ -1669,7 +1706,8 @@ pub fn run() -> i32 {
 mod tests {
     use super::*;
 
-    const EXPECTED_SIDES: [(&str, Side); 35] = [
+    const EXPECTED_SIDES: [(&str, Side); 36] = [
+        ("agent group exists", Side::Developer),
         ("agent user exists", Side::Developer),
         ("shared group exists", Side::Developer),
         ("developer is a member of the shared group", Side::Developer),
@@ -1779,7 +1817,7 @@ mod tests {
             developer_checks.len().saturating_add(agent_checks.len()),
             CATALOGUE.len()
         );
-        assert_eq!(developer_checks.len(), 21);
+        assert_eq!(developer_checks.len(), 22);
         assert_eq!(agent_checks.len(), 14);
     }
 
@@ -1795,10 +1833,11 @@ mod tests {
     fn assemble_keeps_produced_results_and_fails_closed_on_gaps() {
         let produced = [Finding::new(Check::AgentUserExists, Status::Present)];
         let findings = assemble(Side::Developer, &produced);
-        assert_eq!(
-            findings.first().map(|finding| &finding.status),
-            Some(&Status::Present)
-        );
+        let agent_user = findings
+            .iter()
+            .find(|finding| finding.check == Check::AgentUserExists)
+            .map(|finding| &finding.status);
+        assert_eq!(agent_user, Some(&Status::Present));
         let shared_group = findings
             .iter()
             .find(|finding| finding.check == Check::SharedGroupExists)
