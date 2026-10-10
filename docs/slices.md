@@ -9,15 +9,16 @@ The design is `docs/design.html`. Section numbers below refer to it.
 ## Operator prerequisites
 
 - A dedicated macOS user for agents with its own primary group, not `staff` (design
-  section 7, trust boundaries). No credentials of any kind in that account. The core
-  runs as the developer.
+  section 7, trust boundaries), and a deny entry for it in the developer's home ACL, since
+  every local account is in `staff` through `localaccounts`. No credentials of any kind in
+  that account. The core runs as the developer.
 - A group shared by the developer and the agent user, for the zmx socket directory.
 - Vendor logins for that user, done once from a terminal: Claude Code (subscription),
   Codex (ChatGPT plan). Antigravity is optional in slice zero.
 - The entire CLI logged in as the developer if the entire mirror is the sync remote.
 
 `mise run provision-agent`, run as the developer from a terminal, creates the user, both
-groups and the socket directories, asking for sudo on the terminal
+groups, the home ACL entry and the socket directories, asking for sudo on the terminal
 ([provisioning](process.md#provisioning-the-agent-user)). The logins need a login flow in
 the account concerned and stay with the operator. `mise run setup` checks every
 precondition above and prints what is missing, so the state of the machine is never

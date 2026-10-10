@@ -109,17 +109,33 @@ what the developer side of `mise run setup` checks, in this order:
 2. the user `tycho-agent` with that group as its primary group (`sysadminctl -addUser`
    with `-GID` and `-password -`, so sysadminctl asks for the new user's password itself);
 3. the shared group `tycho-zmx`, with the developer and the agent as members;
-4. `/Users/Shared/tycho-agent-zmx`, owned by the developer, group `tycho-zmx`, mode 2770;
-5. the core socket directory `~/.tycho/zmx`, mode 0700.
+4. a deny entry for the agent in the developer's home ACL,
+   `chmod +a "user:tycho-agent deny search,list,readattr,readextattr" ~`, run as the
+   developer;
+5. `/Users/Shared/tycho-agent-zmx`, owned by the developer, group `tycho-zmx`, mode 2770;
+6. the core socket directory `~/.tycho/zmx`, mode 0700.
+
+The agent's own primary group does not keep it out of the developer's home: macOS makes
+every local account a member of `staff` through the `localaccounts` group, and a home is
+commonly `staff` at 0750. The deny entry does, since the ACL is read before the mode bits.
+Setup reports the home as open while the ACL holds no such entry and the mode lets others,
+or a group the agent is in, search it.
 
 - Each step runs only while its probe fails, and the probe runs again after it. A step whose
   probe still fails, or whose command prints output its decoder does not recognise, stops
   the run. A second run skips what is in place.
 - The directory-service steps run through `sudo`, which asks for the developer's password on
-  the terminal. The xtask never reads or passes a password, and refuses to start when stdin
-  is not a terminal, as the agent user, or as root. The directories are created one level at
-  a time and set on their descriptors by the xtask as the developer; a socket directory
-  another user owns is first given to the developer with `sudo chown`.
+  the terminal; the task prints a notice before each one. The xtask never reads or passes a
+  password, and refuses to start when stdin is not a terminal, as the agent user, or as root.
+- Root never changes the owner or mode of a path. A socket directory owned by another user,
+  or owned by root with the wrong group or mode, is removed with `sudo /bin/rmdir`, which
+  removes only an empty directory and never follows a link, and the developer creates it
+  again; if `rmdir` fails the run stops and names the directory to inspect. The directories
+  are created one level at a time and set on descriptors opened with `O_NOFOLLOW` by the
+  xtask as the developer.
+- A root step that outlasts its ten minutes is ended by killing `sudo`; the command under it
+  may still finish. The probe after the step reads what happened, so a rerun skips a step
+  that completed and repeats one that did not.
 - `--print` probes, prints the plan and runs nothing; it exits non-zero while a step is
   outstanding.
 - After the steps it prints the developer side of the setup report, with the agent's
