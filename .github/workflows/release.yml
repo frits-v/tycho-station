@@ -93,5 +93,6 @@ jobs:
       - run: cargo build --locked -p xtask
       - run: target/debug/xtask release-pr
         env:
+          TYCHO_RELEASE_CLIENT_ID: ${{ vars.TYCHO_RELEASE_CLIENT_ID }}
           TYCHO_RELEASE_APP_ID: ${{ vars.TYCHO_RELEASE_APP_ID }}
           TYCHO_RELEASE_APP_PRIVATE_KEY: ${{ secrets.TYCHO_RELEASE_APP_PRIVATE_KEY }}

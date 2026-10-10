@@ -7,7 +7,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::app_token::{self, AppCredentials, Repository, APP_ID_VARIABLE, APP_KEY_VARIABLE};
+use crate::app_token::{
+    self, AppCredentials, Repository, APP_ID_VARIABLE, APP_KEY_VARIABLE, CLIENT_ID_VARIABLE,
+};
 use crate::process::{run_bounded, Captured, Exit};
 use std::time::Duration;
 
@@ -235,6 +237,7 @@ fn valid_tag(tag: &str) -> bool {
 
 fn release_pr_inputs() -> Result<(AppCredentials, Repository), String> {
     let credentials = app_token::read_credentials(
+        env::var(CLIENT_ID_VARIABLE).ok(),
         env::var(APP_ID_VARIABLE).ok(),
         env::var(APP_KEY_VARIABLE).ok(),
     )?;
@@ -271,7 +274,7 @@ pub fn release_pr(dry_run: bool) -> i32 {
     }
 }
 
-/// release-plz and the cargo and git processes it starts never see the App id or key.
+/// release-plz and the cargo and git processes it starts never see the App's ids or key.
 fn release_plz_command(
     args: &[&str],
     parent: impl IntoIterator<Item = (OsString, OsString)>,
@@ -731,6 +734,7 @@ mod tests {
     fn release_plz_never_receives_the_app_credentials() {
         let parent: Vec<(OsString, OsString)> = [
             ("PATH", "/usr/bin"),
+            (CLIENT_ID_VARIABLE, "Iv23liExample"),
             (APP_ID_VARIABLE, "1"),
             (APP_KEY_VARIABLE, "key-material"),
         ]

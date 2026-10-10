@@ -18,10 +18,13 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 
 use crate::process::{run_bounded, Exit};
 
+pub const CLIENT_ID_VARIABLE: &str = "TYCHO_RELEASE_CLIENT_ID";
 pub const APP_ID_VARIABLE: &str = "TYCHO_RELEASE_APP_ID";
 pub const APP_KEY_VARIABLE: &str = "TYCHO_RELEASE_APP_PRIVATE_KEY";
 const REPOSITORY_VARIABLE: &str = "GITHUB_REPOSITORY";
 const APP_ID_MAX_DIGITS: usize = 20;
+/// GitHub App client ids are `Iv` and a short alphanumeric suffix, about twenty characters.
+const CLIENT_ID_MAX_CHARS: usize = 64;
 const PRIVATE_KEY_MAX_BYTES: usize = 16 * 1024;
 const REPOSITORY_MAX_CHARS: usize = 140;
 const TOKEN_MAX_CHARS: usize = 1024;
@@ -38,9 +41,10 @@ const IMPLICIT_PERMISSION: (&str, &str) = ("metadata", "read");
 static CONFIG_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const GH_INHERITED_VARIABLES: [&str; 4] = ["PATH", "TMPDIR", "LANG", "LC_ALL"];
 
-/// The App's identity and signing key, read from the environment.
+/// The App's identity and signing key, read from the environment. `issuer` is the JWT `iss`:
+/// the App's client id, or its numeric App id when no client id is set.
 pub struct AppCredentials {
-    app_id: u64,
+    issuer: String,
     key: EncodingKey,
 }
 
@@ -48,7 +52,7 @@ impl fmt::Debug for AppCredentials {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AppCredentials")
-            .field("app_id", &self.app_id)
+            .field("issuer", &self.issuer)
             .field("key", &"[redacted]")
             .finish()
     }
@@ -97,29 +101,56 @@ enum TokenOutcome {
 
 fn missing_credentials() -> String {
     format!(
-        "{APP_ID_VARIABLE} (variable) and {APP_KEY_VARIABLE} (secret) of the `release` \
-         environment must both be set: the release pull request is opened with a GitHub App \
-         installation token (Releases in docs/process.md)"
+        "{CLIENT_ID_VARIABLE} (variable, preferred) or {APP_ID_VARIABLE} (variable, accepted), \
+         and {APP_KEY_VARIABLE} (secret), of the `release` environment must be set: the release \
+         pull request is opened with a GitHub App installation token (Releases in \
+         docs/process.md)"
     )
 }
 
-/// Reads the App id and private key; neither value appears in an error.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// The JWT issuer: the client id when set, else the numeric App id. A client id that is set
+/// but malformed is an error, not a reason to fall back.
+fn read_issuer(client_id: Option<String>, app_id: Option<String>) -> Result<String, String> {
+    if let Some(client_id) = non_empty(client_id) {
+        let valid = client_id.len() <= CLIENT_ID_MAX_CHARS
+            && client_id.chars().all(|c| c.is_ascii_alphanumeric());
+        return if valid {
+            Ok(client_id)
+        } else {
+            Err(format!(
+                "{CLIENT_ID_VARIABLE} is not a GitHub App client id: letters and digits, at \
+                 most {CLIENT_ID_MAX_CHARS}"
+            ))
+        };
+    }
+    let Some(app_id) = non_empty(app_id) else {
+        return Err(missing_credentials());
+    };
+    let digits = app_id.len() <= APP_ID_MAX_DIGITS && app_id.chars().all(|c| c.is_ascii_digit());
+    match app_id.parse::<u64>() {
+        Ok(number) if digits && number > 0 => Ok(number.to_string()),
+        _ => Err(format!("{APP_ID_VARIABLE} is not a GitHub App id")),
+    }
+}
+
+/// Reads the App's client id (or its App id) and private key; the key never appears in an
+/// error.
 pub fn read_credentials(
+    client_id: Option<String>,
     app_id: Option<String>,
     key: Option<String>,
 ) -> Result<AppCredentials, String> {
-    let (Some(app_id), Some(key)) = (app_id, key) else {
+    let Some(key) = non_empty(key) else {
         return Err(missing_credentials());
     };
-    let (app_id, key) = (app_id.trim(), key.trim());
-    if app_id.is_empty() || key.is_empty() {
-        return Err(missing_credentials());
-    }
-    let digits = app_id.len() <= APP_ID_MAX_DIGITS && app_id.chars().all(|c| c.is_ascii_digit());
-    let app_id = match app_id.parse::<u64>() {
-        Ok(number) if digits && number > 0 => number,
-        _ => return Err(format!("{APP_ID_VARIABLE} is not a GitHub App id")),
-    };
+    let issuer = read_issuer(client_id, app_id)?;
+    let key = key.as_str();
     if key.len() > PRIVATE_KEY_MAX_BYTES {
         return Err(format!(
             "{APP_KEY_VARIABLE} is larger than {PRIVATE_KEY_MAX_BYTES} bytes"
@@ -130,7 +161,7 @@ pub fn read_credentials(
             "{APP_KEY_VARIABLE} is not an RSA private key in PEM form"
         ));
     };
-    Ok(AppCredentials { app_id, key })
+    Ok(AppCredentials { issuer, key })
 }
 
 /// `owner/name` from the Actions environment, bounded and limited to GitHub's name characters:
@@ -171,7 +202,7 @@ fn unix_now() -> Result<u64, String> {
 }
 
 /// The App JWT: `iat` backdated, `exp` exactly [`JWT_MAX_LIFETIME_SECONDS`] after `iat`, and
-/// `iss` the App id as a string, the JSON web token `StringOrURI` form.
+/// `iss` the client id, or the App id as a string, the JSON web token `StringOrURI` form.
 fn app_jwt(credentials: &AppCredentials, now: u64) -> Result<String, String> {
     let issued = now
         .checked_sub(JWT_BACKDATE_SECONDS)
@@ -182,7 +213,7 @@ fn app_jwt(credentials: &AppCredentials, now: u64) -> Result<String, String> {
     let claims = serde_json::json!({
         "iat": issued,
         "exp": expires,
-        "iss": credentials.app_id.to_string(),
+        "iss": credentials.issuer,
     });
     jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &credentials.key).map_err(|_| {
         format!("{APP_KEY_VARIABLE} could not sign the App JWT; it is not a usable RSA key")
@@ -190,7 +221,7 @@ fn app_jwt(credentials: &AppCredentials, now: u64) -> Result<String, String> {
 }
 
 /// The parent variables gh may see: where to find itself, a temporary directory and the locale.
-/// Everything else, the App id and key, `HOME`, proxies and certificate overrides included,
+/// Everything else, the App's ids and key, `HOME`, proxies and certificate overrides included,
 /// stays out of its environment.
 fn gh_environment(
     parent: impl IntoIterator<Item = (OsString, OsString)>,
@@ -201,13 +232,15 @@ fn gh_environment(
         .collect()
 }
 
-/// The parent environment minus the App id and key, for a child that needs the rest of it.
+/// The parent environment minus the App's ids and key, for a child that needs the rest of it.
 pub fn without_app_credentials(
     parent: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Vec<(OsString, OsString)> {
     parent
         .into_iter()
-        .filter(|(name, _)| name != APP_ID_VARIABLE && name != APP_KEY_VARIABLE)
+        .filter(|(name, _)| {
+            name != CLIENT_ID_VARIABLE && name != APP_ID_VARIABLE && name != APP_KEY_VARIABLE
+        })
         .collect()
 }
 
@@ -391,7 +424,7 @@ pub fn mint(
         InstallationOutcome::Failed(exit) => {
             return Err(format!(
                 "the installation lookup for {}/{} ended {exit:?}; the App must be installed on \
-                 this repository and the key must belong to the App id",
+                 this repository and the key must belong to the App",
                 repository.owner, repository.name
             ))
         }
@@ -469,7 +502,7 @@ mod tests {
     fn app_jwt_header_and_claims_decode_and_verify_against_the_public_key() {
         let (private, public) = test_key();
         assert!(private.starts_with("-----BEGIN RSA PRIVATE KEY-----"));
-        let credentials = read_credentials(Some("123456".into()), Some(private)).unwrap();
+        let credentials = read_credentials(None, Some("123456".into()), Some(private)).unwrap();
         let jwt = app_jwt(&credentials, NOW).unwrap();
         let header = jsonwebtoken::decode_header(&jwt).unwrap();
         assert_eq!(header.alg, Algorithm::RS256);
@@ -501,7 +534,7 @@ mod tests {
     fn app_jwt_does_not_verify_against_another_key() {
         let (private, _) = test_key();
         let (_, other_public) = test_key();
-        let credentials = read_credentials(Some("7".into()), Some(private)).unwrap();
+        let credentials = read_credentials(None, Some("7".into()), Some(private)).unwrap();
         let jwt = app_jwt(&credentials, NOW).unwrap();
         let mut validation = Validation::new(Algorithm::RS256);
         validation.validate_exp = false;
@@ -523,26 +556,100 @@ mod tests {
             (Some("  ".to_string()), Some(private.clone())),
             (Some("1".to_string()), Some(" ".to_string())),
         ] {
-            let error = read_credentials(app_id, key).unwrap_err();
+            let error = read_credentials(None, app_id, key).unwrap_err();
+            assert!(error.contains(CLIENT_ID_VARIABLE), "{error}");
+            assert!(error.contains("preferred"), "{error}");
             assert!(error.contains(APP_ID_VARIABLE), "{error}");
             assert!(error.contains(APP_KEY_VARIABLE), "{error}");
             assert!(error.contains("Releases"), "{error}");
             assert!(error.contains("`release` environment"), "{error}");
         }
-        assert!(read_credentials(Some("1".into()), Some(private)).is_ok());
+        assert!(read_credentials(None, Some("1".into()), Some(private)).is_ok());
+    }
+
+    fn signed_issuer(credentials: &AppCredentials, public: &str) -> Option<String> {
+        let jwt = app_jwt(credentials, NOW).unwrap();
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_exp = false;
+        let decoded = jsonwebtoken::decode::<serde_json::Value>(
+            &jwt,
+            &DecodingKey::from_rsa_pem(public.as_bytes()).unwrap(),
+            &validation,
+        )
+        .unwrap();
+        decoded
+            .claims
+            .get("iss")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn the_client_id_is_the_issuer_when_set_and_the_app_id_is_the_fallback() {
+        let (private, public) = test_key();
+        let both = read_credentials(
+            Some(" Iv23liAbC123 ".into()),
+            Some("123456".into()),
+            Some(private.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            signed_issuer(&both, &public).as_deref(),
+            Some("Iv23liAbC123")
+        );
+        let client_only =
+            read_credentials(Some("Iv23liAbC123".into()), None, Some(private.clone())).unwrap();
+        assert_eq!(
+            signed_issuer(&client_only, &public).as_deref(),
+            Some("Iv23liAbC123")
+        );
+        for empty_client_id in [None, Some(String::new()), Some("  ".to_string())] {
+            let fallback = read_credentials(
+                empty_client_id,
+                Some("123456".into()),
+                Some(private.clone()),
+            )
+            .unwrap();
+            assert_eq!(signed_issuer(&fallback, &public).as_deref(), Some("123456"));
+        }
+    }
+
+    #[test]
+    fn a_malformed_client_id_is_refused_without_falling_back() {
+        let (private, _) = test_key();
+        let too_long = "a".repeat(CLIENT_ID_MAX_CHARS.saturating_add(1));
+        for client_id in [
+            "Iv23-li",
+            "Iv23 li",
+            "Iv23li\u{e9}",
+            "Iv23li\"x",
+            "Iv.23",
+            too_long.as_str(),
+        ] {
+            let error = read_credentials(
+                Some(client_id.into()),
+                Some("123456".into()),
+                Some(private.clone()),
+            )
+            .unwrap_err();
+            assert!(error.contains(CLIENT_ID_VARIABLE), "{client_id}: {error}");
+            assert!(!error.contains(client_id), "{error}");
+        }
+        let longest = "a".repeat(CLIENT_ID_MAX_CHARS);
+        assert!(read_credentials(Some(longest), None, Some(private)).is_ok());
     }
 
     #[test]
     fn refuses_a_key_that_is_not_pem_and_an_app_id_that_is_not_a_number() {
         let not_pem = "MIIEowIBAAKCAQEA-not-a-pem-key";
-        let error = read_credentials(Some("1".into()), Some(not_pem.into())).unwrap_err();
+        let error = read_credentials(None, Some("1".into()), Some(not_pem.into())).unwrap_err();
         assert!(error.contains("PEM"), "{error}");
         assert!(!error.contains(not_pem));
         let oversized = "x".repeat(PRIVATE_KEY_MAX_BYTES.saturating_add(1));
-        assert!(read_credentials(Some("1".into()), Some(oversized)).is_err());
+        assert!(read_credentials(None, Some("1".into()), Some(oversized)).is_err());
         let (private, _) = test_key();
         for app_id in ["abc", "0", "-1", "123456789012345678901"] {
-            let refused = read_credentials(Some(app_id.into()), Some(private.clone()));
+            let refused = read_credentials(None, Some(app_id.into()), Some(private.clone()));
             assert!(refused.is_err(), "{app_id}");
         }
     }
@@ -693,7 +800,7 @@ mod tests {
         }
         let issued = InstallationToken(TOKEN.into());
         assert!(!format!("{issued:?}").contains(TOKEN));
-        let credentials = read_credentials(Some("1".into()), Some(private)).unwrap();
+        let credentials = read_credentials(None, Some("1".into()), Some(private)).unwrap();
         assert!(!format!("{credentials:?}").contains(&key_line));
     }
 
@@ -719,6 +826,7 @@ mod tests {
         [
             ("PATH", "/usr/bin:/bin"),
             ("HOME", "/home/runner"),
+            (CLIENT_ID_VARIABLE, "Iv23liExample"),
             (APP_ID_VARIABLE, "123456"),
             (
                 APP_KEY_VARIABLE,
@@ -764,6 +872,7 @@ mod tests {
             );
         }
         for absent in [
+            CLIENT_ID_VARIABLE,
             APP_ID_VARIABLE,
             APP_KEY_VARIABLE,
             "key-material",
