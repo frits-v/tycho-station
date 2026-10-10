@@ -96,6 +96,7 @@ pub enum Check {
     AgentUserExists,
     SharedGroupExists,
     DeveloperInSharedGroup,
+    DeveloperHomeClosedToAgent,
     AgentDirExists,
     AgentDirIsDirectory,
     AgentDirOwnerUid,
@@ -142,7 +143,7 @@ const fn spec(check: Check, name: &'static str, side: Side) -> CheckSpec {
 }
 
 /// Every check, in print order; each one runs on exactly one side.
-const CATALOGUE: [CheckSpec; 36] = [
+const CATALOGUE: [CheckSpec; 37] = [
     spec(
         Check::AgentGroupExists,
         "agent group exists",
@@ -157,6 +158,11 @@ const CATALOGUE: [CheckSpec; 36] = [
     spec(
         Check::DeveloperInSharedGroup,
         "developer is a member of the shared group",
+        Side::Developer,
+    ),
+    spec(
+        Check::DeveloperHomeClosedToAgent,
+        "agent user cannot search the developer's home",
         Side::Developer,
     ),
     spec(
@@ -1145,6 +1151,215 @@ fn membership_status(user: &str, group: &str) -> Status {
     }
 }
 
+/// The entry in the developer's home ACL that keeps the agent out, as `chmod +a` takes it.
+/// The agent's own primary group does not: macOS makes every local account a member of
+/// `staff` through `localaccounts`, and a home is commonly `staff` at 0750.
+pub const HOME_DENY_ENTRY: &str = "user:tycho-agent deny search,list,readattr,readextattr";
+const HOME_DENY_PRINCIPAL: &str = "user:tycho-agent";
+/// The most entries macOS keeps in one ACL (`KAUTH_ACL_MAX_ENTRIES`).
+const ACL_ENTRIES_MAX: usize = 128;
+const HOME_CLOSED_HINT: &str = "as the developer: chmod +a \"user:tycho-agent deny search,list,readattr,readextattr\" ~ (mise run provision-agent runs it)";
+
+/// One ACL entry as `ls -le` prints it: `<n>: <principal> [inherited] <allow|deny> <perms>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AclEntry {
+    principal: String,
+    allows: bool,
+    permissions: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AclListing {
+    Entries(Vec<AclEntry>),
+    Unrecognised(String),
+}
+
+fn decode_acl_entry(line: &str) -> Option<AclEntry> {
+    let (index, rest) = line.trim_start().split_once(": ")?;
+    if index.is_empty() || !index.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    let mut tokens = rest.split_whitespace();
+    let principal = tokens.next().filter(|principal| principal.contains(':'))?;
+    let mut kind = tokens.next()?;
+    if kind == "inherited" {
+        kind = tokens.next()?;
+    }
+    let allows = match kind {
+        "allow" => true,
+        "deny" => false,
+        _ => return None,
+    };
+    let permissions = tokens.next()?.split(',').map(str::to_string).collect();
+    if tokens.next().is_some() {
+        return None;
+    }
+    Some(AclEntry {
+        principal: principal.to_string(),
+        allows,
+        permissions,
+    })
+}
+
+/// `ls -lde <dir>` prints the directory's long line, then one line per ACL entry.
+fn decode_acl_listing(stdout: &str) -> AclListing {
+    let mut lines = stdout.lines();
+    let Some(head) = lines.next() else {
+        return AclListing::Unrecognised("no output".to_string());
+    };
+    if !head.starts_with('d') {
+        return AclListing::Unrecognised(head.to_string());
+    }
+    let mut entries = Vec::new();
+    for line in lines {
+        if entries.len() >= ACL_ENTRIES_MAX {
+            return AclListing::Unrecognised(format!("more than {ACL_ENTRIES_MAX} ACL entries"));
+        }
+        match decode_acl_entry(line) {
+            Some(entry) => entries.push(entry),
+            None => return AclListing::Unrecognised(line.to_string()),
+        }
+    }
+    AclListing::Entries(entries)
+}
+
+/// Whether the agent belongs to the group a home is owned by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentInGroup {
+    Member,
+    NotMember,
+    NoAgent,
+}
+
+/// The ACL is read in order and its first entry about search decides; only then do the mode
+/// bits count. An allow entry for anyone but the developer is taken as reaching the agent.
+fn home_search_status(
+    entries: &[AclEntry],
+    mode: u32,
+    developer: &str,
+    agent: AgentInGroup,
+) -> Status {
+    let developer_principal = format!("user:{developer}");
+    for entry in entries {
+        if !entry
+            .permissions
+            .iter()
+            .any(|permission| permission == "search")
+        {
+            continue;
+        }
+        if !entry.allows && entry.principal == HOME_DENY_PRINCIPAL {
+            return Status::Present;
+        }
+        if entry.allows && entry.principal != developer_principal {
+            return Status::Wrong {
+                found: format!("an ACL entry allowing search to {} first", entry.principal),
+                wanted: format!("{HOME_DENY_PRINCIPAL} denied search first"),
+            };
+        }
+    }
+    let wanted = format!("{HOME_DENY_PRINCIPAL} denied search");
+    match agent {
+        AgentInGroup::NoAgent => Status::Missing,
+        _ if mode & 0o001 != 0 => Status::Wrong {
+            found: format!("mode {mode:04o}, which lets every user search it"),
+            wanted,
+        },
+        AgentInGroup::Member if mode & 0o010 != 0 => Status::Wrong {
+            found: format!("mode {mode:04o}, and {AGENT_USER_NAME} is in the home's group"),
+            wanted,
+        },
+        AgentInGroup::Member | AgentInGroup::NotMember => Status::Present,
+    }
+}
+
+fn home_acl(home: &str) -> Result<Vec<AclEntry>, String> {
+    let mut command = plain_command("/bin/ls", &["-lde", home]);
+    command.env_remove("CLICOLOR").env_remove("CLICOLOR_FORCE");
+    match run_bounded(command) {
+        Capture::ExecutableNotFound => Err("/bin/ls is not present".to_string()),
+        Capture::Unreachable(why) => Err(why),
+        Capture::Ran {
+            success: false,
+            stderr,
+            ..
+        } => Err(format!("ls -lde {home}: {}", first_line(&stderr))),
+        Capture::Ran {
+            success: true,
+            stdout,
+            ..
+        } => match decode_acl_listing(&stdout) {
+            AclListing::Entries(entries) => Ok(entries),
+            AclListing::Unrecognised(line) => Err(format!("unrecognised ls -lde line: {line:?}")),
+        },
+    }
+}
+
+/// `dsmemberutil` answers "not a member" for a user's own primary group, so that is compared
+/// first from the user record.
+fn agent_in_group(gid: u32) -> Result<AgentInGroup, String> {
+    let record = dscl_read(&format!("/Users/{AGENT_USER_NAME}"), Some("PrimaryGroupID"));
+    match primary_gid(&record, "agent user") {
+        Ok(primary) if primary == gid => return Ok(AgentInGroup::Member),
+        Ok(_) => {}
+        Err(Status::Missing) => return Ok(AgentInGroup::NoAgent),
+        Err(status) => return Err(status.to_string()),
+    }
+    let gid_text = gid.to_string();
+    match run_bounded(plain_command(
+        "dsmemberutil",
+        &["checkmembership", "-U", AGENT_USER_NAME, "-g", &gid_text],
+    )) {
+        Capture::ExecutableNotFound => Err("dsmemberutil is not on PATH".to_string()),
+        Capture::Unreachable(why) => Err(why),
+        Capture::Ran { code, stdout, .. } => match decode_membership(code, &stdout) {
+            MembershipOutcome::Member => Ok(AgentInGroup::Member),
+            MembershipOutcome::NotMember | MembershipOutcome::GroupNotFound => {
+                Ok(AgentInGroup::NotMember)
+            }
+            MembershipOutcome::UserNotFound => Ok(AgentInGroup::NoAgent),
+            MembershipOutcome::Unrecognised => Err(format!(
+                "unrecognised dsmemberutil result (exit {code:?}): {stdout:?}"
+            )),
+        },
+    }
+}
+
+fn home_closed_status(username: &str) -> Status {
+    let unreachable = |why: String| Status::Unreachable { why };
+    let home = match resolve_home(username) {
+        Ok(home) => home,
+        Err(why) => return unreachable(why),
+    };
+    let metadata = match fs::symlink_metadata(&home) {
+        Ok(metadata) if metadata.is_dir() => metadata,
+        Ok(metadata) => return unreachable(format!("{home} is a {}", file_kind(&metadata))),
+        Err(error) => return unreachable(format!("{home}: {error}")),
+    };
+    let entries = match home_acl(&home) {
+        Ok(entries) => entries,
+        Err(why) => return unreachable(why),
+    };
+    match agent_in_group(metadata.gid()) {
+        Ok(agent) => home_search_status(
+            &entries,
+            metadata.permissions().mode() & 0o7777,
+            username,
+            agent,
+        ),
+        Err(why) => unreachable(why),
+    }
+}
+
+fn home_closed_finding(identity: &Identity) -> Finding {
+    let status = home_closed_status(&identity.username);
+    if status.is_pass() {
+        Finding::new(Check::DeveloperHomeClosedToAgent, status)
+    } else {
+        Finding::with_hint(Check::DeveloperHomeClosedToAgent, status, HOME_CLOSED_HINT)
+    }
+}
+
 const AGENT_GROUP_HINT: &str = "create the group, then make it the agent's primary group: sudo dseditgroup -o create -r \"Tycho Agent\" tycho-agent; sudo dscl . -create /Users/tycho-agent PrimaryGroupID <gid of tycho-agent>";
 
 fn primary_gid(lookup: &DsclLookup, record: &str) -> Result<u32, Status> {
@@ -1543,6 +1758,7 @@ pub fn record_findings(identity: &Identity) -> Vec<Finding> {
             Check::DeveloperInSharedGroup,
             membership_status(&identity.username, SHARED_GROUP_NAME),
         ),
+        home_closed_finding(identity),
     ];
     findings.extend(agent_socket_dir_findings(
         group_gid(&group_lookup),
@@ -1706,11 +1922,15 @@ pub fn run() -> i32 {
 mod tests {
     use super::*;
 
-    const EXPECTED_SIDES: [(&str, Side); 36] = [
+    const EXPECTED_SIDES: [(&str, Side); 37] = [
         ("agent group exists", Side::Developer),
         ("agent user exists", Side::Developer),
         ("shared group exists", Side::Developer),
         ("developer is a member of the shared group", Side::Developer),
+        (
+            "agent user cannot search the developer's home",
+            Side::Developer,
+        ),
         ("agent socket directory: exists", Side::Developer),
         ("agent socket directory: is a directory", Side::Developer),
         ("agent socket directory: owner uid", Side::Developer),
@@ -1817,8 +2037,103 @@ mod tests {
             developer_checks.len().saturating_add(agent_checks.len()),
             CATALOGUE.len()
         );
-        assert_eq!(developer_checks.len(), 22);
+        assert_eq!(developer_checks.len(), 23);
         assert_eq!(agent_checks.len(), 14);
+    }
+
+    /// `ls -lde` on this machine's home and on a directory carrying the deny entry and an
+    /// inherited allow.
+    const HOME_LISTING: &str = "drwxr-x---+ 93 frits  staff  2976 Oct  9 21:13 /Users/frits\n 0: group:everyone deny delete\n";
+    const DENIED_LISTING: &str = "drwxr-xr-x@ 3 frits  wheel  96 Oct  9 21:16 acltest\n 0: user:tycho-agent deny list,search,readattr,readextattr\n 1: group:staff inherited allow list,search,directory_inherit\n";
+
+    fn entries(listing: &str) -> Vec<AclEntry> {
+        match decode_acl_listing(listing) {
+            AclListing::Entries(entries) => entries,
+            AclListing::Unrecognised(line) => panic!("unrecognised {line}"),
+        }
+    }
+
+    #[test]
+    fn decodes_acl_listings_and_rejects_the_unrecognised() {
+        assert_eq!(
+            entries(HOME_LISTING),
+            vec![AclEntry {
+                principal: "group:everyone".to_string(),
+                allows: false,
+                permissions: vec!["delete".to_string()],
+            }]
+        );
+        let denied = entries(DENIED_LISTING);
+        assert_eq!(denied.len(), 2);
+        assert!(denied.get(1).is_some_and(|entry| entry.allows));
+        assert_eq!(
+            entries("drwx------  3 frits  staff  96 Oct  9 21:16 /Users/frits\n"),
+            Vec::new()
+        );
+        for unrecognised in [
+            "",
+            "-rw-r--r--  1 frits  staff  0 Oct  9 21:16 file\n",
+            "drwx------  3 frits  staff  96 Oct  9 21:16 d\n 0: user:tycho-agent maybe search\n",
+            "drwx------  3 frits  staff  96 Oct  9 21:16 d\nsomething else\n",
+        ] {
+            assert!(matches!(
+                decode_acl_listing(unrecognised),
+                AclListing::Unrecognised(_)
+            ));
+        }
+        let lines = (0..=ACL_ENTRIES_MAX)
+            .map(|index| format!(" {index}: group:staff deny delete"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let long = format!("drwx------  3 frits  staff  96 Oct  9 21:16 d\n{lines}");
+        assert!(matches!(
+            decode_acl_listing(&long),
+            AclListing::Unrecognised(_)
+        ));
+    }
+
+    #[test]
+    fn the_agent_is_kept_out_of_the_home_by_the_deny_entry_not_its_primary_group() {
+        let staff_home = entries(HOME_LISTING);
+        assert!(matches!(
+            home_search_status(&staff_home, 0o750, "frits", AgentInGroup::Member),
+            Status::Wrong { .. }
+        ));
+        assert!(matches!(
+            home_search_status(&staff_home, 0o755, "frits", AgentInGroup::NotMember),
+            Status::Wrong { .. }
+        ));
+        assert_eq!(
+            home_search_status(&staff_home, 0o750, "frits", AgentInGroup::NotMember),
+            Status::Present
+        );
+        assert_eq!(
+            home_search_status(&staff_home, 0o700, "frits", AgentInGroup::Member),
+            Status::Present
+        );
+        assert_eq!(
+            home_search_status(&staff_home, 0o750, "frits", AgentInGroup::NoAgent),
+            Status::Missing
+        );
+        assert_eq!(
+            home_search_status(
+                &entries(DENIED_LISTING),
+                0o755,
+                "frits",
+                AgentInGroup::Member
+            ),
+            Status::Present
+        );
+        let allow_first = "drwxr-x---+ 3 frits  staff  96 Oct  9 21:16 d\n 0: group:staff allow list,search\n 1: user:tycho-agent deny list,search,readattr,readextattr\n";
+        assert!(matches!(
+            home_search_status(&entries(allow_first), 0o700, "frits", AgentInGroup::Member),
+            Status::Wrong { .. }
+        ));
+        let owner_allow = "drwxr-x---+ 3 frits  staff  96 Oct  9 21:16 d\n 0: user:frits allow list,search\n 1: user:tycho-agent deny list,search,readattr,readextattr\n";
+        assert_eq!(
+            home_search_status(&entries(owner_allow), 0o750, "frits", AgentInGroup::Member),
+            Status::Present
+        );
     }
 
     #[test]

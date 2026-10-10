@@ -1,12 +1,14 @@
 //! Creates what the developer side of `xtask setup` checks: the agent's group and user, the
-//! shared group and its members, and both socket directories. A step runs only while its probe
-//! fails, and the probe runs again after it; a step whose probe still fails stops the run.
-//! Steps that need root run through `sudo`, which prompts on the terminal itself; this process
-//! never reads, holds or passes a password.
+//! shared group and its members, the deny entry for the agent in the developer's home ACL, and
+//! both socket directories. A step runs only while its probe fails, and the probe runs again
+//! after it; a step whose probe still fails stops the run. Steps that need root run through
+//! `sudo`, which prompts on the terminal itself; this process never reads, holds or passes a
+//! password. Root never changes the owner or mode of a path: in `/Users/Shared`, which every
+//! user can write, the entry's owner could swap it for a link between the probe and the change.
 
-use std::fs::{self, DirBuilder, File, Permissions};
+use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, IsTerminal};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -14,7 +16,8 @@ use std::time::Duration;
 use crate::process::{self, Captured, Exit};
 use crate::setup::{
     self, Check, Finding, Identity, Side, Status, AGENT_GROUP_NAME, AGENT_SOCKET_DIR,
-    AGENT_SOCKET_DIR_MODE, AGENT_USER_NAME, CORE_SOCKET_DIR_MODE, SHARED_GROUP_NAME,
+    AGENT_SOCKET_DIR_MODE, AGENT_USER_NAME, CORE_SOCKET_DIR_MODE, HOME_DENY_ENTRY,
+    SHARED_GROUP_NAME,
 };
 
 const PROVISION_STEPS_MAX: usize = 16;
@@ -23,7 +26,13 @@ const REMEDY_TIMEOUT: Duration = Duration::from_secs(600);
 const SUDO: &str = "/usr/bin/sudo";
 const DSEDITGROUP: &str = "/usr/sbin/dseditgroup";
 const SYSADMINCTL: &str = "/usr/sbin/sysadminctl";
-const CHOWN: &str = "/usr/sbin/chown";
+const RMDIR: &str = "/bin/rmdir";
+const CHMOD: &str = "/bin/chmod";
+/// For a step run as the developer; the prompts of root steps get `REMEDY_TIMEOUT`.
+const DEVELOPER_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const PROMPT_NOTICE: &str =
+    "sudo may ask for your password now, and sysadminctl for the new user's, on this terminal";
+const FOREIGN_SOCKET_DIR_HINT: &str = "it is not an empty directory; inspect /Users/Shared/tycho-agent-zmx, remove it by hand, and run the task again";
 const AGENT_FULL_NAME: &str = "Tycho Agent";
 const AGENT_HOME: &str = "/Users/tycho-agent";
 const AGENT_SHELL: &str = "/bin/zsh";
@@ -48,18 +57,20 @@ enum Remedy {
     CreateSharedGroup,
     AddDeveloperToSharedGroup,
     AddAgentToSharedGroup,
-    OwnAgentSocketDir,
+    CloseDeveloperHome,
+    RemoveForeignAgentSocketDir,
     PrepareAgentSocketDir,
     PrepareCoreSocketDir,
 }
 
-const REMEDIES: [Remedy; 8] = [
+const REMEDIES: [Remedy; 9] = [
     Remedy::CreateAgentGroup,
     Remedy::CreateAgentUser,
     Remedy::CreateSharedGroup,
     Remedy::AddDeveloperToSharedGroup,
     Remedy::AddAgentToSharedGroup,
-    Remedy::OwnAgentSocketDir,
+    Remedy::CloseDeveloperHome,
+    Remedy::RemoveForeignAgentSocketDir,
     Remedy::PrepareAgentSocketDir,
     Remedy::PrepareCoreSocketDir,
 ];
@@ -87,7 +98,10 @@ impl Remedy {
             Self::CreateSharedGroup => "create the shared group",
             Self::AddDeveloperToSharedGroup => "add the developer to the shared group",
             Self::AddAgentToSharedGroup => "add the agent user to the shared group",
-            Self::OwnAgentSocketDir => "give the agent socket directory to the developer",
+            Self::CloseDeveloperHome => "deny the agent user the developer's home",
+            Self::RemoveForeignAgentSocketDir => {
+                "remove the agent socket directory another user owns"
+            }
             Self::PrepareAgentSocketDir => "prepare the agent socket directory",
             Self::PrepareCoreSocketDir => "prepare the core socket directory",
         }
@@ -101,7 +115,8 @@ impl Remedy {
             Self::CreateSharedGroup => &[Check::SharedGroupExists],
             Self::AddDeveloperToSharedGroup => &[Check::DeveloperInSharedGroup],
             Self::AddAgentToSharedGroup => &[Check::AgentInSharedGroup],
-            Self::OwnAgentSocketDir => &[Check::AgentDirOwnerUid],
+            Self::CloseDeveloperHome => &[Check::DeveloperHomeClosedToAgent],
+            Self::RemoveForeignAgentSocketDir => &[Check::AgentDirOwnerUid],
             Self::PrepareAgentSocketDir => &AGENT_DIR_CHECKS,
             Self::PrepareCoreSocketDir => &CORE_DIR_CHECKS,
         }
@@ -116,6 +131,7 @@ pub struct Snapshot {
     agent_group_gid: Option<u32>,
     shared_group_gid: Option<u32>,
     agent_dir_owner: Option<u32>,
+    developer_home: Option<PathBuf>,
     core_dir: Option<PathBuf>,
     core_parent_missing: bool,
 }
@@ -147,6 +163,16 @@ fn passes(snapshot: &Snapshot, checks: &[Check]) -> bool {
         .all(|&check| status_of(snapshot, check).is_pass())
 }
 
+/// Present skips; missing or wrong runs.
+fn need_for_wrong(status: &Status) -> Need {
+    match status {
+        Status::Present => Need::Skip,
+        Status::Missing | Status::Wrong { .. } => Need::Run,
+        Status::Unreachable { why } => Need::Blocked(why.clone()),
+        Status::Deferred { .. } => Need::Blocked(status.to_string()),
+    }
+}
+
 /// Present skips, missing runs; anything else is a state no remedy here creates.
 fn need_for_absence(status: &Status) -> Need {
     match status {
@@ -168,7 +194,9 @@ fn existing_directory(snapshot: &Snapshot, exists: Check, kind: Check) -> Result
     }
 }
 
-fn own_agent_dir_need(snapshot: &Snapshot) -> Need {
+/// A directory neither the developer nor root owns, or a root-owned one that is not settled,
+/// is removed by root and created again by the developer.
+fn remove_agent_dir_need(snapshot: &Snapshot) -> Need {
     match existing_directory(snapshot, Check::AgentDirExists, Check::AgentDirIsDirectory) {
         Ok(true) => {}
         Ok(false) | Err(Need::Run) => return Need::Skip,
@@ -191,6 +219,9 @@ fn own_agent_dir_need(snapshot: &Snapshot) -> Need {
 }
 
 fn prepare_agent_dir_need(snapshot: &Snapshot) -> Need {
+    if remove_agent_dir_need(snapshot) == Need::Run {
+        return Need::Run;
+    }
     match existing_directory(snapshot, Check::AgentDirExists, Check::AgentDirIsDirectory) {
         Ok(true) if passes(snapshot, &[Check::AgentDirOwnerGid, Check::AgentDirMode]) => Need::Skip,
         Ok(true) | Err(Need::Run) => Need::Run,
@@ -217,7 +248,10 @@ fn need(remedy: Remedy, snapshot: &Snapshot) -> Need {
         Remedy::CreateSharedGroup => absence(Check::SharedGroupExists),
         Remedy::AddDeveloperToSharedGroup => absence(Check::DeveloperInSharedGroup),
         Remedy::AddAgentToSharedGroup => absence(Check::AgentInSharedGroup),
-        Remedy::OwnAgentSocketDir => own_agent_dir_need(snapshot),
+        Remedy::CloseDeveloperHome => {
+            need_for_wrong(&status_of(snapshot, Check::DeveloperHomeClosedToAgent))
+        }
+        Remedy::RemoveForeignAgentSocketDir => remove_agent_dir_need(snapshot),
         Remedy::PrepareAgentSocketDir => prepare_agent_dir_need(snapshot),
         Remedy::PrepareCoreSocketDir => prepare_core_dir_need(snapshot),
     }
@@ -287,6 +321,11 @@ enum Action {
     Root(Vec<String>),
     /// Done in this process, as the developer.
     Directory(DirectoryWork),
+    /// A program run as the developer on a directory that must be the developer's own.
+    OnOwnDirectory {
+        words: Vec<String>,
+        directory: PathBuf,
+    },
 }
 
 fn strings(words: &[&str]) -> Vec<String> {
@@ -371,11 +410,19 @@ fn action(remedy: Remedy, snapshot: &Snapshot) -> Option<Action> {
         }
         Remedy::AddDeveloperToSharedGroup => Action::Root(add_member_command(developer)),
         Remedy::AddAgentToSharedGroup => Action::Root(add_member_command(AGENT_USER_NAME)),
-        Remedy::OwnAgentSocketDir => Action::Root(vec![
-            CHOWN.to_string(),
-            format!("{developer}:{SHARED_GROUP_NAME}"),
-            AGENT_SOCKET_DIR.to_string(),
-        ]),
+        Remedy::CloseDeveloperHome => {
+            let home = snapshot.developer_home.clone()?;
+            Action::OnOwnDirectory {
+                words: vec![
+                    CHMOD.to_string(),
+                    "+a".to_string(),
+                    HOME_DENY_ENTRY.to_string(),
+                    home.display().to_string(),
+                ],
+                directory: home,
+            }
+        }
+        Remedy::RemoveForeignAgentSocketDir => Action::Root(strings(&[RMDIR, AGENT_SOCKET_DIR])),
         Remedy::PrepareAgentSocketDir => Action::Directory(agent_dir_work(snapshot)),
         Remedy::PrepareCoreSocketDir => Action::Directory(core_dir_work(snapshot)?),
     })
@@ -411,12 +458,16 @@ fn render(action: &Action) -> Vec<String> {
             lines.push("(as the developer, in this process)".to_string());
             lines
         }
+        Action::OnOwnDirectory { words, .. } => {
+            let shown: Vec<String> = words.iter().map(|word| shell_word(word)).collect();
+            vec![shown.join(" "), "(as the developer)".to_string()]
+        }
     }
 }
 
-/// How a command run through sudo ended.
+/// How a remedy's command ended, through sudo or as the developer.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum RootOutcome {
+enum CommandOutcome {
     Succeeded,
     /// sudo itself refused: no password, wrong password, or not in sudoers.
     SudoRefused(String),
@@ -451,26 +502,26 @@ fn is_sudo_refusal(stderr: &str) -> bool {
 }
 
 /// sysadminctl logs each step to stderr as `<date> sysadminctl[<pid>:<thread>] <message>`.
-fn decode_sysadminctl_success(stdout: &str, stderr: &str) -> RootOutcome {
+fn decode_sysadminctl_success(stdout: &str, stderr: &str) -> CommandOutcome {
     if meaningful_lines(stdout).next().is_some() {
-        return RootOutcome::Unrecognised(first_meaningful(stdout, ""));
+        return CommandOutcome::Unrecognised(first_meaningful(stdout, ""));
     }
     for line in meaningful_lines(stderr) {
         let Some((_, message)) = line.split_once("] ") else {
-            return RootOutcome::Unrecognised(line.to_string());
+            return CommandOutcome::Unrecognised(line.to_string());
         };
         if !line.contains("sysadminctl[") {
-            return RootOutcome::Unrecognised(line.to_string());
+            return CommandOutcome::Unrecognised(line.to_string());
         }
         let lowered = message.to_lowercase();
         if lowered.contains("error") || lowered.contains("fail") {
-            return RootOutcome::Failed(line.to_string());
+            return CommandOutcome::Failed(line.to_string());
         }
     }
-    RootOutcome::Succeeded
+    CommandOutcome::Succeeded
 }
 
-fn decode_root(program: &str, captured: &Captured) -> RootOutcome {
+fn decode_command(program: &str, captured: &Captured) -> CommandOutcome {
     let (stdout, stderr) = (captured.stdout.as_str(), captured.stderr.as_str());
     match &captured.exit {
         Exit::Code(0) if program == SYSADMINCTL => decode_sysadminctl_success(stdout, stderr),
@@ -480,22 +531,22 @@ fn decode_root(program: &str, captured: &Captured) -> RootOutcome {
                 .next()
                 .is_none() =>
         {
-            RootOutcome::Succeeded
+            CommandOutcome::Succeeded
         }
-        Exit::Code(0) => RootOutcome::Unrecognised(first_meaningful(stdout, stderr)),
+        Exit::Code(0) => CommandOutcome::Unrecognised(first_meaningful(stdout, stderr)),
         Exit::Code(1) if is_sudo_refusal(stderr) => {
-            RootOutcome::SudoRefused(first_meaningful("", stderr))
+            CommandOutcome::SudoRefused(first_meaningful("", stderr))
         }
         Exit::Code(code) => {
-            RootOutcome::Failed(format!("exit {code}: {}", first_meaningful(stdout, stderr)))
+            CommandOutcome::Failed(format!("exit {code}: {}", first_meaningful(stdout, stderr)))
         }
-        Exit::Signal => RootOutcome::NotFinished("ended by a signal".to_string()),
+        Exit::Signal => CommandOutcome::NotFinished("ended by a signal".to_string()),
         Exit::TimedOut => {
-            RootOutcome::NotFinished(format!("did not finish within {REMEDY_TIMEOUT:?}"))
+            CommandOutcome::NotFinished(format!("did not finish within {REMEDY_TIMEOUT:?}"))
         }
-        Exit::OutputTooLarge => RootOutcome::NotFinished("output over the cap".to_string()),
-        Exit::OutputUnreadable => RootOutcome::NotFinished("output unreadable".to_string()),
-        Exit::NotStarted(why) => RootOutcome::NotFinished(format!("did not start: {why}")),
+        Exit::OutputTooLarge => CommandOutcome::NotFinished("output over the cap".to_string()),
+        Exit::OutputUnreadable => CommandOutcome::NotFinished("output unreadable".to_string()),
+        Exit::NotStarted(why) => CommandOutcome::NotFinished(format!("did not start: {why}")),
     }
 }
 
@@ -505,6 +556,13 @@ pub trait Host {
     fn run_as_root(&mut self, words: &[String]) -> Captured;
     fn prepare_directory(&mut self, work: &DirectoryWork, developer_uid: u32)
         -> Result<(), String>;
+    /// Runs a program as the developer once `directory` is checked to be the developer's own.
+    fn run_on_own_directory(
+        &mut self,
+        words: &[String],
+        directory: &Path,
+        developer_uid: u32,
+    ) -> Result<Captured, String>;
     /// Prints the setup report and returns its exit code.
     fn report(&mut self, developer: &Identity) -> i32;
 }
@@ -517,9 +575,10 @@ impl Host for SystemHost {
         let developer = setup::current_identity()?;
         let mut findings = setup::record_findings(&developer);
         findings.extend(setup::agent_record_findings());
-        let core_dir = setup::resolve_home(&developer.username)
-            .ok()
-            .map(|home| PathBuf::from(setup::core_socket_dir_path(&home)));
+        let developer_home = setup::resolve_home(&developer.username).ok();
+        let core_dir = developer_home
+            .as_deref()
+            .map(|home| PathBuf::from(setup::core_socket_dir_path(home)));
         let core_parent_missing = core_dir
             .as_deref()
             .and_then(Path::parent)
@@ -532,6 +591,7 @@ impl Host for SystemHost {
             agent_dir_owner: fs::symlink_metadata(AGENT_SOCKET_DIR)
                 .ok()
                 .map(|metadata| metadata.uid()),
+            developer_home: developer_home.map(PathBuf::from),
             core_dir,
             core_parent_missing,
             developer,
@@ -553,6 +613,27 @@ impl Host for SystemHost {
         prepare_directory(work, developer_uid)
     }
 
+    /// The standard library sets no ACL on a descriptor, so `chmod +a` gets the path. The home
+    /// sits in root-owned `/Users`, so only root can put another entry at that name between
+    /// this check and the command.
+    fn run_on_own_directory(
+        &mut self,
+        words: &[String],
+        directory: &Path,
+        developer_uid: u32,
+    ) -> Result<Captured, String> {
+        open_own_directory(directory, developer_uid)?;
+        let (program, arguments) = words
+            .split_first()
+            .ok_or_else(|| "an empty command".to_string())?;
+        let mut command = Command::new(program);
+        command.args(arguments);
+        Ok(process::run_bounded_capturing_stderr(
+            &mut command,
+            DEVELOPER_COMMAND_TIMEOUT,
+        ))
+    }
+
     fn report(&mut self, developer: &Identity) -> i32 {
         let produced = setup::developer_findings(developer);
         let mut findings = setup::assemble(Side::Developer, &produced);
@@ -570,8 +651,8 @@ impl Host for SystemHost {
 }
 
 /// Opens a real directory the developer owns. The path is checked without following links,
-/// then opened, and the opened inode must be the checked one, so a link swapped in between is
-/// refused rather than followed.
+/// then opened with `O_NOFOLLOW`, and the opened inode must be the checked one, so a link or
+/// another directory swapped in between is refused rather than followed.
 fn open_own_directory(path: &Path, developer_uid: u32) -> Result<File, String> {
     let shown = path.display();
     let checked = fs::symlink_metadata(path).map_err(|error| format!("{shown}: {error}"))?;
@@ -584,7 +665,11 @@ fn open_own_directory(path: &Path, developer_uid: u32) -> Result<File, String> {
             checked.uid()
         ));
     }
-    let directory = File::open(path).map_err(|error| format!("{shown}: {error}"))?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| format!("{shown}: {error}"))?;
     let opened = directory
         .metadata()
         .map_err(|error| format!("{shown}: {error}"))?;
@@ -651,6 +736,18 @@ fn prepare_directory(work: &DirectoryWork, developer_uid: u32) -> Result<(), Str
     }
 }
 
+fn outcome_result(program: &str, outcome: &CommandOutcome) -> Result<(), String> {
+    match outcome {
+        CommandOutcome::Succeeded => Ok(()),
+        CommandOutcome::SudoRefused(line) => Err(format!("sudo refused: {line}")),
+        CommandOutcome::Failed(line) => Err(format!("{program} failed: {line}")),
+        CommandOutcome::NotFinished(why) => Err(format!("{program} {why}")),
+        CommandOutcome::Unrecognised(line) => {
+            Err(format!("{program} printed unrecognised output: {line}"))
+        }
+    }
+}
+
 /// Runs one action; any outcome but success is the reason the run stops.
 fn execute(host: &mut impl Host, action: &Action, snapshot: &Snapshot) -> Result<(), String> {
     match action {
@@ -661,15 +758,13 @@ fn execute(host: &mut impl Host, action: &Action, snapshot: &Snapshot) -> Result
                 );
             }
             let program = words.first().map_or("", String::as_str);
-            match decode_root(program, &host.run_as_root(words)) {
-                RootOutcome::Succeeded => Ok(()),
-                RootOutcome::SudoRefused(line) => Err(format!("sudo refused: {line}")),
-                RootOutcome::Failed(line) => Err(format!("{program} failed: {line}")),
-                RootOutcome::NotFinished(why) => Err(format!("{program} {why}")),
-                RootOutcome::Unrecognised(line) => {
-                    Err(format!("{program} printed unrecognised output: {line}"))
-                }
-            }
+            println!("xtask provision-agent: {PROMPT_NOTICE}");
+            outcome_result(program, &decode_command(program, &host.run_as_root(words)))
+        }
+        Action::OnOwnDirectory { words, directory } => {
+            let program = words.first().map_or("", String::as_str);
+            let captured = host.run_on_own_directory(words, directory, snapshot.developer.uid)?;
+            outcome_result(program, &decode_command(program, &captured))
         }
         Action::Directory(work) => {
             if let Some(GroupTarget { gid: None, name }) = work.group {
@@ -681,6 +776,15 @@ fn execute(host: &mut impl Host, action: &Action, snapshot: &Snapshot) -> Result
 }
 
 fn verify(remedy: Remedy, snapshot: &Snapshot) -> Result<(), String> {
+    if remedy == Remedy::RemoveForeignAgentSocketDir {
+        return match status_of(snapshot, Check::AgentDirExists) {
+            Status::Missing => Ok(()),
+            status => Err(format!(
+                "{} ran, but the directory probe reads {status}",
+                remedy.label()
+            )),
+        };
+    }
     let failing: Vec<String> = remedy
         .targets()
         .iter()
@@ -697,6 +801,14 @@ fn verify(remedy: Remedy, snapshot: &Snapshot) -> Result<(), String> {
             remedy.label(),
             failing.join("; ")
         ))
+    }
+}
+
+fn failure(remedy: Remedy, why: &str) -> String {
+    if remedy == Remedy::RemoveForeignAgentSocketDir {
+        format!("{}: {why}; {FOREIGN_SOCKET_DIR_HINT}", remedy.label())
+    } else {
+        format!("{}: {why}", remedy.label())
     }
 }
 
@@ -724,7 +836,7 @@ fn apply(host: &mut impl Host, steps: &[Remedy], initial: Snapshot) -> Result<Sn
         for line in render(&action) {
             println!("  {line}");
         }
-        execute(host, &action, &latest).map_err(|why| format!("{}: {why}", remedy.label()))?;
+        execute(host, &action, &latest).map_err(|why| failure(remedy, &why))?;
         latest = host.snapshot()?;
         verify(remedy, &latest)?;
     }
@@ -843,11 +955,12 @@ mod tests {
     const DEVELOPER_UID: u32 = 501;
     const AGENT_GID: u32 = 502;
     const SHARED_GID: u32 = 503;
-    const RECORD_CHECKS: [Check; 16] = [
+    const RECORD_CHECKS: [Check; 17] = [
         Check::AgentGroupExists,
         Check::AgentUserExists,
         Check::SharedGroupExists,
         Check::DeveloperInSharedGroup,
+        Check::DeveloperHomeClosedToAgent,
         Check::AgentDirExists,
         Check::AgentDirIsDirectory,
         Check::AgentDirOwnerUid,
@@ -879,6 +992,7 @@ mod tests {
             agent_group_gid: Some(AGENT_GID),
             shared_group_gid: Some(SHARED_GID),
             agent_dir_owner: Some(DEVELOPER_UID),
+            developer_home: Some(PathBuf::from("/Users/frits")),
             core_dir: Some(PathBuf::from("/Users/frits/.tycho/zmx")),
             core_parent_missing: false,
         }
@@ -915,6 +1029,7 @@ mod tests {
                 (Check::DeveloperInSharedGroup, Status::Missing),
                 (Check::AgentInSharedGroup, Status::Missing),
                 (Check::AgentPrimaryGroup, Status::Missing),
+                (Check::DeveloperHomeClosedToAgent, Status::Missing),
                 (Check::AgentDirExists, Status::Missing),
                 (Check::AgentDirIsDirectory, absent.clone()),
                 (Check::AgentDirOwnerUid, absent.clone()),
@@ -948,6 +1063,7 @@ mod tests {
         snapshots: VecDeque<Snapshot>,
         root_results: VecDeque<Captured>,
         root_calls: Vec<Vec<String>>,
+        developer_calls: Vec<Vec<String>>,
         directory_calls: Vec<DirectoryWork>,
         snapshot_calls: usize,
         reports: usize,
@@ -962,7 +1078,9 @@ mod tests {
         }
 
         fn acted(&self) -> bool {
-            !self.root_calls.is_empty() || !self.directory_calls.is_empty()
+            !self.root_calls.is_empty()
+                || !self.developer_calls.is_empty()
+                || !self.directory_calls.is_empty()
         }
     }
 
@@ -993,6 +1111,16 @@ mod tests {
             Ok(())
         }
 
+        fn run_on_own_directory(
+            &mut self,
+            words: &[String],
+            _directory: &Path,
+            _developer_uid: u32,
+        ) -> Result<Captured, String> {
+            self.developer_calls.push(words.to_vec());
+            Ok(captured(Exit::Code(0), "", ""))
+        }
+
         fn report(&mut self, _developer: &Identity) -> i32 {
             self.reports = self.reports.saturating_add(1);
             0
@@ -1011,6 +1139,7 @@ mod tests {
                 Remedy::CreateSharedGroup,
                 Remedy::AddDeveloperToSharedGroup,
                 Remedy::AddAgentToSharedGroup,
+                Remedy::CloseDeveloperHome,
                 Remedy::PrepareAgentSocketDir,
                 Remedy::PrepareCoreSocketDir,
             ]
@@ -1190,7 +1319,23 @@ mod tests {
     }
 
     #[test]
-    fn a_socket_directory_another_user_owns_is_given_to_the_developer_first() {
+    fn a_socket_directory_another_user_owns_is_removed_by_root_and_made_again_by_the_developer() {
+        let mut stranger = with(
+            all_present(),
+            &[(Check::AgentDirOwnerUid, wrong("503", "501 or 0"))],
+        );
+        stranger.agent_dir_owner = Some(503);
+        assert_eq!(
+            plan(&stranger).steps,
+            vec![
+                Remedy::RemoveForeignAgentSocketDir,
+                Remedy::PrepareAgentSocketDir
+            ]
+        );
+        assert_eq!(
+            action(Remedy::RemoveForeignAgentSocketDir, &stranger),
+            Some(Action::Root(strings(&[RMDIR, AGENT_SOCKET_DIR])))
+        );
         let mut root_owned = with(
             all_present(),
             &[(Check::AgentDirMode, wrong("0755", "2770"))],
@@ -1198,25 +1343,96 @@ mod tests {
         root_owned.agent_dir_owner = Some(0);
         assert_eq!(
             plan(&root_owned).steps,
-            vec![Remedy::OwnAgentSocketDir, Remedy::PrepareAgentSocketDir]
-        );
-        assert_eq!(
-            action(Remedy::OwnAgentSocketDir, &root_owned),
-            Some(Action::Root(strings(&[
-                CHOWN,
-                "frits:tycho-zmx",
-                AGENT_SOCKET_DIR
-            ])))
+            vec![
+                Remedy::RemoveForeignAgentSocketDir,
+                Remedy::PrepareAgentSocketDir
+            ]
         );
         let mut settled_root = all_present();
         settled_root.agent_dir_owner = Some(0);
         assert!(plan(&settled_root).steps.is_empty());
+
+        let mut removed = with(
+            all_present(),
+            &[
+                (Check::AgentDirExists, Status::Missing),
+                (Check::AgentDirOwnerUid, Status::Missing),
+            ],
+        );
+        removed.agent_dir_owner = None;
+        let mut host = RecordingHost::new(vec![stranger, removed, all_present()]);
+        assert_eq!(provision(Mode::Apply, true, &mut host), 0);
+        assert_eq!(host.root_calls, vec![strings(&[RMDIR, AGENT_SOCKET_DIR])]);
+        assert_eq!(host.directory_calls.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_removal_stops_with_the_hint_before_the_developer_step() {
         let mut stranger = with(
             all_present(),
-            &[(Check::AgentDirOwnerUid, wrong("777", "501 or 0"))],
+            &[(Check::AgentDirOwnerUid, wrong("503", "501 or 0"))],
         );
-        stranger.agent_dir_owner = Some(777);
-        assert_eq!(plan(&stranger).steps, vec![Remedy::OwnAgentSocketDir]);
+        stranger.agent_dir_owner = Some(503);
+        let mut host = RecordingHost::new(vec![stranger.clone()]);
+        host.root_results.push_back(captured(
+            Exit::Code(1),
+            "",
+            "rmdir: /Users/Shared/tycho-agent-zmx: Directory not empty\n",
+        ));
+        let stopped = apply(&mut host, &plan(&stranger).steps, stranger);
+        assert!(stopped.is_err_and(|why| why.contains(FOREIGN_SOCKET_DIR_HINT)));
+        assert!(host.directory_calls.is_empty());
+    }
+
+    #[test]
+    fn root_never_changes_the_owner_or_mode_of_a_path() {
+        let mut stranger = with(
+            all_present(),
+            &[
+                (Check::AgentDirOwnerUid, wrong("503", "501 or 0")),
+                (Check::AgentDirMode, wrong("0777", "2770")),
+            ],
+        );
+        stranger.agent_dir_owner = Some(503);
+        for snapshot in [all_missing(), stranger, all_present()] {
+            for remedy in REMEDIES {
+                if let Some(Action::Root(words)) = action(remedy, &snapshot) {
+                    let program = words.first().map(String::as_str);
+                    assert!(
+                        matches!(program, Some(DSEDITGROUP | SYSADMINCTL | RMDIR)),
+                        "{remedy:?} runs {program:?} as root"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_home_the_agent_can_search_gets_the_deny_entry_as_the_developer() {
+        let open_home = with(
+            all_present(),
+            &[(
+                Check::DeveloperHomeClosedToAgent,
+                wrong(
+                    "mode 0750, and tycho-agent is in the home's group",
+                    "user:tycho-agent denied search",
+                ),
+            )],
+        );
+        assert_eq!(plan(&open_home).steps, vec![Remedy::CloseDeveloperHome]);
+        let expected = vec![
+            CHMOD.to_string(),
+            "+a".to_string(),
+            HOME_DENY_ENTRY.to_string(),
+            "/Users/frits".to_string(),
+        ];
+        let mut host = RecordingHost::new(vec![open_home.clone(), all_present()]);
+        assert_eq!(provision(Mode::Apply, true, &mut host), 0);
+        assert_eq!(host.developer_calls, vec![expected]);
+        assert!(host.root_calls.is_empty());
+        let mut still_open = RecordingHost::new(vec![open_home.clone(), open_home]);
+        assert_eq!(provision(Mode::Apply, true, &mut still_open), 1);
+        assert_eq!(still_open.reports, 0);
     }
 
     #[test]
@@ -1248,15 +1464,15 @@ mod tests {
     #[test]
     fn decodes_each_root_outcome_and_rejects_the_unrecognised() {
         let quiet =
-            |exit, stdout, stderr| decode_root(DSEDITGROUP, &captured(exit, stdout, stderr));
-        assert_eq!(quiet(Exit::Code(0), "", ""), RootOutcome::Succeeded);
+            |exit, stdout, stderr| decode_command(DSEDITGROUP, &captured(exit, stdout, stderr));
+        assert_eq!(quiet(Exit::Code(0), "", ""), CommandOutcome::Succeeded);
         assert_eq!(
             quiet(Exit::Code(0), "", "Sorry, try again.\n"),
-            RootOutcome::Succeeded
+            CommandOutcome::Succeeded
         );
         assert_eq!(
             quiet(Exit::Code(0), "surprise\n", ""),
-            RootOutcome::Unrecognised("surprise".to_string())
+            CommandOutcome::Unrecognised("surprise".to_string())
         );
         for refusal in [
             "Sorry, try again.\nSorry, try again.\nsudo: 3 incorrect password attempts\n",
@@ -1265,16 +1481,16 @@ mod tests {
         ] {
             assert!(matches!(
                 quiet(Exit::Code(1), "", refusal),
-                RootOutcome::SudoRefused(_)
+                CommandOutcome::SudoRefused(_)
             ));
         }
         assert_eq!(
             quiet(Exit::Code(64), "", "Group not found.\n"),
-            RootOutcome::Failed("exit 64: Group not found.".to_string())
+            CommandOutcome::Failed("exit 64: Group not found.".to_string())
         );
         assert_eq!(
             quiet(Exit::Code(1), "", "Record was not found.\n"),
-            RootOutcome::Failed("exit 1: Record was not found.".to_string())
+            CommandOutcome::Failed("exit 1: Record was not found.".to_string())
         );
         for exit in [
             Exit::Signal,
@@ -1283,28 +1499,31 @@ mod tests {
             Exit::OutputUnreadable,
             Exit::NotStarted("no such file".to_string()),
         ] {
-            assert!(matches!(quiet(exit, "", ""), RootOutcome::NotFinished(_)));
+            assert!(matches!(
+                quiet(exit, "", ""),
+                CommandOutcome::NotFinished(_)
+            ));
         }
     }
 
     #[test]
     fn decodes_sysadminctl_log_lines() {
-        let user = |stderr| decode_root(SYSADMINCTL, &captured(Exit::Code(0), "", stderr));
+        let user = |stderr| decode_command(SYSADMINCTL, &captured(Exit::Code(0), "", stderr));
         assert_eq!(
             user("2026-10-09 12:00:00.000 sysadminctl[812:9031] Creating user record\n2026-10-09 12:00:00.100 sysadminctl[812:9031] Assigning UID: 502 GID: 502\n"),
-            RootOutcome::Succeeded
+            CommandOutcome::Succeeded
         );
         assert!(matches!(
             user("2026-10-09 12:00:00.000 sysadminctl[812:9031] Error:-14120 creating record\n"),
-            RootOutcome::Failed(_)
+            CommandOutcome::Failed(_)
         ));
         assert!(matches!(
             user("Creating user record\n"),
-            RootOutcome::Unrecognised(_)
+            CommandOutcome::Unrecognised(_)
         ));
         assert!(matches!(
-            decode_root(SYSADMINCTL, &captured(Exit::Code(0), "unexpected\n", "")),
-            RootOutcome::Unrecognised(_)
+            decode_command(SYSADMINCTL, &captured(Exit::Code(0), "unexpected\n", "")),
+            CommandOutcome::Unrecognised(_)
         ));
     }
 
