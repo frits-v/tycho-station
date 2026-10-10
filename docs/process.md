@@ -37,11 +37,15 @@ away. A step that was skipped is named as skipped.
 
 `xtask ci` refuses to start unless the checkout it was built from (the nearest `.git` above
 its `CARGO_MANIFEST_DIR`) is the current directory's, so a worktree under `.worktrees/` and
-the checkout above it are never confused. The test step runs every test binary
-(`--no-fail-fast`) and prints each one's resolved path and counts. The run closes with
-`xtask ci: N steps passed, M tests passed, F failed, in <checkout> at <commit>`, or the
-failed steps in place of the first part, and exits 0 exactly when every step passed. A log is evidence
-for a branch only when that line names its checkout and commit.
+the checkout above it are never confused; the refusal names both paths. The test step runs
+every test binary (`--no-fail-fast`, no colour) and prints each one's resolved path and
+counts. The run closes with
+`xtask ci: N steps passed, S skipped (<names>), M tests passed, F failed, in <checkout> at <commit>`,
+with the failed steps in place of the first part when any failed, and `with K uncommitted
+changes` after the commit when the tree differs from it. A step with nothing to check, such
+as the title check outside a pull request, counts as skipped, not passed. The exit code is 0
+exactly when no step failed. A log is evidence for a branch only when that line names its
+checkout and a commit with no uncommitted changes.
 
 The developer shell sets `noclobber`: `mise run ci > ci.log` onto an existing `ci.log`
 fails with "file exists" before mise starts, and a following `echo $? >> ci.log` appends

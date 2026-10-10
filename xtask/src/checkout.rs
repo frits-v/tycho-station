@@ -33,20 +33,22 @@ fn resolve(path: &Path) -> Result<PathBuf, String> {
 pub fn same_checkout(built_from: &Path, current: &Path) -> Result<PathBuf, String> {
     let built = resolve(built_from)?;
     let here = resolve(current)?;
+    let both = format!(
+        "this xtask was built from {} (CARGO_MANIFEST_DIR) and runs in {}",
+        built.display(),
+        here.display()
+    );
     let Some(built_root) = checkout_root(&built) else {
-        return Err(format!("{} is in no git checkout", built.display()));
+        return Err(format!("{both}; the first is in no git checkout"));
     };
     let Some(here_root) = checkout_root(&here) else {
-        return Err(format!("{} is in no git checkout", here.display()));
+        return Err(format!("{both}; the second is in no git checkout"));
     };
     if built_root == here_root {
         return Ok(here_root);
     }
     Err(format!(
-        "this xtask was built from {} (CARGO_MANIFEST_DIR) but runs in {}; \
-         run `cargo run -p xtask -- ci` from the checkout under test",
-        built.display(),
-        here.display()
+        "{both}, another checkout; run `cargo run -p xtask -- ci` from the checkout under test"
     ))
 }
 
@@ -70,16 +72,46 @@ fn decode_commit(exit: &Exit, stdout: &str) -> Result<String, String> {
     }
 }
 
-/// The commit checked out at `root`.
-pub fn head_commit(root: &Path) -> Result<String, String> {
-    let captured = run_bounded(
+/// The number of paths `git status --porcelain` lists: changed, staged or untracked.
+fn decode_status(exit: &Exit, stdout: &str) -> Result<usize, String> {
+    match exit {
+        Exit::Code(0) => Ok(stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()),
+        other => Err(format!("git status --porcelain ended {other:?}")),
+    }
+}
+
+/// The commit with the number of uncommitted changes when there are any, so a dirty tree is
+/// never named by its commit alone.
+fn describe_revision(commit: &str, uncommitted: usize) -> String {
+    if uncommitted == 0 {
+        commit.to_string()
+    } else {
+        format!("{commit} with {uncommitted} uncommitted changes")
+    }
+}
+
+/// The commit checked out at `root` and whether the tree differs from it.
+pub fn revision(root: &Path) -> Result<String, String> {
+    let head = run_bounded(
         Command::new("git")
             .arg("-C")
             .arg(root)
             .args(["rev-parse", "HEAD"]),
         GIT_TIMEOUT,
     );
-    decode_commit(&captured.exit, &captured.stdout)
+    let commit = decode_commit(&head.exit, &head.stdout)?;
+    let status = run_bounded(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["status", "--porcelain"]),
+        GIT_TIMEOUT,
+    );
+    let uncommitted = decode_status(&status.exit, &status.stdout)?;
+    Ok(describe_revision(&commit, uncommitted))
 }
 
 #[cfg(test)]
@@ -135,7 +167,17 @@ mod tests {
             assert!(refusal.contains(&built_shown), "{refusal}");
             assert!(refusal.contains(&current_shown), "{refusal}");
         }
-        assert!(same_checkout(&root.join("loose/xtask"), &main).is_err());
+        for (built, current) in [
+            (root.join("loose/xtask"), main.clone()),
+            (main.join("xtask"), root.join("loose")),
+        ] {
+            let refusal = same_checkout(&built, &current).unwrap_err();
+            assert!(refusal.contains("is in no git checkout"), "{refusal}");
+            for path in [&built, &current] {
+                let shown = resolve(path).unwrap().display().to_string();
+                assert!(refusal.contains(&shown), "{refusal}");
+            }
+        }
         assert!(same_checkout(&main.join("absent"), &main).is_err());
         fs::remove_dir_all(&root).unwrap();
     }
@@ -145,6 +187,51 @@ mod tests {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let found = running_checkout().unwrap();
         assert_eq!(Some(found.as_path()), resolve(manifest).unwrap().parent());
+    }
+
+    fn git(root: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "user.name=xtask", "-c", "user.email=xtask@localhost"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(arguments)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?}");
+    }
+
+    #[test]
+    fn a_tree_with_uncommitted_changes_is_never_named_by_its_commit_alone() {
+        let root = env::temp_dir().join(format!("xtask-revision-test-{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(&root, &["add", "a.txt"]);
+        git(&root, &["commit", "-q", "-m", "one"]);
+        let clean = revision(&root).unwrap();
+        assert!(decode_commit(&Exit::Code(0), &clean).is_ok(), "{clean}");
+        fs::write(root.join("a.txt"), "two\n").unwrap();
+        fs::write(root.join("b.txt"), "new\n").unwrap();
+        let dirty = revision(&root).unwrap();
+        assert_eq!(dirty, format!("{clean} with 2 uncommitted changes"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn status_lines_count_as_uncommitted_changes_and_a_failed_status_is_an_error() {
+        assert_eq!(decode_status(&Exit::Code(0), ""), Ok(0));
+        assert_eq!(decode_status(&Exit::Code(0), " M a.txt\n?? b.txt\n"), Ok(2));
+        assert!(decode_status(&Exit::Code(128), "").is_err());
+        assert!(decode_status(&Exit::TimedOut, "").is_err());
+        assert_eq!(describe_revision("511cf42", 0), "511cf42");
+        assert_eq!(
+            describe_revision("511cf42", 1),
+            "511cf42 with 1 uncommitted changes"
+        );
     }
 
     #[test]

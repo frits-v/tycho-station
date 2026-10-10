@@ -1,6 +1,6 @@
-//! The ci test step: `mbx test --workspace --no-fail-fast` with cargo's and the test
-//! harness's output merged, decoded into one result per test binary, each reported with its
-//! resolved path and counts.
+//! The ci test step: `mbx test --workspace --no-fail-fast` without colour, with cargo's and
+//! the test harness's output merged, decoded into one result per test binary, each reported
+//! with its resolved path and counts.
 
 use std::fmt;
 use std::fs;
@@ -12,9 +12,12 @@ use crate::process::{run_bounded_merged, Exit};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const BINARIES_MAX: usize = 512;
-const RUNNING_PREFIX: &str = "Running ";
-const DOC_TESTS_PREFIX: &str = "Doc-tests ";
+/// Cargo right-aligns its status verbs in twelve columns.
+const RUNNING_PREFIX: &str = "     Running ";
+const DOC_TESTS_PREFIX: &str = "   Doc-tests ";
 const RESULT_PREFIX: &str = "test result: ";
+/// Cargo's line after a binary that failed; with no result before it, the binary crashed.
+const BINARY_FAILED_PREFIX: &str = "error: test failed, to rerun pass ";
 
 /// One line of merged `cargo test` output.
 #[derive(Debug, PartialEq, Eq)]
@@ -25,6 +28,8 @@ pub enum TestLine {
     DocTests { package: String },
     /// The harness's last line for one binary.
     Result(Counts),
+    /// Cargo reports that a binary failed and names how to rerun it.
+    BinaryFailed,
     /// A `test result:` line whose counts do not parse.
     Unrecognised(String),
     /// Anything else: test names, panics, compiler and mbx lines.
@@ -84,21 +89,26 @@ fn result_counts(rest: &str) -> Option<Counts> {
     })
 }
 
+/// Decodes one line by its exact prefix, the indentation included, so text a test prints
+/// matches only when it reproduces cargo's or the harness's layout.
 pub fn decode_line(line: &str) -> TestLine {
-    let trimmed = line.trim();
-    if let Some(rest) = trimmed.strip_prefix(RESULT_PREFIX) {
-        return result_counts(rest).map_or_else(
-            || TestLine::Unrecognised(format!("unreadable result: {trimmed}")),
+    if let Some(rest) = line.strip_prefix(RESULT_PREFIX) {
+        return result_counts(rest.trim_end()).map_or_else(
+            || TestLine::Unrecognised(format!("unreadable result: {line}")),
             TestLine::Result,
         );
     }
-    if let Some(package) = trimmed.strip_prefix(DOC_TESTS_PREFIX) {
+    if line.starts_with(BINARY_FAILED_PREFIX) {
+        return TestLine::BinaryFailed;
+    }
+    if let Some(package) = line.strip_prefix(DOC_TESTS_PREFIX) {
         return TestLine::DocTests {
-            package: package.to_string(),
+            package: package.trim_end().to_string(),
         };
     }
-    let started = trimmed
+    let started = line
         .strip_prefix(RUNNING_PREFIX)
+        .map(str::trim_end)
         .and_then(|rest| rest.strip_suffix(')'))
         .and_then(|rest| rest.rsplit_once(" ("));
     match started {
@@ -127,38 +137,48 @@ pub fn totals(runs: &[BinaryRun]) -> Totals {
     }
 }
 
-/// Pairs each binary cargo starts with the one result its harness prints. A binary without a
-/// result (it crashed), a result without a binary, no binary at all, no test passed, or an
-/// exit that disagrees with the results is unrecognised.
+type Open = Option<(String, Option<String>)>;
+
+/// Pairs each binary cargo starts with the one result its harness prints. A header is taken
+/// only while no binary is open, and a result only while one is, so a test's own output in
+/// between is never read as either. A binary that cargo reports failed before it printed a
+/// result (it crashed), a result with no binary open, output that ends with a binary open,
+/// no binary, no passed test, or an exit that disagrees with the results is unrecognised.
 pub fn decode(exit: &Exit, output: &str) -> TestOutcome {
+    if *exit == Exit::OutputStillOpen {
+        return TestOutcome::Unrecognised("output still open after cargo exited".to_string());
+    }
     let mut runs: Vec<BinaryRun> = Vec::new();
-    let mut started: Option<(String, Option<String>)> = None;
+    let mut open: Open = None;
     for line in output.lines() {
-        let header = match decode_line(line) {
-            TestLine::Running { source, binary } => (source, Some(binary)),
-            TestLine::DocTests { package } => (format!("doc-tests {package}"), None),
-            TestLine::Result(counts) => {
-                let Some((label, binary)) = started.take() else {
-                    return TestOutcome::Unrecognised(format!("a result with no binary: {line}"));
-                };
+        match (decode_line(line), open.take()) {
+            (TestLine::Running { source, binary }, None) => open = Some((source, Some(binary))),
+            (TestLine::DocTests { package }, None) => {
+                open = Some((format!("doc-tests {package}"), None));
+            }
+            (TestLine::Result(counts), Some((label, binary))) => {
+                if runs.len() >= BINARIES_MAX {
+                    return TestOutcome::Unrecognised(format!(
+                        "more than {BINARIES_MAX} test binaries"
+                    ));
+                }
                 runs.push(BinaryRun {
                     label,
                     binary,
                     counts,
                 });
-                continue;
             }
-            TestLine::Unrecognised(reason) => return TestOutcome::Unrecognised(reason),
-            TestLine::Other => continue,
-        };
-        if let Some((label, _)) = started.replace(header) {
-            return TestOutcome::Unrecognised(format!("{label} printed no test result"));
-        }
-        if runs.len() >= BINARIES_MAX {
-            return TestOutcome::Unrecognised(format!("more than {BINARIES_MAX} test binaries"));
+            (TestLine::Result(_), None) => {
+                return TestOutcome::Unrecognised(format!("a result with no binary: {line}"));
+            }
+            (TestLine::BinaryFailed, Some((label, _))) => {
+                return TestOutcome::Unrecognised(format!("{label} failed without a test result"));
+            }
+            (TestLine::Unrecognised(reason), _) => return TestOutcome::Unrecognised(reason),
+            (_, still_open) => open = still_open,
         }
     }
-    if let Some((label, _)) = started {
+    if let Some((label, _)) = open {
         return TestOutcome::Unrecognised(format!("{label} printed no test result"));
     }
     judge(exit, runs)
@@ -214,7 +234,16 @@ pub struct Failure {
 
 pub fn test() -> Result<Totals, Failure> {
     let captured = run_bounded_merged(
-        Command::new("mbx").args(["test", "--workspace", "--no-fail-fast"]),
+        Command::new("mbx").args([
+            "test",
+            "--workspace",
+            "--no-fail-fast",
+            "--color",
+            "never",
+            "--",
+            "--color",
+            "never",
+        ]),
         TEST_TIMEOUT,
     );
     match decode(&captured.exit, &captured.stdout) {
@@ -283,6 +312,14 @@ mod tests {
             TestLine::Unrecognised(_)
         ));
         assert_eq!(decode_line("running 138 tests"), TestLine::Other);
+        assert_eq!(
+            decode_line("error: test failed, to rerun pass `-p xtask --bin xtask`"),
+            TestLine::BinaryFailed
+        );
+        assert_eq!(
+            decode_line("Running unittests src/main.rs (target/debug/deps/x-1)"),
+            TestLine::Other
+        );
     }
 
     #[test]
@@ -321,8 +358,29 @@ mod tests {
     }
 
     #[test]
+    fn a_header_printed_by_a_test_while_its_binary_is_open_is_not_a_new_binary() {
+        let output = lines(&[
+            RUNNING_XTASK,
+            "---- tests::x stdout ----",
+            RUNNING_LIB,
+            DOC_TESTS,
+            PASSED_XTASK,
+        ]);
+        let TestOutcome::Passed(runs) = decode(&Exit::Code(0), &output) else {
+            panic!("expected a pass");
+        };
+        assert_eq!(totals(&runs).binaries, 1);
+        assert_eq!(runs.first().map(|run| run.counts.passed), Some(138));
+    }
+
+    #[test]
     fn output_that_does_not_account_for_every_binary_is_unrecognised() {
-        let crashed = lines(&[RUNNING_LIB, RUNNING_XTASK, PASSED_XTASK]);
+        let crashed = lines(&[
+            RUNNING_LIB,
+            "error: test failed, to rerun pass `-p tycho --lib`",
+            RUNNING_XTASK,
+            PASSED_XTASK,
+        ]);
         let orphan = lines(&[PASSED, RUNNING_XTASK, PASSED_XTASK]);
         let unfinished = lines(&[RUNNING_LIB, PASSED, RUNNING_XTASK]);
         for output in [crashed, orphan, unfinished] {
@@ -331,6 +389,14 @@ mod tests {
                 TestOutcome::Unrecognised(_)
             ));
         }
+    }
+
+    #[test]
+    fn output_held_open_after_cargo_exited_is_named() {
+        assert_eq!(
+            decode(&Exit::OutputStillOpen, ""),
+            TestOutcome::Unrecognised("output still open after cargo exited".to_string())
+        );
     }
 
     #[test]
@@ -345,6 +411,7 @@ mod tests {
             (Exit::Code(0), empty.as_str()),
             (Exit::Code(101), "error: could not compile `xtask`"),
             (Exit::Code(0), ""),
+            (Exit::OutputStillOpen, ""),
         ] {
             assert!(
                 matches!(decode(&exit, output), TestOutcome::Unrecognised(_)),

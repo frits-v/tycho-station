@@ -20,6 +20,9 @@ pub enum Exit {
     TimedOut,
     OutputTooLarge,
     OutputUnreadable,
+    /// The child exited cleanly but its output pipe stayed open past the reader deadline,
+    /// held by a process it started.
+    OutputStillOpen,
     NotStarted(String),
 }
 
@@ -215,20 +218,31 @@ fn read_echoed<W: Write + Send + 'static>(pipe: PipeReader, mut echo: W) -> Read
 }
 
 /// The text a reader kept and the exit to report: a reader's own failure overrides a clean
-/// exit, and a reader that never answered turns a clean exit into `OutputUnreadable`.
+/// exit, a reader that did not finish by the deadline turns a clean exit into
+/// `OutputStillOpen`, and a missing pipe turns it into `OutputUnreadable`.
 fn collect(reader: Option<ReaderResult>, exit: Exit) -> (String, Exit) {
-    let Some(Ok((kept, reader_state))) =
-        reader.map(|receiver| receiver.recv_timeout(READER_JOIN_TIMEOUT))
-    else {
-        let exit = if exit == Exit::Code(0) {
-            Exit::OutputUnreadable
-        } else {
-            exit
-        };
-        return (String::new(), exit);
+    let Some(receiver) = reader else {
+        return (
+            String::new(),
+            clean_exit_becomes(exit, Exit::OutputUnreadable),
+        );
+    };
+    let Ok((kept, reader_state)) = receiver.recv_timeout(READER_JOIN_TIMEOUT) else {
+        return (
+            String::new(),
+            clean_exit_becomes(exit, Exit::OutputStillOpen),
+        );
     };
     let text = String::from_utf8_lossy(&kept).into_owned();
     (text, reader_state.unwrap_or(exit))
+}
+
+fn clean_exit_becomes(exit: Exit, instead: Exit) -> Exit {
+    if exit == Exit::Code(0) {
+        instead
+    } else {
+        exit
+    }
 }
 
 fn wait_with_deadline(child: &mut std::process::Child, timeout: Duration) -> Exit {
@@ -326,6 +340,20 @@ mod tests {
             std::io::sink(),
         );
         assert!(matches!(missing.exit, Exit::NotStarted(_)));
+    }
+
+    #[test]
+    fn a_reader_that_never_answers_after_a_clean_exit_is_output_still_open() {
+        let (sender, receiver) = mpsc::channel();
+        drop(sender);
+        assert_eq!(
+            collect(Some(receiver), Exit::Code(0)),
+            (String::new(), Exit::OutputStillOpen)
+        );
+        let (sender, receiver) = mpsc::channel::<(Vec<u8>, Option<Exit>)>();
+        drop(sender);
+        assert_eq!(collect(Some(receiver), Exit::Code(101)).1, Exit::Code(101));
+        assert_eq!(collect(None, Exit::Code(0)).1, Exit::OutputUnreadable);
     }
 
     #[test]

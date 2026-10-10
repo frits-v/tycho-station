@@ -21,7 +21,7 @@ check is not repeated in any instruction file. "review" means a reader rejects i
 | Assertions at boundaries (entry, parsing, ingress, persistence, external calls), each with a negative test | review |
 | A check reports how many things it examined; zero is a failure | `xtask` `finish`; review for new checks |
 | A probe that could not run is a failure, never not applicable | review |
-| `xtask ci` runs in the checkout it was built from, runs every test binary, and closes with the steps, the tests that passed, the checkout and the commit; its exit code is the step results | `checkout::same_checkout`, `test_step::decode` and `ci_summary` in the xtask, each with its tests |
+| `xtask ci` runs in the checkout it was built from, runs every test binary, and closes with the passed, skipped and failed steps, the test counts, the checkout, the commit and any uncommitted changes; its exit code is the step results | `checkout::same_checkout`, `checkout::revision`, `test_step::decode` and `ci_summary` in the xtask, each with its tests; `xtask/tests/ci_checkout.rs` |
 | Specific names; no `tmp`, `ctx`, `obj`, `arr`, `cfg` unless a framework imposes it | `xtask check-names` |
 | A cargo build started from Rust goes through `mbx` by name (`mbx clippy`, `mbx test`); `cargo fmt` is not a build and stays | `xtask opengrep` (`rust-cargo-build-bypasses-mbx`) |
 | Every `allow` states a reason | clippy `allow_attributes_without_reason` |
