@@ -35,8 +35,8 @@ mandate: #Mandate & {
 			pending: false
 		}
 		setup: {
-			what:    "xtask setup checks, on the agent user's side, that the agent user's primary group is tycho-agent and not staff, that no credential file exists, and that no keychain item exists for a forbidden service."
-			runs:    "on demand, once per side"
+			what:    "xtask provision-agent creates the agent user with its own primary group tycho-agent, the shared group and the socket directories, each step verified by the setup probe it answers; xtask setup checks, on the agent user's side, that the agent user's primary group is tycho-agent and not staff, that no credential file exists, and that no keychain item exists for a forbidden service."
+			runs:    "on demand, once per side; provisioning once per machine as the developer"
 			record:  "not_recorded"
 			pending: false
 		}
