@@ -10,9 +10,13 @@ use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::thread;
+use std::time::Duration;
 
 use nix::fcntl::{fcntl, FcntlArg, FdFlag};
 use nix::sys::socket::{bind, socket, AddressFamily, SockFlag, SockType, UnixAddr};
+
+/// How long a fixture waits for a client's half-close, so a failed post never blocks it.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A listener that takes `connections` posts in turn and returns what each one sent.
 ///
@@ -30,6 +34,7 @@ pub fn listener_for(
         let mut received = Vec::with_capacity(connections);
         for _ in 0..connections {
             let (mut stream, _) = listener.accept().unwrap();
+            stream.set_read_timeout(Some(READ_TIMEOUT)).unwrap();
             let mut text = String::new();
             stream.read_to_string(&mut text).unwrap();
             stream.write_all(reply).unwrap();
