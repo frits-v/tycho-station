@@ -8,7 +8,7 @@ use std::time::Duration;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use ureq::Agent;
 
-pub const GITHUB_API: &str = "https://api.github.com";
+const GITHUB_API: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
 const USER_AGENT: &str = "tycho-xtask";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -31,7 +31,7 @@ pub enum Reply {
 }
 
 /// An agent that never follows a redirect, ignores proxy variables, and, when `https_only`,
-/// refuses plain HTTP; tests turn that off to talk to a local listener.
+/// refuses plain HTTP; only tests build one without it, to talk to a loopback listener.
 fn agent(https_only: bool) -> Agent {
     let tls = TlsConfig::builder()
         .provider(TlsProvider::Rustls)
@@ -60,34 +60,71 @@ const fn failure(error: &ureq::Error) -> &'static str {
     }
 }
 
-/// Sends one request to `base` + `path` with `credential` as the bearer token and reads the
-/// body up to [`RESPONSE_MAX_BYTES`].
-pub fn request(
-    base: &str,
+/// A client for one API base. Outside tests the only one is GitHub's, HTTPS only.
+#[derive(Debug)]
+pub struct Client {
+    base: String,
+    agent: Agent,
+}
+
+impl Client {
+    pub fn github() -> Self {
+        Self {
+            base: GITHUB_API.to_string(),
+            agent: agent(true),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn loopback(base: &str) -> Self {
+        Self {
+            base: base.to_string(),
+            agent: agent(false),
+        }
+    }
+
+    /// Sends one request to the base + `path` with `credential` as the bearer token and reads
+    /// the body up to [`RESPONSE_MAX_BYTES`].
+    pub fn request(
+        &self,
+        method: Method,
+        path: &str,
+        credential: &str,
+        json_body: Option<&str>,
+    ) -> Reply {
+        send(
+            &self.agent,
+            &format!("{}{path}", self.base),
+            method,
+            credential,
+            json_body,
+        )
+    }
+}
+
+fn send(
+    agent: &Agent,
+    url: &str,
     method: Method,
-    path: &str,
     credential: &str,
     json_body: Option<&str>,
 ) -> Reply {
-    let https_only = base.starts_with("https://");
-    let agent = agent(https_only);
-    let url = format!("{base}{path}");
     let authorization = format!("Bearer {credential}");
     let sent = match method {
         Method::Get => agent
-            .get(&url)
+            .get(url)
             .header("Authorization", &authorization)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", API_VERSION)
             .call(),
         Method::Delete => agent
-            .delete(&url)
+            .delete(url)
             .header("Authorization", &authorization)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", API_VERSION)
             .call(),
         Method::Post => agent
-            .post(&url)
+            .post(url)
             .header("Authorization", &authorization)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", API_VERSION)
@@ -187,8 +224,7 @@ pub mod tests {
     #[test]
     fn the_credential_travels_once_as_a_bearer_header() {
         let (base, seen) = listener(vec![(200, r#"{"id":42}"#.to_string())]);
-        let reply = request(
-            &base,
+        let reply = Client::loopback(&base).request(
             Method::Get,
             "/repos/o/r/installation",
             "the.jwt.value",
@@ -226,7 +262,8 @@ pub mod tests {
                 .saturating_add(1),
         );
         let (base, seen) = listener(vec![(201, oversized)]);
-        let reply = request(&base, Method::Post, "/p", "credential", Some(r#"{"a":1}"#));
+        let reply =
+            Client::loopback(&base).request(Method::Post, "/p", "credential", Some(r#"{"a":1}"#));
         assert_eq!(reply, Reply::BodyTooLarge);
         let requests = seen.recv().unwrap();
         let raw = requests.first().unwrap();
@@ -240,8 +277,63 @@ pub mod tests {
         let base = format!("http://{}", unused.local_addr().unwrap());
         drop(unused);
         assert_eq!(
-            request(&base, Method::Get, "/", "secret", None),
+            Client::loopback(&base).request(Method::Get, "/", "secret", None),
             Reply::Failed("the connection failed")
+        );
+    }
+
+    #[test]
+    fn the_github_client_is_https_only_without_proxy_or_redirects() {
+        let client = Client::github();
+        let config = client.agent.config();
+        assert!(config.https_only());
+        assert!(config.proxy().is_none());
+        assert_eq!(config.max_redirects(), 0);
+        let plain = Client {
+            base: "http://127.0.0.1:9".to_string(),
+            agent: agent(true),
+        };
+        assert_eq!(
+            plain.request(Method::Get, "/", "secret", None),
+            Reply::Failed("the URL is not HTTPS")
+        );
+    }
+
+    #[test]
+    fn a_redirect_is_returned_not_followed() {
+        let second = TcpListener::bind("127.0.0.1:0").unwrap();
+        second.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/elsewhere", second.local_addr().unwrap());
+        let bound = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", bound.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = bound.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let raw = read_request(&mut stream);
+            let reply = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+            raw
+        });
+        let reply = Client::loopback(&base).request(Method::Get, "/start", "secret", None);
+        assert_eq!(
+            reply,
+            Reply::Response {
+                status: 302,
+                body: String::new()
+            }
+        );
+        assert!(server
+            .join()
+            .unwrap()
+            .starts_with("GET /start HTTP/1.1\r\n"));
+        let followed = second.accept();
+        assert!(
+            matches!(&followed, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{followed:?}"
         );
     }
 

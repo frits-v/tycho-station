@@ -169,8 +169,9 @@ GitHub App installation token that the xtask mints for each run:
   ```
 
   `TYCHO_RELEASE_APP_ID` with the numeric App id is accepted in place of the client id; when
-  both are set the client id is used. Then delete any repository secret that holds a user token for this workflow, and revoke
-  that token in the account settings of the user who issued it.
+  both are set the client id is used. Then delete any repository secret that holds a user
+  token for this workflow, and revoke that token in the account settings of the user who
+  issued it.
 
 - Rotation: generate a new private key in the App settings, store it with the same
   `gh secret set` command, delete the local file, then delete the old key in the App

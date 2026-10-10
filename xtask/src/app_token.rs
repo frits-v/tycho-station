@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 
-use crate::github_api::{self, github_message, Method, Reply, GITHUB_API};
+use crate::github_api::{github_message, Client, Method, Reply};
 
 pub const CLIENT_ID_VARIABLE: &str = "TYCHO_RELEASE_CLIENT_ID";
 pub const APP_ID_VARIABLE: &str = "TYCHO_RELEASE_APP_ID";
@@ -354,11 +354,11 @@ pub fn mint(
     credentials: &AppCredentials,
     repository: &Repository,
 ) -> Result<InstallationToken, String> {
-    mint_at(GITHUB_API, credentials, repository, unix_now()?)
+    mint_at(&Client::github(), credentials, repository, unix_now()?)
 }
 
 fn mint_at(
-    base: &str,
+    client: &Client,
     credentials: &AppCredentials,
     repository: &Repository,
     now: u64,
@@ -368,14 +368,8 @@ fn mint_at(
         "/repos/{}/{}/installation",
         repository.owner, repository.name
     );
-    let (status, body) = response(github_api::request(
-        base,
-        Method::Get,
-        &lookup_path,
-        &jwt,
-        None,
-    ))
-    .map_err(|reason| format!("the installation lookup failed: {reason}"))?;
+    let (status, body) = response(client.request(Method::Get, &lookup_path, &jwt, None))
+        .map_err(|reason| format!("the installation lookup failed: {reason}"))?;
     let installation = match decode_installation(status, &body) {
         InstallationOutcome::Found(id) => id,
         InstallationOutcome::Failed(status, message) => {
@@ -391,20 +385,15 @@ fn mint_at(
     };
     let token_path = format!("/app/installations/{installation}/access_tokens");
     let request_body = access_token_body(repository);
-    let (status, body) = response(github_api::request(
-        base,
-        Method::Post,
-        &token_path,
-        &jwt,
-        Some(&request_body),
-    ))
-    .map_err(|reason| format!("the installation token request failed: {reason}"))?;
+    let (status, body) =
+        response(client.request(Method::Post, &token_path, &jwt, Some(&request_body)))
+            .map_err(|reason| format!("the installation token request failed: {reason}"))?;
     let outcome = decode_access_token(status, &body, repository);
     let reason = describe_token_failure(&outcome);
     match outcome {
         TokenOutcome::Issued(token) => Ok(token),
         TokenOutcome::Overgranted(token) | TokenOutcome::UnreadableGrant(token) => {
-            Err(match revoke_at(base, &token) {
+            Err(match revoke_at(client, &token) {
                 Ok(()) => format!("{reason}; the token is revoked"),
                 Err(revocation) => format!("{reason}; {revocation}"),
             })
@@ -415,17 +404,11 @@ fn mint_at(
 
 /// Revokes the token so it does not outlive the job that minted it.
 pub fn revoke(token: &InstallationToken) -> Result<(), String> {
-    revoke_at(GITHUB_API, token)
+    revoke_at(&Client::github(), token)
 }
 
-fn revoke_at(base: &str, token: &InstallationToken) -> Result<(), String> {
-    let revoked = github_api::request(
-        base,
-        Method::Delete,
-        "/installation/token",
-        token.expose(),
-        None,
-    );
+fn revoke_at(client: &Client, token: &InstallationToken) -> Result<(), String> {
+    let revoked = client.request(Method::Delete, "/installation/token", token.expose(), None);
     match response(revoked) {
         Ok((status, _)) if succeeded(status) => Ok(()),
         Ok((status, body)) => Err(format!(
@@ -834,6 +817,7 @@ mod tests {
             pkcs1.clone(),
             pkcs8.clone(),
             pkcs1.replace('\n', "\r\n"),
+            pkcs8.replace('\n', "\r\n"),
             format!("\n{pkcs1}\n\n"),
             format!("\r\n{pkcs8}"),
         ] {
@@ -867,11 +851,11 @@ mod tests {
     fn mint_sends_the_jwt_as_a_bearer_token_and_scopes_the_request() {
         let (credentials, public) = client_credentials();
         let exact = r#"{"contents":"write","pull_requests":"write","metadata":"read"}"#;
-        let (base, seen) = github_api::tests::listener(vec![
+        let (base, seen) = crate::github_api::tests::listener(vec![
             (200, r#"{"id":42}"#.to_string()),
             (201, token_response(exact, r#"[{"name":"tycho-station"}]"#)),
         ]);
-        let token = mint_at(&base, &credentials, &repository(), NOW).unwrap();
+        let token = mint_at(&Client::loopback(&base), &credentials, &repository(), NOW).unwrap();
         assert_eq!(token.expose(), TOKEN);
         let requests = seen.recv().unwrap();
         let [lookup, issue] = requests.as_slice() else {
@@ -913,12 +897,13 @@ mod tests {
         let (credentials, _) = client_credentials();
         let wider =
             r#"{"contents":"write","pull_requests":"write","metadata":"read","workflows":"write"}"#;
-        let (base, seen) = github_api::tests::listener(vec![
+        let (base, seen) = crate::github_api::tests::listener(vec![
             (200, r#"{"id":42}"#.to_string()),
             (201, token_response(wider, r#"[{"name":"tycho-station"}]"#)),
             (204, String::new()),
         ]);
-        let error = mint_at(&base, &credentials, &repository(), NOW).unwrap_err();
+        let error =
+            mint_at(&Client::loopback(&base), &credentials, &repository(), NOW).unwrap_err();
         assert!(
             error.contains("refusing it; the token is revoked"),
             "{error}"
@@ -936,11 +921,12 @@ mod tests {
     #[test]
     fn a_rejected_lookup_reports_githubs_message_and_no_credential() {
         let (credentials, _) = client_credentials();
-        let (base, seen) = github_api::tests::listener(vec![(
+        let (base, seen) = crate::github_api::tests::listener(vec![(
             401,
             r#"{"message":"A JSON web token could not be decoded","status":"401"}"#.to_string(),
         )]);
-        let error = mint_at(&base, &credentials, &repository(), NOW).unwrap_err();
+        let error =
+            mint_at(&Client::loopback(&base), &credentials, &repository(), NOW).unwrap_err();
         let jwt = bearer_of(seen.recv().unwrap().first().unwrap());
         assert!(
             error.contains("ended HTTP 401, A JSON web token could not be decoded"),
