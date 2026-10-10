@@ -740,6 +740,9 @@ fn outcome_result(program: &str, outcome: &CommandOutcome) -> Result<(), String>
     match outcome {
         CommandOutcome::Succeeded => Ok(()),
         CommandOutcome::SudoRefused(line) => Err(format!("sudo refused: {line}")),
+        CommandOutcome::Failed(line) if program == RMDIR => Err(format!(
+            "{program} failed: {line}; {FOREIGN_SOCKET_DIR_HINT}"
+        )),
         CommandOutcome::Failed(line) => Err(format!("{program} failed: {line}")),
         CommandOutcome::NotFinished(why) => Err(format!("{program} {why}")),
         CommandOutcome::Unrecognised(line) => {
@@ -804,14 +807,6 @@ fn verify(remedy: Remedy, snapshot: &Snapshot) -> Result<(), String> {
     }
 }
 
-fn failure(remedy: Remedy, why: &str) -> String {
-    if remedy == Remedy::RemoveForeignAgentSocketDir {
-        format!("{}: {why}; {FOREIGN_SOCKET_DIR_HINT}", remedy.label())
-    } else {
-        format!("{}: {why}", remedy.label())
-    }
-}
-
 /// Runs the planned steps in order, each only while still needed, each verified after.
 fn apply(host: &mut impl Host, steps: &[Remedy], initial: Snapshot) -> Result<Snapshot, String> {
     let mut latest = initial;
@@ -836,7 +831,7 @@ fn apply(host: &mut impl Host, steps: &[Remedy], initial: Snapshot) -> Result<Sn
         for line in render(&action) {
             println!("  {line}");
         }
-        execute(host, &action, &latest).map_err(|why| failure(remedy, &why))?;
+        execute(host, &action, &latest).map_err(|why| format!("{}: {why}", remedy.label()))?;
         latest = host.snapshot()?;
         verify(remedy, &latest)?;
     }
@@ -1379,9 +1374,18 @@ mod tests {
             "",
             "rmdir: /Users/Shared/tycho-agent-zmx: Directory not empty\n",
         ));
-        let stopped = apply(&mut host, &plan(&stranger).steps, stranger);
+        let stopped = apply(&mut host, &plan(&stranger).steps, stranger.clone());
         assert!(stopped.is_err_and(|why| why.contains(FOREIGN_SOCKET_DIR_HINT)));
         assert!(host.directory_calls.is_empty());
+        for refusal in [
+            captured(Exit::Code(1), "", "sudo: a password is required\n"),
+            captured(Exit::TimedOut, "", ""),
+        ] {
+            let mut refused = RecordingHost::new(vec![stranger.clone()]);
+            refused.root_results.push_back(refusal);
+            let stopped = apply(&mut refused, &plan(&stranger).steps, stranger.clone());
+            assert!(stopped.is_err_and(|why| !why.contains(FOREIGN_SOCKET_DIR_HINT)));
+        }
     }
 
     #[test]

@@ -1232,7 +1232,8 @@ enum AgentInGroup {
 }
 
 /// The ACL is read in order and its first entry about search decides; only then do the mode
-/// bits count. An allow entry for anyone but the developer is taken as reaching the agent.
+/// bits count. An allow entry for anyone but the developer is taken as reaching the agent. An
+/// `only_inherit` entry applies to what is created inside the home, not to the home itself.
 fn home_search_status(
     entries: &[AclEntry],
     mode: u32,
@@ -1241,11 +1242,13 @@ fn home_search_status(
 ) -> Status {
     let developer_principal = format!("user:{developer}");
     for entry in entries {
-        if !entry
-            .permissions
-            .iter()
-            .any(|permission| permission == "search")
-        {
+        let names = |wanted: &str| {
+            entry
+                .permissions
+                .iter()
+                .any(|permission| permission == wanted)
+        };
+        if !names("search") || names("only_inherit") {
             continue;
         }
         if !entry.allows && entry.principal == HOME_DENY_PRINCIPAL {
@@ -2127,6 +2130,11 @@ mod tests {
         let allow_first = "drwxr-x---+ 3 frits  staff  96 Oct  9 21:16 d\n 0: group:staff allow list,search\n 1: user:tycho-agent deny list,search,readattr,readextattr\n";
         assert!(matches!(
             home_search_status(&entries(allow_first), 0o700, "frits", AgentInGroup::Member),
+            Status::Wrong { .. }
+        ));
+        let inherit_only = "drwxr-x---+ 3 frits  staff  96 Oct  9 21:16 d\n 0: user:tycho-agent deny list,search,readattr,readextattr,directory_inherit,only_inherit\n";
+        assert!(matches!(
+            home_search_status(&entries(inherit_only), 0o750, "frits", AgentInGroup::Member),
             Status::Wrong { .. }
         ));
         let owner_allow = "drwxr-x---+ 3 frits  staff  96 Oct  9 21:16 d\n 0: user:frits allow list,search\n 1: user:tycho-agent deny list,search,readattr,readextattr\n";
