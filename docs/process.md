@@ -122,16 +122,21 @@ update, and release-plz updates it on every push, so the `release-pr` job opens 
 GitHub App installation token that the xtask mints for each run:
 
 - The xtask signs an RS256 JWT with the App's private key (`iat` sixty seconds in the
-  past, `exp` ten minutes after `iat`), looks up the App's installation on this
+  past, `exp` ten minutes after `iat`, `iss` the App's client id from
+  `TYCHO_RELEASE_CLIENT_ID`, or its numeric App id from `TYCHO_RELEASE_APP_ID` when no
+  client id is set; GitHub prefers the client id), looks up the App's installation on this
   repository, and requests an installation token limited to this repository and to
   Contents and Pull requests write. A token whose grant is wider, or whose grant the
   response does not state, it refuses and revokes. The token reaches release-plz as
-  `GIT_TOKEN` in its environment and is revoked when release-plz exits. The key, the JWT
-  and the token never appear in arguments, output, errors or child environments: gh runs
-  in a new empty private directory that is also its `GH_CONFIG_DIR`, with `PATH`,
-  `TMPDIR` and the locale from the job, telemetry off and the credential in `GH_TOKEN`;
-  release-plz and the processes it starts get the job's environment without the App id
-  and key.
+  `GIT_TOKEN` in its environment and is revoked when release-plz exits. The xtask makes
+  the lookup, the token request and the revocation itself, over HTTPS (rustls on
+  aws-lc-rs, the webpki roots compiled in, no proxy, no redirects), sending the JWT or
+  the token as `Authorization: Bearer`; GitHub reads an App JWT only under that scheme.
+  The key, the JWT and the token never appear in arguments, output, errors or child
+  environments: no child process sees the JWT, release-plz sees the token only as
+  `GIT_TOKEN`, and release-plz and the processes it starts get the job's environment
+  without the App's ids and key. An error names GitHub's status and its message when the
+  message reads as plain text.
 - The workflow builds the xtask in a step without the key, then runs the built binary in
   the step that holds it, so no build script or proc-macro inherits the key. A build
   script in the build step can still write `$GITHUB_ENV` or replace `target/debug/xtask`,
@@ -148,8 +153,9 @@ GitHub App installation token that the xtask mints for each run:
   repository permissions Contents and Pull requests set to read and write and nothing
   else, installable only on this account. Install it on this repository only. Create the
   `release` environment limited to the default branch, so a workflow on any other branch
-  cannot read its secret. Generate a private key, then store the App id and the key in
-  the environment and delete the downloaded file:
+  cannot read its secret. Generate a private key, then store the App's client id (shown
+  on the App's settings page) and the key in the environment and delete the downloaded
+  file:
 
   ```sh
   gh api -X PUT repos/frits-v/tycho-station/environments/release \
@@ -157,21 +163,23 @@ GitHub App installation token that the xtask mints for each run:
     -F 'deployment_branch_policy[custom_branch_policies]=true'
   gh api -X POST repos/frits-v/tycho-station/environments/release/deployment-branch-policies \
     -f name=main -f type=branch
-  gh variable set TYCHO_RELEASE_APP_ID -R frits-v/tycho-station --env release --body <app-id>
+  gh variable set TYCHO_RELEASE_CLIENT_ID -R frits-v/tycho-station --env release --body <client-id>
   gh secret set TYCHO_RELEASE_APP_PRIVATE_KEY -R frits-v/tycho-station --env release < key.pem
   rm key.pem
   ```
 
-  Then delete any repository secret that holds a user token for this workflow, and revoke
-  that token in the account settings of the user who issued it.
+  `TYCHO_RELEASE_APP_ID` with the numeric App id is accepted in place of the client id; when
+  both are set the client id is used. Then delete any repository secret that holds a user
+  token for this workflow, and revoke that token in the account settings of the user who
+  issued it.
 
 - Rotation: generate a new private key in the App settings, store it with the same
   `gh secret set` command, delete the local file, then delete the old key in the App
   settings. The next `release-pr` run uses the new key.
 - The first run that names the `release` environment creates it without a branch policy
-  if it does not exist yet; the `PUT` above sets the policy either way. Until the variable
-  and the secret exist in it, the `release-pr` job fails with a message naming both and
-  this section; the `release` and `binaries` jobs use the
+  if it does not exist yet; the `PUT` above sets the policy either way. Until a client id
+  or App id variable and the secret exist in it, the `release-pr` job fails with a message
+  naming them and this section; the `release` and `binaries` jobs use the
   workflow's own `GITHUB_TOKEN` and are unaffected. A key that does not belong to the App
-  id, or an App not installed on this repository, fails the installation lookup with
+  the id names, or an App not installed on this repository, fails the installation lookup with
   GitHub's message.

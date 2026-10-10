@@ -1,0 +1,368 @@
+//! Calls to the GitHub REST API made in process, so a credential travels only as an
+//! `Authorization: Bearer` header inside the TLS stream: never in a child process's arguments,
+//! environment or output. TLS is rustls on aws-lc-rs with the webpki root store compiled in.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+use ureq::Agent;
+
+const GITHUB_API: &str = "https://api.github.com";
+const API_VERSION: &str = "2022-11-28";
+const USER_AGENT: &str = "tycho-xtask";
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const RESPONSE_MAX_BYTES: u64 = 256 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Method {
+    Get,
+    Post,
+    Delete,
+}
+
+/// What a request came back with. Transport failures carry a fixed description, never the
+/// error's text, so no header or URL detail can ride along.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Reply {
+    Response { status: u16, body: String },
+    BodyTooLarge,
+    Failed(&'static str),
+}
+
+/// An agent that never follows a redirect, ignores proxy variables, and, when `https_only`,
+/// refuses plain HTTP; only tests build one without it, to talk to a loopback listener.
+fn agent(https_only: bool) -> Agent {
+    let tls = TlsConfig::builder()
+        .provider(TlsProvider::Rustls)
+        .root_certs(RootCerts::WebPki)
+        .unversioned_rustls_crypto_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .build();
+    Agent::config_builder()
+        .tls_config(tls)
+        .https_only(https_only)
+        .proxy(None)
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .timeout_global(Some(REQUEST_TIMEOUT))
+        .user_agent(USER_AGENT)
+        .build()
+        .into()
+}
+
+const fn failure(error: &ureq::Error) -> &'static str {
+    match error {
+        ureq::Error::Timeout(_) => "the request timed out",
+        ureq::Error::Io(_) => "the connection failed",
+        ureq::Error::Tls(_) | ureq::Error::Rustls(_) => "the TLS handshake failed",
+        ureq::Error::RequireHttpsOnly(_) => "the URL is not HTTPS",
+        _ => "the request failed",
+    }
+}
+
+/// A client for one API base. Outside tests the only one is GitHub's, HTTPS only.
+#[derive(Debug)]
+pub struct Client {
+    base: String,
+    agent: Agent,
+}
+
+impl Client {
+    pub fn github() -> Self {
+        Self {
+            base: GITHUB_API.to_string(),
+            agent: agent(true),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn loopback(base: &str) -> Self {
+        Self {
+            base: base.to_string(),
+            agent: agent(false),
+        }
+    }
+
+    /// Sends one request to the base + `path` with `credential` as the bearer token and reads
+    /// the body up to [`RESPONSE_MAX_BYTES`].
+    pub fn request(
+        &self,
+        method: Method,
+        path: &str,
+        credential: &str,
+        json_body: Option<&str>,
+    ) -> Reply {
+        send(
+            &self.agent,
+            &format!("{}{path}", self.base),
+            method,
+            credential,
+            json_body,
+        )
+    }
+}
+
+fn send(
+    agent: &Agent,
+    url: &str,
+    method: Method,
+    credential: &str,
+    json_body: Option<&str>,
+) -> Reply {
+    let authorization = format!("Bearer {credential}");
+    let sent = match method {
+        Method::Get => agent
+            .get(url)
+            .header("Authorization", &authorization)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .call(),
+        Method::Delete => agent
+            .delete(url)
+            .header("Authorization", &authorization)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .call(),
+        Method::Post => agent
+            .post(url)
+            .header("Authorization", &authorization)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", API_VERSION)
+            .content_type("application/json")
+            .send(json_body.unwrap_or("{}")),
+    };
+    let mut response = match sent {
+        Ok(response) => response,
+        Err(error) => return Reply::Failed(failure(&error)),
+    };
+    let status = response.status().as_u16();
+    match response
+        .body_mut()
+        .with_config()
+        .limit(RESPONSE_MAX_BYTES)
+        .read_to_string()
+    {
+        Ok(body) => Reply::Response { status, body },
+        Err(ureq::Error::BodyExceedsLimit(_)) => Reply::BodyTooLarge,
+        Err(error) => Reply::Failed(failure(&error)),
+    }
+}
+
+/// GitHub's `message` from an error body, kept only when it reads as a short sentence: no word
+/// longer than 32 characters and only letters, digits, spaces and plain punctuation, so a body
+/// that echoes a token, a JWT or key material contributes nothing.
+pub fn github_message(body: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let message = value.get("message")?.as_str()?;
+    let plain = message.len() <= 160
+        && message
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || " .,'()-".contains(c))
+        && message.split(' ').all(|word| word.len() <= 32);
+    plain.then(|| message.to_string())
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    const REQUEST_MAX_BYTES: usize = 64 * 1024;
+
+    /// A one-connection-per-reply HTTP listener on loopback: answers each request with the next
+    /// canned `(status, body)` and hands back every raw request it read.
+    pub fn listener(replies: Vec<(u16, String)>) -> (String, mpsc::Receiver<Vec<String>>) {
+        let bound = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", bound.local_addr().unwrap());
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let mut seen = Vec::new();
+            for (status, body) in replies {
+                let (mut stream, _) = bound.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                seen.push(read_request(&mut stream));
+                let reply = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(reply.as_bytes()).unwrap();
+            }
+            sender.send(seen).unwrap();
+        });
+        (base, receiver)
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        let mut raw = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).unwrap();
+            raw.extend_from_slice(&chunk[..read]);
+            let text = String::from_utf8_lossy(&raw).into_owned();
+            if let Some(end) = text.find("\r\n\r\n") {
+                let length = text
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .map(str::to_string)
+                    })
+                    .map_or(0, |value| value.trim().parse::<usize>().unwrap());
+                if raw.len() >= end.saturating_add(4).saturating_add(length) {
+                    return text;
+                }
+            }
+            assert!(read > 0 && raw.len() < REQUEST_MAX_BYTES, "short request");
+        }
+    }
+
+    #[test]
+    fn the_credential_travels_once_as_a_bearer_header() {
+        let (base, seen) = listener(vec![(200, r#"{"id":42}"#.to_string())]);
+        let reply = Client::loopback(&base).request(
+            Method::Get,
+            "/repos/o/r/installation",
+            "the.jwt.value",
+            None,
+        );
+        assert_eq!(
+            reply,
+            Reply::Response {
+                status: 200,
+                body: r#"{"id":42}"#.to_string()
+            }
+        );
+        let requests = seen.recv().unwrap();
+        let raw = requests.first().unwrap();
+        assert!(
+            raw.starts_with("GET /repos/o/r/installation HTTP/1.1\r\n"),
+            "{raw}"
+        );
+        assert!(
+            raw.contains("\r\nauthorization: Bearer the.jwt.value\r\n")
+                || raw.contains("\r\nAuthorization: Bearer the.jwt.value\r\n"),
+            "{raw}"
+        );
+        assert_eq!(raw.matches("the.jwt.value").count(), 1, "{raw}");
+        assert!(raw
+            .to_ascii_lowercase()
+            .contains("\r\nx-github-api-version: 2022-11-28\r\n"));
+    }
+
+    #[test]
+    fn a_post_carries_its_json_body_and_a_body_over_the_cap_is_refused() {
+        let oversized = "x".repeat(
+            usize::try_from(RESPONSE_MAX_BYTES)
+                .unwrap()
+                .saturating_add(1),
+        );
+        let (base, seen) = listener(vec![(201, oversized)]);
+        let reply =
+            Client::loopback(&base).request(Method::Post, "/p", "credential", Some(r#"{"a":1}"#));
+        assert_eq!(reply, Reply::BodyTooLarge);
+        let requests = seen.recv().unwrap();
+        let raw = requests.first().unwrap();
+        assert!(raw.starts_with("POST /p HTTP/1.1\r\n"), "{raw}");
+        assert!(raw.ends_with("\r\n\r\n{\"a\":1}"), "{raw}");
+    }
+
+    #[test]
+    fn a_refused_connection_is_a_fixed_failure() {
+        let unused = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", unused.local_addr().unwrap());
+        drop(unused);
+        assert_eq!(
+            Client::loopback(&base).request(Method::Get, "/", "secret", None),
+            Reply::Failed("the connection failed")
+        );
+    }
+
+    #[test]
+    fn the_github_client_is_https_only_without_proxy_or_redirects() {
+        let client = Client::github();
+        let config = client.agent.config();
+        assert!(config.https_only());
+        assert!(config.proxy().is_none());
+        assert_eq!(config.max_redirects(), 0);
+        let plain = Client {
+            base: "http://127.0.0.1:9".to_string(),
+            agent: agent(true),
+        };
+        assert_eq!(
+            plain.request(Method::Get, "/", "secret", None),
+            Reply::Failed("the URL is not HTTPS")
+        );
+    }
+
+    #[test]
+    fn a_redirect_is_returned_not_followed() {
+        let second = TcpListener::bind("127.0.0.1:0").unwrap();
+        second.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/elsewhere", second.local_addr().unwrap());
+        let bound = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", bound.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = bound.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let raw = read_request(&mut stream);
+            let reply = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+            raw
+        });
+        let reply = Client::loopback(&base).request(Method::Get, "/start", "secret", None);
+        assert_eq!(
+            reply,
+            Reply::Response {
+                status: 302,
+                body: String::new()
+            }
+        );
+        assert!(server
+            .join()
+            .unwrap()
+            .starts_with("GET /start HTTP/1.1\r\n"));
+        let followed = second.accept();
+        assert!(
+            matches!(&followed, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{followed:?}"
+        );
+    }
+
+    #[test]
+    fn only_a_plain_short_message_is_kept() {
+        for (body, kept) in [
+            (
+                r#"{"message":"A JSON web token could not be decoded"}"#,
+                Some("A JSON web token could not be decoded"),
+            ),
+            (
+                r#"{"message":"Integration not found"}"#,
+                Some("Integration not found"),
+            ),
+            (
+                r#"{"message":"Bad credentials ghs_16C7e42F292c6912E7710c838347Ae178B4a"}"#,
+                None,
+            ),
+            (
+                r#"{"message":"key MIIEowIBAAKCAQEAxyzxyzxyzxyzxyzxyzxyzxyzxyzxyz"}"#,
+                None,
+            ),
+            (
+                r#"{"message":"eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiIxIn0.c2ln"}"#,
+                None,
+            ),
+            ("not json", None),
+        ] {
+            assert_eq!(github_message(body).as_deref(), kept, "{body}");
+        }
+    }
+}
