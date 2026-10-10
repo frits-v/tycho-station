@@ -13,7 +13,8 @@ use tycho_types::launcher::{EnvError, LauncherEnv, ENV_SESSION_NAME, ENV_VALUE_M
 use tycho_types::service::Service;
 
 use crate::agent_files::{read_checked, shred};
-use crate::config::{AgentDirs, AGENT_DIR_ENV, ZMX_ENV};
+use crate::config::{AgentDirs, CorePorts, AGENT_DIR_ENV, ZMX_ENV};
+use crate::config_store::{PortOffset, PortOffsetError, PORT_OFFSET_ENV};
 use crate::launch_probe::LAUNCH_PROBE_SERVICE;
 
 pub const HEARTBEAT_TARGET_ENV: &str = "TYCHO_HEARTBEAT_TARGET";
@@ -131,6 +132,7 @@ pub enum SettingsError {
     Tier(String),
     CoreUid,
     CurrentExe(std::io::Error),
+    PortOffset(PortOffsetError),
 }
 
 impl fmt::Display for SettingsError {
@@ -152,6 +154,7 @@ impl fmt::Display for SettingsError {
             ),
             Self::CoreUid => write!(formatter, "{CORE_UID_ENV} is not a uid"),
             Self::CurrentExe(error) => write!(formatter, "cannot find the tycho binary: {error}"),
+            Self::PortOffset(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -165,6 +168,8 @@ pub struct LauncherSettings {
     pub heartbeat: HeartbeatTarget,
     pub terminal: VendorTerminal,
     pub vendor_dir: Option<PathBuf>,
+    /// The core's ports: the production ports unless the spec names a test core's offset.
+    pub ports: CorePorts,
     /// The core's uid from a spec it wrote; the relay reads only the core's files.
     pub core_uid: Option<u32>,
     /// The spec pairs on the vendor allowlist; never the awaitable id or the secret.
@@ -227,6 +232,12 @@ impl LauncherSettings {
         } else {
             None
         };
+        let ports = environment
+            .get(PORT_OFFSET_ENV)
+            .map(|text| PortOffset::parse(text))
+            .transpose()
+            .map_err(SettingsError::PortOffset)?
+            .map_or(CorePorts::PRODUCTION, CorePorts::at);
         let allowed = |name: &str| {
             VENDOR_SPEC_ENV.contains(&name)
                 || AGENT_TELEMETRY_ENV
@@ -245,6 +256,7 @@ impl LauncherSettings {
             heartbeat,
             terminal,
             vendor_dir,
+            ports,
             core_uid: None,
             vendor_env,
             tier: None,
@@ -491,6 +503,28 @@ pub mod tests {
     }
 
     #[test]
+    fn the_spec_carries_a_test_core_offset_and_refuses_one_out_of_range() {
+        let dir = Path::new("/agent");
+        let production = LauncherSettings::from_map(&environment(dir)).unwrap();
+        assert_eq!(production.ports, CorePorts::PRODUCTION);
+        let mut offset = environment(dir);
+        offset.insert(PORT_OFFSET_ENV.to_string(), "1056".to_string());
+        let test_core = LauncherSettings::from_map(&offset).unwrap();
+        assert_eq!(test_core.ports.offset.get(), 1056);
+        for refused in ["0", "29824", "1025", "-1", ""] {
+            let mut bad = environment(dir);
+            bad.insert(PORT_OFFSET_ENV.to_string(), refused.to_string());
+            assert!(
+                matches!(
+                    LauncherSettings::from_map(&bad),
+                    Err(SettingsError::PortOffset(_))
+                ),
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[test]
     fn vendor_arguments_and_tiers_are_bounded() {
         assert!(check_vendor(&[]).is_err());
         assert_eq!(check_tier("t2-fast").unwrap(), "t2-fast");
@@ -506,7 +540,9 @@ pub mod tests {
 
     #[test]
     fn the_vendor_environment_is_exactly_the_allowlist() {
-        let mut settings = LauncherSettings::from_map(&environment(Path::new("/agent"))).unwrap();
+        let mut spec_environment = environment(Path::new("/agent"));
+        spec_environment.insert(PORT_OFFSET_ENV.to_string(), "1056".to_string());
+        let mut settings = LauncherSettings::from_map(&spec_environment).unwrap();
         settings.tier = Some("t2".to_string());
         let pairs =
             settings.vendor_environment(Path::new("/s/progress.json"), Path::new("/s/result.json"));

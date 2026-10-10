@@ -16,7 +16,7 @@ use tycho_types::service::handler::SESSION_HEARTBEAT;
 use tycho_types::session::SessionName;
 
 use crate::agent_files::{read_checked, write_new};
-use crate::config::ingress_url;
+use crate::config::CorePorts;
 use crate::http::{Http, Outcome};
 
 pub const SPOOL_SCHEMA_VERSION: u32 = 1;
@@ -206,23 +206,35 @@ pub struct HeartbeatSend<'a> {
     pub body: String,
 }
 
-impl Ingress for Http {
+/// The core's ingress over HTTP, at the ports the launcher was handed.
+#[derive(Debug, Clone)]
+pub struct CoreIngress {
+    pub http: Http,
+    pub ports: CorePorts,
+}
+
+impl Ingress for CoreIngress {
     fn deliver(&self, awaitable: &AwaitableId, resolution: &Resolution) -> Ack {
         let (verb, content_type, body) = match resolution {
             Resolution::Resolve(body) => ("resolve", "application/json", body),
             Resolution::Reject(reason) => ("reject", "text/plain", reason),
         };
-        let url = ingress_url(&format!("/restate/awakeables/{awaitable}/{verb}"));
-        decode_ack(self.post(&url, content_type, &[], body.clone()))
+        let url = self
+            .ports
+            .ingress_url(&format!("/restate/awakeables/{awaitable}/{verb}"));
+        decode_ack(self.http.post(&url, content_type, &[], body.clone()))
     }
 
     fn heartbeat(&self, call: &HeartbeatSend<'_>) -> Ack {
-        let url = ingress_url(&format!(
+        let url = self.ports.ingress_url(&format!(
             "/{}/{}/{SESSION_HEARTBEAT}/send",
             call.service, call.session
         ));
         let headers = [("idempotency-key", call.idempotency_key.as_str())];
-        decode_ack(self.post(&url, "application/json", &headers, call.body.clone()))
+        decode_ack(
+            self.http
+                .post(&url, "application/json", &headers, call.body.clone()),
+        )
     }
 }
 

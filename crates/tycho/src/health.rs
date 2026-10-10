@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::config::{admin_url, endpoint_url, CoreRole};
+use crate::config::{CorePorts, CoreRole};
 use crate::http::{Http, Outcome};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,11 +47,17 @@ pub fn decode_health(outcome: Outcome) -> Health {
 
 /// The admin API's health for the server; the endpoint's own health route for the endpoint.
 #[must_use]
-pub fn probe(http: &Http, role: CoreRole) -> Health {
+pub fn probe(http: &Http, ports: CorePorts, role: CoreRole) -> Health {
     match role {
-        CoreRole::Restate => decode_health(http.get(&admin_url("/health"))),
-        CoreRole::Endpoint => decode_health(http.get_h2c(&endpoint_url("/health"))),
+        CoreRole::Restate => decode_health(http.get(&ports.admin_url("/health"))),
+        CoreRole::Endpoint => decode_health(http.get_h2c(&ports.endpoint_url("/health"))),
     }
+}
+
+/// Restate's ingress health route, which answers only once the ingress listens.
+#[must_use]
+pub fn probe_ingress(http: &Http, ports: CorePorts) -> Health {
+    decode_health(http.get(&ports.ingress_url("/restate/health")))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,9 +107,9 @@ pub fn decode_registration(outcome: Outcome) -> Registration {
 
 /// Registers the endpoint; the admin API answers 200 for an unchanged deployment.
 #[must_use]
-pub fn register(http: &Http) -> Registration {
-    let body = format!("{{\"uri\":\"{}\"}}", endpoint_url(""));
-    decode_registration(http.post_json(&admin_url("/deployments"), body))
+pub fn register(http: &Http, ports: CorePorts) -> Registration {
+    let body = format!("{{\"uri\":\"{}\"}}", ports.endpoint_url(""));
+    decode_registration(http.post_json(&ports.admin_url("/deployments"), body))
 }
 
 #[cfg(test)]

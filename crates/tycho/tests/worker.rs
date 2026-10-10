@@ -31,14 +31,12 @@ use restate_sdk::prelude::HttpServer;
 use serde_json::{json, Value};
 use tycho::agent_files::current_uid;
 use tycho::config::{
-    self, admin_url, ingress_url, loopback, AgentDirs, CoreConfig, CoreRole, HOME_ENV,
-    MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
+    self, AgentDirs, CoreConfig, CorePorts, PortClaim, HOME_ENV, MISE_NO_INSTALL,
+    RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
 use tycho::endpoint;
 use tycho::entire_graph::EntireGraph;
-use tycho::health;
-use tycho::http::Http;
 use tycho::launch_spec::HeartbeatTarget;
 use tycho::launcher::SessionFiles;
 use tycho::repositories::{ProjectName, Repositories};
@@ -49,14 +47,13 @@ use tycho::services::operator::read_secret_file;
 use tycho::services::workers::WorkerPorts;
 use tycho::services::{Ports, Timing};
 use tycho::spool::ACKNOWLEDGED_SUFFIX;
-use tycho::zmx::{ListEntry, Zmx};
+use tycho::zmx::Zmx;
 use tycho_types::envelope::CommitSha;
 use tycho_types::service::handler;
 use tycho_types::session::SessionName;
 use tycho_types::task_packet::RoutingName;
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
-const TEST_ENDPOINT_PORT: u16 = 19_081;
 const WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 const PROJECT: &str = "widget";
 const UNIT: &str = "wu01";
@@ -67,12 +64,31 @@ struct Core {
     config: CoreConfig,
     environment: Vec<(&'static str, String)>,
     agent: PathBuf,
+    /// Held until the core is stopped, after the teardown in `drop`.
+    _port_claim: PortClaim,
+}
+
+fn test_home(test: &str) -> PathBuf {
+    let user_home = PathBuf::from(env::var_os("HOME").unwrap());
+    user_home.join(format!(".tycho-worker-{test}-{}", std::process::id()))
+}
+
+/// A port slot claim for the test's home, taken before any double is built from its ports.
+fn test_claim(test: &str) -> PortClaim {
+    claim_ports(&test_home(test))
+}
+
+/// Claims a port slot for the home, held until the core is stopped; a slot whose ports
+/// another process holds is skipped and named, and the test fails only when no slot is left.
+fn claim_ports(home: &Path) -> PortClaim {
+    let claim = CorePorts::claim(home).unwrap_or_else(|error| panic!("{error}"));
+    println!("evidence: {claim}");
+    claim
 }
 
 impl Core {
-    fn new(test: &str) -> Self {
-        let user_home = PathBuf::from(env::var_os("HOME").unwrap());
-        let home = user_home.join(format!(".tycho-worker-{test}-{}", std::process::id()));
+    fn new(claim: PortClaim) -> Self {
+        let home = claim.home.clone();
         if home.exists() {
             fs::remove_dir_all(&home).unwrap();
         }
@@ -84,25 +100,18 @@ impl Core {
             restate_server.clone(),
             PathBuf::from(TYCHO),
         )
-        .unwrap();
-        // Other suites share the core's ports: wait for them to free, up to fifteen minutes.
-        let http = Http::new(Duration::from_secs(2)).unwrap();
-        let free = (0..60).any(|_| {
-            let busy = CoreRole::ALL
-                .iter()
-                .any(|role| health::probe(&http, *role).is_healthy());
-            if busy {
-                thread::sleep(Duration::from_secs(15));
-            }
-            !busy
-        });
-        assert!(free, "another core held the ports for fifteen minutes");
+        .unwrap()
+        .with_port_offset(claim.ports.offset);
         let environment = vec![
             (HOME_ENV, home.display().to_string()),
             (ZMX_ENV, zmx.display().to_string()),
             (RESTATE_SERVER_ENV, restate_server.display().to_string()),
-        ];
+        ]
+        .into_iter()
+        .chain(config.port_offset_pair())
+        .collect();
         Self {
+            _port_claim: claim,
             agent: home.join("agent"),
             config,
             environment,
@@ -135,24 +144,27 @@ impl Core {
 }
 
 /// Kills what zmx still lists in a socket directory and reports how many remain.
-fn clear_sessions(zmx: &Zmx, what: &str) -> Result<usize, String> {
-    for entry in zmx.list().map_err(|error| error.to_string())? {
-        match entry {
-            ListEntry::Running { name, pid, .. } | ListEntry::Ended { name, pid, .. } => {
-                println!("teardown: {what} session {name} (pid {pid}) survived; killing it");
-                drop(
-                    Command::new("/bin/kill")
-                        .args(["-KILL", &pid.to_string()])
-                        .status(),
-                );
-                drop(zmx.kill(&name));
+/// Ends what a socket directory still lists; a pid is signalled only while `ps` shows it
+/// running restate-server, the endpoint or a launcher.
+fn clear_sessions(zmx: &Zmx, label: &str) -> usize {
+    let programs = vec![
+        mise_which("restate-server").display().to_string(),
+        format!("{TYCHO} endpoint"),
+        format!("{TYCHO} launch"),
+    ];
+    match zmx.clear(&programs) {
+        Ok(report) => {
+            for line in &report.lines {
+                println!("teardown: {label} {line}");
             }
-            ListEntry::Unrecognised(line) => return Err(format!("unrecognised zmx line {line:?}")),
+            println!("teardown: {label} sessions left: {}", report.remaining);
+            report.remaining
+        }
+        Err(error) => {
+            println!("teardown: {label} zmx: {error}");
+            usize::MAX
         }
     }
-    let remaining = zmx.list().map_err(|error| error.to_string())?.len();
-    println!("teardown: {what} sessions left: {remaining}");
-    Ok(remaining)
 }
 
 /// The directory the Claude CLI keeps a worktree's transcripts in, named after its path.
@@ -179,15 +191,11 @@ impl Drop for Core {
         self.tycho(&["core", "stop"]);
         let core_zmx = Zmx::new(&self.config.zmx, &self.config.socket_dir());
         let agent_zmx = Zmx::agent(&self.config.zmx, &self.agent);
-        let mut outcome = clear_sessions(&core_zmx, "core")
-            .and_then(|core| {
-                clear_sessions(&agent_zmx, "agent").map(|agent| core.saturating_add(agent))
-            })
-            .and_then(|left| {
-                (left == 0)
-                    .then_some(())
-                    .ok_or_else(|| format!("{left} sessions remain"))
-            });
+        let left =
+            clear_sessions(&core_zmx, "core").saturating_add(clear_sessions(&agent_zmx, "agent"));
+        let mut outcome = (left == 0)
+            .then_some(())
+            .ok_or_else(|| format!("{left} sessions remain"));
         for transcripts in transcript_dir(&self.worktree_root()) {
             println!(
                 "teardown: removing worker transcripts {}",
@@ -213,7 +221,7 @@ struct TestEndpoint {
 }
 
 impl TestEndpoint {
-    fn start(ports: &Ports) -> Self {
+    fn start(ports: &Ports, core_ports: CorePorts) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -221,7 +229,7 @@ impl TestEndpoint {
         let listener = (0..40)
             .find_map(|_| {
                 let bound = runtime
-                    .block_on(tokio::net::TcpListener::bind(loopback(TEST_ENDPOINT_PORT)))
+                    .block_on(tokio::net::TcpListener::bind(core_ports.test_endpoint()))
                     .ok();
                 if bound.is_none() {
                     thread::sleep(Duration::from_millis(250));
@@ -231,9 +239,9 @@ impl TestEndpoint {
             .unwrap();
         let built = endpoint::build(ports);
         runtime.spawn(async move { HttpServer::new(built).serve(listener).await });
-        let body = format!("{{\"uri\":\"http://{}\"}}", loopback(TEST_ENDPOINT_PORT));
+        let body = format!("{{\"uri\":\"http://{}\"}}", core_ports.test_endpoint());
         let response = client()
-            .post(admin_url("/deployments"))
+            .post(core_ports.admin_url("/deployments"))
             .header("content-type", "application/json")
             .body(body)
             .send()
@@ -272,9 +280,9 @@ fn client() -> reqwest::blocking::Client {
         .unwrap()
 }
 
-fn get(path: &str) -> Value {
+fn get(core_ports: CorePorts, path: &str) -> Value {
     let text = client()
-        .get(ingress_url(path))
+        .get(core_ports.ingress_url(path))
         .send()
         .unwrap()
         .text()
@@ -282,9 +290,9 @@ fn get(path: &str) -> Value {
     serde_json::from_str(&text).unwrap_or(Value::Null)
 }
 
-fn post(path: &str, body: &str) -> (u16, String) {
+fn post(core_ports: CorePorts, path: &str, body: &str) -> (u16, String) {
     let response = client()
-        .post(ingress_url(path))
+        .post(core_ports.ingress_url(path))
         .header("content-type", "application/json")
         .body(body.to_string())
         .send()
@@ -346,18 +354,12 @@ fn worker_ports(core: &Core) -> (Arc<WorkerPorts>, CommitSha) {
     (Arc::new(ports), head)
 }
 
-fn start(test: &str) -> (Core, TestEndpoint, Arc<WorkerPorts>) {
-    let core = Core::new(test);
-    // Other suites share the core's ports; a start that loses a race stops and tries again.
-    let started = (0..3).any(|_| {
-        if core.tycho(&["core", "start"]).status.success() {
-            return true;
-        }
-        core.tycho(&["core", "stop"]);
-        thread::sleep(Duration::from_secs(30));
-        false
-    });
-    assert!(started, "the core did not start in three tries");
+fn start(claim: PortClaim) -> (Core, TestEndpoint, Arc<WorkerPorts>) {
+    let core = Core::new(claim);
+    assert!(
+        core.tycho(&["core", "start"]).status.success(),
+        "the core did not start"
+    );
     let (workers, head) = worker_ports(&core);
     let factory = FactoryConfig::embedded().unwrap();
     let spawner = LauncherSpawner {
@@ -368,6 +370,7 @@ fn start(test: &str) -> (Core, TestEndpoint, Arc<WorkerPorts>) {
         core_home: core.config.home.clone(),
         agent_uid: current_uid(),
         heartbeat: HeartbeatTarget::Session,
+        ports: core.config.ports,
     };
     let ports = Ports {
         spawner: Arc::new(spawner),
@@ -382,7 +385,7 @@ fn start(test: &str) -> (Core, TestEndpoint, Arc<WorkerPorts>) {
         packet_dir: Some(core.config.packet_dir()),
         workers: Some(Arc::clone(&workers)),
     };
-    let endpoint = TestEndpoint::start(&ports);
+    let endpoint = TestEndpoint::start(&ports, core.config.ports);
     (core, endpoint, workers)
 }
 
@@ -414,6 +417,7 @@ fn dispatch(core: &Core, brief: &str, max_turns: u16) -> String {
 
 /// What the agent spool holds, printed before a failed wait panics.
 fn dump_spool(core: &Core) {
+    let core_ports = core.config.ports;
     let spool = core.agent.join("spool");
     for entry in fs::read_dir(&spool)
         .into_iter()
@@ -430,15 +434,15 @@ fn dump_spool(core: &Core) {
     }
     println!(
         "evidence: unit status {}",
-        get(&format!("/WorkUnit/{UNIT}/status"))
+        get(core_ports, &format!("/WorkUnit/{UNIT}/status"))
     );
     println!(
         "evidence: worker run status {}",
-        get(&format!("/WorkerRun/{TASK}/status"))
+        get(core_ports, &format!("/WorkerRun/{TASK}/status"))
     );
     let query = json!({"query": "select target, status, last_failure from sys_invocation where status != 'completed'"});
     let answer = client()
-        .post(admin_url("/query"))
+        .post(core_ports.admin_url("/query"))
         .header("content-type", "application/json")
         .header("accept", "application/json")
         .body(query.to_string())
@@ -448,10 +452,9 @@ fn dump_spool(core: &Core) {
 }
 
 fn attach(core: &Core, invocation: &str) -> Value {
+    let core_ports = core.config.ports;
     let answer = client()
-        .get(ingress_url(&format!(
-            "/restate/invocation/{invocation}/attach"
-        )))
+        .get(core_ports.ingress_url(&format!("/restate/invocation/{invocation}/attach")))
         .send()
         .and_then(reqwest::blocking::Response::text);
     let text = answer.unwrap_or_else(|error| {
@@ -539,8 +542,8 @@ fn probe_attempt_cap() -> usize {
     usize::from(route.attempt_cap)
 }
 
-fn worker_status() -> Value {
-    let status = get(&format!("/WorkerRun/{TASK}/status"));
+fn worker_status(core_ports: CorePorts) -> Value {
+    let status = get(core_ports, &format!("/WorkerRun/{TASK}/status"));
     println!("evidence: worker run status {status}");
     status
 }
@@ -571,7 +574,9 @@ fn assert_cloned_and_indexed(core: &Core, view: &Value, workers: &WorkerPorts) -
 #[test]
 #[ignore = "runs a real claude worker; run with mise run worker-tests"]
 fn a_headless_worker_commits_in_a_cloned_worktree_and_leaves_a_checkpoint() {
-    let (core, _endpoint, workers) = start("trivial");
+    let claim = test_claim("trivial");
+    let core_ports = claim.ports;
+    let (core, _endpoint, workers) = start(claim);
     let invocation = dispatch(&core, &trivial_brief(), 30);
     let view = attach(&core, &invocation);
     assert_eq!(view["lifecycle"], "done", "{view}");
@@ -608,7 +613,7 @@ fn a_headless_worker_commits_in_a_cloned_worktree_and_leaves_a_checkpoint() {
         "evidence: index rebuild after the commit took {} ms ({rebuild})",
         rebuild["wall_clock_ms"]
     );
-    let status = worker_status();
+    let status = worker_status(core_ports);
     let outcome = &status["outcome"];
     assert_eq!(outcome["outcome"], "completed", "{status}");
     assert!(outcome["result"]["usage"]["input_tokens"].as_u64().unwrap() > 0);
@@ -626,18 +631,20 @@ fn a_headless_worker_commits_in_a_cloned_worktree_and_leaves_a_checkpoint() {
 #[test]
 #[ignore = "runs a real claude worker; run with mise run worker-tests"]
 fn a_worker_over_its_turn_cap_returns_as_too_large() {
-    let (core, _endpoint, _workers) = start("turn-cap");
+    let claim = test_claim("turn-cap");
+    let core_ports = claim.ports;
+    let (core, _endpoint, _workers) = start(claim);
     let brief = "First run `git log --oneline` and report it, then read src/lib.rs, then make \
                  widget::answer return 42, then run `git status`. Commit the change with git.";
     let invocation = dispatch(&core, brief, 1);
     wait_until("the unit escalated", || {
-        get(&format!("/WorkUnit/{UNIT}/status"))["lifecycle"] == "escalated"
+        get(core_ports, &format!("/WorkUnit/{UNIT}/status"))["lifecycle"] == "escalated"
     });
-    let status = worker_status();
+    let status = worker_status(core_ports);
     assert_eq!(status["outcome"]["outcome"], "replan", "{status}");
     let record = spool_record(&core, &only_worker_session(&core));
     assert_eq!(record["state"], "too_large");
-    let unit = get(&format!("/WorkUnit/{UNIT}/status"));
+    let unit = get(core_ports, &format!("/WorkUnit/{UNIT}/status"));
     assert!(unit["checkpoints"].as_array().unwrap().is_empty(), "{unit}");
     assert_eq!(unit["index"][0]["kind"], "build", "{unit}");
     let secret = read_secret_file(&core.config.operator_secret_file()).unwrap();
@@ -645,7 +652,11 @@ fn a_worker_over_its_turn_cap_returns_as_too_large() {
         r#"{{"secret":"{}","unit":"{UNIT}","rule":{{"epic":"cf7a","attempt":1,"ruling":{{"verdict":"abandon","reason":"re-plan smaller"}}}}}}"#,
         secret.expose()
     );
-    let (ruled, body) = post(&format!("/Operator/{}", handler::OPERATOR_RULE_UNIT), &rule);
+    let (ruled, body) = post(
+        core_ports,
+        &format!("/Operator/{}", handler::OPERATOR_RULE_UNIT),
+        &rule,
+    );
     assert_eq!(ruled, 200, "{body}");
     assert_eq!(attach(&core, &invocation)["lifecycle"], "abandoned");
 }
@@ -695,11 +706,13 @@ fn forced_escalation_brief() -> String {
 #[test]
 #[ignore = "runs a real claude worker; run with mise run worker-tests"]
 fn a_headless_worker_rejects_on_the_planted_contradiction() {
-    let (core, _endpoint, workers) = start("escalation");
+    let claim = test_claim("escalation");
+    let core_ports = claim.ports;
+    let (core, _endpoint, workers) = start(claim);
     let invocation = dispatch(&core, &forced_escalation_brief(), 30);
     let mut packet = None;
     wait_until("the unit escalated with a packet", || {
-        let view = get(&format!("/WorkUnit/{UNIT}/status"));
+        let view = get(core_ports, &format!("/WorkUnit/{UNIT}/status"));
         packet = view["packet"].as_str().map(PathBuf::from);
         view["lifecycle"] == "escalated" && packet.is_some()
     });
@@ -707,7 +720,7 @@ fn a_headless_worker_rejects_on_the_planted_contradiction() {
     let text = fs::read_to_string(&packet).unwrap();
     println!("evidence: packet {}\n{text}", packet.display());
     assert!(text.contains("POLICY.md"), "{text}");
-    worker_status();
+    worker_status(core_ports);
     // A real model does not always write its escalation on the first attempt; the run may
     // retry, but nothing may start after an attempt that escalated.
     let records = spooled_records(&core);
@@ -726,7 +739,7 @@ fn a_headless_worker_rejects_on_the_planted_contradiction() {
         "an attempt started after one escalated: {states:?}"
     );
     let worktree = PathBuf::from(
-        get(&format!("/WorkUnit/{UNIT}/status"))["worktree"]["path"]
+        get(core_ports, &format!("/WorkUnit/{UNIT}/status"))["worktree"]["path"]
             .as_str()
             .unwrap(),
     );

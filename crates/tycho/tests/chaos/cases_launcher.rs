@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tycho::config::{CoreRole, AGENT_USER_ENV};
+use tycho::config::{CorePorts, CoreRole, PortClaim, AGENT_USER_ENV};
 use tycho::health::{self, Health};
 use tycho::kill::{KillRefusal, KillVerdict};
 use tycho::launcher::HEARTBEAT_INTERVAL;
@@ -25,11 +25,11 @@ use tycho::zmx::{count_named, presence, Presence};
 use tycho_types::envelope::CommitSha;
 
 use crate::launcher_spawner::{running_vendor, AgentGuard, LauncherSpawner, VendorPlan, VendorRun};
-use crate::support::running_before_the_kill;
 use crate::support::{
     attach, await_unit_end, dispatch, http, lifecycle_and_attempt, session_status, start_endpoint,
-    start_with_retries, wait_until, worker_run_status, Core, DoublesEndpoint, TYCHO,
+    start_once, wait_until, worker_run_status, Core, DoublesEndpoint, TYCHO,
 };
+use crate::support::{running_before_the_kill, test_claim};
 
 const DEFAULT_SHA: &str = "2222222222222222222222222222222222222222";
 
@@ -73,7 +73,7 @@ struct Rig {
 
 /// A started core, then the real-launcher spawner beside it, then the endpoint built from both.
 fn rig(core: Core, tag: &str, plan: VendorPlan) -> Rig {
-    let spawner = LauncherSpawner::new(&core.config.home, tag, plan);
+    let spawner = LauncherSpawner::new(&core.config.home, core.config.ports, tag, plan);
     let (endpoint, _) = start_endpoint(&core, Arc::new(spawner.clone()), Arc::new(merged_gate()));
     Rig {
         _guard: AgentGuard(spawner.clone()),
@@ -83,9 +83,9 @@ fn rig(core: Core, tag: &str, plan: VendorPlan) -> Rig {
     }
 }
 
-fn started_core(test: &str) -> Core {
-    let core = Core::new(test);
-    start_with_retries(&core, |core| {
+fn started_core(claim: PortClaim) -> Core {
+    let core = Core::new(claim);
+    start_once(&core, |core| {
         core.tycho(&["core", "start"])
             .status
             .success()
@@ -107,17 +107,18 @@ fn spawned(rig: &Rig, index: usize) -> String {
 }
 
 /// Waits for the session's first heartbeat to reach the Session object.
-fn wait_for_heartbeat(name: &str) {
+fn wait_for_heartbeat(core_ports: CorePorts, name: &str) {
     wait_until(&format!("a heartbeat from {name} recorded"), || {
-        !session_status(name)["heartbeat_unix_ms"].is_null()
+        !session_status(core_ports, name)["heartbeat_unix_ms"].is_null()
     });
 }
 
 /// No duplicate session so far, then the unit ended done in the attempt it ran before the kill.
 fn assert_completed(rig: &Rig, invocation: &str, before: &(String, u64), why: &str) {
+    let core_ports = rig.core.config.ports;
     sessions_per_attempt(&rig.spawner);
-    let view = await_unit_end(why, before);
-    let (status, body) = attach(invocation);
+    let view = await_unit_end(core_ports, why, before);
+    let (status, body) = attach(core_ports, invocation);
     assert_eq!(status, 200, "{body}");
     let after = lifecycle_and_attempt(&view);
     println!("evidence: lifecycle before the kill {before:?}, after {after:?}");
@@ -278,7 +279,7 @@ fn attach_client(spawner: &LauncherSpawner, name: &str) -> Pty {
 
 /// The shell a terminal tab runs `tycho core start` from, left running as the tab would be.
 fn core_from_shell(core: &Core) -> Pty {
-    start_with_retries(core, shell_running_core_start)
+    start_once(core, shell_running_core_start)
 }
 
 fn shell_running_core_start(core: &Core) -> Option<Pty> {
@@ -314,7 +315,7 @@ fn core_sessions_listed_once(core: &Core) {
         println!("evidence: {role} sessions listed: {count}");
         assert_eq!(count, 1, "{role} must be listed exactly once");
         assert!(
-            health::probe(&http(), role).is_healthy(),
+            health::probe(&http(), core.config.ports, role).is_healthy(),
             "{role} unhealthy"
         );
     }
@@ -323,14 +324,16 @@ fn core_sessions_listed_once(core: &Core) {
 #[test]
 #[ignore = "starts real processes; run with mise run chaos-tests"]
 fn terminal_app_killed_leaves_the_session_core_and_unit_running() {
-    let core = Core::new("terminal");
+    let claim = test_claim("terminal");
+    let core_ports = claim.ports;
+    let core = Core::new(claim);
     let mut shell = core_from_shell(&core);
     let rig = rig(core, "term", every_attempt(25));
     let invocation = dispatch(&rig.core, &["wu01-t1"]);
     let name = spawned(&rig, 0);
-    wait_for_heartbeat(&name);
+    wait_for_heartbeat(core_ports, &name);
     let mut client = attach_client(&rig.spawner, &name);
-    let before = running_before_the_kill();
+    let before = running_before_the_kill(core_ports);
     let killed_at = now_unix_ms();
     client.hang_up("attach client");
     shell.hang_up("core start shell");
@@ -346,7 +349,7 @@ fn terminal_app_killed_leaves_the_session_core_and_unit_running() {
     wait_until("the launcher renewed its lease after the kill", || {
         lease_heartbeat(&rig.spawner, &name) > killed_at
     });
-    assert_eq!(session_status(&name)["phase"], "running");
+    assert_eq!(session_status(core_ports, &name)["phase"], "running");
     assert_completed(&rig, &invocation, &before, "terminal app killed");
     assert_eq!(rig.spawner.spawned_names(), std::slice::from_ref(&name));
     sessions_per_attempt(&rig.spawner);
@@ -371,7 +374,7 @@ fn kill_restate(core: &Core) {
     println!("evidence: SIGKILL to restate-server pid {pid}");
     wait_until("restate unreachable", || {
         matches!(
-            health::probe(&http(), CoreRole::Restate),
+            health::probe(&http(), core.config.ports, CoreRole::Restate),
             Health::Unreachable(_)
         )
     });
@@ -380,11 +383,13 @@ fn kill_restate(core: &Core) {
 #[test]
 #[ignore = "starts real processes; run with mise run chaos-tests"]
 fn restate_killed_between_worker_exit_and_resolve_resolves_on_the_same_attempt() {
-    let rig = rig(started_core("restate"), "rest", every_attempt(8));
+    let claim = test_claim("restate");
+    let core_ports = claim.ports;
+    let rig = rig(started_core(claim), "rest", every_attempt(8));
     let invocation = dispatch(&rig.core, &["wu01-t1"]);
     let name = spawned(&rig, 0);
-    wait_for_heartbeat(&name);
-    let before = running_before_the_kill();
+    wait_for_heartbeat(core_ports, &name);
+    let before = running_before_the_kill(core_ports);
     kill_restate(&rig.core);
     let files = rig.spawner.files(&name);
     wait_until("the result spooled while restate is down", || {
@@ -403,7 +408,7 @@ fn restate_killed_between_worker_exit_and_resolve_resolves_on_the_same_attempt()
         &before,
         "restate killed before the resolve",
     );
-    let run = worker_run_status("wu01-t1");
+    let run = worker_run_status(core_ports, "wu01-t1");
     println!("evidence: worker run {run}");
     assert_eq!(run["outcome"]["attempt"], 1, "the same attempt");
     assert_eq!(rig.spawner.spawned_names(), std::slice::from_ref(&name));
@@ -500,11 +505,13 @@ fn assert_nothing_spooled(rig: &Rig, name: &str) {
 #[test]
 #[ignore = "starts real processes; run with mise run chaos-tests"]
 fn launcher_killed_before_its_trap_requeues_as_attempt_two() {
-    let rig = rig(started_core("trap"), "trap", first_attempt_hangs());
+    let claim = test_claim("trap");
+    let core_ports = claim.ports;
+    let rig = rig(started_core(claim), "trap", first_attempt_hangs());
     let invocation = dispatch(&rig.core, &["wu01-t1"]);
     let first = spawned(&rig, 0);
-    wait_for_heartbeat(&first);
-    let before = running_before_the_kill();
+    wait_for_heartbeat(core_ports, &first);
+    let before = running_before_the_kill(core_ports);
     kill_launcher(&rig.spawner, &first);
     assert_lease_frozen(&rig.spawner, &first);
     assert_nothing_spooled(&rig, &first);
@@ -520,14 +527,14 @@ fn launcher_killed_before_its_trap_requeues_as_attempt_two() {
     });
     assert_eq!(rig.spawner.listed(&first), 0, "attempt 1 is gone from zmx");
     assert_reap_refused_and_vendor_running(&rig.spawner, &first);
-    assert_eq!(session_status(&first)["phase"], "lost");
+    assert_eq!(session_status(core_ports, &first)["phase"], "lost");
     assert_completed(
         &rig,
         &invocation,
         &before,
         "launcher killed before its trap",
     );
-    let run = worker_run_status("wu01-t1");
+    let run = worker_run_status(core_ports, "wu01-t1");
     println!("evidence: worker run {run}");
     assert_eq!(run["outcome"]["attempt"], 2);
     let counts = sessions_per_attempt(&rig.spawner);

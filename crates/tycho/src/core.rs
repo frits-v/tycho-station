@@ -1,12 +1,15 @@
 //! `tycho core start|stop|status` over the two core sessions.
 
 use std::fmt;
+use std::thread;
 
 use tycho_types::service::{handler, Service, RECONCILER_KEY};
 
-use crate::config::{ingress_url, CoreConfig, CoreRole};
+use crate::config::{
+    CoreConfig, CorePorts, CoreRole, COMMAND_TIMEOUT, HEALTH_WAIT_POLLS_MAX, POLL_INTERVAL,
+};
 use crate::health::{self, Health};
-use crate::http::{Http, Outcome};
+use crate::http::{Http, Outcome, TIMED_OUT};
 use crate::services::operator;
 use crate::watchdog::{OnceReport, Supervisor};
 use crate::zmx::{presence, Presence};
@@ -52,7 +55,14 @@ pub fn start(supervisor: &Supervisor, config: &CoreConfig) -> StartReport {
             Ok(if created { "created" } else { "present" }.to_string())
         });
     let reconciler = if once.succeeded() {
-        start_reconciler(supervisor.http())
+        let (http, ports) = (supervisor.http(), supervisor.ports());
+        wait_for_ingress(
+            HEALTH_WAIT_POLLS_MAX,
+            &mut || health::probe_ingress(http, ports),
+            &mut || thread::sleep(POLL_INTERVAL),
+        )
+        .map_err(|last| format!("ingress did not become healthy: {last}"))
+        .and_then(|_| start_reconciler(ports))
     } else {
         Err("not attempted: the core did not come up".to_string())
     };
@@ -63,17 +73,119 @@ pub fn start(supervisor: &Supervisor, config: &CoreConfig) -> StartReport {
     }
 }
 
-fn start_reconciler(http: &Http) -> Result<String, String> {
-    let path = format!(
-        "/{}/{RECONCILER_KEY}/{}",
-        Service::Reconciler.name(),
-        handler::RECONCILER_START
-    );
-    match http.post_empty(&ingress_url(&path)) {
-        Outcome::Response { status: 200, body } => Ok(format!("generation {}", body.trim())),
-        Outcome::Response { status, body } => Err(format!("status {status}: {body}")),
-        Outcome::Unreachable(reason) => Err(format!("ingress unreachable: {reason}")),
-        Outcome::BodyTooLarge => Err("body over the limit".to_string()),
+/// Restate's admin API answers before its ingress listens, and under load the gap outlasts
+/// one call, so the reconciler's first tick waits for the ingress; returns the probes it took.
+pub fn wait_for_ingress(
+    polls_max: u32,
+    probe: &mut dyn FnMut() -> Health,
+    wait: &mut dyn FnMut(),
+) -> Result<u32, Health> {
+    let mut last = Health::Unrecognised("not probed".to_string());
+    for poll in 1..=polls_max {
+        last = probe();
+        if last.is_healthy() {
+            return Ok(poll);
+        }
+        wait();
+    }
+    Err(last)
+}
+
+/// The first call through ingress reaches the endpoint, so it gets the command timeout.
+fn start_reconciler(ports: CorePorts) -> Result<String, String> {
+    let http = Http::new(COMMAND_TIMEOUT).map_err(|error| error.to_string())?;
+    let url = |handler_name: &str| {
+        ports.ingress_url(&format!(
+            "/{}/{RECONCILER_KEY}/{handler_name}",
+            Service::Reconciler.name()
+        ))
+    };
+    kick_reconciler(
+        &mut || http.post_empty(&url(handler::RECONCILER_START)),
+        &mut || http.post_empty(&url(handler::RECONCILER_STATUS)),
+    )
+}
+
+fn start_again(start: &mut dyn FnMut() -> Outcome, reason: &str) -> Result<String, String> {
+    match decode_start(start()) {
+        StartAnswer::Started(done) => Ok(format!("{done}, after a start that {reason}")),
+        StartAnswer::TimedOut(again) | StartAnswer::Failed(again) => Err(format!(
+            "the start {reason}, the view showed no newer generation, and the second start: {again}"
+        )),
+    }
+}
+
+/// What one start call answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartAnswer {
+    Started(String),
+    /// The call may have been accepted before the answer was lost.
+    TimedOut(String),
+    Failed(String),
+}
+
+#[must_use]
+pub fn decode_start(outcome: Outcome) -> StartAnswer {
+    match outcome {
+        Outcome::Response { status: 200, body } => {
+            StartAnswer::Started(format!("generation {}", body.trim()))
+        }
+        Outcome::Response { status, body } => {
+            StartAnswer::Failed(format!("status {status}: {body}"))
+        }
+        Outcome::Unreachable(reason) if reason.starts_with(TIMED_OUT) => {
+            StartAnswer::TimedOut(reason)
+        }
+        Outcome::Unreachable(reason) => {
+            StartAnswer::Failed(format!("ingress unreachable: {reason}"))
+        }
+        Outcome::BodyTooLarge => StartAnswer::Failed("body over the limit".to_string()),
+    }
+}
+
+/// The generation before a start: zero for a reconciler that never started, `None` when the
+/// view did not answer, so a timed-out start is never judged against an unknown baseline.
+#[must_use]
+pub fn view_baseline(outcome: &Outcome) -> Option<u64> {
+    match outcome {
+        Outcome::Response { status: 200, body } if body.trim() == "null" => Some(0),
+        _ => view_generation(outcome),
+    }
+}
+
+/// The generation in the reconciler's view, when the view answered with one.
+#[must_use]
+pub fn view_generation(outcome: &Outcome) -> Option<u64> {
+    match outcome {
+        Outcome::Response { status: 200, body } => serde_json::from_str::<serde_json::Value>(body)
+            .ok()?
+            .get("generation")?
+            .as_u64()
+            .filter(|generation| *generation >= 1),
+        _ => None,
+    }
+}
+
+/// Starts the reconciler's tick chain, judging a timed-out start against the view before it.
+///
+/// The generation survives restarts, so a generation alone does not show that this start
+/// landed: only one above the generation read before the start does. Any other answer after
+/// a timeout gets one more start, which is harmless after an accepted one, since the older
+/// chain ends at its next tick.
+pub fn kick_reconciler(
+    start: &mut dyn FnMut() -> Outcome,
+    view: &mut dyn FnMut() -> Outcome,
+) -> Result<String, String> {
+    let before = view_baseline(&view());
+    match decode_start(start()) {
+        StartAnswer::Started(done) => Ok(done),
+        StartAnswer::Failed(reason) => Err(reason),
+        StartAnswer::TimedOut(reason) => match (before, view_generation(&view())) {
+            (Some(before), Some(after)) if after > before => Ok(format!(
+                "generation {after}, read from the view after the start {reason}"
+            )),
+            _ => start_again(start, &reason),
+        },
     }
 }
 
@@ -113,9 +225,12 @@ pub fn stop(supervisor: &Supervisor) -> StopReport {
             .map_err(|error| error.to_string())
             .and_then(|entries| match presence(&entries, role.session_name()) {
                 Presence::Absent => Ok("not running".to_string()),
-                Presence::Running { pid, .. } | Presence::Ended { pid } => supervisor
+                Presence::Running { pid, .. } => supervisor
                     .stop(role, pid, "-TERM")
                     .map(|()| format!("stopped pid {pid}")),
+                Presence::Ended { pid } => supervisor
+                    .remove(role)
+                    .map(|()| format!("removed the ended entry (pid {pid} not signalled)")),
                 Presence::Unrecognised => Err("zmx list is unrecognised".to_string()),
             });
         stopped.push((role, result));
@@ -170,12 +285,186 @@ pub fn status(supervisor: &Supervisor) -> StatusReport {
             (
                 *role,
                 presence(&entries, role.session_name()),
-                health::probe(supervisor.http(), *role),
+                health::probe(supervisor.http(), supervisor.ports(), *role),
             )
         })
         .collect();
     StatusReport {
         roles,
         failure: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unreachable() -> Health {
+        Health::Unreachable("connection refused".to_string())
+    }
+
+    #[test]
+    fn the_reconciler_kick_waits_until_the_ingress_answers() {
+        let mut answers = vec![Health::Healthy, unreachable(), unreachable()];
+        let mut waits = 0;
+        let polls = wait_for_ingress(
+            HEALTH_WAIT_POLLS_MAX,
+            &mut || answers.pop().unwrap(),
+            &mut || waits += 1,
+        );
+        assert_eq!(polls, Ok(3));
+        assert_eq!(waits, 2);
+    }
+
+    #[test]
+    fn an_ingress_that_never_answers_fails_after_the_bound_with_the_last_probe() {
+        let mut probes = 0;
+        let mut waits = 0;
+        let outcome = wait_for_ingress(
+            4,
+            &mut || {
+                probes += 1;
+                unreachable()
+            },
+            &mut || waits += 1,
+        );
+        assert_eq!(outcome, Err(unreachable()));
+        assert_eq!((probes, waits), (4, 4));
+    }
+
+    fn timed_out() -> Outcome {
+        Outcome::Unreachable(format!("{TIMED_OUT}: operation timed out"))
+    }
+
+    fn answered(body: &str) -> Outcome {
+        Outcome::Response {
+            status: 200,
+            body: body.to_string(),
+        }
+    }
+
+    /// Answers the view with `before` on its first read and `after` on later ones.
+    fn views(before: &'static str, after: &'static str) -> impl FnMut() -> Outcome {
+        let mut reads: u32 = 0;
+        move || {
+            reads = reads.saturating_add(1);
+            answered(if reads == 1 { before } else { after })
+        }
+    }
+
+    fn counted_timeouts(starts: &mut u32) -> impl FnMut() -> Outcome + '_ {
+        move || {
+            *starts = starts.saturating_add(1);
+            timed_out()
+        }
+    }
+
+    #[test]
+    fn a_timed_out_start_that_raised_the_generation_is_not_repeated() {
+        let mut starts = 0;
+        let kicked = kick_reconciler(
+            &mut counted_timeouts(&mut starts),
+            &mut views(
+                r#"{"generation":4,"expected":[]}"#,
+                r#"{"generation":5,"expected":[]}"#,
+            ),
+        );
+        assert_eq!(starts, 1);
+        assert!(kicked
+            .unwrap()
+            .starts_with("generation 5, read from the view"));
+        let mut fresh = 0;
+        let first = kick_reconciler(
+            &mut counted_timeouts(&mut fresh),
+            &mut views("null", r#"{"generation":1,"expected":[]}"#),
+        );
+        assert_eq!(fresh, 1);
+        assert!(first.is_ok());
+    }
+
+    #[test]
+    fn a_timed_out_start_judged_only_by_a_generation_from_an_earlier_lifetime_is_repeated() {
+        let mut answers = vec![answered("5"), timed_out()];
+        let kicked = kick_reconciler(
+            &mut || answers.pop().unwrap(),
+            &mut views(
+                r#"{"generation":4,"expected":[]}"#,
+                r#"{"generation":4,"expected":[]}"#,
+            ),
+        );
+        assert!(kicked
+            .unwrap()
+            .starts_with("generation 5, after a start that"));
+        assert!(answers.is_empty());
+    }
+
+    #[test]
+    fn a_timed_out_start_with_no_baseline_or_no_newer_generation_is_tried_once_more() {
+        for (before, after) in [
+            ("{", r#"{"generation":4}"#),
+            ("null", "null"),
+            (r#"{"generation":4}"#, r#"{"generation":3}"#),
+        ] {
+            let mut starts = 0;
+            let refused = kick_reconciler(
+                &mut counted_timeouts(&mut starts),
+                &mut views(before, after),
+            );
+            assert_eq!(starts, 2, "{before} then {after}");
+            assert!(refused.is_err());
+        }
+    }
+
+    #[test]
+    fn a_refused_connect_fails_the_start_without_a_second_view_or_start() {
+        let mut views_read = 0;
+        let mut starts = 0;
+        let kicked = kick_reconciler(
+            &mut || {
+                starts += 1;
+                Outcome::Unreachable("connect failed: refused".to_string())
+            },
+            &mut || {
+                views_read += 1;
+                answered("null")
+            },
+        );
+        assert_eq!((views_read, starts), (1, 1));
+        assert!(kicked.unwrap_err().starts_with("ingress unreachable"));
+    }
+
+    #[test]
+    fn a_reconciler_that_never_started_is_baseline_zero_and_an_unread_view_has_none() {
+        assert_eq!(view_baseline(&answered("null")), Some(0));
+        assert_eq!(view_baseline(&answered(r#"{"generation":4}"#)), Some(4));
+        assert_eq!(view_baseline(&answered("{")), None);
+        assert_eq!(view_baseline(&timed_out()), None);
+    }
+
+    #[test]
+    fn only_a_view_with_a_generation_counts() {
+        assert_eq!(
+            view_generation(&answered(r#"{"generation":3,"expected":[]}"#)),
+            Some(3)
+        );
+        for outcome in [
+            answered("null"),
+            answered(r#"{"generation":0}"#),
+            answered("{"),
+            Outcome::Response {
+                status: 500,
+                body: String::new(),
+            },
+            timed_out(),
+        ] {
+            assert_eq!(view_generation(&outcome), None, "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_healthy_ingress_is_probed_once_without_waiting() {
+        let mut waits = 0;
+        let polls = wait_for_ingress(4, &mut || Health::Healthy, &mut || waits += 1);
+        assert_eq!((polls, waits), (Ok(1), 0));
     }
 }

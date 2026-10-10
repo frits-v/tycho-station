@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::command;
 use crate::config::{
-    CoreConfig, CoreRole, COMMAND_TIMEOUT, HEALTH_WAIT_POLLS_MAX, POLL_INTERVAL,
+    CoreConfig, CorePorts, CoreRole, COMMAND_TIMEOUT, HEALTH_WAIT_POLLS_MAX, POLL_INTERVAL,
     SESSION_WAIT_POLLS_MAX, STARTUP_GRACE_SECONDS,
 };
 use crate::health::{self, Health, Registration};
@@ -25,6 +25,9 @@ pub enum Action {
     KillThenRun {
         pid: u32,
     },
+    /// The session's program has ended, so its listed pid may belong to another process by
+    /// now: the entry is removed by name and never signalled.
+    RemoveThenRun,
     /// The state is one the watchdog must not act on.
     Refuse,
 }
@@ -45,7 +48,7 @@ pub const fn decide(presence: Presence, health: &Health, now_unix_seconds: u64) 
                 Action::KillThenRun { pid }
             }
         }
-        Presence::Ended { pid } => Action::KillThenRun { pid },
+        Presence::Ended { .. } => Action::RemoveThenRun,
         Presence::Absent if health.is_healthy() => Action::Refuse,
         Presence::Absent => Action::Run,
         Presence::Unrecognised => Action::Refuse,
@@ -132,6 +135,11 @@ impl Supervisor {
         &self.http
     }
 
+    #[must_use]
+    pub const fn ports(&self) -> CorePorts {
+        self.config.ports
+    }
+
     /// One probe and repair pass over both core sessions.
     #[must_use]
     pub fn once(&self) -> OnceReport {
@@ -153,7 +161,7 @@ impl Supervisor {
                 }
             };
             let presence = presence(&entries, role.session_name());
-            let health = health::probe(&self.http, role);
+            let health = health::probe(&self.http, self.config.ports, role);
             let action = decide(presence, &health, now_unix_seconds());
             let result = self.apply(role, action);
             report.roles.push(RoleReport {
@@ -166,9 +174,9 @@ impl Supervisor {
         }
         if CoreRole::ALL
             .iter()
-            .all(|role| health::probe(&self.http, *role).is_healthy())
+            .all(|role| health::probe(&self.http, self.config.ports, *role).is_healthy())
         {
-            report.registration = Some(health::register(&self.http));
+            report.registration = Some(health::register(&self.http, self.config.ports));
         }
         report
     }
@@ -183,6 +191,11 @@ impl Supervisor {
                 self.stop(role, pid, "-KILL")?;
                 self.start(role)
                     .map(|started| format!("killed pid {pid}; {started}"))
+            }
+            Action::RemoveThenRun => {
+                self.remove(role)?;
+                self.start(role)
+                    .map(|started| format!("removed the ended entry; {started}"))
             }
         }
     }
@@ -221,6 +234,13 @@ impl Supervisor {
         self.wait_for_absent(name)
     }
 
+    /// Removes an ended session by name; its pid is never signalled.
+    pub fn remove(&self, role: CoreRole) -> Result<(), String> {
+        let name = role.session_name();
+        self.zmx.kill(name).map_err(|error| error.to_string())?;
+        self.wait_for_absent(name)
+    }
+
     fn wait_for_running(&self, name: &str) -> Result<u32, String> {
         for _ in 0..SESSION_WAIT_POLLS_MAX {
             let entries = self.zmx.list().map_err(|error| error.to_string())?;
@@ -246,7 +266,7 @@ impl Supervisor {
     fn wait_for_health(&self, role: CoreRole) -> Result<(), String> {
         let mut last = Health::Unrecognised("not probed".to_string());
         for _ in 0..HEALTH_WAIT_POLLS_MAX {
-            last = health::probe(&self.http, role);
+            last = health::probe(&self.http, self.config.ports, role);
             if last.is_healthy() {
                 return Ok(());
             }
@@ -320,10 +340,16 @@ mod tests {
             decide(running(0), &dead(), NOW),
             Action::KillThenRun { pid: 42 }
         );
-        assert_eq!(
-            decide(Presence::Ended { pid: 7 }, &Health::Healthy, NOW),
-            Action::KillThenRun { pid: 7 }
-        );
+    }
+
+    #[test]
+    fn an_ended_session_is_removed_by_name_and_its_pid_never_signalled() {
+        for health in [Health::Healthy, dead()] {
+            assert_eq!(
+                decide(Presence::Ended { pid: 7 }, &health, NOW),
+                Action::RemoveThenRun
+            );
+        }
     }
 
     #[test]

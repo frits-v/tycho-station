@@ -2,7 +2,7 @@
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Arc;
 use std::thread;
@@ -10,21 +10,18 @@ use std::time::{Duration, Instant};
 
 use restate_sdk::prelude::HttpServer;
 use tycho::config::{
-    admin_url, ingress_url, loopback, CoreConfig, CoreRole, HOME_ENV, MISE_NO_INSTALL,
-    RESTATE_INGRESS_PORT, RESTATE_SERVER_ENV, ZMX_ENV,
+    CoreConfig, CorePorts, PortClaim, HOME_ENV, MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
 use tycho::endpoint;
-use tycho::health;
 use tycho::http::Http;
 use tycho::services::merge_gate::MergeGate;
 use tycho::services::spawner::Spawner;
 use tycho::services::{Ports, Timing};
 use tycho::vendors::control::NoVendor;
-use tycho::zmx::{ListEntry, Zmx};
+use tycho::zmx::Zmx;
 
 pub const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
-const DOUBLES_PORT: u16 = 19_081;
 pub const WAIT_TIMEOUT: Duration = Duration::from_secs(120);
 const POLL: Duration = Duration::from_millis(250);
 /// Evidence bodies longer than this are cut, so a large view cannot flood the report.
@@ -33,6 +30,8 @@ const EVIDENCE_MAX_CHARS: usize = 600;
 pub struct Core {
     pub config: CoreConfig,
     pub environment: Vec<(&'static str, String)>,
+    /// Held until the core is stopped, after the teardown in `drop`.
+    _port_claim: PortClaim,
 }
 
 pub fn mise_which(tool: &str) -> PathBuf {
@@ -49,10 +48,27 @@ pub fn http() -> Http {
     Http::new(Duration::from_secs(2)).unwrap()
 }
 
+pub fn test_home(test: &str) -> PathBuf {
+    let user_home = PathBuf::from(env::var_os("HOME").unwrap());
+    user_home.join(format!(".tycho-chaos-{test}-{}", std::process::id()))
+}
+
+/// A port slot claim for the test's home, taken before any double is built from its ports.
+pub fn test_claim(test: &str) -> PortClaim {
+    claim_ports(&test_home(test))
+}
+
+/// Claims a port slot for the home, held until the core is stopped; a slot whose ports
+/// another process holds is skipped and named, and the test fails only when no slot is left.
+pub fn claim_ports(home: &Path) -> PortClaim {
+    let claim = CorePorts::claim(home).unwrap_or_else(|error| panic!("{error}"));
+    println!("evidence: {claim}");
+    claim
+}
+
 impl Core {
-    pub fn new(test: &str) -> Self {
-        let user_home = PathBuf::from(env::var_os("HOME").unwrap());
-        let home = user_home.join(format!(".tycho-chaos-{test}-{}", std::process::id()));
+    pub fn new(claim: PortClaim) -> Self {
+        let home = claim.home.clone();
         if home.exists() {
             fs::remove_dir_all(&home).unwrap();
         }
@@ -64,13 +80,18 @@ impl Core {
             restate_server.clone(),
             PathBuf::from(TYCHO),
         )
-        .unwrap();
+        .unwrap()
+        .with_port_offset(claim.ports.offset);
         let environment = vec![
             (HOME_ENV, home.display().to_string()),
             (ZMX_ENV, zmx.display().to_string()),
             (RESTATE_SERVER_ENV, restate_server.display().to_string()),
-        ];
+        ]
+        .into_iter()
+        .chain(config.port_offset_pair())
+        .collect();
         Self {
+            _port_claim: claim,
             config,
             environment,
         }
@@ -113,64 +134,34 @@ impl Core {
     }
 }
 
-/// Another suite may hold the core's ports for minutes; wait for them rather than fail.
-fn wait_for_free_ports() {
-    let started = Instant::now();
-    let limit = Duration::from_secs(600);
-    while started.elapsed() < limit {
-        let busy: Vec<CoreRole> = CoreRole::ALL
-            .into_iter()
-            .filter(|role| health::probe(&http(), *role).is_healthy())
-            .collect();
-        let doubles_free = std::net::TcpListener::bind(loopback(DOUBLES_PORT)).is_ok();
-        if busy.is_empty() && doubles_free {
-            return;
-        }
-        println!(
-            "waiting: {busy:?} answer on their ports; port {DOUBLES_PORT} free: {doubles_free}"
-        );
-        thread::sleep(Duration::from_secs(10));
-    }
-    panic!("the core's ports stayed busy for {limit:?}; stop the running core first");
-}
-
-/// Starts tried before a case gives up on a core whose ports other suites keep taking.
-const CORE_START_TRIES_MAX: u32 = 5;
-
-/// Other suites share the core's ports: a start that lost the race is stopped and tried again.
-pub fn start_with_retries<T>(core: &Core, mut start: impl FnMut(&Core) -> Option<T>) -> T {
-    for attempt in 1..=CORE_START_TRIES_MAX {
-        wait_for_free_ports();
-        if let Some(started) = start(core) {
-            return started;
-        }
-        println!("core start {attempt} failed; stopping what it started");
-        core.tycho(&["core", "stop"]);
-        drop(core.clear_sessions());
-    }
-    panic!("the core did not start in {CORE_START_TRIES_MAX} tries");
+/// One start: a test core's ports are its own, so a start that fails fails the case.
+pub fn start_once<T>(core: &Core, start: impl FnOnce(&Core) -> Option<T>) -> T {
+    start(core)
+        .unwrap_or_else(|| panic!("the core at {} did not start", core.config.home.display()))
 }
 
 /// Kills every session left in a socket directory by pid and by name; returns how many remain.
+/// Ends what a socket directory still lists; a pid is signalled only while `ps` shows it
+/// running restate-server, the endpoint or a launcher.
 pub fn clear_sessions(zmx: &Zmx, label: &str) -> usize {
-    let Ok(entries) = zmx.list() else {
-        println!("teardown: {label} zmx list failed");
-        return usize::MAX;
-    };
-    for entry in &entries {
-        if let ListEntry::Running { name, pid, .. } | ListEntry::Ended { name, pid, .. } = entry {
-            println!("teardown: {label} session {name} left; killing pid {pid}");
-            drop(
-                Command::new("/bin/kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .status(),
-            );
-            drop(zmx.kill(name));
+    let programs = vec![
+        mise_which("restate-server").display().to_string(),
+        format!("{TYCHO} endpoint"),
+        format!("{TYCHO} launch"),
+    ];
+    match zmx.clear(&programs) {
+        Ok(report) => {
+            for line in &report.lines {
+                println!("teardown: {label} {line}");
+            }
+            println!("teardown: {label} sessions left: {}", report.remaining);
+            report.remaining
+        }
+        Err(error) => {
+            println!("teardown: {label} zmx: {error}");
+            usize::MAX
         }
     }
-    let left = zmx.list().map_or(usize::MAX, |entries| entries.len());
-    println!("teardown: {label} sessions left: {left}");
-    left
 }
 
 impl Drop for Core {
@@ -194,12 +185,12 @@ pub struct DoublesEndpoint {
 }
 
 impl DoublesEndpoint {
-    pub fn start(ports: &Ports) -> Self {
+    pub fn start(ports: &Ports, core_ports: CorePorts) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
-        let listener = bind_with_retries(&runtime);
+        let listener = bind_with_retries(&runtime, core_ports.test_endpoint());
         let built = endpoint::build(ports);
         runtime.spawn(async move { HttpServer::new(built).serve(listener).await });
         Self {
@@ -209,16 +200,17 @@ impl DoublesEndpoint {
 }
 
 /// A port the previous endpoint held can take a moment to free after its runtime stops.
-fn bind_with_retries(runtime: &tokio::runtime::Runtime) -> tokio::net::TcpListener {
+fn bind_with_retries(
+    runtime: &tokio::runtime::Runtime,
+    address: std::net::SocketAddr,
+) -> tokio::net::TcpListener {
     for _ in 0..40 {
-        if let Ok(listener) =
-            runtime.block_on(tokio::net::TcpListener::bind(loopback(DOUBLES_PORT)))
-        {
+        if let Ok(listener) = runtime.block_on(tokio::net::TcpListener::bind(address)) {
             return listener;
         }
         thread::sleep(POLL);
     }
-    panic!("port {DOUBLES_PORT} did not free");
+    panic!("{address} did not free");
 }
 
 impl Drop for DoublesEndpoint {
@@ -243,8 +235,8 @@ fn cut(text: &str) -> String {
 }
 
 /// One ingress call; returns the status and the body.
-pub fn call(path: &str, body: &str) -> (u16, String) {
-    let mut request = client().post(format!("http://127.0.0.1:{RESTATE_INGRESS_PORT}{path}"));
+pub fn call(core_ports: CorePorts, path: &str, body: &str) -> (u16, String) {
+    let mut request = client().post(core_ports.ingress_url(path));
     if !body.is_empty() {
         request = request
             .header("content-type", "application/json")
@@ -259,21 +251,21 @@ pub fn call(path: &str, body: &str) -> (u16, String) {
     }
 }
 
-fn get_json(path: &str) -> serde_json::Value {
-    let (_, body) = call(path, "");
+fn get_json(core_ports: CorePorts, path: &str) -> serde_json::Value {
+    let (_, body) = call(core_ports, path, "");
     serde_json::from_str(&body).unwrap_or(serde_json::Value::Null)
 }
 
-pub fn unit_status() -> serde_json::Value {
-    get_json("/WorkUnit/wu01/status")
+pub fn unit_status(core_ports: CorePorts) -> serde_json::Value {
+    get_json(core_ports, "/WorkUnit/wu01/status")
 }
 
-pub fn worker_run_status(key: &str) -> serde_json::Value {
-    get_json(&format!("/WorkerRun/{key}/status"))
+pub fn worker_run_status(core_ports: CorePorts, key: &str) -> serde_json::Value {
+    get_json(core_ports, &format!("/WorkerRun/{key}/status"))
 }
 
-pub fn session_status(name: &str) -> serde_json::Value {
-    get_json(&format!("/Session/{name}/status"))
+pub fn session_status(core_ports: CorePorts, name: &str) -> serde_json::Value {
+    get_json(core_ports, &format!("/Session/{name}/status"))
 }
 
 /// The unit's lifecycle and attempt, the two fields the restart metric compares.
@@ -285,8 +277,8 @@ pub fn lifecycle_and_attempt(view: &serde_json::Value) -> (String, u64) {
 }
 
 /// Every kill lands on a unit running its first attempt; anything else is a broken setup.
-pub fn running_before_the_kill() -> (String, u64) {
-    let before = lifecycle_and_attempt(&unit_status());
+pub fn running_before_the_kill(core_ports: CorePorts) -> (String, u64) {
+    let before = lifecycle_and_attempt(&unit_status(core_ports));
     assert_eq!(
         before,
         ("running".to_string(), 1),
@@ -295,10 +287,10 @@ pub fn running_before_the_kill() -> (String, u64) {
     before
 }
 
-fn register_doubles() {
-    let body = format!("{{\"uri\":\"http://{}\"}}", loopback(DOUBLES_PORT));
+fn register_doubles(core_ports: CorePorts) {
+    let body = format!("{{\"uri\":\"http://{}\"}}", core_ports.test_endpoint());
     let response = client()
-        .post(admin_url("/deployments"))
+        .post(core_ports.admin_url("/deployments"))
         .header("content-type", "application/json")
         .body(body)
         .send()
@@ -338,12 +330,12 @@ pub fn test_timing() -> Timing {
 
 /// Starts the core through `tycho core start` and an in-process endpoint with the given ports.
 pub fn start_core(
-    test: &str,
+    claim: PortClaim,
     spawner: Arc<dyn Spawner>,
     merge_gate: Arc<dyn MergeGate>,
 ) -> (Core, DoublesEndpoint, Ports) {
-    let core = Core::new(test);
-    start_with_retries(&core, |core| {
+    let core = Core::new(claim);
+    start_once(&core, |core| {
         core.tycho(&["core", "start"])
             .status
             .success()
@@ -368,8 +360,8 @@ pub fn start_endpoint(
         packet_dir: Some(core.config.packet_dir()),
         workers: None,
     };
-    let doubles = DoublesEndpoint::start(&ports);
-    register_doubles();
+    let doubles = DoublesEndpoint::start(&ports, core.config.ports);
+    register_doubles(core.config.ports);
     (doubles, ports)
 }
 
@@ -412,11 +404,9 @@ pub fn dispatch(core: &Core, tasks: &[&str]) -> String {
 }
 
 /// Waits for the unit invocation's result through ingress attach.
-pub fn attach(invocation: &str) -> (u16, String) {
+pub fn attach(core_ports: CorePorts, invocation: &str) -> (u16, String) {
     let response = client()
-        .get(ingress_url(&format!(
-            "/restate/invocation/{invocation}/attach"
-        )))
+        .get(core_ports.ingress_url(&format!("/restate/invocation/{invocation}/attach")))
         .send();
     match response {
         Ok(response) => {
@@ -432,10 +422,14 @@ pub fn attach(invocation: &str) -> (u16, String) {
 const UNIT_TERMINAL: [&str; 3] = ["done", "abandoned", "escalated"];
 
 /// Polls until the unit reaches a terminal lifecycle; on the deadline, reports what is retrying.
-pub fn await_unit_end(why: &str, before: &(String, u64)) -> serde_json::Value {
+pub fn await_unit_end(
+    core_ports: CorePorts,
+    why: &str,
+    before: &(String, u64),
+) -> serde_json::Value {
     let started = Instant::now();
     while started.elapsed() < WAIT_TIMEOUT {
-        let view = unit_status();
+        let view = unit_status(core_ports);
         if UNIT_TERMINAL.contains(&view["lifecycle"].as_str().unwrap_or("")) {
             println!(
                 "evidence: unit ended {} after {:.1}s",
@@ -444,17 +438,17 @@ pub fn await_unit_end(why: &str, before: &(String, u64)) -> serde_json::Value {
             );
             return view;
         }
-        if let Some(looping) = looping_invocation() {
+        if let Some(looping) = looping_invocation(core_ports) {
             print_failed_pair(before, &view);
             panic!("{why}: an invocation of the unit is looping; view {view}; {looping}");
         }
         thread::sleep(Duration::from_millis(500));
     }
-    let retrying = retrying_invocations();
+    let retrying = retrying_invocations(core_ports);
     for (_, line) in &retrying {
         println!("evidence: still retrying: {line}");
     }
-    let view = unit_status();
+    let view = unit_status(core_ports);
     print_failed_pair(before, &view);
     panic!(
         "{why}: the unit did not end within {WAIT_TIMEOUT:?}; view {view}; retrying {retrying:?}"
@@ -469,18 +463,18 @@ fn print_failed_pair(before: &(String, u64), view: &serde_json::Value) {
 /// An invocation Restate has retried this often will not end on its own; the case fails now.
 const RETRIES_LOOPING: u64 = 5;
 
-fn looping_invocation() -> Option<String> {
-    retrying_invocations()
+fn looping_invocation(core_ports: CorePorts) -> Option<String> {
+    retrying_invocations(core_ports)
         .into_iter()
         .find(|(retries, _)| *retries >= RETRIES_LOOPING)
         .map(|(_, line)| line)
 }
 
 /// Runs one SQL query against Restate's admin introspection and returns its rows.
-pub fn admin_query(sql: &str) -> Vec<serde_json::Value> {
+pub fn admin_query(core_ports: CorePorts, sql: &str) -> Vec<serde_json::Value> {
     let body = serde_json::json!({ "query": sql }).to_string();
     let text = client()
-        .post(admin_url("/query"))
+        .post(core_ports.admin_url("/query"))
         .header("content-type", "application/json")
         .header("accept", "application/json")
         .body(body)
@@ -496,8 +490,9 @@ pub fn admin_query(sql: &str) -> Vec<serde_json::Value> {
 }
 
 /// Each invocation still retrying, with its retry count and last failure, as evidence of a loop.
-pub fn retrying_invocations() -> Vec<(u64, String)> {
+pub fn retrying_invocations(core_ports: CorePorts) -> Vec<(u64, String)> {
     admin_query(
+        core_ports,
         "SELECT target_service_name, target_service_key, retry_count, last_failure \
          FROM sys_invocation WHERE status = 'backing-off'",
     )

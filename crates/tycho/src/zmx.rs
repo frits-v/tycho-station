@@ -7,8 +7,11 @@ use std::process::ExitStatus;
 
 use tycho_types::lease::PID_MAX;
 
+use nix::sys::signal::Signal;
+
 use crate::command::{self, Captured, CommandError};
 use crate::config::{COMMAND_OUTPUT_MAX_BYTES, COMMAND_TIMEOUT, LIST_SESSIONS_MAX};
+use crate::process::{self, ProcessFacts};
 
 /// Set inside a zmx session: zmx refuses to attach from inside one, and nothing zmx runs for
 /// the core inherits the caller's session.
@@ -309,11 +312,196 @@ impl Zmx {
         self.status(&["kill", name, "--force"], COMMAND_OUTPUT_MAX_BYTES)
             .map(|_| ())
     }
+
+    /// Ends every listed session by name. A running entry's pid is killed first, and only when
+    /// `ps` shows it running a command that starts with one of `programs`; an ended entry's
+    /// pid may belong to another process by now and is never signalled.
+    pub fn clear(&self, programs: &[String]) -> Result<ClearReport, ZmxError> {
+        let mut lines = Vec::new();
+        for entry in self.list()? {
+            let line = match clear_action(&entry, &process::process_facts, programs) {
+                ClearAction::SignalThenRemove { name, pid } => format!(
+                    "{name} running as pid {pid}, signal: {:?}; zmx kill: {:?}",
+                    process::send(pid, false, Signal::SIGKILL),
+                    self.kill(&name)
+                ),
+                ClearAction::RemoveByName { name, why } => {
+                    format!("{name} {why}; zmx kill: {:?}", self.kill(&name))
+                }
+                ClearAction::Leave(text) => format!("unrecognised entry {text:?}"),
+            };
+            lines.push(line);
+        }
+        let remaining = self.list()?.len();
+        Ok(ClearReport { lines, remaining })
+    }
+}
+
+/// What `Zmx::clear` does with one listed entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClearAction {
+    /// A running session whose pid `ps` shows running an expected program.
+    SignalThenRemove { name: String, pid: u32 },
+    /// Removed by name only, with the reason its pid is not signalled.
+    RemoveByName { name: String, why: String },
+    /// An entry the decoder did not recognise is left and counts as remaining.
+    Leave(String),
+}
+
+/// An ended entry's pid may belong to another process by now, so `ps` is not even asked.
+pub fn clear_action(
+    entry: &ListEntry,
+    facts: &dyn Fn(u32) -> ProcessFacts,
+    programs: &[String],
+) -> ClearAction {
+    match entry {
+        ListEntry::Running { name, pid, .. } => match expected_program(&facts(*pid), programs) {
+            Ok(()) => ClearAction::SignalThenRemove {
+                name: name.clone(),
+                pid: *pid,
+            },
+            Err(reason) => ClearAction::RemoveByName {
+                name: name.clone(),
+                why: format!("running as pid {pid}, not signalled: {reason}"),
+            },
+        },
+        ListEntry::Ended { name, pid, .. } => ClearAction::RemoveByName {
+            name: name.clone(),
+            why: format!("ended (pid {pid} not signalled)"),
+        },
+        ListEntry::Unrecognised(text) => ClearAction::Leave(text.clone()),
+    }
+}
+
+/// What `Zmx::clear` did with each listed entry, and how many entries are still listed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearReport {
+    pub lines: Vec<String>,
+    pub remaining: usize,
+}
+
+const COMMAND_ECHO_MAX_CHARS: usize = 120;
+
+/// Whether `ps`'s answer for a listed pid shows a command starting with one of `programs`.
+pub fn expected_program(facts: &ProcessFacts, programs: &[String]) -> Result<(), String> {
+    match facts {
+        ProcessFacts::Running(facts)
+            if programs
+                .iter()
+                .any(|program| facts.command.starts_with(program.as_str())) =>
+        {
+            Ok(())
+        }
+        ProcessFacts::Running(facts) => Err(format!(
+            "it runs {:?}",
+            facts
+                .command
+                .chars()
+                .take(COMMAND_ECHO_MAX_CHARS)
+                .collect::<String>()
+        )),
+        ProcessFacts::Gone => Err("it is gone".to_string()),
+        ProcessFacts::Unrecognised(text) => Err(format!("ps answered {text:?}")),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::Facts;
+
+    fn running(command: &str) -> ProcessFacts {
+        ProcessFacts::Running(Facts {
+            uid: 501,
+            pgid: 42,
+            started_unix_seconds: 0,
+            command: command.to_string(),
+        })
+    }
+
+    #[test]
+    fn an_ended_entry_is_removed_by_name_without_asking_ps_or_signalling() {
+        let programs = vec!["/opt/restate-server".to_string()];
+        let asked = std::cell::Cell::new(0_u32);
+        let facts = |_pid: u32| {
+            asked.set(asked.get().saturating_add(1));
+            running("/opt/restate-server --base-dir /h")
+        };
+        let ended = ListEntry::Ended {
+            name: "core.restate".to_string(),
+            pid: 60267,
+            exit_code: 137,
+        };
+        assert_eq!(
+            clear_action(&ended, &facts, &programs),
+            ClearAction::RemoveByName {
+                name: "core.restate".to_string(),
+                why: "ended (pid 60267 not signalled)".to_string(),
+            }
+        );
+        assert_eq!(asked.get(), 0);
+    }
+
+    #[test]
+    fn a_running_entry_is_signalled_only_while_it_runs_an_expected_program() {
+        let programs = vec!["/opt/restate-server".to_string()];
+        let entry = ListEntry::Running {
+            name: "core.restate".to_string(),
+            pid: 60889,
+            created_unix_seconds: 0,
+        };
+        assert_eq!(
+            clear_action(
+                &entry,
+                &|_| running("/opt/restate-server --base-dir /h"),
+                &programs
+            ),
+            ClearAction::SignalThenRemove {
+                name: "core.restate".to_string(),
+                pid: 60889,
+            }
+        );
+        assert!(matches!(
+            clear_action(&entry, &|_| running("/bin/zsh -l"), &programs),
+            ClearAction::RemoveByName { .. }
+        ));
+        assert!(matches!(
+            clear_action(&entry, &|_| ProcessFacts::Gone, &programs),
+            ClearAction::RemoveByName { .. }
+        ));
+        assert_eq!(
+            clear_action(
+                &ListEntry::Unrecognised("x".to_string()),
+                &|_| ProcessFacts::Gone,
+                &programs
+            ),
+            ClearAction::Leave("x".to_string())
+        );
+    }
+
+    #[test]
+    fn only_a_pid_running_an_expected_program_is_signalled() {
+        let programs = vec![
+            "/opt/restate-server".to_string(),
+            "/opt/tycho endpoint".to_string(),
+        ];
+        assert_eq!(
+            expected_program(&running("/opt/restate-server --base-dir /h"), &programs),
+            Ok(())
+        );
+        assert_eq!(
+            expected_program(&running("/opt/tycho endpoint"), &programs),
+            Ok(())
+        );
+        for other in [
+            running("/bin/zsh -l"),
+            running("/opt/tycho launch --spec x"),
+            ProcessFacts::Gone,
+            ProcessFacts::Unrecognised("?".to_string()),
+        ] {
+            assert!(expected_program(&other, &programs).is_err(), "{other:?}");
+        }
+    }
 
     const RUNNING: &str = "  name=core.restate\tpid=60889\tclients=0\tcreated=1791528126\tcwd=file://host/Users/someone\n";
     const ENDED: &str = "  name=core.endpoint\tpid=60267\tclients=0\tcreated=1791528101\tcwd=file://host/Users/someone\tended=1791528114\texit_code=137\n";

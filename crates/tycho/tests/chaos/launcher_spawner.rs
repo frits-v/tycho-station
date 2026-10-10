@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tycho::agent_files::current_uid;
-use tycho::config::AgentDirs;
+use tycho::config::{AgentDirs, CorePorts};
 use tycho::kill::{kill_session, reap, KillRequest, KillVerdict};
 use tycho::launcher::{HeartbeatTarget, VendorTerminal};
 use tycho::launcher::{SessionFiles, VendorRecord};
@@ -55,6 +55,7 @@ struct Inner {
     zmx: Zmx,
     dirs: AgentDirs,
     home: PathBuf,
+    core_ports: CorePorts,
     fixture: PathBuf,
     plan: VendorPlan,
     log: Mutex<LauncherLog>,
@@ -68,7 +69,7 @@ pub struct LauncherSpawner {
 
 impl LauncherSpawner {
     /// `core_home` holds the fixture and scrollback; the agent directory is short for zmx sockets.
-    pub fn new(core_home: &Path, tag: &str, plan: VendorPlan) -> Self {
+    pub fn new(core_home: &Path, core_ports: CorePorts, tag: &str, plan: VendorPlan) -> Self {
         let user_home = PathBuf::from(env::var_os("HOME").unwrap());
         let agent = user_home.join(format!(".tca-{tag}-{}", std::process::id()));
         if agent.exists() {
@@ -82,6 +83,7 @@ impl LauncherSpawner {
                 zmx: Zmx::agent(&zmx_binary, &agent),
                 dirs: AgentDirs::new(agent).unwrap(),
                 home: core_home.to_path_buf(),
+                core_ports,
                 fixture,
                 plan,
                 log: Mutex::new(LauncherLog::default()),
@@ -177,6 +179,7 @@ impl LauncherSpawner {
             tier,
             terminal: VendorTerminal::Files,
             vendor_dir: None,
+            ports: self.inner.core_ports,
         })
     }
 

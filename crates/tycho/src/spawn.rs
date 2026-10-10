@@ -21,9 +21,10 @@ use tycho_types::session::SessionName;
 
 use crate::agent_files::{read_checked, write_new, write_new_mode};
 use crate::config::{
-    AgentDirs, AGENT_DIR_ENV, AGENT_DIR_MODE, POLL_INTERVAL, SCROLLBACK_DIR,
+    AgentDirs, CorePorts, AGENT_DIR_ENV, AGENT_DIR_MODE, POLL_INTERVAL, SCROLLBACK_DIR,
     SESSION_WAIT_POLLS_MAX, ZMX_ENV,
 };
+use crate::config_store::PORT_OFFSET_ENV;
 use crate::launch_spec::CORE_UID_ENV;
 use crate::launcher::{
     check_tier, check_vendor, HeartbeatTarget, LaunchSpec, VendorTerminal, AGENT_TELEMETRY_ENV,
@@ -124,6 +125,8 @@ pub struct SpawnRequest<'a> {
     pub terminal: VendorTerminal,
     /// The vendor's working directory; `None` keeps the zmx session's.
     pub vendor_dir: Option<&'a Path>,
+    /// The ports of the core the launcher reports to.
+    pub ports: CorePorts,
 }
 
 /// Splits a trailing `--tier <tier>` off the port's argv: the vendor command and the tier.
@@ -233,6 +236,12 @@ pub fn launch_spec(request: &SpawnRequest<'_>) -> Result<LaunchSpec, SpawnerErro
     }
     if let Some(dir) = request.vendor_dir {
         environment.insert(VENDOR_DIR_ENV.to_string(), dir.display().to_string());
+    }
+    if !request.ports.offset.is_production() {
+        environment.insert(
+            PORT_OFFSET_ENV.to_string(),
+            request.ports.offset.to_string(),
+        );
     }
     let spec = LaunchSpec {
         schema_version: SPEC_SCHEMA_VERSION,
@@ -483,6 +492,7 @@ mod tests {
             tier: Some("t2"),
             terminal: VendorTerminal::Files,
             vendor_dir: None,
+            ports: CorePorts::PRODUCTION,
         };
         let session = SessionName::parse(NAME).unwrap();
         write_durable(
@@ -530,6 +540,7 @@ mod tests {
             tier: Some("t2"),
             terminal: VendorTerminal::Files,
             vendor_dir: None,
+            ports: CorePorts::PRODUCTION,
         }
     }
 
@@ -632,6 +643,24 @@ mod tests {
         let spec = launch_spec(&interactive).unwrap();
         assert_eq!(spec.environment[VENDOR_TERMINAL_ENV], "inherit");
         assert_eq!(spec.environment[VENDOR_DIR_ENV], "/work/wu03");
+    }
+
+    #[test]
+    fn a_test_core_spec_names_its_offset_and_the_production_spec_does_not() {
+        let dirs = AgentDirs::new(PathBuf::from("/a")).unwrap();
+        let zmx = Zmx::agent(Path::new("/z"), &dirs.socket_dir);
+        let env = env();
+        let vendor = ["/bin/sh".to_string()];
+        let production = launch_spec(&shared_request(&dirs, &zmx, &env, &vendor)).unwrap();
+        assert!(!production.environment.contains_key(PORT_OFFSET_ENV));
+        let offset = crate::config_store::PortOffset::new(1056).unwrap();
+        let test_core = SpawnRequest {
+            ports: CorePorts::at(offset),
+            ..shared_request(&dirs, &zmx, &env, &vendor)
+        };
+        let spec = launch_spec(&test_core).unwrap();
+        assert_eq!(spec.environment[PORT_OFFSET_ENV], "1056");
+        assert_eq!(spec.settings().unwrap().ports, CorePorts::at(offset));
     }
 
     #[test]

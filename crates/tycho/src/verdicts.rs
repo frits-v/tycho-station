@@ -12,7 +12,7 @@ use tycho_types::envelope::ShortText;
 use tycho_types::service::{handler, Attempt, EpicId, WorkUnitId};
 
 use crate::agent_files;
-use crate::config::ingress_url;
+use crate::config::CorePorts;
 use crate::epic_command::{self, OperatorAnswer, OPERATOR_SERVICE};
 use crate::http::Http;
 use crate::packets::{RATIONALE_MAX_BYTES, VERDICT_EXTENSION};
@@ -227,7 +227,12 @@ pub struct RuleRequest {
 
 /// `Operator/rule_unit` through ingress; a replay of the same file reuses its key.
 #[must_use]
-pub fn rule_through_operator(http: &Http, secret: &str, request: &RuleRequest) -> RuleAnswer {
+pub fn rule_through_operator(
+    http: &Http,
+    ports: CorePorts,
+    secret: &str,
+    request: &RuleRequest,
+) -> RuleAnswer {
     let call = RuleUnitCall {
         secret: secret.to_string(),
         unit: request.unit.clone(),
@@ -237,7 +242,7 @@ pub fn rule_through_operator(http: &Http, secret: &str, request: &RuleRequest) -
         Ok(body) => body,
         Err(error) => return RuleAnswer::Unavailable(error.to_string()),
     };
-    let url = ingress_url(&format!(
+    let url = ports.ingress_url(&format!(
         "/{OPERATOR_SERVICE}/{}",
         handler::OPERATOR_RULE_UNIT
     ));

@@ -31,13 +31,10 @@ use std::time::{Duration, Instant};
 
 use restate_sdk::prelude::HttpServer;
 use tycho::config::{
-    admin_url, ingress_url, loopback, CoreConfig, CoreRole, HOME_ENV, MISE_NO_INSTALL,
-    RESTATE_INGRESS_PORT, RESTATE_SERVER_ENV, ZMX_ENV,
+    CoreConfig, CorePorts, PortClaim, HOME_ENV, MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
 use tycho::endpoint;
-use tycho::health;
-use tycho::http::Http;
 use tycho::services::doubles::{FixedGate, RecordingSpawner, RecordingVendor, DOUBLE_SOCKET};
 use tycho::services::merge_gate::{GateVerdict, MergeGate, NoGate};
 use tycho::services::operator::read_secret_file;
@@ -45,7 +42,7 @@ use tycho::services::spawner::{SpawnSpec, Spawner};
 use tycho::services::{Ports, Timing};
 use tycho::spool::check_result_envelope;
 use tycho::vendors::control::NoVendor;
-use tycho::zmx::{ListEntry, Zmx};
+use tycho::zmx::Zmx;
 use tycho_types::envelope::{
     CommitSha, EscalationOption, EscalationPayload, QuestionType, Reversibility, ShortText,
 };
@@ -55,18 +52,36 @@ use tycho_types::session::Level;
 use tycho_types::session::SessionName;
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
-const DOUBLES_PORT: u16 = 19_081;
 const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 struct Core {
     config: CoreConfig,
     environment: Vec<(&'static str, String)>,
+    /// Held until the core is stopped, after the teardown in `drop`.
+    _port_claim: PortClaim,
+}
+
+fn test_home(test: &str) -> PathBuf {
+    let user_home = PathBuf::from(env::var_os("HOME").unwrap());
+    user_home.join(format!(".tycho-spine-{test}-{}", std::process::id()))
+}
+
+/// A port slot claim for the test's home, taken before any double is built from its ports.
+fn test_claim(test: &str) -> PortClaim {
+    claim_ports(&test_home(test))
+}
+
+/// Claims a port slot for the home, held until the core is stopped; a slot whose ports
+/// another process holds is skipped and named, and the test fails only when no slot is left.
+fn claim_ports(home: &Path) -> PortClaim {
+    let claim = CorePorts::claim(home).unwrap_or_else(|error| panic!("{error}"));
+    println!("evidence: {claim}");
+    claim
 }
 
 impl Core {
-    fn new(test: &str) -> Self {
-        let user_home = PathBuf::from(env::var_os("HOME").unwrap());
-        let home = user_home.join(format!(".tycho-spine-{test}-{}", std::process::id()));
+    fn new(claim: PortClaim) -> Self {
+        let home = claim.home.clone();
         if home.exists() {
             fs::remove_dir_all(&home).unwrap();
         }
@@ -78,20 +93,18 @@ impl Core {
             restate_server.clone(),
             PathBuf::from(TYCHO),
         )
-        .unwrap();
-        let http = Http::new(Duration::from_secs(2)).unwrap();
-        for role in CoreRole::ALL {
-            assert!(
-                !health::probe(&http, role).is_healthy(),
-                "{role} already answers on its port; stop the running core first"
-            );
-        }
+        .unwrap()
+        .with_port_offset(claim.ports.offset);
         let environment = vec![
             (HOME_ENV, home.display().to_string()),
             (ZMX_ENV, zmx.display().to_string()),
             (RESTATE_SERVER_ENV, restate_server.display().to_string()),
-        ];
+        ]
+        .into_iter()
+        .chain(config.port_offset_pair())
+        .collect();
         Self {
+            _port_claim: claim,
             config,
             environment,
         }
@@ -118,34 +131,12 @@ impl Core {
     }
 
     fn clear_sessions(&self) -> Result<(), String> {
-        let zmx = Zmx::new(&self.config.zmx, &self.config.socket_dir());
-        let entries = zmx.list().map_err(|error| error.to_string())?;
-        for entry in &entries {
-            match entry {
-                ListEntry::Running { name, pid, .. } | ListEntry::Ended { name, pid, .. } => {
-                    println!("teardown: {name} survived core stop; killing pid {pid}");
-                    let killed = Command::new("/bin/kill")
-                        .args(["-KILL", &pid.to_string()])
-                        .status();
-                    println!(
-                        "teardown: kill {pid}: {killed:?}; zmx kill: {:?}",
-                        zmx.kill(name)
-                    );
-                }
-                ListEntry::Unrecognised(line) => {
-                    return Err(format!("unrecognised zmx line {line:?}"))
-                }
-            }
-        }
-        let remaining = zmx.list().map_err(|error| error.to_string())?;
-        println!(
-            "teardown: sessions left in the core socket directory: {}",
-            remaining.len()
-        );
-        if remaining.is_empty() {
-            Ok(())
-        } else {
-            Err(format!("{} sessions remain", remaining.len()))
+        match clear_sessions(
+            &Zmx::new(&self.config.zmx, &self.config.socket_dir()),
+            "core",
+        ) {
+            0 => Ok(()),
+            left => Err(format!("{left} sessions remain")),
         }
     }
 }
@@ -171,12 +162,12 @@ struct DoublesEndpoint {
 }
 
 impl DoublesEndpoint {
-    fn start(ports: &Ports) -> Self {
+    fn start(ports: &Ports, core_ports: CorePorts) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
-        let listener = bind_with_retries(&runtime);
+        let listener = bind_with_retries(&runtime, core_ports.test_endpoint());
         let built = endpoint::build(ports);
         runtime.spawn(async move { HttpServer::new(built).serve(listener).await });
         Self {
@@ -186,16 +177,17 @@ impl DoublesEndpoint {
 }
 
 /// A port the previous endpoint held can take a moment to free after its runtime stops.
-fn bind_with_retries(runtime: &tokio::runtime::Runtime) -> tokio::net::TcpListener {
+fn bind_with_retries(
+    runtime: &tokio::runtime::Runtime,
+    address: std::net::SocketAddr,
+) -> tokio::net::TcpListener {
     for _ in 0..40 {
-        if let Ok(listener) =
-            runtime.block_on(tokio::net::TcpListener::bind(loopback(DOUBLES_PORT)))
-        {
+        if let Ok(listener) = runtime.block_on(tokio::net::TcpListener::bind(address)) {
             return listener;
         }
         thread::sleep(Duration::from_millis(250));
     }
-    panic!("port {DOUBLES_PORT} did not free");
+    panic!("{address} did not free");
 }
 
 impl Drop for DoublesEndpoint {
@@ -226,8 +218,13 @@ fn client() -> reqwest::blocking::Client {
 }
 
 /// One ingress call; returns the status and the body, and prints both as evidence.
-fn call(path: &str, body: &str, idempotency_key: Option<&str>) -> (u16, String) {
-    let mut request = client().post(format!("http://127.0.0.1:{RESTATE_INGRESS_PORT}{path}"));
+fn call(
+    core_ports: CorePorts,
+    path: &str,
+    body: &str,
+    idempotency_key: Option<&str>,
+) -> (u16, String) {
+    let mut request = client().post(core_ports.ingress_url(path));
     if !body.is_empty() {
         request = request
             .header("content-type", "application/json")
@@ -243,10 +240,10 @@ fn call(path: &str, body: &str, idempotency_key: Option<&str>) -> (u16, String) 
     (status, text)
 }
 
-fn register_doubles() {
-    let body = format!("{{\"uri\":\"http://{}\"}}", loopback(DOUBLES_PORT));
+fn register_doubles(core_ports: CorePorts) {
+    let body = format!("{{\"uri\":\"http://{}\"}}", core_ports.test_endpoint());
     let response = client()
-        .post(admin_url("/deployments"))
+        .post(core_ports.admin_url("/deployments"))
         .header("content-type", "application/json")
         .body(body)
         .send()
@@ -257,11 +254,9 @@ fn register_doubles() {
     assert_eq!(status, 201, "registration refused: {text}");
 }
 
-fn handler_metadata(service: &str, handler_name: &str) -> serde_json::Value {
+fn handler_metadata(core_ports: CorePorts, service: &str, handler_name: &str) -> serde_json::Value {
     let text = client()
-        .get(admin_url(&format!(
-            "/services/{service}/handlers/{handler_name}"
-        )))
+        .get(core_ports.admin_url(&format!("/services/{service}/handlers/{handler_name}")))
         .send()
         .unwrap()
         .text()
@@ -284,8 +279,11 @@ fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
     panic!("{what} did not happen within {WAIT_TIMEOUT:?}");
 }
 
-fn start_core_with_doubles(test: &str, spawner: &RecordingSpawner) -> (Core, DoublesEndpoint) {
-    let (core, doubles, _) = start_core_with(test, spawner, Arc::new(NoGate), test_timing());
+fn start_core_with_doubles(
+    claim: PortClaim,
+    spawner: &RecordingSpawner,
+) -> (Core, DoublesEndpoint) {
+    let (core, doubles, _) = start_core_with(claim, spawner, Arc::new(NoGate), test_timing());
     (core, doubles)
 }
 
@@ -306,13 +304,13 @@ fn test_config() -> FactoryConfig {
 }
 
 fn start_core_with(
-    test: &str,
+    claim: PortClaim,
     spawner: &RecordingSpawner,
     merge_gate: Arc<dyn MergeGate>,
     timing: Timing,
 ) -> (Core, DoublesEndpoint, Ports) {
     start_core_with_spawner(
-        test,
+        claim,
         Arc::new(spawner.clone()),
         merge_gate,
         timing,
@@ -320,15 +318,21 @@ fn start_core_with(
     )
 }
 
-/// `adjust` sees the ports before the endpoint starts, with the core for its paths.
+/// `adjust` sees the ports before the endpoint starts, with the core for its paths. The
+/// doubles the caller built read the claim's ports, so the core must listen on exactly those.
 fn start_core_with_spawner(
-    test: &str,
+    claim: PortClaim,
     spawner: Arc<dyn Spawner>,
     merge_gate: Arc<dyn MergeGate>,
     timing: Timing,
     adjust: &dyn Fn(&mut Ports, &Core),
 ) -> (Core, DoublesEndpoint, Ports) {
-    let core = Core::new(test);
+    let expected = claim.ports;
+    let core = Core::new(claim);
+    assert_eq!(
+        core.config.ports, expected,
+        "the doubles answer another core"
+    );
     let started = core.tycho(&["core", "start"]);
     assert!(started.status.success());
     let report = String::from_utf8_lossy(&started.stdout).to_string();
@@ -345,21 +349,26 @@ fn start_core_with_spawner(
         workers: None,
     };
     adjust(&mut ports, &core);
-    let doubles = DoublesEndpoint::start(&ports);
-    register_doubles();
+    let doubles = DoublesEndpoint::start(&ports, core.config.ports);
+    register_doubles(core.config.ports);
     (core, doubles, ports)
 }
 
-fn assert_private(service: Service, handlers: &[&str], key: &str) {
+fn assert_private(core_ports: CorePorts, service: Service, handlers: &[&str], key: &str) {
     for private in handlers {
-        let metadata = handler_metadata(service.name(), private);
+        let metadata = handler_metadata(core_ports, service.name(), private);
         println!(
             "evidence: {}/{private} public = {}",
             service.name(),
             metadata["public"]
         );
         assert_eq!(metadata["public"], serde_json::json!(false), "{private}");
-        let (status, _) = call(&format!("/{}/{key}/{private}", service.name()), "{}", None);
+        let (status, _) = call(
+            core_ports,
+            &format!("/{}/{key}/{private}", service.name()),
+            "{}",
+            None,
+        );
         assert!(
             (400..500).contains(&status),
             "{private} must be refused at ingress"
@@ -367,9 +376,9 @@ fn assert_private(service: Service, handlers: &[&str], key: &str) {
     }
 }
 
-fn epic_status() -> serde_json::Value {
+fn epic_status(core_ports: CorePorts) -> serde_json::Value {
     let path = format!("/{}/cf7a/{}", Service::Epic.name(), handler::EPIC_STATUS);
-    let (status, body) = call(&path, "", None);
+    let (status, body) = call(core_ports, &path, "", None);
     assert_eq!(status, 200);
     serde_json::from_str(&body).unwrap()
 }
@@ -377,25 +386,35 @@ fn epic_status() -> serde_json::Value {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn epic_starts_and_adds_units_only_through_the_operator() {
+    let claim = test_claim("epic");
+    let core_ports = claim.ports;
     let spawner = RecordingSpawner::new();
-    let (core, _doubles) = start_core_with_doubles("epic", &spawner);
+    let (core, _doubles) = start_core_with_doubles(claim, &spawner);
     let handlers = [
         handler::EPIC_START,
         handler::EPIC_ADD_UNIT,
         handler::EPIC_RESERVE,
         handler::EPIC_SETTLE,
     ];
-    assert_private(Service::Epic, &handlers, "cf7a");
+    assert_private(core_ports, Service::Epic, &handlers, "cf7a");
     let wrong = format!(
         r#"{{"secret":"{}","epic":"cf7a","goal":"split the orders table","seat_limit":1,"metered_limit":0}}"#,
         "x".repeat(64)
     );
     let start_epic = format!("/Operator/{}", handler::OPERATOR_START_EPIC);
-    assert_eq!(call(&start_epic, &wrong, None).0, 401, "a wrong secret");
-    let empty = wrong.replace(&"x".repeat(64), "");
-    assert_eq!(call(&start_epic, &empty, None).0, 401, "an empty secret");
     assert_eq!(
-        epic_status(),
+        call(core_ports, &start_epic, &wrong, None).0,
+        401,
+        "a wrong secret"
+    );
+    let empty = wrong.replace(&"x".repeat(64), "");
+    assert_eq!(
+        call(core_ports, &start_epic, &empty, None).0,
+        401,
+        "an empty secret"
+    );
+    assert_eq!(
+        epic_status(core_ports),
         serde_json::Value::Null,
         "no state after refusals"
     );
@@ -410,7 +429,7 @@ fn epic_starts_and_adds_units_only_through_the_operator() {
         String::from_utf8_lossy(&again.stdout).trim(),
         "\"already_present\""
     );
-    let state = epic_status();
+    let state = epic_status(core_ports);
     assert_eq!(state["units"], serde_json::json!(["wu01"]));
     assert_eq!(state["worker_slots"]["limit"], 2);
     let conflict = core.tycho(&["epic", "start", "cf7a", "another goal"]);
@@ -425,8 +444,10 @@ fn epic_starts_and_adds_units_only_through_the_operator() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn session_and_reconciler_refuse_agents_outside_their_scope() {
+    let claim = test_claim("session");
+    let core_ports = claim.ports;
     let spawner = RecordingSpawner::new();
-    let (_core, _doubles) = start_core_with_doubles("session", &spawner);
+    let (_core, _doubles) = start_core_with_doubles(claim, &spawner);
     let name = "cf7a.wu01.wrk.claude.a1";
     let session_handlers = [
         handler::SESSION_SPAWN,
@@ -435,30 +456,39 @@ fn session_and_reconciler_refuse_agents_outside_their_scope() {
         handler::SESSION_EXPIRE,
         handler::SESSION_REAP,
     ];
-    assert_private(Service::Session, &session_handlers, name);
+    assert_private(core_ports, Service::Session, &session_handlers, name);
     let reconciler_handlers = [
         handler::RECONCILER_EXPECT,
         handler::RECONCILER_FORGET,
         handler::RECONCILER_TICK,
     ];
-    assert_private(Service::Reconciler, &reconciler_handlers, RECONCILER_KEY);
+    assert_private(
+        core_ports,
+        Service::Reconciler,
+        &reconciler_handlers,
+        RECONCILER_KEY,
+    );
     let session = format!("/{}/{name}", Service::Session.name());
     let beat = format!(
         r#"{{"secret":"{}","sequence":1,"status":{{"state":null,"summary":"s","last_progress_unix_ms":0,"progress":{{"head_sha":null,"tests_passing":0}},"active_workers":0,"usage":{{"input_tokens":0,"output_tokens":0}},"blockers":[]}},"context_tokens":0}}"#,
         "s".repeat(40)
     );
     let heartbeat = format!("{session}/{}", handler::SESSION_HEARTBEAT);
-    let (status, _) = call(&heartbeat, &beat, Some(&format!("{name}:1")));
+    let (status, _) = call(core_ports, &heartbeat, &beat, Some(&format!("{name}:1")));
     assert_eq!(status, 404, "no session was spawned under this key");
     let status_path = format!("{session}/{}", handler::SESSION_STATUS);
-    assert_eq!(call(&status_path, "", None), (200, "null".to_string()));
+    assert_eq!(
+        call(core_ports, &status_path, "", None),
+        (200, "null".to_string())
+    );
     let reconciler = format!("/{}/{RECONCILER_KEY}", Service::Reconciler.name());
     let start = format!("{reconciler}/{}", handler::RECONCILER_START);
-    assert_eq!(call(&start, "", None), (200, "2".to_string()));
-    assert_eq!(call(&start, "", None), (200, "3".to_string()));
+    assert_eq!(call(core_ports, &start, "", None), (200, "2".to_string()));
+    assert_eq!(call(core_ports, &start, "", None), (200, "3".to_string()));
     let status_path = format!("{reconciler}/{}", handler::RECONCILER_STATUS);
     wait_until("the reconciler answers status while its chain runs", || {
-        call(&status_path, "", None) == (200, r#"{"generation":3,"expected":[]}"#.to_string())
+        call(core_ports, &status_path, "", None)
+            == (200, r#"{"generation":3,"expected":[]}"#.to_string())
     });
 }
 
@@ -492,17 +522,23 @@ enum Launcher {
     Silent,
 }
 
-fn launcher_double(launcher: Launcher) -> RecordingSpawner {
+fn launcher_double(core_ports: CorePorts, launcher: Launcher) -> RecordingSpawner {
     RecordingSpawner::with_hook(Arc::new(move |spec: &SpawnSpec, _pid| {
         let session = spec.session.to_string();
         let awaitable = spec.environment.awaitable_id.to_string();
         match launcher {
             Launcher::Resolve(suffix, delay) if session.ends_with(suffix) => {
                 let branch = format!("wu01/{}", session.rsplit('.').next().unwrap_or("x"));
-                answer(awaitable, delay, "resolve", result_json(&session, &branch));
+                answer(
+                    core_ports,
+                    awaitable,
+                    delay,
+                    "resolve",
+                    result_json(&session, &branch),
+                );
             }
             Launcher::Reject(state, delay) => {
-                answer(awaitable, delay, "reject", state.to_string());
+                answer(core_ports, awaitable, delay, "reject", state.to_string());
             }
             Launcher::HoldSpawn(hold) => thread::sleep(hold),
             Launcher::Resolve(..) | Launcher::Silent => {}
@@ -511,13 +547,17 @@ fn launcher_double(launcher: Launcher) -> RecordingSpawner {
 }
 
 /// Resolves or rejects through ingress after a delay, as a launcher's exit trap would.
-fn answer(awaitable: String, delay: Duration, action: &'static str, body: String) {
+fn answer(
+    core_ports: CorePorts,
+    awaitable: String,
+    delay: Duration,
+    action: &'static str,
+    body: String,
+) {
     thread::spawn(move || {
         thread::sleep(delay);
         let status = client()
-            .post(ingress_url(&format!(
-                "/restate/awakeables/{awaitable}/{action}"
-            )))
+            .post(core_ports.ingress_url(&format!("/restate/awakeables/{awaitable}/{action}")))
             .header("content-type", "application/json")
             .body(if action == "reject" {
                 body
@@ -578,11 +618,9 @@ fn dispatch_plan(core: &Core, plan: &Path) -> String {
     body["invocation_id"].as_str().unwrap().to_string()
 }
 
-fn attach(invocation: &str) -> (u16, String) {
+fn attach(core_ports: CorePorts, invocation: &str) -> (u16, String) {
     let response = client()
-        .get(ingress_url(&format!(
-            "/restate/invocation/{invocation}/attach"
-        )))
+        .get(core_ports.ingress_url(&format!("/restate/invocation/{invocation}/attach")))
         .send()
         .unwrap();
     let status = response.status().as_u16();
@@ -591,15 +629,15 @@ fn attach(invocation: &str) -> (u16, String) {
     (status, text)
 }
 
-fn unit_status() -> serde_json::Value {
-    let (_, body) = call("/WorkUnit/wu01/status", "", None);
+fn unit_status(core_ports: CorePorts) -> serde_json::Value {
+    let (_, body) = call(core_ports, "/WorkUnit/wu01/status", "", None);
     serde_json::from_str(&body).unwrap_or(serde_json::Value::Null)
 }
 
 /// Cancels through the admin API, the way an operator stop would.
-fn cancel(invocation: &str) {
+fn cancel(core_ports: CorePorts, invocation: &str) {
     let status = client()
-        .patch(admin_url(&format!("/invocations/{invocation}/cancel")))
+        .patch(core_ports.admin_url(&format!("/invocations/{invocation}/cancel")))
         .send()
         .unwrap()
         .status()
@@ -630,6 +668,7 @@ fn assert_started_with(view: &serde_json::Value, ports: &Ports) {
 /// A class the routing table does not list, or a tier below the class minimum, is refused at
 /// dispatch before any run starts.
 fn assert_dispatch_refuses_bad_routes(core: &Core) {
+    let core_ports = core.config.ports;
     let path = format!("/Operator/{}", handler::OPERATOR_DISPATCH_UNIT);
     for (class, tier, reason) in [
         ("unlisted", "standard", "not in the routing table"),
@@ -640,28 +679,43 @@ fn assert_dispatch_refuses_bad_routes(core: &Core) {
             operator_secret(core),
             worker(class, tier)
         );
-        let (status, answer) = call(&path, &body, None);
+        let (status, answer) = call(core_ports, &path, &body, None);
         assert_eq!(status, 400, "{class} {tier}: {answer}");
         assert!(answer.contains(reason), "{answer}");
         println!("evidence: dispatch of {class} at {tier} -> {status}");
     }
 }
 
-#[test]
-#[ignore = "starts real processes; run with mise run spine-tests"]
-fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
-    let spawner = launcher_double(Launcher::Resolve("a1", Duration::from_millis(500)));
-    let gate = FixedGate::new(GateVerdict::Merged {
-        default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
-    });
-    let (core, _doubles, ports) =
-        start_core_with("unit", &spawner, Arc::new(gate.clone()), test_timing());
+fn assert_unit_handlers_private(core_ports: CorePorts) {
     assert_private(
+        core_ports,
         Service::WorkUnit,
         &[handler::WORK_UNIT_RUN, handler::WORK_UNIT_RULE],
         "wu01",
     );
-    assert_private(Service::WorkerRun, &[handler::WORKER_RUN_RUN], "wu01-t1");
+    assert_private(
+        core_ports,
+        Service::WorkerRun,
+        &[handler::WORKER_RUN_RUN],
+        "wu01-t1",
+    );
+}
+
+#[test]
+#[ignore = "starts real processes; run with mise run spine-tests"]
+fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
+    let claim = test_claim("unit");
+    let core_ports = claim.ports;
+    let spawner = launcher_double(
+        core_ports,
+        Launcher::Resolve("a1", Duration::from_millis(500)),
+    );
+    let gate = FixedGate::new(GateVerdict::Merged {
+        default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
+    });
+    let (core, _doubles, ports) =
+        start_core_with(claim, &spawner, Arc::new(gate.clone()), test_timing());
+    assert_unit_handlers_private(core_ports);
     let unlisted = format!(
         r#"{{"secret":"{}","unit":"wu09","request":{{"epic":"cf7a","control_vendor":"codex","plan":[{{"task":"t","worker":{}}}]}}}}"#,
         operator_secret(&core),
@@ -670,11 +724,11 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     let invocation = dispatch(&core, &["wu01-t1", "wu01-t2"]);
     let path = format!("/Operator/{}", handler::OPERATOR_DISPATCH_UNIT);
     assert_eq!(
-        call(&path, &unlisted, None).0,
+        call(core_ports, &path, &unlisted, None).0,
         404,
         "a unit the epic does not list"
     );
-    let (status, body) = attach(&invocation);
+    let (status, body) = attach(core_ports, &invocation);
     assert_eq!(status, 200, "{body}");
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(view["lifecycle"], "done");
@@ -696,11 +750,11 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     let log = spawner.log();
     assert_eq!(log.spawned.len(), 2, "one session per task: {log:?}");
     let session = &log.spawned[0].0;
-    let (_, session_view) = call(&format!("/Session/{session}/status"), "", None);
+    let (_, session_view) = call(core_ports, &format!("/Session/{session}/status"), "", None);
     for hidden in ["sign_", "secret", "awaitable"] {
         assert!(!session_view.contains(hidden), "{hidden} in {session_view}");
     }
-    let state = epic_status();
+    let state = epic_status(core_ports);
     assert_eq!(state["reservations"], serde_json::json!({}));
     assert_eq!(
         state["seat"]["charged"], 3000,
@@ -713,7 +767,12 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_silent_worker_is_nudged_at_t1_killed_at_t2_and_requeued_as_attempt_two() {
-    let spawner = launcher_double(Launcher::Resolve("a2", Duration::from_millis(500)));
+    let claim = test_claim("stall");
+    let core_ports = claim.ports;
+    let spawner = launcher_double(
+        core_ports,
+        Launcher::Resolve("a2", Duration::from_millis(500)),
+    );
     let timing = Timing {
         stall_silence: Duration::from_secs(2),
         stall_progress: Duration::from_secs(5),
@@ -722,16 +781,16 @@ fn a_silent_worker_is_nudged_at_t1_killed_at_t2_and_requeued_as_attempt_two() {
     let gate = FixedGate::new(GateVerdict::Merged {
         default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
     });
-    let (core, _doubles, _) = start_core_with("stall", &spawner, Arc::new(gate), timing);
+    let (core, _doubles, _) = start_core_with(claim, &spawner, Arc::new(gate), timing);
     let started = Instant::now();
     let invocation = dispatch(&core, &["wu01-t9"]);
-    let (status, body) = attach(&invocation);
+    let (status, body) = attach(core_ports, &invocation);
     println!(
         "evidence: unit returned after {:.1}s",
         started.elapsed().as_secs_f64()
     );
     assert_eq!(status, 200, "{body}");
-    let (_, run) = call("/WorkerRun/wu01-t9/status", "", None);
+    let (_, run) = call(core_ports, "/WorkerRun/wu01-t9/status", "", None);
     let run: serde_json::Value = serde_json::from_str(&run).unwrap();
     assert_eq!(run["outcome"]["outcome"], "completed");
     assert_eq!(run["outcome"]["attempt"], 2);
@@ -753,7 +812,7 @@ fn a_silent_worker_is_nudged_at_t1_killed_at_t2_and_requeued_as_attempt_two() {
     assert_eq!(log.killed.len(), 1, "T2 killed attempt 1 by pid");
     assert_eq!(log.killed[0].0, names[0]);
     assert_eq!(
-        epic_status()["worker_slots"]["used"],
+        epic_status(core_ports)["worker_slots"]["used"],
         0,
         "both attempts settled"
     );
@@ -762,11 +821,13 @@ fn a_silent_worker_is_nudged_at_t1_killed_at_t2_and_requeued_as_attempt_two() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn an_endpoint_killed_mid_run_replays_to_the_same_state() {
-    let spawner = launcher_double(Launcher::Resolve("a1", Duration::from_secs(6)));
+    let claim = test_claim("replay");
+    let core_ports = claim.ports;
+    let spawner = launcher_double(core_ports, Launcher::Resolve("a1", Duration::from_secs(6)));
     let gate = FixedGate::new(GateVerdict::Merged {
         default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
     });
-    let (core, doubles, ports) = start_core_with("replay", &spawner, Arc::new(gate), test_timing());
+    let (core, doubles, ports) = start_core_with(claim, &spawner, Arc::new(gate), test_timing());
     let invocation = dispatch(&core, &["wu01-t5"]);
     wait_until("the worker session spawned", || {
         spawner.log().spawned.len() == 1
@@ -774,9 +835,9 @@ fn an_endpoint_killed_mid_run_replays_to_the_same_state() {
     drop(doubles);
     println!("evidence: killed the endpoint with unit {invocation} awaiting its worker");
     thread::sleep(Duration::from_secs(2));
-    let _restarted = DoublesEndpoint::start(&ports);
+    let _restarted = DoublesEndpoint::start(&ports, core.config.ports);
     println!("evidence: endpoint restarted on the same port");
-    let (status, body) = attach(&invocation);
+    let (status, body) = attach(core_ports, &invocation);
     assert_eq!(status, 200, "{body}");
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(view["lifecycle"], "done");
@@ -791,21 +852,22 @@ fn an_endpoint_killed_mid_run_replays_to_the_same_state() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_cancel_during_spawn_kills_settles_and_starts_no_second_attempt() {
-    let spawner = launcher_double(Launcher::HoldSpawn(Duration::from_secs(4)));
-    let (core, _doubles, _) =
-        start_core_with("cancel-spawn", &spawner, Arc::new(NoGate), test_timing());
+    let claim = test_claim("cancel-spawn");
+    let core_ports = claim.ports;
+    let spawner = launcher_double(core_ports, Launcher::HoldSpawn(Duration::from_secs(4)));
+    let (core, _doubles, _) = start_core_with(claim, &spawner, Arc::new(NoGate), test_timing());
     let invocation = dispatch(&core, &["wu01-t3"]);
     wait_until("the spawn step started", || {
         spawner.log().spawned.len() == 1
     });
-    cancel(&invocation);
-    let (status, body) = attach(&invocation);
+    cancel(core_ports, &invocation);
+    let (status, body) = attach(core_ports, &invocation);
     assert_eq!(status, 409, "the unit ends cancelled: {body}");
     wait_until("the started session was reaped by name", || {
         spawner.log().reaped.len() == 1
     });
     wait_until("the worker run settled", || {
-        epic_status()["worker_slots"]["used"] == 0
+        epic_status(core_ports)["worker_slots"]["used"] == 0
     });
     thread::sleep(Duration::from_secs(3));
     let log = spawner.log();
@@ -817,11 +879,11 @@ fn a_cancel_during_spawn_kills_settles_and_starts_no_second_attempt() {
         "reaped by name, no pid known"
     );
     let status_path = format!("/Session/{}/status", log.spawned[0].0);
-    assert!(call(&status_path, "", None)
+    assert!(call(core_ports, &status_path, "", None)
         .1
         .contains("\"phase\":\"lost\""));
     assert_eq!(
-        epic_status()["worker_slots"]["used"],
+        epic_status(core_ports)["worker_slots"]["used"],
         0,
         "the attempt settled"
     );
@@ -830,9 +892,10 @@ fn a_cancel_during_spawn_kills_settles_and_starts_no_second_attempt() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn an_error_while_watching_kills_the_session_before_settling() {
-    let spawner = launcher_double(Launcher::Silent);
-    let (core, _doubles, _) =
-        start_core_with("cancel-watch", &spawner, Arc::new(NoGate), test_timing());
+    let claim = test_claim("cancel-watch");
+    let core_ports = claim.ports;
+    let spawner = launcher_double(core_ports, Launcher::Silent);
+    let (core, _doubles, _) = start_core_with(claim, &spawner, Arc::new(NoGate), test_timing());
     let invocation = dispatch(&core, &["wu01-t4"]);
     wait_until("the worker session spawned", || {
         spawner.log().spawned.len() == 1
@@ -840,25 +903,27 @@ fn an_error_while_watching_kills_the_session_before_settling() {
     let session = spawner.log().spawned[0].0.clone();
     let status_path = format!("/Session/{session}/status");
     wait_until("the session recorded", || {
-        call(&status_path, "", None).1.contains("running")
+        call(core_ports, &status_path, "", None)
+            .1
+            .contains("running")
     });
-    cancel(&invocation);
-    assert_eq!(attach(&invocation).0, 409);
+    cancel(core_ports, &invocation);
+    assert_eq!(attach(core_ports, &invocation).0, 409);
     wait_until("the worker run killed the session", || {
         spawner.log().killed.len() == 1
     });
     wait_until("the worker run settled", || {
-        epic_status()["worker_slots"]["used"] == 0
+        epic_status(core_ports)["worker_slots"]["used"] == 0
     });
     let log = spawner.log();
     println!("evidence: spawner log {log:?}");
     assert_eq!(log.killed.len(), 1, "killed on the error path");
     assert_eq!(log.killed[0].0, session);
-    assert!(call(&status_path, "", None)
+    assert!(call(core_ports, &status_path, "", None)
         .1
         .contains("\"phase\":\"killed\""));
     assert_eq!(
-        epic_status()["worker_slots"]["used"],
+        epic_status(core_ports)["worker_slots"]["used"],
         0,
         "settled after the kill"
     );
@@ -867,11 +932,16 @@ fn an_error_while_watching_kills_the_session_before_settling() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn an_escalated_unit_waits_for_a_ruling_through_the_operator() {
-    let spawner = launcher_double(Launcher::Reject("escalated", Duration::from_millis(500)));
-    let (core, _doubles, _) = start_core_with("rule", &spawner, Arc::new(NoGate), test_timing());
+    let claim = test_claim("rule");
+    let core_ports = claim.ports;
+    let spawner = launcher_double(
+        core_ports,
+        Launcher::Reject("escalated", Duration::from_millis(500)),
+    );
+    let (core, _doubles, _) = start_core_with(claim, &spawner, Arc::new(NoGate), test_timing());
     let invocation = dispatch(&core, &["wu01-t6"]);
     wait_until("the unit escalated", || {
-        unit_status()["lifecycle"] == "escalated"
+        unit_status(core_ports)["lifecycle"] == "escalated"
     });
     let rule = |secret: &str, attempt: u16| {
         format!(
@@ -880,24 +950,30 @@ fn an_escalated_unit_waits_for_a_ruling_through_the_operator() {
     };
     let path = format!("/Operator/{}", handler::OPERATOR_RULE_UNIT);
     assert_eq!(
-        call(&path, &rule(&"x".repeat(64), 1), Some("probe-key")).0,
+        call(
+            core_ports,
+            &path,
+            &rule(&"x".repeat(64), 1),
+            Some("probe-key")
+        )
+        .0,
         401,
         "a wrong secret"
     );
     let secret = operator_secret(&core);
     assert_eq!(
-        call(&path, &rule(&secret, 1), Some("probe-key")).0,
+        call(core_ports, &path, &rule(&secret, 1), Some("probe-key")).0,
         401,
         "Restate answers a reused idempotency key with the cached refusal"
     );
     assert_eq!(
-        call(&path, &rule(&secret, 2), None).0,
+        call(core_ports, &path, &rule(&secret, 2), None).0,
         409,
         "not the current attempt"
     );
-    assert_eq!(unit_status()["lifecycle"], "escalated");
-    assert_eq!(call(&path, &rule(&secret, 1), None).0, 200);
-    let (status, body) = attach(&invocation);
+    assert_eq!(unit_status(core_ports)["lifecycle"], "escalated");
+    assert_eq!(call(core_ports, &path, &rule(&secret, 1), None).0, 200);
+    let (status, body) = attach(core_ports, &invocation);
     assert_eq!(status, 200, "{body}");
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(view["lifecycle"], "abandoned");
@@ -907,10 +983,15 @@ fn an_escalated_unit_waits_for_a_ruling_through_the_operator() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_terminal_error_abandons_the_unit_with_its_reason() {
-    let spawner = launcher_double(Launcher::Resolve("a1", Duration::from_millis(500)));
-    let (core, _doubles, _) = start_core_with("abandon", &spawner, Arc::new(NoGate), test_timing());
+    let claim = test_claim("abandon");
+    let core_ports = claim.ports;
+    let spawner = launcher_double(
+        core_ports,
+        Launcher::Resolve("a1", Duration::from_millis(500)),
+    );
+    let (core, _doubles, _) = start_core_with(claim, &spawner, Arc::new(NoGate), test_timing());
     let invocation = dispatch(&core, &["wu01-t7"]);
-    let (status, body) = attach(&invocation);
+    let (status, body) = attach(core_ports, &invocation);
     assert_eq!(status, 200, "{body}");
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(view["lifecycle"], "abandoned", "never stuck at verifying");
@@ -957,7 +1038,7 @@ fn forced_escalation_question() -> EscalationPayload {
 }
 
 /// Rejects the first spawn with the certified question and resolves every later one done.
-fn escalating_double() -> RecordingSpawner {
+fn escalating_double(core_ports: CorePorts) -> RecordingSpawner {
     let rejection = encode_escalation(&forced_escalation_question()).unwrap();
     let spawns = Arc::new(AtomicUsize::new(0));
     RecordingSpawner::with_hook(Arc::new(move |spec: &SpawnSpec, _pid| {
@@ -965,27 +1046,33 @@ fn escalating_double() -> RecordingSpawner {
         let awaitable = spec.environment.awaitable_id.to_string();
         let delay = Duration::from_millis(500);
         if spawns.fetch_add(1, Ordering::SeqCst) == 0 {
-            answer(awaitable, delay, "reject", rejection.clone());
+            answer(core_ports, awaitable, delay, "reject", rejection.clone());
         } else {
             let branch = format!("wu01/{}", session.rsplit('.').next().unwrap_or("x"));
-            answer(awaitable, delay, "resolve", result_json(&session, &branch));
+            answer(
+                core_ports,
+                awaitable,
+                delay,
+                "resolve",
+                result_json(&session, &branch),
+            );
         }
     }))
 }
 
-fn start_escalating(test: &str, spawner: &RecordingSpawner) -> (Core, DoublesEndpoint) {
+fn start_escalating(claim: PortClaim, spawner: &RecordingSpawner) -> (Core, DoublesEndpoint) {
     let gate = FixedGate::new(GateVerdict::Merged {
         default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
     });
-    let (core, doubles, _) = start_core_with(test, spawner, Arc::new(gate), test_timing());
+    let (core, doubles, _) = start_core_with(claim, spawner, Arc::new(gate), test_timing());
     (core, doubles)
 }
 
 /// Waits for the unit to escalate with a packet on its view, and returns the packet path.
-fn wait_for_packet() -> PathBuf {
+fn wait_for_packet(core_ports: CorePorts) -> PathBuf {
     let mut packet = None;
     wait_until("the unit escalated with a packet", || {
-        let view = unit_status();
+        let view = unit_status(core_ports);
         packet = view["packet"].as_str().map(PathBuf::from);
         view["lifecycle"] == "escalated" && packet.is_some()
     });
@@ -1041,17 +1128,19 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_certified_question_lands_as_a_packet_and_continue_resumes_the_unit() {
-    let spawner = escalating_double();
-    let (core, _doubles) = start_escalating("packet-continue", &spawner);
+    let claim = test_claim("packet-continue");
+    let core_ports = claim.ports;
+    let spawner = escalating_double(core_ports);
+    let (core, _doubles) = start_escalating(claim, &spawner);
     let invocation = dispatch(&core, &["wu01-t8"]);
-    let packet = wait_for_packet();
+    let packet = wait_for_packet(core_ports);
     assert_packet(&core, &packet);
     let verdict = packet.with_extension("verdict");
     let pass = rule_by_file(&core, &verdict, "continue\nB: ask the council\n");
     assert!(pass.status.success());
     assert!(!verdict.exists(), "the verdict file was moved");
     assert!(sibling(&verdict, "applied").exists(), "marked applied");
-    let (status, body) = attach(&invocation);
+    let (status, body) = attach(core_ports, &invocation);
     assert_eq!(status, 200, "{body}");
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(view["lifecycle"], "done");
@@ -1070,15 +1159,17 @@ fn a_certified_question_lands_as_a_packet_and_continue_resumes_the_unit() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn an_abandon_verdict_ends_the_unit_with_its_rationale() {
-    let spawner = escalating_double();
-    let (core, _doubles) = start_escalating("packet-abandon", &spawner);
+    let claim = test_claim("packet-abandon");
+    let core_ports = claim.ports;
+    let spawner = escalating_double(core_ports);
+    let (core, _doubles) = start_escalating(claim, &spawner);
     let invocation = dispatch(&core, &["wu01-t8"]);
-    let packet = wait_for_packet();
+    let packet = wait_for_packet(core_ports);
     let rationale = "POLICY.md reserves a ceiling change for a council ruling";
     let verdict = packet.with_extension("verdict");
     let pass = rule_by_file(&core, &verdict, &format!("abandon\n{rationale}\n"));
     assert!(pass.status.success());
-    let (status, body) = attach(&invocation);
+    let (status, body) = attach(core_ports, &invocation);
     assert_eq!(status, 200, "{body}");
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(view["lifecycle"], "abandoned");
@@ -1090,10 +1181,12 @@ fn an_abandon_verdict_ends_the_unit_with_its_rationale() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_malformed_or_stale_verdict_is_rejected_and_the_unit_stays_escalated() {
-    let spawner = escalating_double();
-    let (core, _doubles) = start_escalating("packet-malformed", &spawner);
+    let claim = test_claim("packet-malformed");
+    let core_ports = claim.ports;
+    let spawner = escalating_double(core_ports);
+    let (core, _doubles) = start_escalating(claim, &spawner);
     dispatch(&core, &["wu01-t8"]);
-    let packet = wait_for_packet();
+    let packet = wait_for_packet(core_ports);
     let verdict = packet.with_extension("verdict");
     let pass = rule_by_file(&core, &verdict, "maybe later\n");
     assert!(
@@ -1125,7 +1218,7 @@ fn a_malformed_or_stale_verdict_is_rejected_and_the_unit_stays_escalated() {
         "{reason}"
     );
     thread::sleep(Duration::from_secs(1));
-    let view = unit_status();
+    let view = unit_status(core_ports);
     assert_eq!(view["lifecycle"], "escalated");
     assert_eq!(view["attempt"], 1);
     assert_eq!(spawner.log().spawned.len(), 1);
@@ -1139,12 +1232,20 @@ fn a_malformed_or_stale_verdict_is_rejected_and_the_unit_stays_escalated() {
     dead_code,
     reason = "enabled as a test when a headless worker adapter exists"
 )]
-fn a_headless_worker_rejects_on_the_planted_contradiction(spawner: Arc<dyn Spawner>) {
+fn a_headless_worker_rejects_on_the_planted_contradiction(
+    core_ports: CorePorts,
+    spawner: Arc<dyn Spawner>,
+) {
     let gate = Arc::new(NoGate);
-    let (core, _doubles, _) =
-        start_core_with_spawner("packet-headless", spawner, gate, test_timing(), &|_, _| {});
+    let (core, _doubles, _) = start_core_with_spawner(
+        test_claim("packet-headless"),
+        spawner,
+        gate,
+        test_timing(),
+        &|_, _| {},
+    );
     let invocation = dispatch(&core, &["wu01-t8"]);
-    let packet = wait_for_packet();
+    let packet = wait_for_packet(core_ports);
     let text = fs::read_to_string(&packet).unwrap();
     assert!(text.contains("POLICY.md"), "{text}");
     let verdict = packet.with_extension("verdict");
@@ -1153,7 +1254,7 @@ fn a_headless_worker_rejects_on_the_planted_contradiction(spawner: Arc<dyn Spawn
             .status
             .success()
     );
-    let (status, body) = attach(&invocation);
+    let (status, body) = attach(core_ports, &invocation);
     assert_eq!(status, 200, "{body}");
     assert!(body.contains("abandoned"), "{body}");
 }
@@ -1166,20 +1267,21 @@ fn config_with_unit_cap(cap: u16) -> FactoryConfig {
 
 /// A unit with cap 1 whose only attempt ends without a merge escalates on its own give-up rule.
 fn assert_cap_packet(
-    core_name: &str,
+    claim: PortClaim,
     spawner: &RecordingSpawner,
     gate: Arc<dyn MergeGate>,
     why: &str,
 ) {
+    let core_ports = claim.ports;
     let (core, _doubles, _) = start_core_with_spawner(
-        core_name,
+        claim,
         Arc::new(spawner.clone()),
         gate,
         test_timing(),
         &|ports, _| ports.config = Arc::new(config_with_unit_cap(1)),
     );
     dispatch(&core, &["wu01-t9"]);
-    let packet = wait_for_packet();
+    let packet = wait_for_packet(core_ports);
     let text = fs::read_to_string(&packet).unwrap();
     println!("evidence: cap packet text\n{text}");
     for expected in ["Continue with attempt 2, or abandon the unit?", why] {
@@ -1195,12 +1297,17 @@ fn assert_cap_packet(
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn criteria_failing_at_the_unit_cap_write_a_continue_or_abandon_packet() {
-    let spawner = launcher_double(Launcher::Resolve("a1", Duration::from_millis(500)));
+    let claim = test_claim("cap-criteria");
+    let core_ports = claim.ports;
+    let spawner = launcher_double(
+        core_ports,
+        Launcher::Resolve("a1", Duration::from_millis(500)),
+    );
     let gate = FixedGate::new(GateVerdict::Failed {
         findings: vec![ShortText::parse("criterion 0 failed").unwrap()],
     });
     assert_cap_packet(
-        "cap-criteria",
+        claim,
         &spawner,
         Arc::new(gate),
         "the done criteria failed on the last attempt the cap allows",
@@ -1210,9 +1317,14 @@ fn criteria_failing_at_the_unit_cap_write_a_continue_or_abandon_packet() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_worker_giving_up_at_the_unit_cap_writes_a_continue_or_abandon_packet() {
-    let spawner = launcher_double(Launcher::Reject("cancelled", Duration::from_millis(500)));
+    let claim = test_claim("cap-attempts");
+    let core_ports = claim.ports;
+    let spawner = launcher_double(
+        core_ports,
+        Launcher::Reject("cancelled", Duration::from_millis(500)),
+    );
     assert_cap_packet(
-        "cap-attempts",
+        claim,
         &spawner,
         Arc::new(NoGate),
         "the worker runs gave up on the last attempt the cap allows",
@@ -1222,16 +1334,18 @@ fn a_worker_giving_up_at_the_unit_cap_writes_a_continue_or_abandon_packet() {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn an_escalation_without_a_packet_directory_abandons_the_unit_with_the_reason() {
-    let spawner = escalating_double();
+    let claim = test_claim("packet-none");
+    let core_ports = claim.ports;
+    let spawner = escalating_double(core_ports);
     let (core, _doubles, _) = start_core_with_spawner(
-        "packet-none",
+        claim,
         Arc::new(spawner),
         Arc::new(NoGate),
         test_timing(),
         &|ports, _| ports.packet_dir = None,
     );
     let invocation = dispatch(&core, &["wu01-t8"]);
-    let (status, body) = attach(&invocation);
+    let (status, body) = attach(core_ports, &invocation);
     assert_eq!(status, 200, "{body}");
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(view["lifecycle"], "abandoned");
@@ -1245,7 +1359,9 @@ fn an_escalation_without_a_packet_directory_abandons_the_unit_with_the_reason() 
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_packet_that_cannot_be_written_stays_on_the_view_and_is_written_on_the_next_try() {
-    let spawner = escalating_double();
+    let claim = test_claim("packet-retry");
+    let core_ports = claim.ports;
+    let spawner = escalating_double(core_ports);
     let timing = Timing {
         retry_backoff_initial: Duration::from_millis(100),
         retry_backoff_max: Duration::from_secs(1),
@@ -1253,7 +1369,7 @@ fn a_packet_that_cannot_be_written_stays_on_the_view_and_is_written_on_the_next_
         ..test_timing()
     };
     let (core, _doubles, _) = start_core_with_spawner(
-        "packet-retry",
+        claim,
         Arc::new(spawner),
         Arc::new(FixedGate::new(GateVerdict::Merged {
             default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
@@ -1272,7 +1388,7 @@ fn a_packet_that_cannot_be_written_stays_on_the_view_and_is_written_on_the_next_
     dispatch(&core, &["wu01-t8"]);
     let mut error = String::new();
     wait_until("the unit escalated with a packet error", || {
-        let view = unit_status();
+        let view = unit_status(core_ports);
         error = view["packet_error"].as_str().unwrap_or("").to_string();
         view["lifecycle"] == "escalated" && !error.is_empty() && view["packet"].is_null()
     });
@@ -1281,13 +1397,13 @@ fn a_packet_that_cannot_be_written_stays_on_the_view_and_is_written_on_the_next_
     fs::remove_file(&blocked).unwrap();
     fs::create_dir(&blocked).unwrap();
     fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700)).unwrap();
-    let packet = wait_for_packet();
+    let packet = wait_for_packet(core_ports);
     assert_eq!(
         packet,
         blocked.join("packets").join("cf7a").join("wu01-1.md")
     );
     assert_eq!(mode(&packet), 0o600);
-    let view = unit_status();
+    let view = unit_status(core_ports);
     assert!(view["packet_error"].is_null(), "{view}");
     assert_eq!(view["lifecycle"], "escalated");
 }
@@ -1314,21 +1430,26 @@ fn control_plan_file(core: &Core) -> PathBuf {
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_unit_with_a_control_start_spawns_and_instructs_its_control_session_before_dispatch() {
-    let spawner = launcher_double(Launcher::Resolve("a1", Duration::from_millis(500)));
+    let claim = test_claim("control");
+    let core_ports = claim.ports;
+    let spawner = launcher_double(
+        core_ports,
+        Launcher::Resolve("a1", Duration::from_millis(500)),
+    );
     let vendor = RecordingVendor::new(&spawner);
     let gate = FixedGate::new(GateVerdict::Merged {
         default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
     });
     let ports_vendor = vendor.clone();
     let (core, _doubles, _ports) = start_core_with_spawner(
-        "control",
+        claim,
         Arc::new(spawner.clone()),
         Arc::new(gate),
         test_timing(),
         &move |ports, _| ports.vendor = Arc::new(ports_vendor.clone()),
     );
     let invocation = dispatch_plan(&core, &control_plan_file(&core));
-    let (status, body) = attach(&invocation);
+    let (status, body) = attach(core_ports, &invocation);
     assert_eq!(status, 200, "{body}");
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(view["lifecycle"], "done");
@@ -1357,7 +1478,7 @@ fn a_unit_with_a_control_start_spawns_and_instructs_its_control_session_before_d
         calls[0].spawns_before, 1,
         "instructed after its own spawn and before any worker claimed a lease"
     );
-    let (_, session_view) = call("/Session/cf7a.wu01.ctl.claude/status", "", None);
+    let (_, session_view) = call(core_ports, "/Session/cf7a.wu01.ctl.claude/status", "", None);
     let session_view: serde_json::Value = serde_json::from_str(&session_view).unwrap();
     assert_eq!(session_view["last_instruction"]["path"], "socket");
 }
@@ -1365,18 +1486,23 @@ fn a_unit_with_a_control_start_spawns_and_instructs_its_control_session_before_d
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_unit_whose_control_instruction_is_refused_is_abandoned_without_dispatch() {
-    let spawner = launcher_double(Launcher::Resolve("a1", Duration::from_millis(500)));
+    let claim = test_claim("refused");
+    let core_ports = claim.ports;
+    let spawner = launcher_double(
+        core_ports,
+        Launcher::Resolve("a1", Duration::from_millis(500)),
+    );
     let vendor = RecordingVendor::refusing(&spawner);
     let ports_vendor = vendor.clone();
     let (core, _doubles, _ports) = start_core_with_spawner(
-        "refused",
+        claim,
         Arc::new(spawner.clone()),
         Arc::new(NoGate),
         test_timing(),
         &move |ports, _| ports.vendor = Arc::new(ports_vendor.clone()),
     );
     let invocation = dispatch_plan(&core, &control_plan_file(&core));
-    let (status, body) = attach(&invocation);
+    let (status, body) = attach(core_ports, &invocation);
     assert_eq!(status, 200, "{body}");
     let view: serde_json::Value = serde_json::from_str(&body).unwrap();
     println!("evidence: refused unit view {view}");
@@ -1401,4 +1527,27 @@ fn a_unit_whose_control_instruction_is_refused_is_abandoned_without_dispatch() {
         "the control session only; no worker was dispatched"
     );
     assert_eq!(vendor.calls().len(), 1);
+}
+
+/// Ends what a socket directory still lists; a pid is signalled only while `ps` shows it
+/// running restate-server, the endpoint or a launcher.
+fn clear_sessions(zmx: &Zmx, label: &str) -> usize {
+    let programs = vec![
+        mise_which("restate-server").display().to_string(),
+        format!("{TYCHO} endpoint"),
+        format!("{TYCHO} launch"),
+    ];
+    match zmx.clear(&programs) {
+        Ok(report) => {
+            for line in &report.lines {
+                println!("teardown: {label} {line}");
+            }
+            println!("teardown: {label} sessions left: {}", report.remaining);
+            report.remaining
+        }
+        Err(error) => {
+            println!("teardown: {label} zmx: {error}");
+            usize::MAX
+        }
+    }
 }

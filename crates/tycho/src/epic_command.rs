@@ -9,7 +9,7 @@ use std::path::Path;
 use tycho_types::envelope::ShortText;
 use tycho_types::service::{handler, EpicId, WorkUnitId};
 
-use crate::config::{ingress_url, spine, CoreConfig};
+use crate::config::{spine, CoreConfig, CorePorts};
 use crate::http::{Http, Outcome};
 use crate::services::operator::{read_secret_file, AddUnitCall, DispatchUnitCall, StartEpicCall};
 use crate::services::work_unit::{PlannedTask, WorkUnitRequest};
@@ -54,8 +54,8 @@ pub fn decode(outcome: Outcome) -> OperatorAnswer {
     }
 }
 
-fn call(http: &Http, handler_name: &str, body: String) -> OperatorAnswer {
-    let url = ingress_url(&format!("/{OPERATOR_SERVICE}/{handler_name}"));
+fn call(http: &Http, ports: CorePorts, handler_name: &str, body: String) -> OperatorAnswer {
+    let url = ports.ingress_url(&format!("/{OPERATOR_SERVICE}/{handler_name}"));
     decode(http.post_json(&url, body))
 }
 
@@ -75,7 +75,7 @@ pub fn start(
         metered_limit: spine::EPIC_METERED_LIMIT_DEFAULT,
     };
     let body = serde_json::to_string(&request).map_err(|error| error.to_string())?;
-    Ok(call(http, handler::OPERATOR_START_EPIC, body))
+    Ok(call(http, config.ports, handler::OPERATOR_START_EPIC, body))
 }
 
 pub fn add_unit(
@@ -91,7 +91,7 @@ pub fn add_unit(
         unit: WorkUnitId::parse(unit).map_err(|error| format!("work unit id: {error}"))?,
     };
     let body = serde_json::to_string(&request).map_err(|error| error.to_string())?;
-    Ok(call(http, handler::OPERATOR_ADD_UNIT, body))
+    Ok(call(http, config.ports, handler::OPERATOR_ADD_UNIT, body))
 }
 
 /// Bounds the dispatch plan file `tycho epic dispatch` reads.
@@ -143,7 +143,12 @@ pub fn dispatch(
         },
     };
     let body = serde_json::to_string(&request).map_err(|error| error.to_string())?;
-    Ok(call(http, handler::OPERATOR_DISPATCH_UNIT, body))
+    Ok(call(
+        http,
+        config.ports,
+        handler::OPERATOR_DISPATCH_UNIT,
+        body,
+    ))
 }
 
 #[cfg(test)]

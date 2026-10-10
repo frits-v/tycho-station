@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 use restate_sdk::prelude::{Endpoint, HttpServer};
 use tycho::agent_files::current_uid;
 use tycho::config::{
-    admin_url, loopback, AgentDirs, CoreConfig, CoreRole, AGENT_USER_ENV, HOME_ENV,
-    MISE_NO_INSTALL, RESTATE_INGRESS_PORT, RESTATE_SERVER_ENV, ZMX_ENV,
+    AgentDirs, CoreConfig, CorePorts, CoreRole, PortClaim, AGENT_USER_ENV, HOME_ENV,
+    MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::health::{self, Health};
 use tycho::http::Http;
@@ -41,7 +41,7 @@ use tycho::process::now_unix_ms;
 use tycho::services::spawner::LeaseRead;
 use tycho::spawn::{read_lease, save_scrollback, spawn_session, SpawnOutcome, SpawnRequest};
 use tycho::spool::ACKNOWLEDGED_SUFFIX;
-use tycho::zmx::{count_named, presence, ListEntry, Presence, Zmx};
+use tycho::zmx::{count_named, presence, Presence, Zmx};
 use tycho_types::launcher::{LauncherEnv, ENV_AWAITABLE_ID, ENV_SESSION_NAME, ENV_SESSION_SECRET};
 use tycho_types::lease::{Freshness, RequeueReason};
 use tycho_types::session::SessionName;
@@ -61,9 +61,6 @@ if [ -n "$3" ]; then printf '%s' "$3" > "$TYCHO_RESULT_FILE"; fi
 exit 0
 "#;
 
-/// The launch probe's own endpoint: it returns awakeable ids, so production never binds it.
-const PROBE_ENDPOINT_PORT: u16 = 19092;
-
 struct Harness {
     probe_endpoint: Option<tokio::runtime::Runtime>,
     config: CoreConfig,
@@ -72,6 +69,8 @@ struct Harness {
     zmx: Zmx,
     fixture: PathBuf,
     names: Vec<SessionName>,
+    /// Held until the core is stopped, after the teardown in `drop`.
+    _port_claim: PortClaim,
 }
 
 fn mise_which(tool: &str) -> PathBuf {
@@ -93,6 +92,7 @@ impl Harness {
         let user_home = PathBuf::from(env::var_os("HOME").unwrap());
         let pid = std::process::id();
         let home = user_home.join(format!(".tycho-test-launch-{tag}-{pid}"));
+        let claim = claim_ports(&home);
         let agent = user_home.join(format!(".tla-{tag}-{pid}"));
         for dir in [&home, &agent] {
             if dir.exists() {
@@ -107,22 +107,21 @@ impl Harness {
             restate_server.clone(),
             PathBuf::from(TYCHO),
         )
-        .unwrap();
-        for role in CoreRole::ALL {
-            assert!(
-                !health::probe(&http(), role).is_healthy(),
-                "{role} already answers on its port; stop the running core first"
-            );
-        }
+        .unwrap()
+        .with_port_offset(claim.ports.offset);
         let dirs = AgentDirs::new(agent.clone()).unwrap();
         let mut harness = Self {
+            _port_claim: claim,
             probe_endpoint: None,
             environment: vec![
                 (HOME_ENV, home.display().to_string()),
                 (ZMX_ENV, zmx_binary.display().to_string()),
                 (RESTATE_SERVER_ENV, restate_server.display().to_string()),
                 (AGENT_USER_ENV, env::var("USER").unwrap()),
-            ],
+            ]
+            .into_iter()
+            .chain(config.port_offset_pair())
+            .collect(),
             zmx: Zmx::agent(&zmx_binary, &agent),
             fixture: home.join("vendor.sh"),
             config,
@@ -130,7 +129,7 @@ impl Harness {
             names: Vec::new(),
         };
         assert!(harness.tycho(&["core", "start"]).status.success());
-        harness.probe_endpoint = Some(start_probe_endpoint());
+        harness.probe_endpoint = Some(start_probe_endpoint(harness.config.ports));
         fs::write(&harness.fixture, VENDOR_SCRIPT).unwrap();
         harness
     }
@@ -205,6 +204,7 @@ impl Harness {
             tier: Some("t1"),
             terminal: VendorTerminal::Files,
             vendor_dir: None,
+            ports: self.config.ports,
         })
         .unwrap();
         println!("evidence: spawn_session({name}) -> {outcome:?}");
@@ -243,25 +243,27 @@ impl Harness {
 }
 
 /// Kills every session left in a socket directory by pid and by name; returns how many remain.
+/// Ends what a socket directory still lists; a pid is signalled only while `ps` shows it
+/// running restate-server, the endpoint or a launcher.
 fn clear_sessions(zmx: &Zmx, label: &str) -> usize {
-    let Ok(entries) = zmx.list() else {
-        println!("teardown: {label} zmx list failed");
-        return usize::MAX;
-    };
-    for entry in &entries {
-        if let ListEntry::Running { name, pid, .. } | ListEntry::Ended { name, pid, .. } = entry {
-            println!("teardown: {label} session {name} left; killing pid {pid}");
-            drop(
-                Command::new("/bin/kill")
-                    .args(["-KILL", &pid.to_string()])
-                    .status(),
-            );
-            drop(zmx.kill(name));
+    let programs = vec![
+        mise_which("restate-server").display().to_string(),
+        format!("{TYCHO} endpoint"),
+        format!("{TYCHO} launch"),
+    ];
+    match zmx.clear(&programs) {
+        Ok(report) => {
+            for line in &report.lines {
+                println!("teardown: {label} {line}");
+            }
+            println!("teardown: {label} sessions left: {}", report.remaining);
+            report.remaining
+        }
+        Err(error) => {
+            println!("teardown: {label} zmx: {error}");
+            usize::MAX
         }
     }
-    let left = zmx.list().map_or(usize::MAX, |entries| entries.len());
-    println!("teardown: {label} sessions left: {left}");
-    left
 }
 
 impl Drop for Harness {
@@ -329,16 +331,17 @@ fn kill_orphan_vendor(files: &SessionFiles) -> bool {
 }
 
 /// Serves `LaunchProbe` in this process and registers it beside the production endpoint.
-fn start_probe_endpoint() -> tokio::runtime::Runtime {
+/// The launch probe returns awakeable ids, so it is served on the test endpoint port only.
+fn start_probe_endpoint(core_ports: CorePorts) -> tokio::runtime::Runtime {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();
     let listener = runtime
-        .block_on(tokio::net::TcpListener::bind(loopback(PROBE_ENDPOINT_PORT)))
+        .block_on(tokio::net::TcpListener::bind(core_ports.test_endpoint()))
         .unwrap();
     let before = reqwest::blocking::Client::new()
-        .get(admin_url("/services/LaunchProbe"))
+        .get(core_ports.admin_url("/services/LaunchProbe"))
         .send()
         .unwrap()
         .status()
@@ -347,9 +350,9 @@ fn start_probe_endpoint() -> tokio::runtime::Runtime {
     assert_eq!(before, 404, "the production endpoint binds LaunchProbe");
     let endpoint = Endpoint::builder().bind(LaunchProbe).build();
     runtime.spawn(async move { HttpServer::new(endpoint).serve(listener).await });
-    let body = format!("{{\"uri\":\"http://{}\"}}", loopback(PROBE_ENDPOINT_PORT));
+    let body = format!("{{\"uri\":\"http://{}\"}}", core_ports.test_endpoint());
     let response = reqwest::blocking::Client::new()
-        .post(admin_url("/deployments"))
+        .post(core_ports.admin_url("/deployments"))
         .header("content-type", "application/json")
         .body(body)
         .send()
@@ -380,9 +383,9 @@ fn wait_until<T>(what: &str, limit: Duration, mut probe: impl FnMut() -> Option<
     panic!("{what} did not happen within {limit:?}");
 }
 
-fn ingress(path: &str) -> Option<String> {
+fn ingress(core_ports: CorePorts, path: &str) -> Option<String> {
     let response = reqwest::blocking::Client::new()
-        .post(format!("http://127.0.0.1:{RESTATE_INGRESS_PORT}{path}"))
+        .post(core_ports.ingress_url(path))
         .timeout(Duration::from_secs(5))
         .send()
         .ok()?;
@@ -393,21 +396,21 @@ fn ingress(path: &str) -> Option<String> {
         .flatten()
 }
 
-fn start_wait(key: &str) -> String {
-    ingress(&format!("/LaunchProbe/{key}/wait/send")).unwrap();
+fn start_wait(core_ports: CorePorts, key: &str) -> String {
+    ingress(core_ports, &format!("/LaunchProbe/{key}/wait/send")).unwrap();
     wait_until("awakeable id stored", WAIT_LIMIT, || {
-        let body = ingress(&format!("/LaunchProbe/{key}/awakeable"))?;
+        let body = ingress(core_ports, &format!("/LaunchProbe/{key}/awakeable"))?;
         serde_json::from_str::<Option<String>>(&body).ok().flatten()
     })
 }
 
-fn outcome(key: &str) -> Option<String> {
-    let body = ingress(&format!("/LaunchProbe/{key}/outcome"))?;
+fn outcome(core_ports: CorePorts, key: &str) -> Option<String> {
+    let body = ingress(core_ports, &format!("/LaunchProbe/{key}/outcome"))?;
     serde_json::from_str::<Option<String>>(&body).ok().flatten()
 }
 
-fn heartbeats(name: &SessionName) -> (u64, u64) {
-    ingress(&format!("/LaunchProbe/{name}/heartbeats"))
+fn heartbeats(core_ports: CorePorts, name: &SessionName) -> (u64, u64) {
+    ingress(core_ports, &format!("/LaunchProbe/{name}/heartbeats"))
         .and_then(|body| serde_json::from_str(&body).ok())
         .unwrap_or((0, 0))
 }
@@ -475,9 +478,10 @@ fn assert_scrollback_without_secret(harness: &Harness, name: &SessionName) {
 #[ignore = "starts real processes; run with mise run launcher-tests"]
 fn launch_spools_resolves_and_ends_its_session() {
     let mut harness = Harness::new("ok");
+    let core_ports = harness.config.ports;
     let name = harness.name("ok");
     let key = format!("{name}.await");
-    let awaitable = start_wait(&key);
+    let awaitable = start_wait(core_ports, &key);
     let files = harness.files(&name);
     let outcome_spawn = harness.spawn(&name, &awaitable, "12", &result_json(&name));
     assert!(matches!(outcome_spawn, SpawnOutcome::Spawned { .. }));
@@ -492,12 +496,14 @@ fn launch_spools_resolves_and_ends_its_session() {
     );
     assert_eq!(terminal.trim(), "detached");
     let (count, last) = wait_until("two heartbeats arrived", WAIT_LIMIT, || {
-        let (count, last) = heartbeats(&name);
+        let (count, last) = heartbeats(core_ports, &name);
         (count >= 2).then_some((count, last))
     });
     println!("evidence: {count} heartbeats, last sequence {last}");
     assert_scrollback_without_secret(&harness, &name);
-    let resolved = wait_until("awakeable resolved", WAIT_LIMIT, || outcome(&key));
+    let resolved = wait_until("awakeable resolved", WAIT_LIMIT, || {
+        outcome(core_ports, &key)
+    });
     println!(
         "evidence: outcome {}",
         resolved.chars().take(160).collect::<String>()
@@ -540,9 +546,10 @@ fn assert_lease_frozen(harness: &Harness, name: &SessionName) -> u64 {
 #[ignore = "starts real processes; run with mise run launcher-tests"]
 fn launcher_killed_before_its_trap_resolves_nothing() {
     let mut harness = Harness::new("kill");
+    let core_ports = harness.config.ports;
     let name = harness.name("kill");
     let key = format!("{name}.await");
-    let awaitable = start_wait(&key);
+    let awaitable = start_wait(core_ports, &key);
     let files = harness.files(&name);
     assert!(matches!(
         harness.spawn(&name, &awaitable, "300", ""),
@@ -561,7 +568,11 @@ fn launcher_killed_before_its_trap_resolves_nothing() {
     assert!(status.success());
     println!("evidence: SIGKILL to launcher pid {}", lease.pid());
     let frozen = assert_lease_frozen(&harness, &name);
-    assert_eq!(outcome(&key), None, "something resolved the awakeable");
+    assert_eq!(
+        outcome(core_ports, &key),
+        None,
+        "something resolved the awakeable"
+    );
     assert!(
         !files.spool.exists(),
         "a spool exists after a kill before the trap"
@@ -599,16 +610,17 @@ fn launcher_killed_before_its_trap_resolves_nothing() {
 #[ignore = "starts real processes; run with mise run launcher-tests"]
 fn restate_killed_between_vendor_exit_and_resolve() {
     let mut harness = Harness::new("restate");
+    let core_ports = harness.config.ports;
     let name = harness.name("rs");
     let key = format!("{name}.await");
-    let awaitable = start_wait(&key);
+    let awaitable = start_wait(core_ports, &key);
     let files = harness.files(&name);
     assert!(matches!(
         harness.spawn(&name, &awaitable, "8", &result_json(&name)),
         SpawnOutcome::Spawned { .. }
     ));
     wait_until("first heartbeat", WAIT_LIMIT, || {
-        (heartbeats(&name).0 >= 1).then_some(())
+        (heartbeats(core_ports, &name).0 >= 1).then_some(())
     });
     let server = harness.core_pid(CoreRole::Restate);
     let status = Command::new("/bin/kill")
@@ -619,7 +631,7 @@ fn restate_killed_between_vendor_exit_and_resolve() {
     println!("evidence: SIGKILL to restate-server pid {server}");
     wait_until("restate unreachable", WAIT_LIMIT, || {
         matches!(
-            health::probe(&http(), CoreRole::Restate),
+            health::probe(&http(), core_ports, CoreRole::Restate),
             Health::Unreachable(_)
         )
         .then_some(())
@@ -632,7 +644,7 @@ fn restate_killed_between_vendor_exit_and_resolve() {
     assert!(harness.sessions_named(&name) <= 1);
     assert!(harness.tycho(&["watchdog", "once"]).status.success());
     let resolved = wait_until("awakeable resolved after the restart", WAIT_LIMIT, || {
-        outcome(&key)
+        outcome(core_ports, &key)
     });
     println!(
         "evidence: outcome {}",
@@ -649,4 +661,12 @@ fn restate_killed_between_vendor_exit_and_resolve() {
         "{after:?}"
     );
     assert_eq!(harness.sessions_named(&name), 0);
+}
+
+/// Claims a port slot for the home, held until the core is stopped; a slot whose ports
+/// another process holds is skipped and named, and the test fails only when no slot is left.
+fn claim_ports(home: &Path) -> PortClaim {
+    let claim = CorePorts::claim(home).unwrap_or_else(|error| panic!("{error}"));
+    println!("evidence: {claim}");
+    claim
 }
