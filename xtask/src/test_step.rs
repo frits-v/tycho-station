@@ -205,7 +205,14 @@ fn report(runs: &[BinaryRun]) {
     }
 }
 
-pub fn test() -> Result<Totals, String> {
+/// A test step that did not pass, with the totals when every binary was accounted for.
+#[derive(Debug)]
+pub struct Failure {
+    pub reason: String,
+    pub totals: Option<Totals>,
+}
+
+pub fn test() -> Result<Totals, Failure> {
     let captured = run_bounded_merged(
         Command::new("mbx").args(["test", "--workspace", "--no-fail-fast"]),
         TEST_TIMEOUT,
@@ -217,9 +224,16 @@ pub fn test() -> Result<Totals, String> {
         }
         TestOutcome::Failed(runs) => {
             report(&runs);
-            Err(totals(&runs).to_string())
+            let counted = totals(&runs);
+            Err(Failure {
+                reason: counted.to_string(),
+                totals: Some(counted),
+            })
         }
-        TestOutcome::Unrecognised(reason) => Err(reason),
+        TestOutcome::Unrecognised(reason) => Err(Failure {
+            reason,
+            totals: None,
+        }),
     }
 }
 

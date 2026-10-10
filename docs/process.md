@@ -39,8 +39,8 @@ away. A step that was skipped is named as skipped.
 its `CARGO_MANIFEST_DIR`) is the current directory's, so a worktree under `.worktrees/` and
 the checkout above it are never confused. The test step runs every test binary
 (`--no-fail-fast`) and prints each one's resolved path and counts. The run closes with
-`xtask ci: N steps passed, M tests passed, in <checkout> at <commit>`, or the failed steps
-in place of the first part, and exits 0 exactly when every step passed. A log is evidence
+`xtask ci: N steps passed, M tests passed, F failed, in <checkout> at <commit>`, or the
+failed steps in place of the first part, and exits 0 exactly when every step passed. A log is evidence
 for a branch only when that line names its checkout and commit.
 
 The developer shell sets `noclobber`: `mise run ci > ci.log` onto an existing `ci.log`

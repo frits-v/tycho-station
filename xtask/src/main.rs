@@ -329,20 +329,20 @@ fn ci() -> i32 {
     }
     let formatted = run("cargo", &["fmt", "--all", "--", "--check"]).success();
     let linted = step_passed("clippy", clippy::clippy());
-    let tests_passed = match test_step::test() {
+    let (tested, tests) = match test_step::test() {
         Ok(totals) => {
             println!("xtask test: {totals}");
-            Some(totals.counts.passed)
+            (true, Some(totals.counts))
         }
-        Err(reason) => {
-            eprintln!("xtask test: {reason}");
-            None
+        Err(failure) => {
+            eprintln!("xtask test: {}", failure.reason);
+            (false, failure.totals.map(|totals| totals.counts))
         }
     };
     let mut steps: Vec<(&str, bool)> = vec![
         ("fmt", formatted),
         ("clippy", linted),
-        ("test", tests_passed.is_some()),
+        ("test", tested),
         (
             "workflows",
             workflows::workflows(workflows::Network::Online) == 0,
@@ -361,7 +361,7 @@ fn ci() -> i32 {
         steps.push((name, check() == 0));
     }
     steps.push(("check-pr-title", check_pr_title(pr_title_from_event()) == 0));
-    let (code, line) = ci_summary(&steps, tests_passed, &checkout, &commit);
+    let (code, line) = ci_summary(&steps, tests, &checkout, &commit);
     if code == 0 {
         println!("{line}");
     } else {
@@ -374,7 +374,7 @@ fn ci() -> i32 {
 /// tests counted, the checkout and the commit, so a log identifies the tree it came from.
 fn ci_summary(
     steps: &[(&str, bool)],
-    tests_passed: Option<usize>,
+    tests: Option<test_step::Counts>,
     checkout: &Path,
     commit: &str,
 ) -> (i32, String) {
@@ -383,9 +383,9 @@ fn ci_summary(
         .filter(|(_, passed)| !passed)
         .map(|(name, _)| *name)
         .collect();
-    let tests = tests_passed.map_or_else(
+    let tests = tests.map_or_else(
         || "tests not counted".to_string(),
-        |count| format!("{count} tests passed"),
+        |counts| format!("{} tests passed, {} failed", counts.passed, counts.failed),
     );
     let place = format!("in {} at {commit}", checkout.display());
     if failed.is_empty() {
@@ -932,22 +932,34 @@ mod tests {
     fn the_ci_exit_code_is_zero_exactly_when_every_step_passed() {
         let checkout = Path::new("/station");
         let commit = "511cf42";
+        let counted = test_step::Counts {
+            passed: 590,
+            failed: 0,
+            ignored: 2,
+        };
         let passing = [("fmt", true), ("test", true), ("check-pr-title", true)];
-        let (code, line) = ci_summary(&passing, Some(590), checkout, commit);
+        let (code, line) = ci_summary(&passing, Some(counted), checkout, commit);
         assert_eq!(code, 0);
         assert_eq!(
             line,
-            "xtask ci: 3 steps passed, 590 tests passed, in /station at 511cf42"
+            "xtask ci: 3 steps passed, 590 tests passed, 0 failed, in /station at 511cf42"
         );
+        let one_failed = test_step::Counts {
+            failed: 1,
+            ..counted
+        };
         let failing = [("fmt", true), ("test", false), ("check-pr-title", true)];
-        let (code, line) = ci_summary(&failing, None, checkout, commit);
+        let (code, line) = ci_summary(&failing, Some(one_failed), checkout, commit);
         assert_eq!(code, 1);
         assert_eq!(
             line,
-            "xtask ci: 1 of 3 steps failed: test; tests not counted; in /station at 511cf42"
+            "xtask ci: 1 of 3 steps failed: test; 590 tests passed, 1 failed; in /station at 511cf42"
         );
+        let (code, line) = ci_summary(&failing, None, checkout, commit);
+        assert_eq!(code, 1);
+        assert!(line.contains("tests not counted"), "{line}");
         let last_failing = [("fmt", true), ("test", true), ("check-pr-title", false)];
-        let (code, line) = ci_summary(&last_failing, Some(590), checkout, commit);
+        let (code, line) = ci_summary(&last_failing, Some(counted), checkout, commit);
         assert_eq!(code, 1);
         assert!(!line.contains("steps passed"), "{line}");
     }
