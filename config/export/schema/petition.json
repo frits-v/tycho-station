@@ -70,7 +70,7 @@
         },
         "RepeatedRulingBaseline": {
             "type": "object",
-            "description": "What a suppressing case records, per counter; dormancy and early petitions record none.",
+            "description": "What a suppressing case records, per counter: the counter's value when the case is written\n(design section 11). Dormancy and early petitions record none.",
             "additionalProperties": false,
             "properties": {
                 "count": {

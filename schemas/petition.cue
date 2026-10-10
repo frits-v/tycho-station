@@ -11,7 +11,8 @@ import "list"
 // closes without a merge goes from amend back to open.
 #PetitionState: "open" | "amend" | "merged" | "closed" | "reject"
 
-// What a suppressing case records, per counter; dormancy and early petitions record none.
+// What a suppressing case records, per counter: the counter's value when the case is written
+// (design section 11). Dormancy and early petitions record none.
 #RepeatedRulingBaseline: {
 	counter!: "repeated_ruling"
 	count!:   #U32
