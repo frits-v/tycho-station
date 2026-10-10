@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output};
 
 mod app_token;
+mod checkout;
 mod clippy;
 mod code_scanning;
 mod config;
@@ -25,6 +26,7 @@ mod provision;
 mod release;
 mod sarif;
 mod setup;
+mod test_step;
 mod workflows;
 
 use sarif::{Finding, Rule};
@@ -307,17 +309,40 @@ type Check = fn() -> i32;
 /// SARIF. A cargo build started here finds rustup's cargo on `PATH`, not the mise wrapper
 /// that routes it through the mbx cache, so builds start `mbx` with the cargo subcommand.
 fn ci() -> i32 {
+    let checkout = match checkout::running_checkout() {
+        Ok(root) => root,
+        Err(reason) => {
+            eprintln!("xtask ci: {reason}");
+            return 1;
+        }
+    };
+    let commit = match checkout::head_commit(&checkout) {
+        Ok(commit) => commit,
+        Err(reason) => {
+            eprintln!("xtask ci: {reason}");
+            return 1;
+        }
+    };
     if let Err(reason) = sarif::clear() {
         eprintln!("xtask ci: {reason}");
         return 1;
     }
+    let formatted = run("cargo", &["fmt", "--all", "--", "--check"]).success();
+    let linted = step_passed("clippy", clippy::clippy());
+    let tests_passed = match test_step::test() {
+        Ok(totals) => {
+            println!("xtask test: {totals}");
+            Some(totals.counts.passed)
+        }
+        Err(reason) => {
+            eprintln!("xtask test: {reason}");
+            None
+        }
+    };
     let mut steps: Vec<(&str, bool)> = vec![
-        (
-            "fmt",
-            run("cargo", &["fmt", "--all", "--", "--check"]).success(),
-        ),
-        ("clippy", step_passed("clippy", clippy::clippy())),
-        ("test", run("mbx", &["test", "--workspace"]).success()),
+        ("fmt", formatted),
+        ("clippy", linted),
+        ("test", tests_passed.is_some()),
         (
             "workflows",
             workflows::workflows(workflows::Network::Online) == 0,
@@ -336,22 +361,44 @@ fn ci() -> i32 {
         steps.push((name, check() == 0));
     }
     steps.push(("check-pr-title", check_pr_title(pr_title_from_event()) == 0));
+    let (code, line) = ci_summary(&steps, tests_passed, &checkout, &commit);
+    if code == 0 {
+        println!("{line}");
+    } else {
+        eprintln!("{line}");
+    }
+    code
+}
+
+/// The exit code and the closing line: 0 exactly when every step passed. The line names the
+/// tests counted, the checkout and the commit, so a log identifies the tree it came from.
+fn ci_summary(
+    steps: &[(&str, bool)],
+    tests_passed: Option<usize>,
+    checkout: &Path,
+    commit: &str,
+) -> (i32, String) {
     let failed: Vec<&str> = steps
         .iter()
         .filter(|(_, passed)| !passed)
         .map(|(name, _)| *name)
         .collect();
+    let tests = tests_passed.map_or_else(
+        || "tests not counted".to_string(),
+        |count| format!("{count} tests passed"),
+    );
+    let place = format!("in {} at {commit}", checkout.display());
     if failed.is_empty() {
-        println!("xtask ci: {} steps passed", steps.len());
-        0
+        let line = format!("xtask ci: {} steps passed, {tests}, {place}", steps.len());
+        (0, line)
     } else {
-        eprintln!(
-            "xtask ci: {} of {} steps failed: {}",
+        let line = format!(
+            "xtask ci: {} of {} steps failed: {}; {tests}; {place}",
             failed.len(),
             steps.len(),
             failed.join(", ")
         );
-        1
+        (1, line)
     }
 }
 
@@ -879,6 +926,30 @@ mod tests {
         assert_eq!(rule_defects(Path::new("r.md"), unscoped).len(), 1);
         let long = format!("{good}{}", "x\n".repeat(RULE_MAX_LINES));
         assert_eq!(rule_defects(Path::new("r.md"), &long).len(), 1);
+    }
+
+    #[test]
+    fn the_ci_exit_code_is_zero_exactly_when_every_step_passed() {
+        let checkout = Path::new("/station");
+        let commit = "511cf42";
+        let passing = [("fmt", true), ("test", true), ("check-pr-title", true)];
+        let (code, line) = ci_summary(&passing, Some(590), checkout, commit);
+        assert_eq!(code, 0);
+        assert_eq!(
+            line,
+            "xtask ci: 3 steps passed, 590 tests passed, in /station at 511cf42"
+        );
+        let failing = [("fmt", true), ("test", false), ("check-pr-title", true)];
+        let (code, line) = ci_summary(&failing, None, checkout, commit);
+        assert_eq!(code, 1);
+        assert_eq!(
+            line,
+            "xtask ci: 1 of 3 steps failed: test; tests not counted; in /station at 511cf42"
+        );
+        let last_failing = [("fmt", true), ("test", true), ("check-pr-title", false)];
+        let (code, line) = ci_summary(&last_failing, Some(590), checkout, commit);
+        assert_eq!(code, 1);
+        assert!(!line.contains("steps passed"), "{line}");
     }
 
     #[test]
