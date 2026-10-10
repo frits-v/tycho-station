@@ -331,19 +331,21 @@ fn pr_title_step(title: Option<String>) -> Step {
     )
 }
 
-/// The checkout, its revision and a clean SARIF directory, or the reason ci cannot start.
-fn ci_start() -> Result<(PathBuf, String), String> {
+/// The checkout, its commit, its uncommitted change count and a clean SARIF directory, or
+/// the reason ci cannot start.
+fn ci_start() -> Result<(PathBuf, String, usize), String> {
     let checkout = checkout::running_checkout()?;
-    let revision = checkout::revision(&checkout)?;
+    let commit = checkout::head_commit(&checkout)?;
+    let uncommitted = checkout::uncommitted(&checkout)?;
     sarif::clear()?;
-    Ok((checkout, revision))
+    Ok((checkout, commit, uncommitted))
 }
 
 /// Runs every step even after one fails, so one run reports all findings and writes all
 /// SARIF. A cargo build started here finds rustup's cargo on `PATH`, not the mise wrapper
 /// that routes it through the mbx cache, so builds start `mbx` with the cargo subcommand.
 fn ci() -> i32 {
-    let (checkout, revision) = match ci_start() {
+    let (checkout, commit, uncommitted_before) = match ci_start() {
         Ok(started) => started,
         Err(reason) => {
             eprintln!("xtask ci: {reason}");
@@ -384,6 +386,13 @@ fn ci() -> i32 {
         steps.push((name, step(check() == 0)));
     }
     steps.push(("check-pr-title", pr_title_step(pr_title_from_event())));
+    let after = checkout::uncommitted(&checkout);
+    let revision =
+        checkout::closing_revision(&commit, uncommitted_before, after).unwrap_or_else(|reason| {
+            eprintln!("xtask ci: recounting uncommitted changes: {reason}");
+            steps.push(("recount-uncommitted", Step::Failed));
+            checkout::describe_revision(&commit, uncommitted_before)
+        });
     let (code, line) = ci_summary(&steps, tests, &checkout, &revision);
     if code == 0 {
         println!("{line}");
@@ -413,10 +422,11 @@ fn ci_summary(
     let failed = steps_in(steps, Step::Failed);
     let skipped = steps_in(steps, Step::Skipped);
     let passed = steps_in(steps, Step::Passed);
-    let skipped = if skipped.is_empty() {
-        String::new()
+    let skipped_clause = format!("{} skipped ({})", skipped.len(), skipped.join(", "));
+    let (skipped, failed_skipped) = if skipped.is_empty() {
+        (String::new(), String::new())
     } else {
-        format!(", {} skipped ({})", skipped.len(), skipped.join(", "))
+        (format!(", {skipped_clause}"), format!("; {skipped_clause}"))
     };
     let tests = tests.map_or_else(
         || "tests not counted".to_string(),
@@ -431,7 +441,7 @@ fn ci_summary(
         (0, line)
     } else {
         let line = format!(
-            "xtask ci: {} of {} steps failed: {}{skipped}; {tests}; {place}",
+            "xtask ci: {} of {} steps failed: {}{failed_skipped}; {tests}; {place}",
             failed.len(),
             steps.len(),
             failed.join(", ")
@@ -998,7 +1008,7 @@ mod tests {
         assert_eq!(code, 1);
         assert_eq!(
             line,
-            "xtask ci: 1 of 3 steps failed: test, 1 skipped (check-pr-title); 590 tests passed, 1 failed; in /station at 511cf42"
+            "xtask ci: 1 of 3 steps failed: test; 1 skipped (check-pr-title); 590 tests passed, 1 failed; in /station at 511cf42"
         );
         let (code, line) = ci_summary(&failing, None, checkout, "511cf42");
         assert_eq!(code, 1);

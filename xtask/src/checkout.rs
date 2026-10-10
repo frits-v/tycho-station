@@ -85,7 +85,7 @@ fn decode_status(exit: &Exit, stdout: &str) -> Result<usize, String> {
 
 /// The commit with the number of uncommitted changes when there are any, so a dirty tree is
 /// never named by its commit alone.
-fn describe_revision(commit: &str, uncommitted: usize) -> String {
+pub fn describe_revision(commit: &str, uncommitted: usize) -> String {
     if uncommitted == 0 {
         commit.to_string()
     } else {
@@ -93,8 +93,8 @@ fn describe_revision(commit: &str, uncommitted: usize) -> String {
     }
 }
 
-/// The commit checked out at `root` and whether the tree differs from it.
-pub fn revision(root: &Path) -> Result<String, String> {
+/// The commit checked out at `root`.
+pub fn head_commit(root: &Path) -> Result<String, String> {
     let head = run_bounded(
         Command::new("git")
             .arg("-C")
@@ -102,7 +102,11 @@ pub fn revision(root: &Path) -> Result<String, String> {
             .args(["rev-parse", "HEAD"]),
         GIT_TIMEOUT,
     );
-    let commit = decode_commit(&head.exit, &head.stdout)?;
+    decode_commit(&head.exit, &head.stdout)
+}
+
+/// How many paths in `root` differ from its commit.
+pub fn uncommitted(root: &Path) -> Result<usize, String> {
     let status = run_bounded(
         Command::new("git")
             .arg("-C")
@@ -110,8 +114,18 @@ pub fn revision(root: &Path) -> Result<String, String> {
             .args(["status", "--porcelain"]),
         GIT_TIMEOUT,
     );
-    let uncommitted = decode_status(&status.exit, &status.stdout)?;
-    Ok(describe_revision(&commit, uncommitted))
+    decode_status(&status.exit, &status.stdout)
+}
+
+/// The revision a run closes with: the commit and the larger of the counts taken before and
+/// after the steps, so a step that changed tracked files cannot leave a bare commit. A count
+/// that could not be taken after the steps is an error.
+pub fn closing_revision(
+    commit: &str,
+    before: usize,
+    after: Result<usize, String>,
+) -> Result<String, String> {
+    after.map(|count| describe_revision(commit, before.max(count)))
 }
 
 #[cfg(test)]
@@ -189,6 +203,13 @@ mod tests {
         assert_eq!(Some(found.as_path()), resolve(manifest).unwrap().parent());
     }
 
+    /// The revision as `ci` closes with it when nothing changed during the steps.
+    fn revision(root: &Path) -> Result<String, String> {
+        let commit = head_commit(root)?;
+        let before = uncommitted(root)?;
+        closing_revision(&commit, before, uncommitted(root))
+    }
+
     fn git(root: &Path, arguments: &[&str]) {
         let status = Command::new("git")
             .arg("-C")
@@ -228,6 +249,21 @@ mod tests {
         assert!(decode_status(&Exit::Code(128), "").is_err());
         assert!(decode_status(&Exit::TimedOut, "").is_err());
         assert_eq!(describe_revision("511cf42", 0), "511cf42");
+        assert_eq!(
+            closing_revision("511cf42", 0, Ok(3)),
+            Ok("511cf42 with 3 uncommitted changes".to_string())
+        );
+        assert_eq!(
+            closing_revision("511cf42", 2, Ok(0)),
+            Ok("511cf42 with 2 uncommitted changes".to_string())
+        );
+        assert_eq!(
+            closing_revision("511cf42", 0, Ok(0)),
+            Ok("511cf42".to_string())
+        );
+        assert!(
+            closing_revision("511cf42", 0, Err("git status ended Signal".to_string())).is_err()
+        );
         assert_eq!(
             describe_revision("511cf42", 1),
             "511cf42 with 1 uncommitted changes"

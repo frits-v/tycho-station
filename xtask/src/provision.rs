@@ -1504,6 +1504,7 @@ mod tests {
             Exit::TimedOut,
             Exit::OutputTooLarge,
             Exit::OutputUnreadable,
+            Exit::OutputStillOpen,
             Exit::NotStarted("no such file".to_string()),
         ] {
             assert!(matches!(

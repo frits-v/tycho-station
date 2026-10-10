@@ -42,7 +42,8 @@ every test binary (`--no-fail-fast`, no colour) and prints each one's resolved p
 counts. The run closes with
 `xtask ci: N steps passed, S skipped (<names>), M tests passed, F failed, in <checkout> at <commit>`,
 with the failed steps in place of the first part when any failed, and `with K uncommitted
-changes` after the commit when the tree differs from it. A step with nothing to check, such
+changes` after the commit when the tree differs from it, counted before and after the
+steps with the larger count reported. A step with nothing to check, such
 as the title check outside a pull request, counts as skipped, not passed. The exit code is 0
 exactly when no step failed. A log is evidence for a branch only when that line names its
 checkout and a commit with no uncommitted changes.

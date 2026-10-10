@@ -218,23 +218,33 @@ fn read_echoed<W: Write + Send + 'static>(pipe: PipeReader, mut echo: W) -> Read
 }
 
 /// The text a reader kept and the exit to report: a reader's own failure overrides a clean
-/// exit, a reader that did not finish by the deadline turns a clean exit into
-/// `OutputStillOpen`, and a missing pipe turns it into `OutputUnreadable`.
+/// exit; after a clean exit, a reader still reading at the deadline becomes `OutputStillOpen`,
+/// and a missing or vanished reader becomes `OutputUnreadable`.
 fn collect(reader: Option<ReaderResult>, exit: Exit) -> (String, Exit) {
+    collect_within(reader, exit, READER_JOIN_TIMEOUT)
+}
+
+fn collect_within(reader: Option<ReaderResult>, exit: Exit, deadline: Duration) -> (String, Exit) {
     let Some(receiver) = reader else {
         return (
             String::new(),
             clean_exit_becomes(exit, Exit::OutputUnreadable),
         );
     };
-    let Ok((kept, reader_state)) = receiver.recv_timeout(READER_JOIN_TIMEOUT) else {
-        return (
+    match receiver.recv_timeout(deadline) {
+        Ok((kept, reader_state)) => {
+            let text = String::from_utf8_lossy(&kept).into_owned();
+            (text, reader_state.unwrap_or(exit))
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => (
             String::new(),
             clean_exit_becomes(exit, Exit::OutputStillOpen),
-        );
-    };
-    let text = String::from_utf8_lossy(&kept).into_owned();
-    (text, reader_state.unwrap_or(exit))
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => (
+            String::new(),
+            clean_exit_becomes(exit, Exit::OutputUnreadable),
+        ),
+    }
 }
 
 fn clean_exit_becomes(exit: Exit, instead: Exit) -> Exit {
@@ -343,16 +353,29 @@ mod tests {
     }
 
     #[test]
-    fn a_reader_that_never_answers_after_a_clean_exit_is_output_still_open() {
+    fn a_reader_still_reading_at_the_deadline_after_a_clean_exit_is_output_still_open() {
         let (sender, receiver) = mpsc::channel();
+        let quick = Duration::from_millis(10);
+        assert_eq!(
+            collect_within(Some(receiver), Exit::Code(0), quick),
+            (String::new(), Exit::OutputStillOpen)
+        );
+        let (_still_reading, receiver) = mpsc::channel::<(Vec<u8>, Option<Exit>)>();
+        assert_eq!(
+            collect_within(Some(receiver), Exit::Code(101), quick).1,
+            Exit::Code(101)
+        );
+        drop(sender);
+    }
+
+    #[test]
+    fn a_reader_that_vanished_or_never_started_after_a_clean_exit_is_output_unreadable() {
+        let (sender, receiver) = mpsc::channel::<(Vec<u8>, Option<Exit>)>();
         drop(sender);
         assert_eq!(
             collect(Some(receiver), Exit::Code(0)),
-            (String::new(), Exit::OutputStillOpen)
+            (String::new(), Exit::OutputUnreadable)
         );
-        let (sender, receiver) = mpsc::channel::<(Vec<u8>, Option<Exit>)>();
-        drop(sender);
-        assert_eq!(collect(Some(receiver), Exit::Code(101)).1, Exit::Code(101));
         assert_eq!(collect(None, Exit::Code(0)).1, Exit::OutputUnreadable);
     }
 
