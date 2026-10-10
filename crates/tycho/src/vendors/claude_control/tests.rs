@@ -5,10 +5,14 @@
 
 use std::fs;
 use std::io::{BufRead, BufReader};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
+use std::process::{Command, Stdio};
 use std::thread;
+
+use nix::sys::socket::{bind, socket, AddressFamily, SockFlag, SockType, UnixAddr};
 
 use tycho_types::session::SessionName;
 use tycho_types::task_packet::AbsolutePath;
@@ -247,54 +251,104 @@ fn the_instruction_line_is_one_json_user_message() {
     );
 }
 
-/// A listener that reads one line, answers with `reply`, and returns the line it read.
+/// A listener that reads to the client's half-close, answers with `reply`, and returns what it read.
+///
+/// Reading to the half-close keeps the listener from hanging up before the client's half-close.
+/// Its own half-close, not the drop, ends the reply: on macOS a child spawned by another test
+/// can inherit the accepted descriptor before its close-on-exec flag is set, and that copy
+/// would hold a dropped connection open.
 fn listener(path: &Path, reply: &'static [u8]) -> thread::JoinHandle<String> {
     let listener = UnixListener::bind(path).unwrap();
     thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        reader.get_mut().write_all(reply).unwrap();
-        line
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut received = String::new();
+        stream.read_to_string(&mut received).unwrap();
+        stream.write_all(reply).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        received
     })
+}
+
+/// A socket file nothing listens on: bound and never listening, so a connect is refused even
+/// while a child holds an inherited copy of the descriptor, which a dropped listener is not.
+fn bound_without_listener(path: &Path) -> OwnedFd {
+    let bound = socket(
+        AddressFamily::Unix,
+        SockType::Stream,
+        SockFlag::empty(),
+        None,
+    )
+    .unwrap();
+    bind(bound.as_raw_fd(), &UnixAddr::new(path).unwrap()).unwrap();
+    bound
 }
 
 #[test]
 fn each_socket_outcome_has_its_own_state() {
     let dir = scratch("post");
-    let socket = dir.join("i.sock");
     let line = instruction_line(&ShortText::parse("go").unwrap());
-    let server = listener(&socket, b"");
-    assert!(matches!(
-        post(&socket, &line, current_uid()),
-        Delivery::Posted { .. }
-    ));
+    let posted = dir.join("posted.sock");
+    let server = listener(&posted, b"");
+    let delivery = post(&posted, &line, current_uid());
+    assert!(matches!(delivery, Delivery::Posted { .. }), "{delivery:?}");
     assert_eq!(server.join().unwrap(), line);
-    fs::remove_file(&socket).unwrap();
-    let server = listener(&socket, b"ok");
+    let replied = dir.join("replied.sock");
+    let server = listener(&replied, b"ok");
+    let delivery = post(&replied, &line, current_uid());
     assert!(
-        matches!(post(&socket, &line, current_uid()), Delivery::Replied { reply, .. } if reply == "ok")
+        matches!(&delivery, Delivery::Replied { reply, .. } if reply == "ok"),
+        "{delivery:?}"
     );
     server.join().unwrap();
+    let stale = dir.join("stale.sock");
+    let _bound = bound_without_listener(&stale);
+    let delivery = post(&stale, &line, current_uid());
     assert!(
-        matches!(
-            post(&socket, &line, current_uid()),
-            Delivery::Refused { .. }
-        ),
-        "a stale socket"
+        matches!(delivery, Delivery::Refused { .. }),
+        "a stale socket: {delivery:?}"
     );
-    fs::remove_file(&socket).unwrap();
-    assert!(matches!(
-        post(&socket, &line, current_uid()),
-        Delivery::NoSocket { .. }
-    ));
-    let _held = UnixListener::bind(&socket).unwrap();
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o000)).unwrap();
-    assert!(matches!(
-        post(&socket, &line, current_uid()),
-        Delivery::Denied { .. }
-    ));
+    let delivery = post(&dir.join("absent.sock"), &line, current_uid());
+    assert!(
+        matches!(delivery, Delivery::NoSocket { .. }),
+        "{delivery:?}"
+    );
+    let denied = dir.join("denied.sock");
+    let _held = UnixListener::bind(&denied).unwrap();
+    fs::set_permissions(&denied, fs::Permissions::from_mode(0o000)).unwrap();
+    let delivery = post(&denied, &line, current_uid());
+    assert!(matches!(delivery, Delivery::Denied { .. }), "{delivery:?}");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_child_holding_a_dropped_listener_keeps_it_listening_but_a_bound_socket_stays_refused() {
+    let dir = scratch("inherited");
+    let dropped = dir.join("dropped.sock");
+    let listening = UnixListener::bind(&dropped).unwrap();
+    let stale = dir.join("stale.sock");
+    let bound = bound_without_listener(&stale);
+    // A child's stdin and stdout carry no close-on-exec flag: the same copies a child spawned
+    // during the window between `socket()` and setting that flag on macOS would hold.
+    let mut holder = Command::new("/bin/sleep")
+        .arg("30")
+        .stdin(Stdio::from(OwnedFd::from(listening.try_clone().unwrap())))
+        .stdout(Stdio::from(bound.try_clone().unwrap()))
+        .spawn()
+        .unwrap();
+    drop(listening);
+    drop(bound);
+    let through_child = UnixStream::connect(&dropped);
+    let refused = UnixStream::connect(&stale);
+    holder.kill().unwrap();
+    holder.wait().unwrap();
+    assert!(
+        through_child.is_ok(),
+        "a dropped listener a child still holds accepts: {through_child:?}"
+    );
+    assert!(
+        matches!(&refused, Err(error) if error.kind() == io::ErrorKind::ConnectionRefused),
+        "{refused:?}"
+    );
     fs::remove_dir_all(&dir).unwrap();
 }
 
