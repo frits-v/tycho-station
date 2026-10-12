@@ -94,6 +94,7 @@ fn mode_for(username: &str) -> Side {
 pub enum Check {
     AgentGroupExists,
     AgentUserExists,
+    AgentHomeDirectory,
     SharedGroupExists,
     DeveloperInSharedGroup,
     DeveloperHomeClosedToAgent,
@@ -143,13 +144,18 @@ const fn spec(check: Check, name: &'static str, side: Side) -> CheckSpec {
 }
 
 /// Every check, in print order; each one runs on exactly one side.
-const CATALOGUE: [CheckSpec; 37] = [
+const CATALOGUE: [CheckSpec; 38] = [
     spec(
         Check::AgentGroupExists,
         "agent group exists",
         Side::Developer,
     ),
     spec(Check::AgentUserExists, "agent user exists", Side::Developer),
+    spec(
+        Check::AgentHomeDirectory,
+        "agent home directory",
+        Side::Developer,
+    ),
     spec(
         Check::SharedGroupExists,
         "shared group exists",
@@ -1024,10 +1030,12 @@ fn decode_dscl_failure(stderr: &str) -> DsclFailure {
 }
 
 fn dscl_read(path: &str, key: Option<&str>) -> DsclLookup {
+    dscl_read_keys(path, key.as_slice())
+}
+
+fn dscl_read_keys(path: &str, keys: &[&str]) -> DsclLookup {
     let mut args = vec![".", "-read", path];
-    if let Some(key) = key {
-        args.push(key);
-    }
+    args.extend_from_slice(keys);
     match run_bounded(plain_command("dscl", &args)) {
         Capture::ExecutableNotFound => DsclLookup::Unreachable("dscl is not on PATH".to_string()),
         Capture::Unreachable(why) => DsclLookup::Unreachable(why),
@@ -1422,6 +1430,199 @@ fn primary_group_finding(username: &str) -> Finding {
     }
 }
 
+/// The home `sysadminctl -addUser -home` records for the agent. The record alone creates no
+/// directory; macOS makes one at a first login through the login window.
+pub const AGENT_HOME: &str = "/Users/tycho-agent";
+/// Nobody but the agent searches or lists its home.
+pub const AGENT_HOME_MODE: u32 = 0o700;
+const AGENT_HOME_KEYS: [&str; 3] = ["NFSHomeDirectory", "UniqueID", "PrimaryGroupID"];
+const AGENT_HOME_CREATE_HINT: &str = "sudo /usr/sbin/createhomedir -c -u tycho-agent, then sudo /bin/chmod 0700 /Users/tycho-agent if its mode is wider (mise run provision-agent runs both)";
+
+/// The facts in the agent's user record that its home is measured against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentRecord {
+    home: String,
+    uid: u32,
+    gid: u32,
+}
+
+/// One attribute of the home that differs from the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Differs {
+    pub found: u32,
+    pub wanted: u32,
+}
+
+/// Each attribute of the home that differs from the record; `None` matches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HomeMismatch {
+    /// What sits at the path when it is not a directory.
+    pub kind: Option<&'static str>,
+    pub owner: Option<Differs>,
+    pub group: Option<Differs>,
+    pub mode: Option<Differs>,
+}
+
+impl HomeMismatch {
+    /// Only the mode differs, and it grants a bit beyond the agent's own.
+    pub fn is_only_a_wider_mode(&self) -> bool {
+        self.kind.is_none()
+            && self.owner.is_none()
+            && self.group.is_none()
+            && self
+                .mode
+                .is_some_and(|mode| mode.found & !AGENT_HOME_MODE != 0)
+    }
+}
+
+/// What the agent home probe found; an unrecognised record is never taken as usable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentHomeState {
+    Ok,
+    Missing,
+    Wrong(HomeMismatch),
+    Unreachable(String),
+    Unrecognised(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentHome {
+    /// The record's `NFSHomeDirectory`, once the record is read and recognised.
+    pub path: Option<String>,
+    pub state: AgentHomeState,
+}
+
+fn record_number(stdout: &str, key: &str) -> Result<u32, AgentHomeState> {
+    let value = dscl_value(stdout, key)
+        .ok_or_else(|| AgentHomeState::Unrecognised(format!("agent user record without {key}")))?;
+    value.parse().map_err(|_| {
+        AgentHomeState::Unrecognised(format!("{key} {value:?} in the agent user record"))
+    })
+}
+
+/// A record that does not exist has no home either, so it reads missing.
+fn decode_agent_record(lookup: &DsclLookup) -> Result<AgentRecord, AgentHomeState> {
+    let stdout = match lookup {
+        DsclLookup::Found(stdout) => stdout,
+        DsclLookup::NotFound => return Err(AgentHomeState::Missing),
+        DsclLookup::Unreachable(why) => return Err(AgentHomeState::Unreachable(why.clone())),
+    };
+    let home = dscl_value(stdout, "NFSHomeDirectory").ok_or_else(|| {
+        AgentHomeState::Unrecognised("agent user record without NFSHomeDirectory".to_string())
+    })?;
+    if !home.starts_with('/') || home.contains('\n') {
+        return Err(AgentHomeState::Unrecognised(format!(
+            "NFSHomeDirectory {home:?} in the agent user record"
+        )));
+    }
+    Ok(AgentRecord {
+        uid: record_number(stdout, "UniqueID")?,
+        gid: record_number(stdout, "PrimaryGroupID")?,
+        home,
+    })
+}
+
+fn differs(found: u32, wanted: u32) -> Option<Differs> {
+    (found != wanted).then_some(Differs { found, wanted })
+}
+
+/// Reads the entry without following a link rather than opening it: the developer cannot open
+/// another user's 0700 directory, so an open would fail on the home in its wanted state.
+fn measure_agent_home(record: &AgentRecord) -> AgentHomeState {
+    let metadata = match fs::symlink_metadata(&record.home) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return AgentHomeState::Missing,
+        Err(error) => return AgentHomeState::Unreachable(format!("{}: {error}", record.home)),
+    };
+    let mismatch = HomeMismatch {
+        kind: (!metadata.is_dir()).then(|| file_kind(&metadata)),
+        owner: differs(metadata.uid(), record.uid),
+        group: differs(metadata.gid(), record.gid),
+        mode: differs(metadata.permissions().mode() & 0o7777, AGENT_HOME_MODE),
+    };
+    if mismatch == HomeMismatch::default() {
+        AgentHomeState::Ok
+    } else {
+        AgentHomeState::Wrong(mismatch)
+    }
+}
+
+pub fn agent_home() -> AgentHome {
+    let lookup = dscl_read_keys(&format!("/Users/{AGENT_USER_NAME}"), &AGENT_HOME_KEYS);
+    match decode_agent_record(&lookup) {
+        Ok(record) => AgentHome {
+            state: measure_agent_home(&record),
+            path: Some(record.home),
+        },
+        Err(state) => AgentHome { path: None, state },
+    }
+}
+
+fn mismatch_status(mismatch: &HomeMismatch) -> Status {
+    let mut found = Vec::new();
+    let mut wanted = Vec::new();
+    if let Some(kind) = mismatch.kind {
+        found.push(format!("a {kind}"));
+        wanted.push("a directory".to_string());
+    }
+    if let Some(owner) = mismatch.owner {
+        found.push(format!("owner uid {}", owner.found));
+        wanted.push(format!("owner uid {} ({AGENT_USER_NAME})", owner.wanted));
+    }
+    if let Some(group) = mismatch.group {
+        found.push(format!("group gid {}", group.found));
+        wanted.push(format!("group gid {}", group.wanted));
+    }
+    if let Some(mode) = mismatch.mode {
+        found.push(format!("mode {:04o}", mode.found));
+        wanted.push(format!("mode {:04o}", mode.wanted));
+    }
+    Status::Wrong {
+        found: found.join(", "),
+        wanted: wanted.join(", "),
+    }
+}
+
+/// A home that is not the agent's own is left to the operator: root does not change its owner
+/// by path. A group or mode on the agent's own home the agent can set itself.
+fn mismatch_hint(mismatch: &HomeMismatch, path: &str) -> String {
+    if mismatch.kind.is_some() || mismatch.owner.is_some() {
+        return format!("{path} is not a directory the agent owns; inspect it and move it aside by hand, then run mise run provision-agent again");
+    }
+    let mut steps = Vec::new();
+    if let Some(group) = mismatch.group {
+        steps.push(format!(
+            "sudo -u {AGENT_USER_NAME} /usr/bin/chgrp {} {path}",
+            group.wanted
+        ));
+    }
+    if mismatch.mode.is_some() {
+        steps.push(format!(
+            "sudo -u {AGENT_USER_NAME} /bin/chmod {AGENT_HOME_MODE:04o} {path} (mise run provision-agent narrows a wider mode)"
+        ));
+    }
+    steps.join("; ")
+}
+
+pub fn agent_home_finding(home: &AgentHome) -> Finding {
+    let check = Check::AgentHomeDirectory;
+    match &home.state {
+        AgentHomeState::Ok => Finding::new(check, Status::Present),
+        AgentHomeState::Missing => {
+            Finding::with_hint(check, Status::Missing, AGENT_HOME_CREATE_HINT)
+        }
+        AgentHomeState::Wrong(mismatch) => Finding::with_hint(
+            check,
+            mismatch_status(mismatch),
+            mismatch_hint(mismatch, home.path.as_deref().unwrap_or(AGENT_HOME)),
+        ),
+        AgentHomeState::Unreachable(why) => Finding::unreachable(check, why.clone()),
+        AgentHomeState::Unrecognised(what) => {
+            Finding::unreachable(check, format!("unrecognised {what}"))
+        }
+    }
+}
+
 fn credential_absence_finding(
     check: Check,
     home: &Result<String, String>,
@@ -1750,12 +1951,20 @@ pub fn developer_findings(identity: &Identity) -> Vec<Finding> {
 /// The developer-side checks of directory records and socket directories, which read no
 /// tool and no network.
 pub fn record_findings(identity: &Identity) -> Vec<Finding> {
+    record_probe(identity).0
+}
+
+/// The record findings with the agent home they were measured from, so a remedy decides on
+/// the same probe the finding reports.
+pub fn record_probe(identity: &Identity) -> (Vec<Finding>, AgentHome) {
     let agent_group_lookup = dscl_read(&format!("/Groups/{AGENT_GROUP_NAME}"), None);
     let agent_lookup = dscl_read(&format!("/Users/{AGENT_USER_NAME}"), Some("RecordName"));
     let group_lookup = dscl_read(&format!("/Groups/{SHARED_GROUP_NAME}"), None);
+    let home = agent_home();
     let mut findings = vec![
         Finding::new(Check::AgentGroupExists, lookup_status(&agent_group_lookup)),
         Finding::new(Check::AgentUserExists, lookup_status(&agent_lookup)),
+        agent_home_finding(&home),
         Finding::new(Check::SharedGroupExists, lookup_status(&group_lookup)),
         Finding::new(
             Check::DeveloperInSharedGroup,
@@ -1768,7 +1977,7 @@ pub fn record_findings(identity: &Identity) -> Vec<Finding> {
         identity.uid,
     ));
     findings.extend(core_socket_findings(identity));
-    findings
+    (findings, home)
 }
 
 /// The agent's membership and primary group, read from directory services by name, which the
@@ -1925,9 +2134,10 @@ pub fn run() -> i32 {
 mod tests {
     use super::*;
 
-    const EXPECTED_SIDES: [(&str, Side); 37] = [
+    const EXPECTED_SIDES: [(&str, Side); 38] = [
         ("agent group exists", Side::Developer),
         ("agent user exists", Side::Developer),
+        ("agent home directory", Side::Developer),
         ("shared group exists", Side::Developer),
         ("developer is a member of the shared group", Side::Developer),
         (
@@ -2040,7 +2250,7 @@ mod tests {
             developer_checks.len().saturating_add(agent_checks.len()),
             CATALOGUE.len()
         );
-        assert_eq!(developer_checks.len(), 23);
+        assert_eq!(developer_checks.len(), 24);
         assert_eq!(agent_checks.len(), 14);
     }
 
@@ -2839,5 +3049,213 @@ mod tests {
                 wanted: "501 or 0".to_string()
             }
         );
+    }
+
+    fn home_scratch(name: &str) -> std::path::PathBuf {
+        let base =
+            std::env::temp_dir().join(format!("xtask-setup-home-{}-{name}", std::process::id()));
+        fs::create_dir(&base).expect("create the scratch directory");
+        base
+    }
+
+    /// A record naming `path`, owned as `path`'s parent is, so only what a test changes differs.
+    fn record_for(path: &Path) -> AgentRecord {
+        let parent = fs::metadata(path.parent().expect("a parent")).expect("stat the parent");
+        AgentRecord {
+            home: path.display().to_string(),
+            uid: parent.uid(),
+            gid: parent.gid(),
+        }
+    }
+
+    fn home_dir(base: &Path, mode: u32) -> std::path::PathBuf {
+        let home = base.join("home");
+        fs::create_dir(&home).expect("create the home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(mode)).expect("set the mode");
+        home
+    }
+
+    #[test]
+    fn an_agent_home_at_the_records_owner_group_and_0700_is_ok() {
+        let base = home_scratch("ok");
+        let home = home_dir(&base, 0o700);
+        let record = record_for(&home);
+        assert_eq!(measure_agent_home(&record), AgentHomeState::Ok);
+        let finding = agent_home_finding(&AgentHome {
+            path: Some(record.home),
+            state: AgentHomeState::Ok,
+        });
+        assert_eq!(finding.status, Status::Present);
+        assert!(finding.hint.is_none());
+        fs::remove_dir(&home).expect("remove the home");
+        fs::remove_dir(&base).expect("remove the base");
+    }
+
+    #[test]
+    fn an_agent_home_the_record_names_but_nobody_created_is_missing() {
+        let base = home_scratch("missing");
+        let record = record_for(&base.join("never-created"));
+        assert_eq!(measure_agent_home(&record), AgentHomeState::Missing);
+        assert_eq!(
+            decode_agent_record(&DsclLookup::NotFound),
+            Err(AgentHomeState::Missing)
+        );
+        let finding = agent_home_finding(&AgentHome {
+            path: Some(record.home),
+            state: AgentHomeState::Missing,
+        });
+        assert_eq!(finding.status, Status::Missing);
+        assert!(finding
+            .hint
+            .is_some_and(|hint| hint.contains("createhomedir -c -u tycho-agent")));
+        fs::remove_dir(&base).expect("remove the base");
+    }
+
+    #[test]
+    fn an_agent_home_with_another_owner_group_or_mode_is_wrong_and_names_each() {
+        let base = home_scratch("wrong");
+        let home = home_dir(&base, 0o755);
+        let mut record = record_for(&home);
+        let (uid, gid) = (record.uid, record.gid);
+        assert_eq!(
+            measure_agent_home(&record),
+            AgentHomeState::Wrong(HomeMismatch {
+                mode: Some(Differs {
+                    found: 0o755,
+                    wanted: 0o700
+                }),
+                ..HomeMismatch::default()
+            })
+        );
+        record.uid = uid.wrapping_add(1);
+        record.gid = gid.wrapping_add(1);
+        let AgentHomeState::Wrong(mismatch) = measure_agent_home(&record) else {
+            panic!("a home owned by another uid and gid is wrong");
+        };
+        assert_eq!(
+            mismatch.owner,
+            Some(Differs {
+                found: uid,
+                wanted: uid.wrapping_add(1)
+            })
+        );
+        assert_eq!(
+            mismatch.group,
+            Some(Differs {
+                found: gid,
+                wanted: gid.wrapping_add(1)
+            })
+        );
+        assert!(!mismatch.is_only_a_wider_mode());
+        let finding = agent_home_finding(&AgentHome {
+            path: Some(record.home),
+            state: AgentHomeState::Wrong(mismatch),
+        });
+        let Status::Wrong { found, wanted } = &finding.status else {
+            panic!("the finding is wrong");
+        };
+        assert_eq!(
+            found,
+            &format!("owner uid {uid}, group gid {gid}, mode 0755")
+        );
+        assert!(wanted.contains("mode 0700"));
+        assert!(finding
+            .hint
+            .is_some_and(|hint| hint.contains("move it aside by hand")));
+        fs::remove_dir(&home).expect("remove the home");
+        fs::remove_dir(&base).expect("remove the base");
+    }
+
+    #[test]
+    fn a_symlink_at_the_agent_home_is_wrong_and_its_target_is_not_measured() {
+        let base = home_scratch("symlink");
+        let target = home_dir(&base, 0o700);
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("plant the link");
+        let AgentHomeState::Wrong(mismatch) = measure_agent_home(&record_for(&link)) else {
+            panic!("a symlink is not a home");
+        };
+        assert_eq!(mismatch.kind, Some("symlink"));
+        fs::remove_file(&link).expect("remove the link");
+        fs::remove_dir(&target).expect("remove the target");
+        fs::remove_dir(&base).expect("remove the base");
+    }
+
+    #[test]
+    fn only_a_mode_beyond_the_agents_own_bits_is_wider() {
+        let mode = |found| HomeMismatch {
+            mode: Some(Differs {
+                found,
+                wanted: AGENT_HOME_MODE,
+            }),
+            ..HomeMismatch::default()
+        };
+        assert!(mode(0o750).is_only_a_wider_mode());
+        assert!(mode(0o1700).is_only_a_wider_mode());
+        assert!(!mode(0o500).is_only_a_wider_mode());
+        let mut owned_elsewhere = mode(0o755);
+        owned_elsewhere.owner = Some(Differs {
+            found: 0,
+            wanted: 503,
+        });
+        assert!(!owned_elsewhere.is_only_a_wider_mode());
+    }
+
+    #[test]
+    fn an_agent_home_that_cannot_be_read_is_unreachable() {
+        let base = home_scratch("unreachable");
+        let file = base.join("file");
+        fs::write(&file, b"").expect("create the file");
+        assert!(matches!(
+            measure_agent_home(&record_for(&file.join("home"))),
+            AgentHomeState::Unreachable(why) if why.contains("Not a directory")
+        ));
+        let failed = DsclLookup::Unreachable("dscl is not on PATH".to_string());
+        assert_eq!(
+            decode_agent_record(&failed),
+            Err(AgentHomeState::Unreachable(
+                "dscl is not on PATH".to_string()
+            ))
+        );
+        let finding = agent_home_finding(&AgentHome {
+            path: None,
+            state: AgentHomeState::Unreachable("dscl is not on PATH".to_string()),
+        });
+        assert!(matches!(finding.status, Status::Unreachable { .. }));
+        fs::remove_file(&file).expect("remove the file");
+        fs::remove_dir(&base).expect("remove the base");
+    }
+
+    #[test]
+    fn decodes_the_agent_record_and_rejects_the_unrecognised() {
+        let found = |stdout: &str| decode_agent_record(&DsclLookup::Found(stdout.to_string()));
+        assert_eq!(
+            found("NFSHomeDirectory: /Users/tycho-agent\nPrimaryGroupID: 502\nUniqueID: 503\n"),
+            Ok(AgentRecord {
+                home: "/Users/tycho-agent".to_string(),
+                uid: 503,
+                gid: 502,
+            })
+        );
+        for unrecognised in [
+            "PrimaryGroupID: 502\nUniqueID: 503\n",
+            "NFSHomeDirectory: tycho-agent\nPrimaryGroupID: 502\nUniqueID: 503\n",
+            "NFSHomeDirectory:\n /Users/a\n /Users/b\nPrimaryGroupID: 502\nUniqueID: 503\n",
+            "NFSHomeDirectory: /Users/tycho-agent\nPrimaryGroupID: 502\n",
+            "NFSHomeDirectory: /Users/tycho-agent\nPrimaryGroupID: staff\nUniqueID: 503\n",
+        ] {
+            assert!(
+                matches!(found(unrecognised), Err(AgentHomeState::Unrecognised(_))),
+                "{unrecognised:?}"
+            );
+        }
+        let finding = agent_home_finding(&AgentHome {
+            path: None,
+            state: AgentHomeState::Unrecognised("agent user record without UniqueID".to_string()),
+        });
+        assert!(matches!(
+            finding.status,
+            Status::Unreachable { ref why } if why.starts_with("unrecognised")
+        ));
     }
 }
