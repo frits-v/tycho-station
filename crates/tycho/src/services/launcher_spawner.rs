@@ -9,7 +9,7 @@ use tycho_types::session::SessionName;
 use std::io::Write;
 
 use crate::agent_files::open_append;
-use crate::config::{AgentDirs, CorePorts, ToolPrefix, LOG_DIR};
+use crate::config::{AgentDirs, ConfigError, CorePorts, ToolPrefix, LOG_DIR};
 use crate::kill::{kill_by_name, kill_session, KillReport, KillRequest};
 use crate::launch_spec::{HeartbeatTarget, VendorTerminal};
 use crate::private_dir;
@@ -70,6 +70,33 @@ pub fn kill_line(session: &SessionName, pid: u32, report: &KillReport) -> String
 }
 
 impl LauncherSpawner {
+    /// A spawner whose launcher is the prefix's `tycho` and whose sessions run under the
+    /// prefix's recorded zmx, so a session starts from the prefix and from nothing else.
+    pub fn for_prefix(
+        tool_prefix: ToolPrefix,
+        dirs: AgentDirs,
+        home: PathBuf,
+        core_home: PathBuf,
+        agent_uid: u32,
+        heartbeat: HeartbeatTarget,
+        ports: CorePorts,
+    ) -> Result<Self, ConfigError> {
+        let zmx_binary = tool_prefix.tool("zmx").ok_or_else(|| {
+            ConfigError::ToolPrefixManifest("station.json records no zmx".to_string())
+        })?;
+        Ok(Self {
+            zmx: Zmx::agent(zmx_binary, &dirs.socket_dir),
+            tycho: tool_prefix.tycho(),
+            dirs,
+            home,
+            core_home,
+            agent_uid,
+            heartbeat,
+            ports,
+            tool_prefix,
+        })
+    }
+
     fn log_kill(&self, line: &str) -> Result<(), SpawnerError> {
         let dir = self.core_home.join(LOG_DIR);
         let path = dir.join(KILL_LOG);
@@ -162,6 +189,40 @@ mod tests {
     use super::*;
     use std::path::Path;
     use tycho_types::lease::RequeueReason;
+
+    #[test]
+    fn a_prefix_spawner_launches_the_prefix_tycho_under_the_recorded_zmx() {
+        let prefix = crate::config::tool_prefix::tests::production();
+        let spawner = LauncherSpawner::for_prefix(
+            prefix,
+            AgentDirs::new(PathBuf::from("/Users/Shared/tycho-agent-zmx")).unwrap(),
+            PathBuf::from("/Users/tycho-agent"),
+            PathBuf::from("/core"),
+            1,
+            HeartbeatTarget::Session,
+            CorePorts::PRODUCTION,
+        )
+        .unwrap();
+        assert_eq!(
+            spawner.tycho,
+            PathBuf::from("/Users/Shared/tycho/bin/tycho")
+        );
+        assert_eq!(
+            spawner.zmx.binary(),
+            Path::new("/Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx")
+        );
+        let bare = ToolPrefix::new(PathBuf::from("/tmp/prefix")).unwrap();
+        assert!(LauncherSpawner::for_prefix(
+            bare,
+            AgentDirs::new(PathBuf::from("/a")).unwrap(),
+            PathBuf::from("/h"),
+            PathBuf::from("/c"),
+            1,
+            HeartbeatTarget::Session,
+            CorePorts::PRODUCTION,
+        )
+        .is_err());
+    }
 
     #[test]
     fn a_kill_logs_both_verdicts() {

@@ -253,11 +253,11 @@ pub fn launch_spec(request: &SpawnRequest<'_>) -> Result<LaunchSpec, SpawnerErro
     Ok(spec)
 }
 
-/// The words zmx types: `exec env -i HOME PATH <mise> <tycho> launch --spec <file>`, bounded.
+/// The words zmx types: `exec env -i HOME PATH MISE_* <tycho> launch --spec <file>`, bounded.
 ///
 /// The launcher's whole environment besides its own contract; `env -i` drops the rest. `PATH`
-/// starts at the tool prefix, and the mise variables make a shim the vendor starts resolve the
-/// prefix's installs.
+/// holds the prefix's `bin` and the recorded install directories, and the mise variables keep
+/// any mise a session starts on the prefix's pins, offline.
 pub fn typed_words(request: &SpawnRequest<'_>, spec: &Path) -> Result<Vec<String>, SpawnerError> {
     let mut words = vec![
         "exec".to_string(),

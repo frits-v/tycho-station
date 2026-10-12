@@ -42,6 +42,7 @@ use tycho::services::spawner::LeaseRead;
 use tycho::spawn::{read_lease, save_scrollback, spawn_session, SpawnOutcome, SpawnRequest};
 use tycho::spool::ACKNOWLEDGED_SUFFIX;
 use tycho::zmx::{count_named, presence, Presence, Zmx};
+use tycho_harness::tool_prefix::link_scratch_prefix;
 use tycho_types::launcher::{LauncherEnv, ENV_AWAITABLE_ID, ENV_SESSION_NAME, ENV_SESSION_SECRET};
 use tycho_types::lease::{Freshness, RequeueReason};
 use tycho_types::session::SessionName;
@@ -67,6 +68,10 @@ struct Harness {
     environment: Vec<(&'static str, String)>,
     dirs: AgentDirs,
     zmx: Zmx,
+    /// A scratch prefix holding the built `tycho` and the pinned tools, where sessions start.
+    prefix: ToolPrefix,
+    /// The prefix's `tycho`, which zmx types as the launcher.
+    launcher: PathBuf,
     fixture: PathBuf,
     names: Vec<SessionName>,
     /// Held until the core is stopped, after the teardown in `drop`.
@@ -94,13 +99,15 @@ impl Harness {
         let home = user_home.join(format!(".tycho-test-launch-{tag}-{pid}"));
         let claim = claim_ports(&home);
         let agent = user_home.join(format!(".tla-{tag}-{pid}"));
-        for dir in [&home, &agent] {
+        let prefix_root = user_home.join(format!(".tlp-{tag}-{pid}"));
+        for dir in [&home, &agent, &prefix_root] {
             if dir.exists() {
                 fs::remove_dir_all(dir).unwrap();
             }
         }
         let zmx_binary = mise_which("zmx");
         let restate_server = mise_which("restate-server");
+        let prefix = scratch_prefix(&prefix_root, &zmx_binary);
         let config = CoreConfig::new(
             home.clone(),
             zmx_binary.clone(),
@@ -122,7 +129,9 @@ impl Harness {
             .into_iter()
             .chain(config.port_offset_pair())
             .collect(),
-            zmx: Zmx::agent(&zmx_binary, &agent),
+            zmx: Zmx::agent(prefix.tool("zmx").unwrap(), &agent),
+            launcher: prefix.tycho(),
+            prefix,
             fixture: home.join("vendor.sh"),
             config,
             dirs,
@@ -195,7 +204,7 @@ impl Harness {
         let outcome = spawn_session(&SpawnRequest {
             zmx: &self.zmx,
             dirs: &self.dirs,
-            tycho: Path::new(TYCHO),
+            tycho: &self.launcher,
             home: &home,
             env: &env,
             heartbeat: HeartbeatTarget::LaunchProbe,
@@ -205,7 +214,7 @@ impl Harness {
             terminal: VendorTerminal::Files,
             vendor_dir: None,
             ports: self.config.ports,
-            tool_prefix: &scratch_prefix(),
+            tool_prefix: &self.prefix,
         })
         .unwrap();
         println!("evidence: spawn_session({name}) -> {outcome:?}");
@@ -219,7 +228,7 @@ impl Harness {
             session: name,
             pid,
             agent_uid: current_uid(),
-            tycho: Path::new(TYCHO),
+            tycho: &self.launcher,
         }
     }
 
@@ -246,11 +255,11 @@ impl Harness {
 /// Kills every session left in a socket directory by pid and by name; returns how many remain.
 /// Ends what a socket directory still lists; a pid is signalled only while `ps` shows it
 /// running restate-server, the endpoint or a launcher.
-fn clear_sessions(zmx: &Zmx, label: &str) -> usize {
+fn clear_sessions(zmx: &Zmx, label: &str, launcher: &Path) -> usize {
     let programs = vec![
         mise_which("restate-server").display().to_string(),
         format!("{TYCHO} endpoint"),
-        format!("{TYCHO} launch"),
+        format!("{} launch", launcher.display()),
     ];
     match zmx.clear(&programs) {
         Ok(report) => {
@@ -283,7 +292,7 @@ impl Drop for Harness {
             }
             kill_orphan_vendor(&self.files(name));
         }
-        let agent_left = clear_sessions(&self.zmx, "agent");
+        let agent_left = clear_sessions(&self.zmx, "agent", &self.launcher);
         if agent_left != 0 {
             problems.push(format!("{agent_left} agent sessions remain"));
         }
@@ -291,11 +300,16 @@ impl Drop for Harness {
         let core_left = clear_sessions(
             &Zmx::new(&self.config.zmx, &self.config.socket_dir()),
             "core",
+            Path::new(TYCHO),
         );
         if core_left != 0 {
             problems.push(format!("{core_left} core sessions remain"));
         }
-        for dir in [&self.config.home, &self.dirs.socket_dir] {
+        for dir in [
+            &self.config.home,
+            &self.dirs.socket_dir,
+            &self.prefix.root().to_path_buf(),
+        ] {
             if let Err(error) = fs::remove_dir_all(dir) {
                 problems.push(format!("cannot remove {}: {error}", dir.display()));
             }
@@ -485,7 +499,20 @@ fn launch_spools_resolves_and_ends_its_session() {
     let awaitable = start_wait(core_ports, &key);
     let files = harness.files(&name);
     let outcome_spawn = harness.spawn(&name, &awaitable, "12", &result_json(&name));
-    assert!(matches!(outcome_spawn, SpawnOutcome::Spawned { .. }));
+    let SpawnOutcome::Spawned { pid } = outcome_spawn else {
+        panic!("expected a spawn, got {outcome_spawn:?}");
+    };
+    let tycho::process::ProcessFacts::Running(launcher) = tycho::process::process_facts(pid) else {
+        panic!("the launcher {pid} is not running");
+    };
+    println!("evidence: the launcher runs as {}", launcher.command);
+    assert!(
+        launcher
+            .command
+            .starts_with(&format!("{} launch", harness.launcher.display())),
+        "the launcher did not start from the prefix: {}",
+        launcher.command
+    );
     wait_until("vendor saw the lease before it ran", WAIT_LIMIT, || {
         harness.marker(&name, ".lease-seen").exists().then_some(())
     });
@@ -672,8 +699,24 @@ fn claim_ports(home: &Path) -> PortClaim {
     claim
 }
 
-/// A prefix with no tools recorded, so a test session's `PATH` never reaches the host's
-/// installed prefix; the vendor runs by the absolute path the test hands it.
-fn scratch_prefix() -> ToolPrefix {
-    ToolPrefix::new(std::env::temp_dir().join("tycho-test-prefix")).unwrap()
+/// A scratch prefix at `root` with the built `tycho` as its launcher and the developer's
+/// pinned tools as its installs, so a session starts from a prefix the way production does.
+fn scratch_prefix(root: &Path, zmx: &Path) -> ToolPrefix {
+    link_scratch_prefix(
+        root,
+        Path::new(TYCHO),
+        &[
+            ("claude", &mise_which("claude")),
+            ("codex", &mise_which("codex")),
+            ("zmx", zmx),
+        ],
+    )
+    .unwrap();
+    let prefix = ToolPrefix::load(root.to_path_buf()).unwrap();
+    println!(
+        "evidence: sessions start from {} under zmx {}",
+        prefix.tycho().display(),
+        prefix.tool("zmx").unwrap().display()
+    );
+    prefix
 }

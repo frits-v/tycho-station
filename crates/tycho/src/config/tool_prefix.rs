@@ -132,6 +132,12 @@ impl ToolPrefix {
         &self.root
     }
 
+    /// The station's own binary in the prefix, which zmx types as the launcher.
+    #[must_use]
+    pub fn tycho(&self) -> PathBuf {
+        self.root.join("bin/tycho")
+    }
+
     /// The absolute path of a recorded tool's executable.
     #[must_use]
     pub fn tool(&self, name: &str) -> Option<&Path> {
