@@ -139,12 +139,17 @@ fn wrap(script: &str) -> String {
     format!("(\n{script}\n)\nrc=$?\nprintf '\\n{MARKER} uid=%s exit=%s\\n' \"$(/usr/bin/id -u)\" \"$rc\"")
 }
 
-/// Reads the marker line: the uid and exit status, or why they cannot be read.
+/// Reads the marker, which counts only as the last non-empty line: the uid and exit status,
+/// or why they cannot be read.
 fn read_marker(stdout: &str) -> Option<Result<(u32, i32), String>> {
-    let line = stdout
-        .lines()
-        .rev()
-        .find_map(|line| line.strip_prefix(MARKER).map(str::trim))?;
+    let last = stdout.lines().rev().find(|line| !line.trim().is_empty());
+    let line = match last.and_then(|line| line.strip_prefix(MARKER)) {
+        Some(line) => line.trim(),
+        None if stdout.lines().any(|line| line.starts_with(MARKER)) => {
+            return Some(Err("output follows the marker line".to_string()));
+        }
+        None => return None,
+    };
     let mut words = line.split(' ');
     let uid = words.next().and_then(|word| word.strip_prefix("uid="));
     let exit = words.next().and_then(|word| word.strip_prefix("exit="));
@@ -201,7 +206,7 @@ fn decode(stdout: &str, stderr: &str, agent_uid: u32) -> Outcome {
         Err(reason) => return Outcome::Unrecognised(reason),
     };
     if uid != agent_uid {
-        return Outcome::Unrecognised(format!("ran as uid {uid}, not the agent's {agent_uid}"));
+        return Outcome::Unrecognised("ran under a uid other than the agent's".to_string());
     }
     if exit == 0 {
         let reached = stdout
@@ -240,7 +245,7 @@ fn run_as_agent(agent: &Agent, script: &str, arguments: &[&str]) -> Outcome {
         MARKER,
     ];
     words.extend_from_slice(arguments);
-    match command::run_status_with_terminal_input(
+    match command::run_status_from(
         Path::new(SUDO),
         &words,
         Path::new("/"),
@@ -252,6 +257,20 @@ fn run_as_agent(agent: &Agent, script: &str, arguments: &[&str]) -> Outcome {
             Outcome::Unrecognised(error.to_string())
         }
         Err(error) => Outcome::CouldNotRun(error.to_string()),
+    }
+}
+
+/// Drops sudo's cached credential when the run ends, passed or failed, so the developer's
+/// ticket does not outlive the suite.
+struct ForgetSudo;
+
+impl Drop for ForgetSudo {
+    fn drop(&mut self) {
+        match Command::new(SUDO).arg("-k").status() {
+            Ok(status) if status.success() => println!("boundary: sudo -k at the end of the run"),
+            Ok(status) => eprintln!("boundary: sudo -k at the end exited {status}"),
+            Err(error) => eprintln!("boundary: sudo -k at the end could not run: {error}"),
+        }
     }
 }
 
@@ -344,6 +363,11 @@ const ADMIN_HEALTH: &str =
 const WRITE_OBJECTS: &str = ": > \"$1/objects/tycho-boundary-probe\" && echo \"wrote $1/objects\"";
 const WRITE_HOOK: &str = "/bin/mkdir -p \"$1/hooks\" && printf '#!/bin/sh\\nexit 0\\n' > \
      \"$1/hooks/pre-receive\" && echo \"wrote $1/hooks/pre-receive\"";
+/// Names the first directory on the way to `$1` that refuses a search, so a refusal of the
+/// canonical repository says which layer gave it.
+const LAYER_WALK: &str = "walked=''; IFS=/; for part in $1; do [ -z \"$part\" ] && continue; \
+     walked=\"$walked/$part\"; /bin/ls -d \"$walked/.\" > /dev/null 2>&1 || \
+     { echo \"first refused layer: $walked\"; exit 0; }; done; echo 'every layer searchable'";
 /// git reports an unreadable repository as one that does not exist, so a failed push is
 /// followed by a look at the path, whose refusal names the cause. A step before the push that
 /// fails says so in a line that decodes as unrecognised, never as a refusal.
@@ -500,6 +524,7 @@ fn canonical_repository(core_home: &Path, worktree_root: PathBuf) -> (Repositori
 #[ignore = "probes as the agent user through sudo; run with mise run boundary-tests from a terminal"]
 fn the_agent_user_is_refused_at_every_boundary() {
     let agent = preflight();
+    let _forget = ForgetSudo;
     let claim = support::claim_ports(&test_home("agent"));
     let core = support::Core::new(claim);
     support::start_once(&core, |core| {
@@ -531,6 +556,8 @@ fn the_agent_user_is_refused_at_every_boundary() {
             (boundary.name, boundary.expectation, outcome)
         })
         .collect();
+    let layer = run_as_agent(&agent, LAYER_WALK, &[canonical.to_str().unwrap()]);
+    println!("evidence: the agent's walk to the canonical repository: {layer:?}");
     let failures = report(&results);
     assert_eq!(
         failures, 0,
@@ -546,6 +573,9 @@ struct GateScratch {
 
 impl GateScratch {
     fn new() -> Self {
+        // Under the developer's home like the production core home `~/.tycho`, which is
+        // where the agent's refusal starts; the remote and worktrees stay in a temporary
+        // directory.
         let core_home = test_home("gate");
         let scratch = env::temp_dir().join(format!("tycho-boundary-gate-{}", std::process::id()));
         for dir in [&core_home, &scratch] {
@@ -814,6 +844,27 @@ mod probes {
     }
 
     #[test]
+    fn the_layer_walk_names_the_first_directory_that_refuses_a_search() {
+        let owned = scratch("walk");
+        let inside = owned.0.join("a/b");
+        fs::create_dir_all(&inside).unwrap();
+        assert_eq!(
+            run_as_self(LAYER_WALK, &[inside.to_str().unwrap()]),
+            Outcome::Succeeded("every layer searchable".to_string())
+        );
+        let refused = format!("{}/repositories/widget.git", root_home());
+        let resolved_root = fs::canonicalize(root_home()).unwrap();
+        assert_eq!(
+            run_as_self(LAYER_WALK, &[resolved_root.join("x").to_str().unwrap()]),
+            Outcome::Succeeded(format!("first refused layer: {}", resolved_root.display()))
+        );
+        assert!(matches!(
+            run_as_self(LAYER_WALK, &[&refused]),
+            Outcome::Succeeded(text) if text.starts_with("first refused layer: ")
+        ));
+    }
+
+    #[test]
     fn the_settings_probe_leaves_an_existing_file_as_it_was() {
         let owned = scratch("settings");
         let settings = owned.0.join("settings.json");
@@ -967,6 +1018,27 @@ mod decoders {
             assert!(disposition(Expectation::Refused, outcome).fails());
         }
         assert_eq!(cases.len(), 7);
+    }
+
+    #[test]
+    fn a_marker_followed_by_more_output_is_not_read() {
+        let trailing = format!("{MARKER} uid={AGENT} exit=1\nls: x: Permission denied\n");
+        assert_eq!(
+            read_marker(&trailing),
+            Some(Err("output follows the marker line".to_string()))
+        );
+        assert!(matches!(
+            decode(&trailing, "", AGENT),
+            Outcome::Unrecognised(_)
+        ));
+        assert_eq!(
+            read_marker(&format!("{MARKER} uid={AGENT} exit=1\n\n  \n")),
+            Some(Ok((AGENT, 1)))
+        );
+        assert_eq!(
+            decode(&ran("", 501, 1), "ls: x: Permission denied\n", AGENT),
+            Outcome::Unrecognised("ran under a uid other than the agent's".to_string())
+        );
     }
 
     #[test]

@@ -107,9 +107,9 @@ pub fn run_status_capped(
     run_piped(command, timeout, output_max_bytes)
 }
 
-/// Runs from `current_dir` with this process's stdin, so a program that asks the operator
-/// (sudo's password prompt) reaches the terminal; stdout and stderr are captured under the cap.
-pub fn run_status_with_terminal_input(
+/// Runs from `current_dir` with stdin closed, stdout and stderr captured under the cap. sudo
+/// still asks for a password on the controlling terminal, which it opens as `/dev/tty`.
+pub fn run_status_from(
     program: &Path,
     arguments: &[&str],
     current_dir: &Path,
@@ -120,7 +120,7 @@ pub fn run_status_with_terminal_input(
     command
         .args(arguments)
         .current_dir(current_dir)
-        .stdin(Stdio::inherit());
+        .stdin(Stdio::null());
     run_piped(command, timeout, output_max_bytes)
 }
 
@@ -330,8 +330,8 @@ mod tests {
     }
 
     #[test]
-    fn a_terminal_input_run_starts_in_the_given_directory_and_captures_both_streams() {
-        let captured = run_status_with_terminal_input(
+    fn a_run_from_a_directory_starts_there_and_captures_both_streams() {
+        let captured = run_status_from(
             Path::new("/bin/sh"),
             &["-c", "pwd; echo refused >&2; exit 3"],
             Path::new("/"),
@@ -343,7 +343,7 @@ mod tests {
         assert_eq!(captured.stderr, "refused\n");
         assert_eq!(captured.status.code(), Some(3));
         assert!(matches!(
-            run_status_with_terminal_input(
+            run_status_from(
                 Path::new("/bin/sleep"),
                 &["5"],
                 Path::new("/"),
