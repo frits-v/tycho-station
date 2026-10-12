@@ -167,8 +167,11 @@ what the developer side of `mise run setup` checks, in this order:
    appears at a first login through the login window, and until it exists
    `sudo -iu tycho-agent` fails. Setup checks that the directory the record's
    `NFSHomeDirectory` names exists, is a directory and not a link, is owned by the agent's
-   uid and primary gid, and has mode 0700. It reads the entry without following a link
-   rather than opening it, since the developer cannot open another user's 0700 directory;
+   uid and primary gid, has mode 0700, and holds no ACL allow entry (a deny entry, such as
+   the `group:everyone deny delete` a created home carries, passes). It reads the entry
+   without following a link and the ACL with `ls -lde` rather than opening the directory,
+   since the developer cannot open another user's 0700 directory. Both commands act only
+   on `/Users/tycho-agent`; a record naming another path is left to the operator;
 4. the shared group `tycho-zmx`, with the developer and the agent as members;
 5. a deny entry for the agent in the developer's home ACL,
    `chmod +a "user:tycho-agent deny search,list,readattr,readextattr" ~`, run as the
@@ -193,9 +196,10 @@ or a group the agent is in, search it.
   owned by another user, with another group, or with a mode narrower than 0700 is reported
   with its fix, not changed. A socket directory owned by another user, or owned by root
   with the wrong group or mode, is removed with `sudo /bin/rmdir`, which removes only an
-  empty directory and never follows a link, and the developer creates it again; if `rmdir` fails the run stops and names the directory to inspect. The directories
-  are created one level at a time and set on descriptors opened with `O_NOFOLLOW` by the
-  xtask as the developer.
+  empty directory and never follows a link, and the developer creates it again; if `rmdir`
+  fails the run stops and names the directory to inspect. The directories are created one
+  level at a time and set on descriptors opened with `O_NOFOLLOW` by the xtask as the
+  developer.
 - A root step that outlasts its ten minutes is ended by killing `sudo`; the command under it
   may still finish. The probe after the step reads what happened, so a rerun skips a step
   that completed and repeats one that did not.

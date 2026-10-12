@@ -251,11 +251,12 @@ fn prepare_core_dir_need(snapshot: &Snapshot) -> Need {
 }
 
 /// A home that exists in any form is not created again; what is wrong with it is the mode
-/// step's or the operator's.
+/// step's or the operator's. Like the mode step, it acts only at `AGENT_HOME`.
 fn create_home_need(snapshot: &Snapshot) -> Need {
-    match &snapshot.agent_home.state {
-        AgentHomeState::Missing => Need::Run,
-        AgentHomeState::Ok | AgentHomeState::Wrong(_) => Need::Skip,
+    let home = &snapshot.agent_home;
+    match &home.state {
+        AgentHomeState::Missing if home.is_at_agent_home() => Need::Run,
+        AgentHomeState::Ok | AgentHomeState::Missing | AgentHomeState::Wrong(_) => Need::Skip,
         AgentHomeState::Unreachable(why) => Need::Blocked(why.clone()),
         AgentHomeState::Unrecognised(what) => Need::Blocked(format!("unrecognised {what}")),
     }
@@ -266,7 +267,7 @@ fn create_home_need(snapshot: &Snapshot) -> Need {
 /// record not yet read is the one the user step creates at that path.
 fn narrow_home_need(snapshot: &Snapshot) -> Need {
     let home = &snapshot.agent_home;
-    let at_chmod_path = home.path.as_deref().is_none_or(|path| path == AGENT_HOME);
+    let at_chmod_path = home.is_at_agent_home();
     match &home.state {
         AgentHomeState::Missing if at_chmod_path => Need::Run,
         AgentHomeState::Wrong(mismatch) if at_chmod_path && mismatch.is_only_a_wider_mode() => {
@@ -1622,26 +1623,58 @@ mod tests {
             found: 0o755,
             wanted: AGENT_HOME_MODE,
         });
-        for snapshot in [
-            with_home(
-                all_present(),
-                Some(AGENT_HOME),
-                AgentHomeState::Wrong(owned_elsewhere),
+        let narrows = "mise run provision-agent narrows it";
+        for (snapshot, expected) in [
+            (
+                with_home(
+                    all_present(),
+                    Some(AGENT_HOME),
+                    AgentHomeState::Wrong(owned_elsewhere),
+                ),
+                "/Users/tycho-agent is not a directory the agent owns; inspect it and move it aside by hand, then run mise run provision-agent again".to_string(),
             ),
-            with_home(all_present(), Some(AGENT_HOME), home_mode(0o500)),
-            with_home(all_present(), Some("/Users/elsewhere"), home_mode(0o755)),
+            (
+                with_home(all_present(), Some(AGENT_HOME), home_mode(0o500)),
+                "sudo -u tycho-agent /bin/chmod 0700 /Users/tycho-agent".to_string(),
+            ),
+            (
+                with_home(all_present(), Some("/Users/elsewhere"), home_mode(0o755)),
+                "sudo -u tycho-agent /bin/chmod 0700 /Users/elsewhere".to_string(),
+            ),
+            (
+                with_home(all_present(), Some("/Users/elsewhere"), AgentHomeState::Missing),
+                "the agent user record names /Users/elsewhere, not /Users/tycho-agent, and the task creates only /Users/tycho-agent; point NFSHomeDirectory at /Users/tycho-agent (sudo dscl . -create /Users/tycho-agent NFSHomeDirectory /Users/tycho-agent) and run mise run provision-agent again".to_string(),
+            ),
         ] {
             let planned = plan(&snapshot);
             assert!(planned.steps.is_empty(), "{:?}", snapshot.agent_home);
             let left = unremedied(&snapshot, &planned.steps);
             assert_eq!(left.len(), 1);
-            assert!(left.first().is_some_and(
-                |finding| finding.check == Check::AgentHomeDirectory && finding.hint.is_some()
-            ));
+            let hint = left
+                .first()
+                .filter(|finding| finding.check == Check::AgentHomeDirectory)
+                .and_then(|finding| finding.hint.clone());
+            assert_eq!(hint.as_deref(), Some(expected.as_str()));
+            assert!(!expected.contains(narrows));
             let mut host = RecordingHost::new(vec![snapshot]);
             assert_eq!(provision(Mode::Print, false, &mut host), 1);
             assert!(!host.acted());
         }
+    }
+
+    #[test]
+    fn the_narrowing_note_appears_only_where_the_task_narrows() {
+        let wide = with_home(all_present(), Some(AGENT_HOME), home_mode(0o750));
+        let hint = wide
+            .findings
+            .iter()
+            .find(|finding| finding.check == Check::AgentHomeDirectory)
+            .and_then(|finding| finding.hint.clone());
+        assert_eq!(
+            hint.as_deref(),
+            Some("sudo -u tycho-agent /bin/chmod 0700 /Users/tycho-agent (mise run provision-agent narrows it)")
+        );
+        assert_eq!(plan(&wide).steps, vec![Remedy::NarrowAgentHomeMode]);
     }
 
     #[test]

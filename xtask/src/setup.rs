@@ -1284,7 +1284,8 @@ fn home_search_status(
     }
 }
 
-fn home_acl(home: &str) -> Result<Vec<AclEntry>, String> {
+/// The home's ACL listing; `Err` when `ls` could not run or failed.
+fn home_acl(home: &str) -> Result<AclListing, String> {
     let mut command = plain_command("/bin/ls", &["-lde", home]);
     command.env_remove("CLICOLOR").env_remove("CLICOLOR_FORCE");
     match run_bounded(command) {
@@ -1299,10 +1300,7 @@ fn home_acl(home: &str) -> Result<Vec<AclEntry>, String> {
             success: true,
             stdout,
             ..
-        } => match decode_acl_listing(&stdout) {
-            AclListing::Entries(entries) => Ok(entries),
-            AclListing::Unrecognised(line) => Err(format!("unrecognised ls -lde line: {line:?}")),
-        },
+        } => Ok(decode_acl_listing(&stdout)),
     }
 }
 
@@ -1348,7 +1346,10 @@ fn home_closed_status(username: &str) -> Status {
         Err(error) => return unreachable(format!("{home}: {error}")),
     };
     let entries = match home_acl(&home) {
-        Ok(entries) => entries,
+        Ok(AclListing::Entries(entries)) => entries,
+        Ok(AclListing::Unrecognised(line)) => {
+            return unreachable(format!("unrecognised ls -lde line: {line:?}"))
+        }
         Err(why) => return unreachable(why),
     };
     match agent_in_group(metadata.gid()) {
@@ -1454,13 +1455,15 @@ pub struct Differs {
 }
 
 /// Each attribute of the home that differs from the record; `None` matches.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HomeMismatch {
     /// What sits at the path when it is not a directory.
     pub kind: Option<&'static str>,
     pub owner: Option<Differs>,
     pub group: Option<Differs>,
     pub mode: Option<Differs>,
+    /// The first ACL entry that allows anything, as `chmod -a` takes it.
+    pub acl_allow: Option<String>,
 }
 
 impl HomeMismatch {
@@ -1469,6 +1472,7 @@ impl HomeMismatch {
         self.kind.is_none()
             && self.owner.is_none()
             && self.group.is_none()
+            && self.acl_allow.is_none()
             && self
                 .mode
                 .is_some_and(|mode| mode.found & !AGENT_HOME_MODE != 0)
@@ -1490,6 +1494,14 @@ pub struct AgentHome {
     /// The record's `NFSHomeDirectory`, once the record is read and recognised.
     pub path: Option<String>,
     pub state: AgentHomeState,
+}
+
+impl AgentHome {
+    /// The record names `AGENT_HOME`, or is not read yet, so it is the one the user step
+    /// creates there: the only path the home steps act on.
+    pub fn is_at_agent_home(&self) -> bool {
+        self.path.as_deref().is_none_or(|path| path == AGENT_HOME)
+    }
 }
 
 fn record_number(stdout: &str, key: &str) -> Result<u32, AgentHomeState> {
@@ -1526,6 +1538,26 @@ fn differs(found: u32, wanted: u32) -> Option<Differs> {
     (found != wanted).then_some(Differs { found, wanted })
 }
 
+/// A deny entry, such as the `group:everyone deny delete` a created home carries, only takes
+/// access away; an allow entry grants what the 0700 mode withholds.
+fn first_allow(entries: &[AclEntry]) -> Option<String> {
+    entries
+        .iter()
+        .find(|entry| entry.allows)
+        .map(|entry| format!("{} allow {}", entry.principal, entry.permissions.join(",")))
+}
+
+/// The ACL of a home that is a directory; `ls -lde` reads it without opening the directory.
+fn home_acl_allow(home: &str) -> Result<Option<String>, AgentHomeState> {
+    match home_acl(home) {
+        Ok(AclListing::Entries(entries)) => Ok(first_allow(&entries)),
+        Ok(AclListing::Unrecognised(line)) => Err(AgentHomeState::Unrecognised(format!(
+            "ls -lde line {line:?} for the agent home"
+        ))),
+        Err(why) => Err(AgentHomeState::Unreachable(why)),
+    }
+}
+
 /// Reads the entry without following a link rather than opening it: the developer cannot open
 /// another user's 0700 directory, so an open would fail on the home in its wanted state.
 fn measure_agent_home(record: &AgentRecord) -> AgentHomeState {
@@ -1534,11 +1566,20 @@ fn measure_agent_home(record: &AgentRecord) -> AgentHomeState {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return AgentHomeState::Missing,
         Err(error) => return AgentHomeState::Unreachable(format!("{}: {error}", record.home)),
     };
+    let acl_allow = if metadata.is_dir() {
+        match home_acl_allow(&record.home) {
+            Ok(allow) => allow,
+            Err(state) => return state,
+        }
+    } else {
+        None
+    };
     let mismatch = HomeMismatch {
         kind: (!metadata.is_dir()).then(|| file_kind(&metadata)),
         owner: differs(metadata.uid(), record.uid),
         group: differs(metadata.gid(), record.gid),
         mode: differs(metadata.permissions().mode() & 0o7777, AGENT_HOME_MODE),
+        acl_allow,
     };
     if mismatch == HomeMismatch::default() {
         AgentHomeState::Ok
@@ -1577,15 +1618,23 @@ fn mismatch_status(mismatch: &HomeMismatch) -> Status {
         found.push(format!("mode {:04o}", mode.found));
         wanted.push(format!("mode {:04o}", mode.wanted));
     }
+    if let Some(entry) = &mismatch.acl_allow {
+        found.push(format!("ACL entry {entry}"));
+        wanted.push("no ACL allow entry".to_string());
+    }
     Status::Wrong {
         found: found.join(", "),
         wanted: wanted.join(", "),
     }
 }
 
+const NARROWS_NOTE: &str = "mise run provision-agent narrows it";
+
 /// A home that is not the agent's own is left to the operator: root does not change its owner
-/// by path. A group or mode on the agent's own home the agent can set itself.
-fn mismatch_hint(mismatch: &HomeMismatch, path: &str) -> String {
+/// by path. A group, mode or ACL entry on the agent's own home the agent can set itself.
+/// The note that the task narrows the mode appears only where `provision-agent` would.
+fn mismatch_hint(mismatch: &HomeMismatch, home: &AgentHome) -> String {
+    let path = home.path.as_deref().unwrap_or(AGENT_HOME);
     if mismatch.kind.is_some() || mismatch.owner.is_some() {
         return format!("{path} is not a directory the agent owns; inspect it and move it aside by hand, then run mise run provision-agent again");
     }
@@ -1596,12 +1645,30 @@ fn mismatch_hint(mismatch: &HomeMismatch, path: &str) -> String {
             group.wanted
         ));
     }
-    if mismatch.mode.is_some() {
+    if let Some(entry) = &mismatch.acl_allow {
         steps.push(format!(
-            "sudo -u {AGENT_USER_NAME} /bin/chmod {AGENT_HOME_MODE:04o} {path} (mise run provision-agent narrows a wider mode)"
+            "sudo -u {AGENT_USER_NAME} /bin/chmod -a \"{entry}\" {path}"
         ));
     }
+    if mismatch.mode.is_some() {
+        let chmod = format!("sudo -u {AGENT_USER_NAME} /bin/chmod {AGENT_HOME_MODE:04o} {path}");
+        if home.is_at_agent_home() && mismatch.is_only_a_wider_mode() {
+            steps.push(format!("{chmod} ({NARROWS_NOTE})"));
+        } else {
+            steps.push(chmod);
+        }
+    }
     steps.join("; ")
+}
+
+/// The home steps act only on `AGENT_HOME`; a record naming another path is the operator's.
+fn missing_home_hint(home: &AgentHome) -> String {
+    match home.path.as_deref() {
+        Some(path) if !home.is_at_agent_home() => format!(
+            "the agent user record names {path}, not {AGENT_HOME}, and the task creates only {AGENT_HOME}; point NFSHomeDirectory at {AGENT_HOME} (sudo dscl . -create /Users/{AGENT_USER_NAME} NFSHomeDirectory {AGENT_HOME}) and run mise run provision-agent again"
+        ),
+        _ => AGENT_HOME_CREATE_HINT.to_string(),
+    }
 }
 
 pub fn agent_home_finding(home: &AgentHome) -> Finding {
@@ -1609,12 +1676,12 @@ pub fn agent_home_finding(home: &AgentHome) -> Finding {
     match &home.state {
         AgentHomeState::Ok => Finding::new(check, Status::Present),
         AgentHomeState::Missing => {
-            Finding::with_hint(check, Status::Missing, AGENT_HOME_CREATE_HINT)
+            Finding::with_hint(check, Status::Missing, missing_home_hint(home))
         }
         AgentHomeState::Wrong(mismatch) => Finding::with_hint(
             check,
             mismatch_status(mismatch),
-            mismatch_hint(mismatch, home.path.as_deref().unwrap_or(AGENT_HOME)),
+            mismatch_hint(mismatch, home),
         ),
         AgentHomeState::Unreachable(why) => Finding::unreachable(check, why.clone()),
         AgentHomeState::Unrecognised(what) => {
@@ -3100,14 +3167,91 @@ mod tests {
             decode_agent_record(&DsclLookup::NotFound),
             Err(AgentHomeState::Missing)
         );
-        let finding = agent_home_finding(&AgentHome {
+        let elsewhere = agent_home_finding(&AgentHome {
             path: Some(record.home),
             state: AgentHomeState::Missing,
         });
-        assert_eq!(finding.status, Status::Missing);
+        assert_eq!(elsewhere.status, Status::Missing);
+        assert!(elsewhere.hint.is_some_and(|hint| hint
+            .contains("point NFSHomeDirectory at /Users/tycho-agent")
+            && !hint.contains("createhomedir")));
+        for path in [Some(AGENT_HOME.to_string()), None] {
+            let at_agent_home = agent_home_finding(&AgentHome {
+                path,
+                state: AgentHomeState::Missing,
+            });
+            assert_eq!(at_agent_home.hint.as_deref(), Some(AGENT_HOME_CREATE_HINT));
+        }
+        fs::remove_dir(&base).expect("remove the base");
+    }
+
+    /// The deny-delete entry would keep the scratch directory from being removed.
+    fn chmod_clear_acl(path: &Path) {
+        let status = Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(path)
+            .status()
+            .expect("run chmod -N");
+        assert!(status.success(), "chmod -N");
+    }
+
+    #[test]
+    fn an_acl_allow_entry_on_the_agent_home_is_wrong_and_a_deny_entry_passes() {
+        let base = home_scratch("acl");
+        let home = home_dir(&base, 0o700);
+        let record = record_for(&home);
+        let chmod = |entry: &str| {
+            let status = Command::new("/bin/chmod")
+                .args(["+a", entry])
+                .arg(&home)
+                .status()
+                .expect("run chmod");
+            assert!(status.success(), "chmod +a {entry}");
+        };
+        chmod("group:everyone deny delete");
+        assert_eq!(measure_agent_home(&record), AgentHomeState::Ok);
+        chmod("group:staff allow list,search");
+        let AgentHomeState::Wrong(mismatch) = measure_agent_home(&record) else {
+            panic!("an allow entry is wrong");
+        };
+        assert_eq!(
+            mismatch,
+            HomeMismatch {
+                acl_allow: Some("group:staff allow list,search".to_string()),
+                ..HomeMismatch::default()
+            }
+        );
+        assert!(!mismatch.is_only_a_wider_mode());
+        let finding = agent_home_finding(&AgentHome {
+            path: Some(record.home),
+            state: AgentHomeState::Wrong(mismatch),
+        });
+        assert!(matches!(
+            &finding.status,
+            Status::Wrong { found, .. } if found == "ACL entry group:staff allow list,search"
+        ));
         assert!(finding
             .hint
-            .is_some_and(|hint| hint.contains("createhomedir -c -u tycho-agent")));
+            .is_some_and(|hint| hint.contains("chmod -a \"group:staff allow list,search\"")));
+        let entries = vec![
+            AclEntry {
+                principal: "group:everyone".to_string(),
+                allows: false,
+                permissions: vec!["delete".to_string()],
+            },
+            AclEntry {
+                principal: "user:frits".to_string(),
+                allows: true,
+                permissions: vec!["search".to_string(), "list".to_string()],
+            },
+        ];
+        assert_eq!(
+            first_allow(&entries),
+            Some("user:frits allow search,list".to_string())
+        );
+        assert_eq!(first_allow(entries.get(..1).unwrap_or_default()), None);
+        chmod_clear_acl(&home);
+        fs::remove_dir(&home).expect("remove the home");
         fs::remove_dir(&base).expect("remove the base");
     }
 
