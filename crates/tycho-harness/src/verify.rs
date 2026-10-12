@@ -491,11 +491,7 @@ mod tests {
         assert!(!unit_passed(unit.pass_condition, &before));
         assert_named_test_failed(&before, "tests::answer_is_42");
 
-        repository::apply_patch(
-            &sandbox.checkout(),
-            include_bytes!("../fixtures/patches/trivial.patch"),
-        )
-        .unwrap();
+        repository::apply_patch(&sandbox.checkout(), repository::PATCH_TRIVIAL).unwrap();
         let after = verify_unit(&sandbox.checkout(), &unit, &sandbox.options());
         assert!(unit_passed(unit.pass_condition, &after));
     }
@@ -509,11 +505,7 @@ mod tests {
         assert!(!unit_passed(unit.pass_condition, &before));
         assert_named_test_failed(&before, "tests::answer_times_two_is_84");
 
-        repository::apply_patch(
-            &sandbox.checkout(),
-            include_bytes!("../fixtures/patches/trivial.patch"),
-        )
-        .unwrap();
+        repository::apply_patch(&sandbox.checkout(), repository::PATCH_TRIVIAL).unwrap();
         let after = verify_unit(&sandbox.checkout(), &unit, &sandbox.options());
         assert!(unit_passed(unit.pass_condition, &after));
     }
