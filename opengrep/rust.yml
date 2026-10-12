@@ -49,8 +49,9 @@ rules:
   - id: rust-git-inherits-hook-environment
     message: >-
       A git child inherits GIT_DIR and the rest of a hook's environment and acts on the
-      repository that ran the hook. Start git through `tycho_types::git_environment::git_command`,
-      or a runner given `&git_environment_removed()`, or clear the environment.
+      repository that ran the hook. Start git through
+      `tycho_types::git_environment::git_command`, or a runner given
+      `&git_environment_removed()`, or clear the environment.
     languages: [rust]
     severity: ERROR
     paths:
@@ -61,20 +62,34 @@ rules:
           - pattern-either:
               - pattern: Command::new("git")
               - pattern: std::process::Command::new("git")
-          - pattern-not-inside: Command::new("git").env_clear()
+              - pattern: Command::new(&$HOLDER.git)
+              - pattern: Command::new($HOLDER.git)
+          - pattern-not-inside: Command::new($PROGRAM).env_clear()
           - pattern-not-inside: |
-              let mut $COMMAND = Command::new("git");
+              let mut $COMMAND = Command::new($PROGRAM);
               $COMMAND.env_clear();
               ...
-      # The bounded runners in `crates/tycho/src/command.rs`, given git by literal path or
-      # through a binary field named for it. metavariable-regex anchors at the start. Only `run_status_capped`, `run_captured_without`
-      # and `run_detached` take a removal list; a call passing the git one is exempt.
+      # The bounded runners in `crates/tycho/src/command.rs`, given git by literal path,
+      # by a name `git` or `GIT`, by a field named `git`, or by a variable bound to a git
+      # path. metavariable-regex anchors at the start. `run_status_capped`,
+      # `run_captured_without` and `run_detached` take a removal list, and a call passing
+      # the git one is exempt; `run_status_from` takes none, so git through it is refused.
       - patterns:
-          - pattern: $RUNNER($PROGRAM, ...)
+          - pattern-either:
+              - patterns:
+                  - pattern: $RUNNER($PROGRAM, ...)
+                  - metavariable-regex:
+                      metavariable: $PROGRAM
+                      regex: '.*(?:"(?:[^"]*/)?git"|\bgit\b|\bGIT\b)'
+              - patterns:
+                  - pattern-inside: |
+                      let $BINDING = $INITIAL;
+                      ...
+                  - pattern: $RUNNER($BINDING, ...)
+                  - metavariable-regex:
+                      metavariable: $INITIAL
+                      regex: '.*"(?:[^"]*/)?git"'
           - metavariable-regex:
               metavariable: $RUNNER
-              regex: '^(?:\w+(?:::|\s+))*run_(?:captured|status|status_capped|captured_without|detached)$'
-          - metavariable-regex:
-              metavariable: $PROGRAM
-              regex: '.*(?:"(?:[^"]*/)?git"|\.git\b)'
-          - pattern-not: $RUNNER($PROGRAM, $ARGUMENTS, $ENVIRONMENT, &git_environment_removed(), ...)
+              regex: '^(?:\w+(?:::|\s+))*run_(?:captured|status|detached)\w*$'
+          - pattern-not: $RUNNER($ANY, $WORDS, $PAIRS, &git_environment_removed(), ...)

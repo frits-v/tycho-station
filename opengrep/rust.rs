@@ -100,3 +100,29 @@ fn git_through_runners(&self) {
     // ok: rust-git-inherits-hook-environment
     let digest = run_captured(Path::new("/usr/bin/digest"), &["-a", "sha256"], &[], COMMAND_TIMEOUT);
 }
+
+fn git_held_in_a_name(&self, git: &Path) {
+    let program = Path::new("git");
+    // ruleid: rust-git-inherits-hook-environment
+    let head = run_captured(program, &["rev-parse", "HEAD"], &[], COMMAND_TIMEOUT);
+    // ruleid: rust-git-inherits-hook-environment
+    let status = run_status(git, &["status"], &[], COMMAND_TIMEOUT);
+    // ruleid: rust-git-inherits-hook-environment
+    let log = command::run_captured(Path::new(GIT), &["log"], &[], COMMAND_TIMEOUT);
+    // ruleid: rust-git-inherits-hook-environment
+    let from = run_status_from(&self.git, &["status"], Path::new("/"), COMMAND_TIMEOUT, MAX);
+    // ruleid: rust-git-inherits-hook-environment
+    let from_root = command::run_status_from(Path::new("git"), &["log"], Path::new("/"), COMMAND_TIMEOUT, MAX);
+    // ruleid: rust-git-inherits-hook-environment
+    let output = Command::new(&self.git).arg("status").output();
+    // ruleid: rust-git-inherits-hook-environment
+    let fetch = Command::new(self.git).arg("fetch").output();
+    // ok: rust-git-inherits-hook-environment
+    let scrubbed = run_captured_without(program, &["log"], &[], &git_environment_removed(), COMMAND_TIMEOUT);
+    // ok: rust-git-inherits-hook-environment
+    let cleared = Command::new(&self.git).env_clear().arg("status").output();
+    // ok: rust-git-inherits-hook-environment
+    let probe = run_status_from(Path::new(SUDO), &["-n", "true"], Path::new("/"), COMMAND_TIMEOUT, MAX);
+    // ok: rust-git-inherits-hook-environment
+    let timeout = run_captured(Path::new("cargo"), &["metadata"], &[], GIT_TIMEOUT);
+}

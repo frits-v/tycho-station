@@ -46,10 +46,14 @@ repository and commit its fixture onto the branch being pushed.
 - Every git the code starts, production and test, goes through `git_command`,
   `scrub_git_environment`, or a runner given `git_environment_removed()`; the harness
   repository builder and setup's credential check clear the whole environment instead. The
-  opengrep rule `rust-git-inherits-hook-environment` refuses any other `Command::new("git")`,
-  and any `run_captured`, `run_status`, `run_status_capped`, `run_captured_without` or
-  `run_detached` call given git without `&git_environment_removed()`, outside `tests/`
-  directories, which opengrep skips by default; there it is review.
+  opengrep rule `rust-git-inherits-hook-environment` refuses `Command::new` given git by
+  literal path or a field named `git` without `env_clear`, and a `run_captured`,
+  `run_status`, `run_status_capped`, `run_captured_without`, `run_detached` or
+  `run_status_from` call given git by literal path, a name `git` or `GIT`, a field named
+  `git` or a variable bound to a git path, without `&git_environment_removed()`.
+  `run_status_from` takes no removal list, so git through it is always refused. Git reached
+  any other way, and anything under `tests/` directories, which opengrep skips by default,
+  is review.
 - A test that spawns git calls `refuse_hook_environment` first. With any of `GIT_DIR`,
   `GIT_INDEX_FILE`, `GIT_WORK_TREE` or `GIT_COMMON_DIR` set in the test process it panics,
   naming the variables and the hook it probably runs under, so `cargo test` started straight
