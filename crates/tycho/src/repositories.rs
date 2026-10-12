@@ -763,6 +763,7 @@ impl Repositories {
             &text(&self.canonical(project)),
             "push",
             "--quiet",
+            "--end-of-options",
             remote,
             &refspec,
         ])?;
@@ -1314,9 +1315,30 @@ pub(crate) mod tests {
             elsewhere.trim(),
             "a diverged remote is not overwritten"
         );
-        assert!(matches!(
-            repositories.sync(&project, "--receive-pack=evil", &trunk()),
-            Err(RepositoryError::Input(_))
-        ));
+    }
+
+    #[test]
+    fn sync_refuses_a_remote_that_is_empty_an_option_or_over_the_bound() {
+        let scratch = Scratch::new("sync-remote");
+        let (repositories, project) = fixture(&scratch);
+        let oversize = format!("/{}", "r".repeat(REMOTE_MAX_BYTES));
+        for refused in ["--receive-pack=evil", "", oversize.as_str()] {
+            assert!(
+                matches!(
+                    repositories.sync(&project, refused, &trunk()),
+                    Err(RepositoryError::Input(_))
+                ),
+                "{} bytes",
+                refused.len()
+            );
+        }
+        let longest = format!("/{}", "r".repeat(REMOTE_MAX_BYTES - 1));
+        assert!(
+            matches!(
+                repositories.sync(&project, &longest, &trunk()),
+                Err(RepositoryError::Git(_))
+            ),
+            "a remote at the bound reaches git, which finds nothing there"
+        );
     }
 }
