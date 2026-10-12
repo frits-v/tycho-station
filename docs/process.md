@@ -209,7 +209,13 @@ what the developer side of `mise run setup` checks, in this order:
    `chmod +a "user:tycho-agent deny search,list,readattr,readextattr" ~`, run as the
    developer;
 6. `/Users/Shared/tycho-agent-zmx`, owned by the developer, group `tycho-zmx`, mode 2770;
-7. the core socket directory `~/.tycho/zmx`, mode 0700.
+7. the core socket directory `~/.tycho/zmx`, mode 0700;
+8. the shared tool prefix `/Users/Shared/tycho` with `bin` and `mise` beneath it, each mode
+   0755;
+9. the pinned mise in `/Users/Shared/tycho/bin/mise`;
+10. the agent's tools in the prefix's mise data directory, recorded with their paths and
+    digests in `station.json`;
+11. release builds of `xtask` and `tycho` in `/Users/Shared/tycho/bin`.
 
 The agent's own primary group does not keep it out of the developer's home: macOS makes
 every local account a member of `staff` through the `localaccounts` group, and a home is
@@ -242,11 +248,103 @@ or a group the agent is in, search it.
   of it fails.
 - An agent user that exists with another primary group is reported with its fix, not
   changed: rebinding a live account's group is left to the operator.
-- Left to the operator, since each needs a login or a setting in the agent's own session:
-  `claude` and `codex login` as `tycho-agent` from a terminal in that account
-  (`sudo -iu tycho-agent` or a login session), `git config --global credential.helper ""` as
-  `tycho-agent`, and `entire auth` as the developer if the entire mirror is the sync remote.
-  Then `mise run setup` as `tycho-agent`.
+- Left to the operator, since each needs a login or a setting of the agent's own: from a
+  terminal, in this order, each run as `tycho-agent` through `sudo` with no login shell, so
+  none of the agent's startup files runs and the environment holds only what is written:
+
+  ```sh
+  sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent USER=tycho-agent LOGNAME=tycho-agent TERM=xterm-256color PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise /Users/Shared/tycho/mise/installs/claude/2.1.280/claude
+  sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent USER=tycho-agent LOGNAME=tycho-agent TERM=xterm-256color PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise /Users/Shared/tycho/mise/installs/codex/0.160.1/bin/codex login
+  sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent PATH=/usr/bin:/bin /usr/bin/git config --global credential.helper ""
+  sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent USER=tycho-agent LOGNAME=tycho-agent PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise /Users/Shared/tycho/bin/xtask setup
+  ```
+
+  The first is the Claude subscription login and the second the Codex plan login; the empty
+  credential helper clears every helper git reads, Apple's osxkeychain included. A login
+  stores its credential in the agent's keychain; if one cannot reach that keychain from a
+  `sudo` session, the same `/usr/bin/env -i` command run from a login session of the agent
+  should. `entire auth` as the developer is needed only if the entire mirror is the sync
+  remote. The task prints the same commands, with the versions of the pins it was built
+  with.
+
+### The shared tool prefix
+
+The agent cannot search the developer's home, where mise installs every tool and where the
+station is built, so every binary the agent runs lives in `/Users/Shared/tycho`:
+
+| Path | What |
+|---|---|
+| `bin/mise` | mise 2026.9.13, the version the workflows pin |
+| `bin/xtask`, `bin/tycho` | release builds of this repository |
+| `mise.toml` | the global mise configuration: the agent's pins and nothing else |
+| `mise/installs/<tool>/<pin>` | the pinned claude, codex and zmx; codex's executable is under `bin` |
+| `cache` | mise's cache, filled by the developer and read-only to the agent |
+| `station.json` | per tool, its pin, the absolute path of its executable and the SHA-256 of its install; the SHA-256 of `bin/xtask` and `bin/tycho`, the commit they were built from and whether the tree was clean |
+
+- The developer owns the prefix and every entry beneath it, and none is writable by group
+  or other, so the agent reads and executes and changes nothing. `/Users/Shared` is
+  world-writable and sticky, so only the developer or root can rename or remove the
+  prefix's entry. No step runs as root and a pin bump needs no sudo.
+- A session runs claude, codex and zmx by the absolute paths `station.json` records, and
+  `PATH` holds those install directories, never mise's shims. A shim asks mise which version
+  to run, and mise reads `.tool-versions` and `mise.toml` in the working directory and its
+  parents, and cached bin paths, all of which the agent can write in its worktree or its
+  home; a shim is therefore no trust anchor and nothing here goes through one. Any mise a
+  session or a probe starts gets `MISE_OVERRIDE_CONFIG_FILENAMES` naming a path in the
+  prefix that never exists, `MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none`, the prefix's
+  read-only cache, `MISE_OFFLINE=1` and `MISE_AUTO_INSTALL=false`.
+- The agent needs claude, codex and zmx from the prefix, and git from the system; nothing
+  else. The prefix's `mise.toml` names those three at the versions in the repository's
+  `mise.toml`, which are compiled into the xtask so the agent's `xtask setup` needs no
+  checkout.
+- mise is downloaded from the jdx/mise release with its `SHASUMS256.txt`. The digest
+  compiled into the xtask for the pinned version is the anchor: the published digest and
+  the download's must both equal it. A redirect is followed only to GitHub's own hosts, over
+  HTTPS. A test keeps the pin equal to every `jdx/mise-action` version in the workflows.
+- The tools are installed by the prefix's mise run from `/` with a cleared environment,
+  file creation mask 022, the prefix's mise variables with the network allowed, and a state
+  directory under the developer's home kept apart from the developer's own mise
+  (`~/.local/state/tycho-prefix-mise`). The install step then requires `mise which` to name
+  each pinned install's executable and records the path and the install's SHA-256 (over
+  every entry's path, mode, and file content or link target).
+- The station binaries are built with `mbx build --release --locked -p xtask -p tycho` from
+  the checkout the task runs in. The commit and the tree's state are read before and after
+  the build, and a change between them refuses the install. Every file is written beside its
+  final name, flushed, given its mode, and renamed over the old one.
+- `station.json` catches an accidental change, a partial install or a stale build. It does
+  not stop tampering: whoever can replace a binary in the prefix can rewrite it too.
+- Setup checks, on the developer's side: the prefix is a real directory the developer owns,
+  mode 0755, with every ancestor a real directory owned by root or the developer and either
+  closed to group and other writes or sticky, opened with `O_NOFOLLOW|O_DIRECTORY`; a walk of
+  at most 4096 entries that follows no link finds every entry the developer's, no file or
+  directory writable by group or other, every link resolving inside the prefix, and no
+  `no-project-config`; mise answers with the pinned version; each of claude, codex and zmx
+  resolves through `mise which` to its pinned install's executable, answers by absolute path
+  with its pin, and has the recorded install digest; `bin/xtask` and `bin/tycho` have the
+  digests `station.json` records, and it records this checkout's commit from a clean tree. A
+  new commit therefore reads as not current until the task runs again.
+- On the agent's side, `/Users/Shared/tycho/bin/xtask setup` walks the prefix and asks the
+  kernel with `access(W_OK)` whether the agent can write any directory or file, which counts
+  access lists and group memberships the mode bits do not show, and reports how many entries
+  it examined; checks mise; runs each tool by absolute path at its pin and compares its
+  install digest; and runs the claude and codex login probes by absolute path.
+- A prefix that is a link, is owned by another user, or sits below an ancestor another user
+  can swap is reported with its fix and nothing is installed into it.
+- `LauncherSpawner::for_prefix` builds the spawner from `ToolPrefix`, which reads
+  `station.json`: zmx types the prefix's `bin/tycho` as the launcher, sessions run under the
+  recorded zmx, the launcher's `PATH` holds the prefix's `bin` and the recorded install
+  directories, and the vendor gets the mise variables. `TYCHO_TOOL_PREFIX` moves the prefix
+  for a test core home and is refused for the production one. The launcher, control, worker
+  and chaos suites start their sessions this way from a scratch prefix that links the built
+  `tycho` and the developer's pinned tools (`tycho_harness::tool_prefix`). The production
+  endpoint does not start sessions yet; when it does, it builds its spawner with
+  `for_prefix`. The core's own processes (restate-server, the endpoint, the watchdog) run as
+  the developer and keep the developer's `mise which` and the running `tycho`.
+- `bin/xtask` resolves the checkout it was built from, so after that checkout is removed its
+  station checks read as unreachable until `mise run provision-agent` runs again from a
+  current checkout.
+- The agent's shell startup files are not written: a file in the agent's home is the
+  agent's to replace, so every agent command sets its environment in full instead.
 
 ## Releases
 

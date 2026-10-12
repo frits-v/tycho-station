@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 
 use tycho_types::session::{SESSION_NAME_MAX_BYTES, SOCKET_PATH_MAX_BYTES};
 
+use crate::tool_prefix::{self, AgentTool};
+
 pub const AGENT_USER_NAME: &str = "tycho-agent";
 pub const AGENT_GROUP_NAME: &str = "tycho-agent";
 /// `staff`, the default primary group, whose members can traverse a 0750 home.
@@ -46,7 +48,7 @@ const CODEX_LOGGED_OUT_EXIT: i32 = 1;
 /// `git config --get-all` exit code when the key is not set.
 const GIT_CONFIG_KEY_UNSET_EXIT: i32 = 1;
 
-fn workspace_root() -> &'static Path {
+pub fn workspace_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -78,6 +80,14 @@ impl Side {
         match self {
             Self::Developer => "the developer",
             Self::Agent => AGENT_USER_NAME,
+        }
+    }
+
+    /// The agent runs the prefix's xtask, which needs neither mise nor a checkout.
+    const fn setup_command(self) -> &'static str {
+        match self {
+            Self::Developer => "mise run setup",
+            Self::Agent => "/Users/Shared/tycho/bin/xtask setup",
         }
     }
 }
@@ -116,6 +126,14 @@ pub enum Check {
     PinEntire,
     PinCue,
     EntireLogin,
+    PrefixDirectory,
+    PrefixTree,
+    PrefixMise,
+    PrefixClaude,
+    PrefixCodex,
+    PrefixZmx,
+    PrefixStationXtask,
+    PrefixStationTycho,
     AgentInSharedGroup,
     AgentPrimaryGroup,
     CredentialSsh,
@@ -130,6 +148,11 @@ pub enum Check {
     KeychainGhCli,
     ClaudeLogin,
     CodexLogin,
+    AgentPrefixWritable,
+    AgentPrefixMise,
+    AgentPrefixClaude,
+    AgentPrefixCodex,
+    AgentPrefixZmx,
 }
 
 #[derive(Debug)]
@@ -144,7 +167,7 @@ const fn spec(check: Check, name: &'static str, side: Side) -> CheckSpec {
 }
 
 /// Every check, in print order; each one runs on exactly one side.
-const CATALOGUE: [CheckSpec; 38] = [
+const CATALOGUE: [CheckSpec; 51] = [
     spec(
         Check::AgentGroupExists,
         "agent group exists",
@@ -262,6 +285,46 @@ const CATALOGUE: [CheckSpec; 38] = [
         Side::Developer,
     ),
     spec(
+        Check::PrefixDirectory,
+        "tool prefix: a real directory the developer owns, mode 0755",
+        Side::Developer,
+    ),
+    spec(
+        Check::PrefixTree,
+        "tool prefix: every entry the developer's, closed to group and other writes, links inside",
+        Side::Developer,
+    ),
+    spec(
+        Check::PrefixMise,
+        "tool prefix: mise is the pinned version",
+        Side::Developer,
+    ),
+    spec(
+        Check::PrefixClaude,
+        "tool prefix: claude is the pinned install, run by path, at its recorded digest",
+        Side::Developer,
+    ),
+    spec(
+        Check::PrefixCodex,
+        "tool prefix: codex is the pinned install, run by path, at its recorded digest",
+        Side::Developer,
+    ),
+    spec(
+        Check::PrefixZmx,
+        "tool prefix: zmx is the pinned install, run by path, at its recorded digest",
+        Side::Developer,
+    ),
+    spec(
+        Check::PrefixStationXtask,
+        "tool prefix: xtask is the recorded build of this checkout's commit",
+        Side::Developer,
+    ),
+    spec(
+        Check::PrefixStationTycho,
+        "tool prefix: tycho is the recorded build of this checkout's commit",
+        Side::Developer,
+    ),
+    spec(
         Check::AgentInSharedGroup,
         "agent user is a member of the shared group",
         Side::Agent,
@@ -331,6 +394,31 @@ const CATALOGUE: [CheckSpec; 38] = [
         "codex logged in as the agent",
         Side::Agent,
     ),
+    spec(
+        Check::AgentPrefixWritable,
+        "as the agent: nothing in the tool prefix is writable",
+        Side::Agent,
+    ),
+    spec(
+        Check::AgentPrefixMise,
+        "as the agent: mise in the tool prefix is the pinned version",
+        Side::Agent,
+    ),
+    spec(
+        Check::AgentPrefixClaude,
+        "as the agent: claude runs by path at its pin and recorded digest",
+        Side::Agent,
+    ),
+    spec(
+        Check::AgentPrefixCodex,
+        "as the agent: codex runs by path at its pin and recorded digest",
+        Side::Agent,
+    ),
+    spec(
+        Check::AgentPrefixZmx,
+        "as the agent: zmx runs by path at its pin and recorded digest",
+        Side::Agent,
+    ),
 ];
 
 pub fn check_name(check: Check) -> &'static str {
@@ -389,7 +477,7 @@ impl Finding {
         }
     }
 
-    fn with_hint(check: Check, status: Status, hint: impl Into<String>) -> Self {
+    pub fn with_hint(check: Check, status: Status, hint: impl Into<String>) -> Self {
         Self {
             check,
             status,
@@ -397,14 +485,14 @@ impl Finding {
         }
     }
 
-    fn unreachable(check: Check, why: impl Into<String>) -> Self {
+    pub fn unreachable(check: Check, why: impl Into<String>) -> Self {
         Self::new(check, Status::Unreachable { why: why.into() })
     }
 }
 
 /// What running an external probe produced; every decoder reads this, never the raw `Output`.
 #[derive(Debug)]
-enum Capture {
+pub enum Capture {
     Ran {
         success: bool,
         /// `None` when a signal ended the process.
@@ -416,11 +504,11 @@ enum Capture {
     Unreachable(String),
 }
 
-fn first_line(text: &str) -> &str {
+pub fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or_default().trim()
 }
 
-fn plain_command(program: &str, args: &[&str]) -> Command {
+pub fn plain_command(program: &str, args: &[&str]) -> Command {
     let mut command = Command::new(program);
     command.args(args);
     command
@@ -466,8 +554,12 @@ fn recv_by<T>(receiver: &mpsc::Receiver<T>, deadline: Instant) -> Option<T> {
     receiver.recv_timeout(remaining).ok()
 }
 
+fn run_bounded(command: Command) -> Capture {
+    run_bounded_within(command, PROBE_TIMEOUT)
+}
+
 /// Runs `command` bounded: stdout/stderr read on separate threads, timeout kills by pid.
-fn run_bounded(mut command: Command) -> Capture {
+pub fn run_bounded_within(mut command: Command, timeout: Duration) -> Capture {
     let program = command.get_program().to_string_lossy().into_owned();
     command
         .stdin(Stdio::null())
@@ -487,7 +579,7 @@ fn run_bounded(mut command: Command) -> Capture {
     thread::spawn(move || drop(wait_sender.send(child.wait())));
 
     let deadline = Instant::now()
-        .checked_add(PROBE_TIMEOUT)
+        .checked_add(timeout)
         .unwrap_or_else(Instant::now);
     let stdout = recv_by(&stdout_receiver, deadline);
     let stderr = recv_by(&stderr_receiver, deadline);
@@ -499,7 +591,7 @@ fn run_bounded(mut command: Command) -> Capture {
     ) = (stdout, stderr, status)
     else {
         drop(Command::new("kill").args(["-9", &pid.to_string()]).status());
-        return Capture::Unreachable(format!("{program} did not finish within {PROBE_TIMEOUT:?}"));
+        return Capture::Unreachable(format!("{program} did not finish within {timeout:?}"));
     };
     if stdout_overflow || stderr_overflow {
         return Capture::Unreachable(format!(
@@ -517,7 +609,7 @@ fn run_bounded(mut command: Command) -> Capture {
     }
 }
 
-fn decode_zmx_version(stdout: &str) -> Option<String> {
+pub fn decode_zmx_version(stdout: &str) -> Option<String> {
     let mut tokens = stdout.lines().next().unwrap_or_default().split_whitespace();
     if tokens.next()? != "zmx" {
         return None;
@@ -557,7 +649,7 @@ fn decode_entire_version(stdout: &str) -> Option<String> {
     tokens.next().map(str::to_string)
 }
 
-fn decode_claude_version(stdout: &str) -> Option<String> {
+pub fn decode_claude_version(stdout: &str) -> Option<String> {
     let mut tokens = stdout.lines().next().unwrap_or_default().split_whitespace();
     let version = tokens.next()?;
     if tokens.next()? != "(Claude" || tokens.next()? != "Code)" {
@@ -566,7 +658,7 @@ fn decode_claude_version(stdout: &str) -> Option<String> {
     Some(version.to_string())
 }
 
-fn decode_codex_version(stdout: &str) -> Option<String> {
+pub fn decode_codex_version(stdout: &str) -> Option<String> {
     let mut tokens = stdout.lines().next().unwrap_or_default().split_whitespace();
     if tokens.next()? != "codex-cli" {
         return None;
@@ -871,6 +963,42 @@ fn login_finding(probe: &LoginProbe, ls: &MiseLs) -> Finding {
     args.extend_from_slice(probe.args);
     match run_bounded(mise_command(&args)) {
         Capture::ExecutableNotFound => Finding::unreachable(probe.check, "mise is not on PATH"),
+        capture => decoded_login(probe, capture),
+    }
+}
+
+/// The agent's login probe runs the pinned install by absolute path, never `mise exec` in the
+/// checkout, which the agent cannot read, and only once that install checks out.
+fn prefix_login_finding(
+    probe: &LoginProbe,
+    tool: AgentTool,
+    gate: &Status,
+    identity: &Identity,
+) -> Finding {
+    if !gate.is_pass() {
+        return Finding::unreachable(
+            probe.check,
+            format!(
+                "{} does not run from the tool prefix at its pin, so its login cannot be checked: {gate}",
+                probe.tool
+            ),
+        );
+    }
+    let command = match tool_prefix::agent_tool_command(identity, tool, probe.args) {
+        Ok(command) => command,
+        Err(why) => return Finding::unreachable(probe.check, why),
+    };
+    decoded_login(
+        probe,
+        run_bounded_within(command, tool_prefix::TOOL_PROBE_TIMEOUT),
+    )
+}
+
+fn decoded_login(probe: &LoginProbe, capture: Capture) -> Finding {
+    match capture {
+        Capture::ExecutableNotFound => {
+            Finding::unreachable(probe.check, format!("{} is not installed", probe.tool))
+        }
         Capture::Unreachable(why) => Finding::unreachable(probe.check, why),
         Capture::Ran {
             code,
@@ -2017,6 +2145,8 @@ pub fn developer_findings(identity: &Identity) -> Vec<Finding> {
     findings.extend(vendor_findings(&ls));
     findings.push(login_finding(&ENTIRE_LOGIN, &ls));
     findings
+        .extend(tool_prefix::Probe::read(&tool_prefix::Prefix::production(), identity).findings());
+    findings
 }
 
 /// The developer-side checks of directory records and socket directories, which read no
@@ -2083,9 +2213,31 @@ fn agent_findings(identity: &Identity) -> Vec<Finding> {
     findings.push(primary_group_finding(&identity.username));
     findings.extend(credential_findings(&home));
     findings.extend(keychain_findings());
-    let ls = mise_ls();
-    findings.push(login_finding(&CLAUDE_LOGIN, &ls));
-    findings.push(login_finding(&CODEX_LOGIN, &ls));
+    let prefix = tool_prefix::agent_findings(identity);
+    let gate = |check: Check| {
+        prefix
+            .iter()
+            .find(|finding| finding.check == check)
+            .map_or_else(
+                || Status::Unreachable {
+                    why: "no probe produced this finding".to_string(),
+                },
+                |finding| finding.status.clone(),
+            )
+    };
+    findings.push(prefix_login_finding(
+        &CLAUDE_LOGIN,
+        AgentTool::Claude,
+        &gate(Check::AgentPrefixClaude),
+        identity,
+    ));
+    findings.push(prefix_login_finding(
+        &CODEX_LOGIN,
+        AgentTool::Codex,
+        &gate(Check::AgentPrefixCodex),
+        identity,
+    ));
+    findings.extend(prefix);
     findings
 }
 
@@ -2172,8 +2324,9 @@ pub fn summarize(mode: Option<Side>, findings: &[Finding]) -> i32 {
     );
     match mode {
         Some(mode) => println!(
-            "xtask setup: {deferred} deferred to the {} run (run `mise run setup` as {})",
+            "xtask setup: {deferred} deferred to the {} run (run `{}` as {})",
             mode.other().label(),
+            mode.other().setup_command(),
             mode.other().run_as()
         ),
         None => println!("xtask setup: {deferred} deferred; no side could run"),
@@ -2205,7 +2358,7 @@ pub fn run() -> i32 {
 mod tests {
     use super::*;
 
-    const EXPECTED_SIDES: [(&str, Side); 38] = [
+    const EXPECTED_SIDES: [(&str, Side); 51] = [
         ("agent group exists", Side::Developer),
         ("agent user exists", Side::Developer),
         ("agent home directory", Side::Developer),
@@ -2257,6 +2410,35 @@ mod tests {
             Side::Developer,
         ),
         ("entire logged in as the developer", Side::Developer),
+        (
+            "tool prefix: a real directory the developer owns, mode 0755",
+            Side::Developer,
+        ),
+        (
+            "tool prefix: every entry the developer's, closed to group and other writes, links inside",
+            Side::Developer,
+        ),
+        ("tool prefix: mise is the pinned version", Side::Developer),
+        (
+            "tool prefix: claude is the pinned install, run by path, at its recorded digest",
+            Side::Developer,
+        ),
+        (
+            "tool prefix: codex is the pinned install, run by path, at its recorded digest",
+            Side::Developer,
+        ),
+        (
+            "tool prefix: zmx is the pinned install, run by path, at its recorded digest",
+            Side::Developer,
+        ),
+        (
+            "tool prefix: xtask is the recorded build of this checkout's commit",
+            Side::Developer,
+        ),
+        (
+            "tool prefix: tycho is the recorded build of this checkout's commit",
+            Side::Developer,
+        ),
         ("agent user is a member of the shared group", Side::Agent),
         ("agent user's primary group is tycho-agent", Side::Agent),
         ("agent credential: ~/.ssh", Side::Agent),
@@ -2271,6 +2453,26 @@ mod tests {
         ("agent keychain: no item for gh:github.com", Side::Agent),
         ("claude logged in as the agent", Side::Agent),
         ("codex logged in as the agent", Side::Agent),
+        (
+            "as the agent: nothing in the tool prefix is writable",
+            Side::Agent,
+        ),
+        (
+            "as the agent: mise in the tool prefix is the pinned version",
+            Side::Agent,
+        ),
+        (
+            "as the agent: claude runs by path at its pin and recorded digest",
+            Side::Agent,
+        ),
+        (
+            "as the agent: codex runs by path at its pin and recorded digest",
+            Side::Agent,
+        ),
+        (
+            "as the agent: zmx runs by path at its pin and recorded digest",
+            Side::Agent,
+        ),
     ];
 
     fn checks_run(findings: &[Finding]) -> Vec<Check> {
@@ -2321,8 +2523,8 @@ mod tests {
             developer_checks.len().saturating_add(agent_checks.len()),
             CATALOGUE.len()
         );
-        assert_eq!(developer_checks.len(), 24);
-        assert_eq!(agent_checks.len(), 14);
+        assert_eq!(developer_checks.len(), 32);
+        assert_eq!(agent_checks.len(), 19);
     }
 
     /// `ls -lde` on this machine's home and on a directory carrying the deny entry and an

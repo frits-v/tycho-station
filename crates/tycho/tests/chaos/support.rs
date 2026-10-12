@@ -125,7 +125,7 @@ impl Core {
 
     fn clear_sessions(&self) -> Result<(), String> {
         let zmx = self.core_zmx();
-        let left = clear_sessions(&zmx, "core");
+        let left = clear_sessions(&zmx, "core", Path::new(TYCHO));
         if left == 0 {
             Ok(())
         } else {
@@ -143,11 +143,11 @@ pub fn start_once<T>(core: &Core, start: impl FnOnce(&Core) -> Option<T>) -> T {
 /// Kills every session left in a socket directory by pid and by name; returns how many remain.
 /// Ends what a socket directory still lists; a pid is signalled only while `ps` shows it
 /// running restate-server, the endpoint or a launcher.
-pub fn clear_sessions(zmx: &Zmx, label: &str) -> usize {
+pub fn clear_sessions(zmx: &Zmx, label: &str, launcher: &Path) -> usize {
     let programs = vec![
         mise_which("restate-server").display().to_string(),
         format!("{TYCHO} endpoint"),
-        format!("{TYCHO} launch"),
+        format!("{} launch", launcher.display()),
     ];
     match zmx.clear(&programs) {
         Ok(report) => {

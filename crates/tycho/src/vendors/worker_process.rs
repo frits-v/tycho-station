@@ -22,7 +22,7 @@ use tycho_types::session::{SessionName, Vendor};
 
 use crate::agent_files::{current_uid, ensure_private_dir, read_checked, write_durable};
 use crate::command::{run_captured, run_captured_without};
-use crate::config::COMMAND_TIMEOUT;
+use crate::config::{COMMAND_TIMEOUT, MISE_PREFIX_ENV};
 use crate::exit_decode::ChildEnd;
 use crate::launch_spec::{
     AGENT_TELEMETRY_ENV, PROGRESS_FILE_ENV, RESULT_FILE_ENV, VENDOR_SANDBOX_SETTINGS_ENV,
@@ -71,6 +71,7 @@ impl WorkerEnvironment {
             .map_err(|error| WorkerError::Argument(error.to_string()))?;
         let inherited_names = ["HOME", "PATH"]
             .into_iter()
+            .chain(MISE_PREFIX_ENV)
             .chain(AGENT_TELEMETRY_ENV.iter().map(|(name, _)| *name));
         let inherited = inherited_names
             .filter_map(|name| {
@@ -605,6 +606,14 @@ pub mod tests {
             (VENDOR_SANDBOX_SETTINGS_ENV.to_string(), "{}".to_string()),
             ("HOME".to_string(), "/Users/agent".to_string()),
             ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+            (
+                "MISE_DATA_DIR".to_string(),
+                "/Users/Shared/tycho/mise".to_string(),
+            ),
+            (
+                "MISE_GLOBAL_CONFIG_FILE".to_string(),
+                "/Users/Shared/tycho/mise.toml".to_string(),
+            ),
             ("TYCHO_TIER".to_string(), "light".to_string()),
         ]);
         for (name, value) in AGENT_TELEMETRY_ENV {
@@ -631,7 +640,8 @@ pub mod tests {
             ESCALATION_FILE_ENV.to_string(),
             "/spool/escalation/escalation.json".to_string()
         )));
-        assert_eq!(names.len(), 5 + AGENT_TELEMETRY_ENV.len());
+        assert!(names.contains(&"MISE_DATA_DIR") && names.contains(&"MISE_GLOBAL_CONFIG_FILE"));
+        assert_eq!(names.len(), 7 + AGENT_TELEMETRY_ENV.len());
     }
 
     #[test]

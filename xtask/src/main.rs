@@ -22,12 +22,15 @@ mod credentials;
 mod figures;
 mod github_api;
 mod opengrep;
+mod prefix_install;
+mod prefix_manifest;
 mod process;
 mod provision;
 mod release;
 mod sarif;
 mod setup;
 mod test_step;
+mod tool_prefix;
 mod workflows;
 
 use sarif::{Finding, Rule};
@@ -131,7 +134,7 @@ const COMMANDS: [(&str, &str); 23] = [
     ),
     (
         "provision-agent [--print]",
-        "create the agent user, groups and socket directories setup checks",
+        "create the agent user, groups, socket directories and tool prefix setup checks",
     ),
 ];
 const ABBREVIATIONS: [&str; 5] = ["tmp", "ctx", "obj", "arr", "cfg"];

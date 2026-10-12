@@ -13,16 +13,22 @@ The design is `docs/design.html`. Section numbers below refer to it.
   every local account is in `staff` through `localaccounts`. No credentials of any kind in
   that account. The core runs as the developer.
 - A group shared by the developer and the agent user, for the zmx socket directory.
+- The shared tool prefix `/Users/Shared/tycho`, owned by the developer and closed to group
+  and other writes, holding every binary the agent runs: the pinned mise, claude, codex and
+  zmx, and release builds of the station (design section 7). The agent cannot search the
+  developer's home, where mise otherwise installs them.
 - Vendor logins for that user, done once from a terminal: Claude Code (subscription),
   Codex (ChatGPT plan). Antigravity is optional in slice zero.
 - The entire CLI logged in as the developer if the entire mirror is the sync remote.
 
 `mise run provision-agent`, run as the developer from a terminal, creates the user, both
-groups, the home ACL entry and the socket directories, asking for sudo on the terminal
+groups, the home ACL entry and the socket directories, asking for sudo on the terminal, and
+creates and fills the tool prefix with no root step
 ([provisioning](process.md#provisioning-the-agent-user)). The logins need a login flow in
-the account concerned and stay with the operator. `mise run setup` checks every
-precondition above and prints what is missing, so the state of the machine is never
-guessed.
+the account concerned and stay with the operator, who runs them from the prefix with the
+environment the task prints. `mise run setup` as the developer and
+`/Users/Shared/tycho/bin/xtask setup` as the agent check every precondition above and print
+what is missing, so the state of the machine is never guessed.
 
 ## Slice zero: the spine
 

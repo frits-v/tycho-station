@@ -21,7 +21,7 @@ use tycho_types::session::SessionName;
 
 use crate::agent_files::{read_checked, write_new, write_new_mode};
 use crate::config::{
-    AgentDirs, CorePorts, AGENT_DIR_ENV, AGENT_DIR_MODE, POLL_INTERVAL, SCROLLBACK_DIR,
+    AgentDirs, CorePorts, ToolPrefix, AGENT_DIR_ENV, AGENT_DIR_MODE, POLL_INTERVAL, SCROLLBACK_DIR,
     SESSION_WAIT_POLLS_MAX, ZMX_ENV,
 };
 use crate::config_store::PORT_OFFSET_ENV;
@@ -36,8 +36,6 @@ use crate::process::now_unix_ms;
 use crate::services::spawner::{LeaseRead, SpawnerError};
 use crate::zmx::{presence, Presence, Zmx};
 
-/// The launcher's whole environment besides its own contract; `env -i` drops the rest.
-pub const LAUNCHER_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 /// Enabled, no unsandboxed retry, fail if unavailable, no excluded commands, and a network
 /// allowlist that admits nothing until the adapter names the hosts a worker needs.
 pub const CLAUDE_SANDBOX_SETTINGS: &str = r#"{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false,"excludedCommands":[],"network":{"allowedDomains":[],"allowLocalBinding":false,"allowAllUnixSockets":false}}}"#;
@@ -127,6 +125,8 @@ pub struct SpawnRequest<'a> {
     pub vendor_dir: Option<&'a Path>,
     /// The ports of the core the launcher reports to.
     pub ports: CorePorts,
+    /// Where the launcher's `PATH` and the vendor's mise variables point.
+    pub tool_prefix: &'a ToolPrefix,
 }
 
 /// Splits a trailing `--tier <tier>` off the port's argv: the vendor command and the tier.
@@ -140,6 +140,15 @@ pub fn split_tier(argv: &[String]) -> (&[String], Option<&str>) {
 
 /// Adopts, re-queues or spawns by the lease, then checks zmx before `run`.
 pub fn spawn_session(request: &SpawnRequest<'_>) -> Result<SpawnOutcome, SpawnerError> {
+    // A launcher from anywhere but the prefix would run a binary nothing checked.
+    let prefix_tycho = request.tool_prefix.tycho();
+    if request.tycho != prefix_tycho {
+        return Err(SpawnerError::Refused(format!(
+            "the launcher {} is not the tool prefix's {}",
+            request.tycho.display(),
+            prefix_tycho.display()
+        )));
+    }
     let session = &request.env.session_name;
     let lease = match read_lease(request.dirs, session, request.agent_uid) {
         LeaseRead::Absent => None,
@@ -253,20 +262,33 @@ pub fn launch_spec(request: &SpawnRequest<'_>) -> Result<LaunchSpec, SpawnerErro
     Ok(spec)
 }
 
-/// The words zmx types: `exec env -i HOME PATH <tycho> launch --spec <file>`, bounded.
+/// The words zmx types: `exec env -i HOME PATH MISE_* <tycho> launch --spec <file>`, bounded.
+///
+/// The launcher's whole environment besides its own contract; `env -i` drops the rest. `PATH`
+/// holds the prefix's `bin` and the recorded install directories, and the mise variables keep
+/// any mise a session starts on the prefix's pins, offline.
 pub fn typed_words(request: &SpawnRequest<'_>, spec: &Path) -> Result<Vec<String>, SpawnerError> {
     let mut words = vec![
         "exec".to_string(),
         "/usr/bin/env".to_string(),
         "-i".to_string(),
         format!("HOME={}", request.home.display()),
-        format!("PATH={LAUNCHER_PATH}"),
+        format!("PATH={}", request.tool_prefix.path()),
+    ];
+    words.extend(
+        request
+            .tool_prefix
+            .mise_environment()
+            .iter()
+            .map(|(name, value)| format!("{name}={value}")),
+    );
+    words.extend([
         format!("{CORE_UID_ENV}={}", Uid::current().as_raw()),
         request.tycho.display().to_string(),
         "launch".to_string(),
         "--spec".to_string(),
         spec.display().to_string(),
-    ];
+    ]);
     if let Some(tier) = request.tier {
         check_tier(tier).map_err(|error| SpawnerError::Refused(error.to_string()))?;
         words.push(TIER_FLAG.to_string());
@@ -416,6 +438,9 @@ mod tests {
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef";
 
+    static PRODUCTION_PREFIX: std::sync::LazyLock<ToolPrefix> =
+        std::sync::LazyLock::new(crate::config::tool_prefix::tests::production);
+
     fn env() -> LauncherEnv {
         LauncherEnv::from_map(&BTreeMap::from([
             (ENV_AWAITABLE_ID.to_string(), "sign_1abc".to_string()),
@@ -483,7 +508,7 @@ mod tests {
         let request = SpawnRequest {
             zmx: &zmx,
             dirs: &dirs,
-            tycho: Path::new("/nonexistent/tycho"),
+            tycho: Path::new("/Users/Shared/tycho/bin/tycho"),
             home: Path::new("/nonexistent"),
             env: &env,
             heartbeat: HeartbeatTarget::Session,
@@ -493,6 +518,7 @@ mod tests {
             terminal: VendorTerminal::Files,
             vendor_dir: None,
             ports: CorePorts::PRODUCTION,
+            tool_prefix: &PRODUCTION_PREFIX,
         };
         let session = SessionName::parse(NAME).unwrap();
         write_durable(
@@ -500,6 +526,14 @@ mod tests {
             &lease(now_unix_ms()).to_bytes().unwrap(),
         )
         .unwrap();
+        let elsewhere = SpawnRequest {
+            tycho: Path::new("/usr/local/bin/tycho"),
+            ..request
+        };
+        assert!(matches!(
+            spawn_session(&elsewhere),
+            Err(SpawnerError::Refused(why)) if why.contains("not the tool prefix's")
+        ));
         assert_eq!(
             spawn_session(&request),
             Ok(SpawnOutcome::Adopted { pid: 4242 })
@@ -531,7 +565,7 @@ mod tests {
         SpawnRequest {
             zmx,
             dirs,
-            tycho: Path::new("/opt/tycho"),
+            tycho: Path::new("/Users/Shared/tycho/bin/tycho"),
             home: Path::new("/Users/agent"),
             env,
             heartbeat: HeartbeatTarget::Session,
@@ -541,6 +575,7 @@ mod tests {
             terminal: VendorTerminal::Files,
             vendor_dir: None,
             ports: CorePorts::PRODUCTION,
+            tool_prefix: &PRODUCTION_PREFIX,
         }
     }
 
@@ -595,6 +630,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(&words[..3], ["exec", "/usr/bin/env", "-i"]);
+        let test_prefix = ToolPrefix::new(PathBuf::from("/tmp/prefix")).unwrap();
+        let moved = SpawnRequest {
+            tool_prefix: &test_prefix,
+            ..request
+        };
+        let moved_words = typed_words(&moved, Path::new("/s")).unwrap();
+        assert!(moved_words
+            .iter()
+            .any(|word| word == "PATH=/tmp/prefix/bin:/usr/bin:/bin:/usr/sbin:/sbin"));
         assert_eq!(&words[words.len() - 2..], ["--tier", "t2"]);
         assert!(
             !words.iter().any(|word| word.contains(SECRET)),
@@ -626,6 +670,36 @@ mod tests {
         assert_eq!(split_tier(&argv[..1]), (&argv[..1], None));
     }
 
+    #[test]
+    fn the_typed_line_starts_at_the_prefix_installs_and_keeps_mise_offline() {
+        let dirs = AgentDirs::new(PathBuf::from("/Users/Shared/tycho-agent-zmx")).unwrap();
+        let zmx = Zmx::agent(Path::new("/opt/zmx"), &dirs.socket_dir);
+        let env = env();
+        let vendor = ["/bin/sh".to_string()];
+        let request = shared_request(&dirs, &zmx, &env, &vendor);
+        let words = typed_words(&request, Path::new("/s")).unwrap();
+        let environment: Vec<&str> = words
+            .iter()
+            .skip(3)
+            .take_while(|word| !word.starts_with("TYCHO_CORE_UID="))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            environment,
+            [
+                "HOME=/Users/agent",
+                "PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin:/usr/sbin:/sbin",
+                "MISE_DATA_DIR=/Users/Shared/tycho/mise",
+                "MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml",
+                "MISE_CACHE_DIR=/Users/Shared/tycho/cache",
+                "MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config",
+                "MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none",
+                "MISE_OFFLINE=1",
+                "MISE_AUTO_INSTALL=false",
+            ]
+        );
+        assert!(!words.iter().any(|word| word.contains("shims")));
+    }
     #[test]
     fn an_interactive_spec_names_its_terminal_and_directory() {
         let dirs = AgentDirs::new(PathBuf::from("/a")).unwrap();
