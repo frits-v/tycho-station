@@ -248,20 +248,24 @@ or a group the agent is in, search it.
   of it fails.
 - An agent user that exists with another primary group is reported with its fix, not
   changed: rebinding a live account's group is left to the operator.
-- Left to the operator, since each needs a login or a setting in the agent's own session,
-  in a terminal in that account (`sudo -iu tycho-agent` or a login session), in this order:
+- Left to the operator, since each needs a login or a setting of the agent's own: from a
+  terminal, in this order, each run as `tycho-agent` through `sudo` with no login shell, so
+  none of the agent's startup files runs and the environment holds only what is written:
 
   ```sh
-  env PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise /Users/Shared/tycho/mise/installs/claude/2.1.280/claude
-  env PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise /Users/Shared/tycho/mise/installs/codex/0.160.1/bin/codex login
-  git config --global credential.helper ""
-  /Users/Shared/tycho/bin/xtask setup
+  sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent USER=tycho-agent LOGNAME=tycho-agent TERM=xterm-256color PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise /Users/Shared/tycho/mise/installs/claude/2.1.280/claude
+  sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent USER=tycho-agent LOGNAME=tycho-agent TERM=xterm-256color PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise /Users/Shared/tycho/mise/installs/codex/0.160.1/bin/codex login
+  sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent PATH=/usr/bin:/bin /usr/bin/git config --global credential.helper ""
+  sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent USER=tycho-agent LOGNAME=tycho-agent PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise /Users/Shared/tycho/bin/xtask setup
   ```
 
-  The first is the Claude subscription login, the second the Codex plan login; the empty
-  credential helper clears every helper git reads, Apple's osxkeychain included. `entire
-  auth` as the developer is needed only if the entire mirror is the sync remote. The task
-  prints the same commands, with the versions of the pins it was built with.
+  The first is the Claude subscription login and the second the Codex plan login; the empty
+  credential helper clears every helper git reads, Apple's osxkeychain included. A login
+  stores its credential in the agent's keychain; if one cannot reach that keychain from a
+  `sudo` session, the same `/usr/bin/env -i` command run from a login session of the agent
+  should. `entire auth` as the developer is needed only if the entire mirror is the sync
+  remote. The task prints the same commands, with the versions of the pins it was built
+  with.
 
 ### The shared tool prefix
 
@@ -326,14 +330,16 @@ station is built, so every binary the agent runs lives in `/Users/Shared/tycho`:
   install digest; and runs the claude and codex login probes by absolute path.
 - A prefix that is a link, is owned by another user, or sits below an ancestor another user
   can swap is reported with its fix and nothing is installed into it.
-- The launcher's `PATH` starts at the prefix's `bin` and the recorded install directories,
-  and the launcher passes the mise variables to the vendor. The prefix is `ToolPrefix` in the
-  core's configuration, read from `station.json`; `TYCHO_TOOL_PREFIX` moves it for a test
-  core home and is refused for the production one, and the integration suites use a scratch
-  prefix with no tools. The production endpoint does not yet start launchers, so no
-  production code builds a `LauncherSpawner` or vendor ports from the prefix; the core's own
-  zmx and restate-server, which run as the developer, still come from the developer's
-  `mise which`.
+- `LauncherSpawner::for_prefix` builds the spawner from `ToolPrefix`, which reads
+  `station.json`: zmx types the prefix's `bin/tycho` as the launcher, sessions run under the
+  recorded zmx, the launcher's `PATH` holds the prefix's `bin` and the recorded install
+  directories, and the vendor gets the mise variables. `TYCHO_TOOL_PREFIX` moves the prefix
+  for a test core home and is refused for the production one. The launcher, control, worker
+  and chaos suites start their sessions this way from a scratch prefix that links the built
+  `tycho` and the developer's pinned tools (`tycho_harness::tool_prefix`). The production
+  endpoint does not start sessions yet; when it does, it builds its spawner with
+  `for_prefix`. The core's own processes (restate-server, the endpoint, the watchdog) run as
+  the developer and keep the developer's `mise which` and the running `tycho`.
 - `bin/xtask` resolves the checkout it was built from, so after that checkout is removed its
   station checks read as unreachable until `mise run provision-agent` runs again from a
   current checkout.
