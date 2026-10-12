@@ -9,6 +9,7 @@
 pub mod agent_call;
 pub mod envelope;
 pub mod exit;
+pub mod git_environment;
 pub mod launcher;
 pub mod lease;
 pub mod rejection;

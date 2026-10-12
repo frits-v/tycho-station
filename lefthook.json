@@ -6,13 +6,13 @@
   },
   "pre-commit": {
     "commands": {
-      "fmt": { "run": "cargo fmt --all -- --check" }
+      "fmt": { "run": "cargo run -q -p xtask -- fmt" }
     }
   },
   "pre-push": {
     "commands": {
-      "clippy": { "run": "cargo clippy --workspace --all-targets -- -D warnings" },
-      "test": { "run": "cargo test --workspace" },
+      "clippy": { "run": "cargo run -q -p xtask -- clippy" },
+      "test": { "run": "cargo run -q -p xtask -- test" },
       "workflows": { "glob": ".github/**", "run": "cargo run -q -p xtask -- workflows --offline" }
     }
   }

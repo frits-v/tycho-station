@@ -18,8 +18,8 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tycho_types::git_environment::git_command;
 
 use tycho::code_graph::{
     BuildReport, Callers, Checkout, CodeGraph, Definitions, Impact, RepoPath, Revision, StepKey,
@@ -42,7 +42,7 @@ impl Drop for Scratch {
 }
 
 fn git(checkout: &Path, arguments: &[&str]) {
-    let status = Command::new("git")
+    let status = git_command()
         .arg("-C")
         .arg(checkout)
         .args([
@@ -91,7 +91,7 @@ fn default_cache_entries() -> Option<usize> {
 fn clone_this_repository(scratch: &Scratch, name: &str) -> Checkout {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let checkout_path = scratch.0.join(name);
-    let status = Command::new("git")
+    let status = git_command()
         .args(["clone", "--quiet", "--no-hardlinks"])
         .arg(&source)
         .arg(&checkout_path)

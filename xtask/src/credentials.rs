@@ -4,8 +4,8 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
+use tycho_types::git_environment::git_command;
 
 use crate::finish_findings;
 use crate::process::{run_bounded, Exit};
@@ -62,7 +62,7 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// `base`. A listing over the bound or a git that cannot run is an error, never an empty scan.
 fn listed_files(base: &Path) -> Result<Vec<PathBuf>, String> {
     let listed = run_bounded(
-        Command::new("git").current_dir(base).args([
+        git_command().current_dir(base).args([
             "ls-files",
             "-z",
             "--cached",
@@ -378,6 +378,7 @@ mod tests {
 
     #[test]
     fn the_repository_scan_lists_every_tracked_file_and_skips_only_this_one() {
+        crate::refuse_hook_environment();
         let files = listed_files(repository_root()).unwrap();
         for expected in [
             "README.md",

@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tycho_types::envelope::{BranchName, CommitSha};
+use tycho_types::git_environment::git_environment_removed;
 use tycho_types::service::{Attempt, EpicId, WorkUnitId};
 use tycho_types::session::SessionName;
 use tycho_types::token::check_slug;
@@ -53,12 +54,6 @@ const GIT_ENVIRONMENT: [(&str, &str); 3] = [
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_TERMINAL_PROMPT", "0"),
-];
-const GIT_REMOVED: [&str; 4] = [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,12 +366,11 @@ impl Repositories {
 
     /// Runs git and returns whatever exit status it ends with.
     fn git_status(&self, arguments: &[&str]) -> Result<Captured, RepositoryError> {
-        let removed: Vec<OsString> = GIT_REMOVED.iter().map(OsString::from).collect();
         run_status_capped(
             &self.git,
             arguments,
             &GIT_ENVIRONMENT,
-            &removed,
+            &git_environment_removed(),
             GIT_TIMEOUT,
             COMMAND_OUTPUT_MAX_BYTES,
         )
@@ -788,12 +782,22 @@ impl Repositories {
 pub(crate) mod tests {
     use super::*;
     use std::process::Command;
+    use tycho_types::git_environment::{git_command, git_environment_in, hook_environment_refusal};
+
+    /// Panics when this test process inherited a git hook's environment; every test that
+    /// spawns git calls it first.
+    pub fn refuse_hook_environment() {
+        if let Some(refusal) = hook_environment_refusal() {
+            panic!("{refusal}");
+        }
+    }
 
     #[derive(Debug)]
     pub struct Scratch(pub PathBuf);
 
     impl Scratch {
         pub fn new(test: &str) -> Self {
+            refuse_hook_environment();
             let dir = std::env::temp_dir()
                 .join(format!("tycho-repositories-{test}-{}", std::process::id()));
             if dir.exists() {
@@ -811,7 +815,8 @@ pub(crate) mod tests {
     }
 
     fn git(dir: &Path, arguments: &[&str]) -> String {
-        let output = Command::new("git")
+        refuse_hook_environment();
+        let output = git_command()
             .args(["-C", &text(dir)])
             .args(arguments)
             .envs(GIT_ENVIRONMENT)
@@ -898,6 +903,91 @@ pub(crate) mod tests {
         assert!(Repositories::new(PathBuf::from("git"), "core".into(), "/w".into(), 0).is_err());
     }
 
+    const INHERITED_CHILD: &str =
+        "repositories::tests::the_git_runner_under_an_inherited_hook_environment";
+
+    /// Runs only in a child process that `the_git_runner_hides_the_hook_environment` starts
+    /// with the hook environment set. The runner spawns a shell in place of git that lists
+    /// variable names only: mbx adds about 50 KiB of values to a test's environment, past the
+    /// runner's 64 KiB output cap.
+    #[test]
+    #[ignore = "run by the_git_runner_hides_the_hook_environment in a child process"]
+    fn the_git_runner_under_an_inherited_hook_environment() {
+        assert!(
+            std::env::var_os("GIT_DIR").is_some(),
+            "the parent sets GIT_DIR"
+        );
+        let shell = PathBuf::from("/bin/sh");
+        let repositories = Repositories::new(shell, "/core".into(), "/agent/wt".into(), 0).unwrap();
+        let captured = repositories.git(&["-c", "env | sed 's/=.*/=/'"]).unwrap();
+        assert!(captured.stdout.contains("GIT_CONFIG_GLOBAL="));
+        assert_eq!(
+            git_environment_in(&captured.stdout),
+            Vec::<&str>::new(),
+            "{}",
+            captured.stdout
+        );
+    }
+
+    #[test]
+    fn the_git_runner_hides_the_hook_environment() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", INHERITED_CHILD])
+            .env("GIT_DIR", "/nonexistent/hook/.git")
+            .env("GIT_WORK_TREE", "/nonexistent/hook")
+            .env("GIT_INDEX_FILE", "/nonexistent/hook/.git/index")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}{stderr}");
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "the child must run exactly one test: {stdout}"
+        );
+    }
+
+    const REFUSING_CHILD: &str = "repositories::tests::a_scratch_under_an_inherited_git_dir";
+
+    /// Runs only in a child process that `a_git_spawning_test_refuses_an_inherited_git_dir`
+    /// starts with `GIT_DIR` set; `Scratch::new` must panic before it creates anything.
+    #[test]
+    #[ignore = "run by a_git_spawning_test_refuses_an_inherited_git_dir in a child process"]
+    fn a_scratch_under_an_inherited_git_dir() {
+        assert!(
+            std::env::var_os("GIT_DIR").is_some(),
+            "the parent sets GIT_DIR"
+        );
+        let scratch = Scratch::new("refused");
+        panic!(
+            "Scratch::new returned {} under GIT_DIR",
+            scratch.0.display()
+        );
+    }
+
+    #[test]
+    fn a_git_spawning_test_refuses_an_inherited_git_dir() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", REFUSING_CHILD])
+            .env("GIT_DIR", "/nonexistent/hook/.git")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stdout}{stderr}");
+        assert!(
+            stdout.contains("test result: FAILED. 0 passed; 1 failed"),
+            "the child must run exactly one test: {stdout}"
+        );
+        let report = format!("{stdout}{stderr}");
+        assert!(
+            report.contains("GIT_DIR=/nonexistent/hook/.git in this test process")
+                && report.contains("probably runs under a pre-push hook"),
+            "{report}"
+        );
+        assert!(!report.contains("Scratch::new returned"), "{report}");
+    }
+
     #[test]
     fn a_worktree_is_a_clone_of_the_canonical_repository_on_its_own_branch() {
         let scratch = Scratch::new("clone");
@@ -923,7 +1013,7 @@ pub(crate) mod tests {
             git(&path, &["config", "remote.origin.pushurl"]).trim(),
             PUSH_DISABLED
         );
-        let push = Command::new("git")
+        let push = git_command()
             .args([
                 "-C",
                 &text(&path),

@@ -58,7 +58,25 @@ pub fn run_captured(
     environment: &[(&str, &str)],
     timeout: Duration,
 ) -> Result<Captured, CommandError> {
-    let captured = run_status(program, arguments, environment, timeout)?;
+    run_captured_without(program, arguments, environment, &[], timeout)
+}
+
+/// `run_captured` with inherited variables removed.
+pub fn run_captured_without(
+    program: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+    removed: &[OsString],
+    timeout: Duration,
+) -> Result<Captured, CommandError> {
+    let captured = run_status_capped(
+        program,
+        arguments,
+        environment,
+        removed,
+        timeout,
+        COMMAND_OUTPUT_MAX_BYTES,
+    )?;
     if !captured.status.success() {
         return Err(CommandError::Failed(
             program.display().to_string(),

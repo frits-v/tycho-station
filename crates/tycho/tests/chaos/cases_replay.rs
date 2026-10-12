@@ -3,11 +3,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
+use tycho_types::git_environment::git_command;
 
 use tycho::code_graph::{Checkout, CodeGraph, StepKey};
 use tycho::config::{self, CorePorts};
@@ -172,7 +172,7 @@ fn assert_each_task_ran_once(core_ports: CorePorts, spawner: &RecordingSpawner, 
 }
 
 fn git(checkout: &Path, arguments: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(checkout)
         .args([
@@ -191,7 +191,7 @@ fn git(checkout: &Path, arguments: &[&str]) -> String {
 
 /// Clones the synthetic repository, applies the trivial unit's reference patch and commits it.
 fn work_in_clone(repository: &Path, checkout: &Path, branch: &str) -> String {
-    let status = Command::new("git")
+    let status = git_command()
         .args(["clone", "--quiet", "--no-hardlinks"])
         .arg(repository)
         .arg(checkout)

@@ -13,7 +13,7 @@
             "pending": false
         },
         "lefthook": {
-            "what": "commit-msg runs check-commit-msg; pre-commit checks formatting; pre-push runs clippy, tests, and xtask workflows --offline when .github changes.",
+            "what": "every command runs through the xtask, which removes the git hook environment before it starts a child: commit-msg runs check-commit-msg; pre-commit runs xtask fmt; pre-push runs xtask clippy, xtask test, and xtask workflows --offline when .github changes.",
             "runs": "local git operations",
             "record": "not_recorded",
             "pending": false

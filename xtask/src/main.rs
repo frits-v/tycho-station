@@ -10,7 +10,8 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output};
+use std::process::{Command, Output};
+use std::time::Duration;
 
 mod app_token;
 mod checkout;
@@ -30,11 +31,13 @@ mod test_step;
 mod workflows;
 
 use sarif::{Finding, Rule};
+use tycho_types::git_environment::git_environment_removed;
 
 const TYPES: [&str; 11] = [
     "feat", "fix", "docs", "chore", "refactor", "test", "build", "ci", "perf", "style", "revert",
 ];
 const SUBJECT_MAX: usize = 72;
+const FMT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const HOOK_INPUT_MAX_BYTES: u64 = 1 << 20;
 const HOOK_REPORT_MAX_LINES: usize = 40;
 const WALK_MAX_FILES: usize = 4096;
@@ -43,10 +46,19 @@ const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
 const DOC_DIRS: [&str; 1] = ["docs"];
 const RULES_DIR: &str = ".claude/rules";
 const RULE_MAX_LINES: usize = 24;
-const COMMANDS: [(&str, &str); 20] = [
+const COMMANDS: [(&str, &str); 23] = [
     (
         "ci",
         "format check, clippy, tests, workflow audits, opengrep, repository checks, PR title",
+    ),
+    ("fmt", "cargo fmt --check over the workspace"),
+    (
+        "clippy",
+        "clippy over every target with the workspace lints",
+    ),
+    (
+        "test",
+        "every test binary, each reported with its path and counts",
     ),
     (
         "opengrep",
@@ -279,17 +291,6 @@ fn report(what: &str, line: &str, verdict: &Verdict) -> i32 {
     }
 }
 
-fn run(program: &str, args: &[&str]) -> ExitStatus {
-    println!("xtask: {program} {}", args.join(" "));
-    Command::new(program)
-        .args(args)
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!("xtask: failed to start {program}: {e}");
-            std::process::exit(2)
-        })
-}
-
 fn step_passed(name: &str, outcome: Result<String, String>) -> bool {
     match outcome {
         Ok(summary) => {
@@ -352,18 +353,9 @@ fn ci() -> i32 {
             return 1;
         }
     };
-    let formatted = run("cargo", &["fmt", "--all", "--", "--check"]).success();
+    let formatted = format_checked();
     let linted = step_passed("clippy", clippy::clippy());
-    let (tested, tests) = match test_step::test() {
-        Ok(totals) => {
-            println!("xtask test: {totals}");
-            (true, Some(totals.counts))
-        }
-        Err(failure) => {
-            eprintln!("xtask test: {}", failure.reason);
-            (false, failure.totals.map(|totals| totals.counts))
-        }
-    };
+    let (tested, tests) = tested();
     let mut steps: Vec<(&str, Step)> = vec![
         ("fmt", step(formatted)),
         ("clippy", step(linted)),
@@ -400,6 +392,53 @@ fn ci() -> i32 {
         eprintln!("{line}");
     }
     code
+}
+
+/// `cargo fmt --check` with its diff echoed as it arrives, bounded like every other step.
+fn format_checked() -> bool {
+    let captured = process::run_bounded_merged(
+        Command::new("cargo").args(["fmt", "--all", "--", "--check"]),
+        FMT_TIMEOUT,
+    );
+    match captured.exit {
+        process::Exit::Code(0) => true,
+        process::Exit::Code(_) => false,
+        other => {
+            eprintln!("xtask fmt: cargo fmt ended {other:?}");
+            false
+        }
+    }
+}
+
+/// Whether every test passed, with the counts when every binary was accounted for.
+fn tested() -> (bool, Option<test_step::Counts>) {
+    match test_step::test() {
+        Ok(totals) => {
+            println!("xtask test: {totals}");
+            (true, Some(totals.counts))
+        }
+        Err(failure) => {
+            eprintln!("xtask test: {}", failure.reason);
+            (false, failure.totals.map(|totals| totals.counts))
+        }
+    }
+}
+
+/// git hands its repository to a hook as `GIT_DIR` and its relatives, and every command the
+/// hook starts inherits them; a test that runs `git init` or `git commit` would act on that
+/// repository. They are removed before any command runs, so no child of the xtask sees them.
+fn scrub_git_hook_environment() {
+    for name in git_environment_removed() {
+        env::remove_var(name);
+    }
+}
+
+const fn exit_code(passed: bool) -> i32 {
+    if passed {
+        0
+    } else {
+        1
+    }
 }
 
 fn steps_in<'name>(steps: &[(&'name str, Step)], wanted: Step) -> Vec<&'name str> {
@@ -821,6 +860,7 @@ fn help() -> i32 {
 }
 
 fn main() {
+    scrub_git_hook_environment();
     let args: Vec<String> = env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
         Some("check-commit-msg") => args.get(1).map_or_else(
@@ -832,6 +872,9 @@ fn main() {
         ),
         Some("check-pr-title") => check_pr_title(args.get(1).cloned().or_else(pr_title_from_event)),
         Some("ci") => ci(),
+        Some("fmt") => exit_code(format_checked()),
+        Some("clippy") => exit_code(step_passed("clippy", clippy::clippy())),
+        Some("test") => exit_code(tested().0),
         Some("opengrep") => opengrep::opengrep(),
         Some("workflows") => match args.get(1).map(String::as_str) {
             None => workflows::workflows(workflows::Network::Online),
@@ -878,9 +921,68 @@ fn main() {
     std::process::exit(code);
 }
 
+/// Every test that spawns git calls it first.
+///
+/// # Panics
+///
+/// When this test process inherited a git hook's environment.
+#[cfg(test)]
+pub fn refuse_hook_environment() {
+    if let Some(refusal) = tycho_types::git_environment::hook_environment_refusal() {
+        panic!("{refusal}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tycho_types::git_environment::{git_environment_in, scrub_git_environment};
+
+    const INHERITED_CHILD: &str = "tests::git_children_under_an_inherited_hook_environment";
+    const ENV_TIMEOUT: Duration = Duration::from_secs(60);
+
+    fn env_listing(command: &mut Command) -> String {
+        let captured = process::run_bounded(command, ENV_TIMEOUT);
+        assert_eq!(captured.exit, process::Exit::Code(0));
+        captured.stdout
+    }
+
+    /// Runs only in a child process that `git_children_never_see_the_hook_environment` starts
+    /// with the hook environment set: first the runner git goes through, then the startup
+    /// scrub, each with `env` in place of git.
+    #[test]
+    #[ignore = "run by git_children_never_see_the_hook_environment in a child process"]
+    fn git_children_under_an_inherited_hook_environment() {
+        assert!(env::var_os("GIT_DIR").is_some(), "the parent sets GIT_DIR");
+        let plain = env_listing(&mut Command::new("env"));
+        assert!(git_environment_in(&plain).contains(&"GIT_DIR"), "{plain}");
+        let scrubbed = env_listing(scrub_git_environment(&mut Command::new("env")));
+        assert_eq!(git_environment_in(&scrubbed), Vec::<&str>::new());
+        scrub_git_hook_environment();
+        assert_eq!(env::var_os("GIT_DIR"), None);
+        let after_startup = env_listing(&mut Command::new("env"));
+        assert_eq!(git_environment_in(&after_startup), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn git_children_never_see_the_hook_environment() {
+        let output = Command::new(env::current_exe().unwrap())
+            .args(["--ignored", "--exact", INHERITED_CHILD])
+            .env("GIT_DIR", "/nonexistent/hook/.git")
+            .env("GIT_WORK_TREE", "/nonexistent/hook")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.bare")
+            .env("GIT_CONFIG_VALUE_0", "true")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}{stderr}");
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "the child must run exactly one test: {stdout}"
+        );
+    }
 
     #[test]
     fn accepts_conventional_subjects() {

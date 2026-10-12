@@ -43,6 +43,7 @@ use tycho_harness::content::content_ref;
 use tycho_harness::verify::{run_criteria_with, unit_passed, VerifyOptions};
 use tycho_harness::work_units::{load_default, PassCondition};
 use tycho_types::envelope::{BranchName, CommitSha};
+use tycho_types::git_environment::{git_command, hook_environment_refusal};
 use tycho_types::service::{Attempt, WorkUnitId};
 
 const SUDO: &str = "/usr/bin/sudo";
@@ -610,7 +611,10 @@ impl Drop for GateScratch {
 }
 
 fn git(directory: &Path, arguments: &[&str]) -> String {
-    let output = Command::new("git")
+    if let Some(refusal) = hook_environment_refusal() {
+        panic!("{refusal}");
+    }
+    let output = git_command()
         .arg("-C")
         .arg(directory)
         .args(arguments)
