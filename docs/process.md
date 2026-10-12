@@ -93,7 +93,7 @@ The suites that start real processes are ignored tests, run by their mise tasks 
 |---|---|
 | `kill-tests`, `spine-tests`, `launcher-tests`, `chaos-tests` | the mise tools; they run at the same time, each test core on its own port slot |
 | `worker-tests` | a Claude token in the core's store (`tycho credentials set claude`), which the suite copies into its test core and hands its worker, and `graph-plugin`; never beside `control-tests` |
-| `control-tests` | the developer's Claude login: its sessions start without the credential hand-off; never beside `worker-tests` |
+| `control-tests` | a Claude token in the core's store, which the suite copies into its test core and hands each control session; never beside `worker-tests` |
 | `graph-tests` | `mise run graph-plugin` |
 | `boundary-tests` | a terminal and the provisioned agent user: sudo asks for the developer's password on the terminal to run each probe as `tycho-agent` |
 
@@ -289,20 +289,27 @@ binaries:
   configuration names the keychain.
 - `credentials status` prints each file's presence, owner, mode and age, never its content,
   and exits non-zero until both are present and private; `xtask setup` checks the same on
-  the developer's side and, as the agent, that the store refuses it.
+  the developer's side, in the core home `TYCHO_HOME` names when set, and, as the agent,
+  that the store under the developer's default core home, `~/.tycho`, refuses it; the agent
+  cannot see a moved core home.
 - A launcher spawner refuses a Claude or Codex session whose credential is absent; a session
   whose launcher got none ends `vendor_credential_unavailable` in the inbox, and one whose
   vendor refused the credential ends `vendor_login_required`.
 - Rotation: run the same pair of commands again. `credentials set` replaces the file by a
   rename, and the next session gets the new value; running sessions keep the old one until
-  they end. The Claude token lasts a year. Codex refreshes its tokens after about eight days
-  and the session's copy is discarded, so once Codex sessions end `vendor_login_required`,
-  run `codex login` and `credentials set codex` again.
+  they end. The Claude token lasts a year.
+- Codex refresh: Codex refreshes its tokens after about eight days and writes them to the
+  session's `auth.json`, which is discarded with the session's Codex home, so the stored seed
+  never advances. After the window every session refreshes from that seed, the second
+  session after the vendor rotates the refresh token fails, and two sessions started together
+  race for one refresh token. Once Codex sessions end `vendor_login_required`, run
+  `codex login` and `credentials set codex` again. Returning the refreshed file to the core
+  is [the Codex refresh issue](https://github.com/frits-v/tycho-station/issues/106).
 - Revocation: removing a vendor's file from the store stops that vendor's new sessions at
-  spawn; running sessions keep their copy until they end. The Claude authentication docs name
-  no command that revokes a `setup-token` token before its year is out, so ending it early is
-  done from the Claude account. `codex logout` removes the developer's local Codex login; the
-  store's copy holds the same refresh token until the plan's account signs it out.
+  spawn; running sessions keep their copy until they end. The Claude token stays valid for
+  its year: the Claude docs document no early revocation of a `setup-token` token, and
+  `claude logout` has nothing to remove, since the token is stored only in the core.
+  `codex logout` removes the developer's local Codex login and nothing in the store.
 
 ### The shared tool prefix
 

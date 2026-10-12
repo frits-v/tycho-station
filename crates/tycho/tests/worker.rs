@@ -204,6 +204,9 @@ impl Drop for Core {
         let left = clear_sessions(&core_zmx, "core", Path::new(TYCHO))
             .saturating_add(clear_sessions(&agent_zmx, "agent", &self.prefix.tycho()));
         drop(fs::remove_dir_all(self.prefix.root()));
+        // The copied token goes whatever else the teardown finds.
+        let shredded = credentials::shred_store(&self.config.home);
+        println!("teardown: shredded the test core's credential store: {shredded:?}");
         let mut outcome = (left == 0)
             .then_some(())
             .ok_or_else(|| format!("{left} sessions remain"));

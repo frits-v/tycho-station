@@ -1,7 +1,8 @@
 //! Control session tests: a real interactive `claude` under zmx, spawned through the launcher
 //! by the Session service and instructed over its inbox socket from a handler step, against
-//! a throwaway core. macOS only, run by `mise run control-tests`; uses the developer's Claude
-//! login, so each case is one short haiku turn.
+//! a throwaway core. macOS only, run by `mise run control-tests`; each session authenticates
+//! with the developer's stored Claude token through the hand-off, so each case is one short
+//! haiku turn.
 #![allow(
     clippy::disallowed_methods,
     reason = "fixtures live in throwaway directories no other user can write"
@@ -32,10 +33,11 @@ use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tycho::agent_files::current_uid;
 use tycho::config::{
-    AgentDirs, CoreConfig, CorePorts, PortClaim, ToolPrefix, AGENT_USER_ENV, HOME_ENV,
+    self, AgentDirs, CoreConfig, CorePorts, PortClaim, ToolPrefix, AGENT_USER_ENV, HOME_ENV,
     MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
+use tycho::credentials::{self, Credential, CredentialVendor, CLAUDE_TOKEN_ENV};
 use tycho::kill::{kill_session, KillRequest};
 use tycho::launch_probe::LaunchProbe;
 use tycho::launcher::{HeartbeatTarget, SessionFiles, VendorRecord, VendorTerminal};
@@ -115,6 +117,29 @@ struct LauncherSpawner {
     prefix: ToolPrefix,
     /// The prefix's `tycho`, which zmx types as the launcher.
     launcher: PathBuf,
+    /// The stored Claude token, copied into the test core and handed to every session.
+    credential: Credential,
+}
+
+/// Production sessions get their credential from the core, so the test core holds the
+/// developer's stored token, which `tycho credentials set claude` put in the core home.
+fn copy_claude_credential(test_home: &Path) -> Credential {
+    let production = config::core_home().unwrap();
+    let credential = credentials::load(&production, CredentialVendor::Claude)
+        .unwrap_or_else(|error| panic!("the control suite needs a stored Claude token: {error}"));
+    credentials::store(test_home, &credential).unwrap();
+    println!("evidence: the test core holds the stored Claude token");
+    credentials::load(test_home, CredentialVendor::Claude).unwrap()
+}
+
+/// Whether the vendor's environment, read with `ps -E` as its own user may, names the token
+/// variable; the value is never printed.
+fn vendor_holds_token(pid: u32) -> bool {
+    let output = Command::new("/bin/ps")
+        .args(["-wwE", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).contains(&format!("{CLAUDE_TOKEN_ENV}="))
 }
 
 impl LauncherSpawner {
@@ -163,8 +188,7 @@ impl Spawner for LauncherSpawner {
             vendor_dir: dir.as_deref(),
             ports: self.core_ports,
             tool_prefix: &self.prefix,
-            // The control sessions run as the developer and use the developer's own login.
-            credential: None,
+            credential: Some(&self.credential),
         })?;
         println!("evidence: spawn_session({}) -> {outcome:?}", spec.session);
         match outcome {
@@ -385,6 +409,7 @@ impl Harness {
             .chain(config.port_offset_pair())
             .collect(),
             spawner: LauncherSpawner {
+                credential: copy_claude_credential(&home),
                 zmx: Zmx::agent(prefix.tool("zmx").unwrap(), &agent),
                 dirs: dirs.clone(),
                 core_home: home,
@@ -785,6 +810,8 @@ impl Drop for Harness {
         if core_left != 0 {
             problems.push(format!("{core_left} core sessions remain"));
         }
+        let shredded = credentials::shred_store(&self.config.home);
+        println!("teardown: shredded the test core's credential store: {shredded:?}");
         let removed = remove_vendor_state(&self.work, &self.controls);
         println!("teardown: removed vendor state {removed:?}");
         let prefix_root = self.spawner.prefix.root();
@@ -857,12 +884,18 @@ impl Harness {
 }
 
 #[test]
-#[ignore = "spawns a real claude session with the developer's login; run with mise run control-tests"]
+#[ignore = "spawns a real claude session with the stored Claude token; run with mise run control-tests"]
 fn an_instruction_posted_from_a_handler_step_reaches_the_session_over_its_socket() {
     let mut harness = Harness::new("socket");
     let core_ports = harness.config.ports;
     let control = new_control("s1");
     let pid = harness.spawn(&control, PermissionMode::AcceptEdits, false);
+    let holds = vendor_holds_token(pid);
+    println!("evidence: the control vendor's environment names {CLAUDE_TOKEN_ENV}: {holds}");
+    assert!(
+        holds,
+        "the control session did not get the handed-over token"
+    );
     let record = instruct(
         core_ports,
         &control,
@@ -974,7 +1007,7 @@ fn dont_ask_never_waits(harness: &mut Harness) {
 }
 
 #[test]
-#[ignore = "spawns real claude sessions with the developer's login; run with mise run control-tests"]
+#[ignore = "spawns real claude sessions with the stored Claude token; run with mise run control-tests"]
 fn a_permission_prompt_stalls_the_session_and_queues_the_inbox_while_dont_ask_does_not() {
     let mut harness = Harness::new("stall");
     let core_ports = harness.config.ports;
@@ -1023,7 +1056,7 @@ fn a_permission_prompt_stalls_the_session_and_queues_the_inbox_while_dont_ask_do
 }
 
 #[test]
-#[ignore = "spawns real claude sessions with the developer's login; run with mise run control-tests"]
+#[ignore = "spawns real claude sessions with the stored Claude token; run with mise run control-tests"]
 fn a_killed_session_resumes_under_its_id_with_the_settings_passed_again() {
     let mut harness = Harness::new("resume");
     let core_ports = harness.config.ports;

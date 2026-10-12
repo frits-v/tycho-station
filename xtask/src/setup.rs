@@ -41,8 +41,12 @@ const PROBE_OUTPUT_MAX_BYTES: usize = 1 << 17;
 const SECURITY_ITEM_NOT_FOUND_EXIT: i32 = 44;
 /// `dsmemberutil checkmembership` exit code when the user or group does not exist.
 const DSMEMBERUTIL_NOT_FOUND_EXIT: i32 = 7;
-/// The core's vendor credential store under the developer's home.
-const CREDENTIAL_STORE_RELATIVE: &str = ".tycho/credentials";
+/// The core home tycho resolves when `TYCHO_HOME` is unset, under the developer's home.
+const CORE_HOME_RELATIVE: &str = ".tycho";
+/// The variable that moves the core home, as `tycho::config::core_home` reads it.
+const CORE_HOME_ENV: &str = "TYCHO_HOME";
+/// The vendor credential store under the core home.
+const CREDENTIALS_DIR: &str = "credentials";
 const CREDENTIAL_STORE_MODE: u32 = 0o700;
 const CREDENTIAL_FILE_MODE: u32 = 0o600;
 /// `git config --get-all` exit code when the key is not set.
@@ -2119,17 +2123,50 @@ const STORED_CREDENTIALS: [StoredCredential; 2] = [
     },
 ];
 
+/// The core home the way `tycho` resolves it: `TYCHO_HOME` when it names a directory strictly
+/// inside the user's home with no link on the way, else `.tycho` under the user's home.
+fn core_home(user_home: &Path, moved: Option<&std::ffi::OsStr>) -> Result<PathBuf, String> {
+    let Some(moved) = moved else {
+        return Ok(user_home.join(CORE_HOME_RELATIVE));
+    };
+    let home = PathBuf::from(moved);
+    let inside = home.is_absolute()
+        && home != user_home
+        && home.starts_with(user_home)
+        && home.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        });
+    if !inside {
+        return Err(format!(
+            "{CORE_HOME_ENV}={} is not a directory inside {}",
+            home.display(),
+            user_home.display()
+        ));
+    }
+    let mut walked = user_home.to_path_buf();
+    for component in home.strip_prefix(user_home).unwrap_or(&home).components() {
+        walked.push(component);
+        if fs::symlink_metadata(&walked).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(format!("{} is a symbolic link", walked.display()));
+        }
+    }
+    Ok(home)
+}
+
 fn stored_credential_findings(identity: &Identity) -> Vec<Finding> {
-    let home = resolve_home(&identity.username);
+    let moved = std::env::var_os(CORE_HOME_ENV);
+    let store = resolve_home(&identity.username)
+        .and_then(|home| core_home(Path::new(&home), moved.as_deref()))
+        .map(|home| home.join(CREDENTIALS_DIR));
     STORED_CREDENTIALS
         .iter()
         .map(|stored| {
-            let status = home.as_ref().map_or_else(
+            let status = store.as_ref().map_or_else(
                 |why| Status::Unreachable { why: why.clone() },
-                |home| {
-                    let store = Path::new(home).join(CREDENTIAL_STORE_RELATIVE);
-                    stored_credential_status(&store, stored.vendor, identity.uid)
-                },
+                |store| stored_credential_status(store, stored.vendor, identity.uid),
             );
             if status.is_pass() {
                 Finding::new(stored.check, status)
@@ -2196,8 +2233,10 @@ fn stored_credential_status(store: &Path, vendor: &str, developer_uid: u32) -> S
     }
 }
 
-/// Where the agent looks for the core's store: under the home of the user who owns the tool
-/// prefix, the developer, read from the password database rather than any environment.
+/// Where the agent looks for the core's store: the default core home of the user who owns the
+/// tool prefix, the developer, read from the password database rather than any environment.
+/// The agent cannot see a core home the developer moved with `TYCHO_HOME`, so a moved home is
+/// checked on the developer's side only.
 fn developer_store() -> Result<PathBuf, String> {
     let metadata = fs::symlink_metadata(tool_prefix::PREFIX_ROOT)
         .map_err(|error| format!("{}: {error}", tool_prefix::PREFIX_ROOT))?;
@@ -2209,7 +2248,7 @@ fn developer_store() -> Result<PathBuf, String> {
                 metadata.uid()
             )
         })?;
-    Ok(user.dir.join(CREDENTIAL_STORE_RELATIVE))
+    Ok(user.dir.join(CORE_HOME_RELATIVE).join(CREDENTIALS_DIR))
 }
 
 /// Run as the agent: a denial at any step of the walk passes; reaching the store, listing it
@@ -2972,6 +3011,29 @@ mod tests {
             stored_credential_status(&store, "claude", me),
             Status::Wrong { wanted, .. } if wanted == "regular file"
         ));
+        remove_scratch(&root);
+    }
+
+    #[test]
+    fn the_store_follows_the_core_home_tycho_resolves() {
+        let root = credential_scratch("home");
+        assert_eq!(core_home(&root, None).unwrap(), root.join(".tycho"));
+        let moved = root.join("test-core");
+        assert_eq!(core_home(&root, Some(moved.as_os_str())).unwrap(), moved);
+        for refused in [
+            PathBuf::from("relative"),
+            root.clone(),
+            PathBuf::from("/elsewhere/core"),
+            root.join("a/../b"),
+        ] {
+            assert!(
+                core_home(&root, Some(refused.as_os_str())).is_err(),
+                "{}",
+                refused.display()
+            );
+        }
+        std::os::unix::fs::symlink("/tmp", root.join("linked")).unwrap();
+        assert!(core_home(&root, Some(root.join("linked/core").as_os_str())).is_err());
         remove_scratch(&root);
     }
 

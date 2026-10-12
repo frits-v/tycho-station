@@ -218,7 +218,7 @@ mandate: #Mandate & {
 		"7.1": {
 			requires: "Agents hold no credentials; only the core touches remotes, the canonical repository, the admin surfaces and the store."
 			mechanisms: ["core_directory_check", "setup", "credential_handoff"]
-			coverage: "core directory check; setup; credential hand-off (pending): the core holds the vendor credentials and hands each session its own, none at rest where the agent can read it"
+			coverage: "core directory check; setup; credential hand-off (pending): the core holds the vendor credentials and hands each session its own, none at rest outside a running session's spool"
 			partial:  true
 			slices: ["zero"]
 		}

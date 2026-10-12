@@ -284,7 +284,7 @@
                 "setup",
                 "credential_handoff"
             ],
-            "coverage": "core directory check; setup; credential hand-off (pending): the core holds the vendor credentials and hands each session its own, none at rest where the agent can read it",
+            "coverage": "core directory check; setup; credential hand-off (pending): the core holds the vendor credentials and hands each session its own, none at rest outside a running session's spool",
             "partial": true,
             "slices": [
                 "zero"

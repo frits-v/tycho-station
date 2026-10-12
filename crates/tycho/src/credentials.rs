@@ -13,7 +13,7 @@ use std::time::SystemTime;
 
 use tycho_types::session::Vendor;
 
-use crate::agent_files::{current_uid, write_durable};
+use crate::agent_files::{current_uid, shred, write_durable};
 use crate::private_dir::{self, DirError};
 
 pub const CREDENTIALS_DIR: &str = "credentials";
@@ -305,6 +305,26 @@ pub fn load(core_home: &Path, vendor: CredentialVendor) -> Result<Credential, Cr
     let parsed = Credential::parse(vendor, &bytes);
     bytes.fill(0);
     parsed
+}
+
+/// Zeroes and removes every vendor's file, then the store if it is empty; absent is fine.
+/// Returns how many files it removed.
+pub fn shred_store(core_home: &Path) -> Result<usize, CredentialError> {
+    let mut removed: usize = 0;
+    for vendor in CredentialVendor::ALL {
+        let path = store_path(core_home, vendor);
+        match shred(&path) {
+            Ok(()) => removed = removed.saturating_add(1),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(CredentialError::Io(path, error)),
+        }
+    }
+    let dir = store_dir(core_home);
+    match fs::remove_dir(&dir) {
+        Ok(()) => Ok(removed),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(removed),
+        Err(error) => Err(CredentialError::Io(dir, error)),
+    }
 }
 
 /// What `status` found for one entry, from its own metadata; contents are never read.
@@ -645,6 +665,20 @@ pub mod tests {
             .problem
             .unwrap()
             .contains("must be a Directory of uid"));
+        fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn shredding_the_store_removes_every_file_and_the_directory() {
+        let home = scratch("shred");
+        assert_eq!(shred_store(&home).unwrap(), 0);
+        store(
+            &home,
+            &Credential::parse(CredentialVendor::Claude, CLAUDE_TOKEN.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(shred_store(&home).unwrap(), 1);
+        assert!(!store_dir(&home).exists());
         fs::remove_dir_all(&home).unwrap();
     }
 
