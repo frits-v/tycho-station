@@ -1,10 +1,11 @@
-//! Creates what the developer side of `xtask setup` checks: the agent's group and user, the
-//! shared group and its members, the deny entry for the agent in the developer's home ACL, and
-//! both socket directories. A step runs only while its probe fails, and the probe runs again
-//! after it; a step whose probe still fails stops the run. Steps that need root run through
-//! `sudo`, which prompts on the terminal itself; this process never reads, holds or passes a
-//! password. Root never changes the owner or mode of a path: in `/Users/Shared`, which every
-//! user can write, the entry's owner could swap it for a link between the probe and the change.
+//! Creates what the developer side of `xtask setup` checks: the agent's group, user and home
+//! directory, the shared group and its members, the deny entry for the agent in the developer's
+//! home ACL, and both socket directories. A step runs only while its probe fails, and the probe
+//! runs again after it; a step whose probe still fails stops the run. Steps that need root run
+//! through `sudo`, which prompts on the terminal itself; this process never reads, holds or
+//! passes a password. Root changes no owner and one mode: the agent home's, whose entry sits in
+//! root-owned `/Users`, where no other user can swap it. In `/Users/Shared`, which every user
+//! can write, the entry's owner could swap it for a link between the probe and the change.
 
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, IsTerminal};
@@ -15,9 +16,9 @@ use std::time::Duration;
 
 use crate::process::{self, Captured, Exit};
 use crate::setup::{
-    self, Check, Finding, Identity, Side, Status, AGENT_GROUP_NAME, AGENT_SOCKET_DIR,
-    AGENT_SOCKET_DIR_MODE, AGENT_USER_NAME, CORE_SOCKET_DIR_MODE, HOME_DENY_ENTRY,
-    SHARED_GROUP_NAME,
+    self, AgentHome, AgentHomeState, Check, Finding, Identity, Side, Status, AGENT_GROUP_NAME,
+    AGENT_HOME, AGENT_HOME_MODE, AGENT_SOCKET_DIR, AGENT_SOCKET_DIR_MODE, AGENT_USER_NAME,
+    CORE_SOCKET_DIR_MODE, HOME_DENY_ENTRY, SHARED_GROUP_NAME,
 };
 
 const PROVISION_STEPS_MAX: usize = 16;
@@ -26,6 +27,7 @@ const REMEDY_TIMEOUT: Duration = Duration::from_secs(600);
 const SUDO: &str = "/usr/bin/sudo";
 const DSEDITGROUP: &str = "/usr/sbin/dseditgroup";
 const SYSADMINCTL: &str = "/usr/sbin/sysadminctl";
+const CREATEHOMEDIR: &str = "/usr/sbin/createhomedir";
 const RMDIR: &str = "/bin/rmdir";
 const CHMOD: &str = "/bin/chmod";
 /// For a step run as the developer; the prompts of root steps get `REMEDY_TIMEOUT`.
@@ -34,7 +36,6 @@ const PROMPT_NOTICE: &str =
     "sudo may ask for your password now, and sysadminctl for the new user's, on this terminal";
 const FOREIGN_SOCKET_DIR_HINT: &str = "it is not an empty directory; inspect /Users/Shared/tycho-agent-zmx, remove it by hand, and run the task again";
 const AGENT_FULL_NAME: &str = "Tycho Agent";
-const AGENT_HOME: &str = "/Users/tycho-agent";
 const AGENT_SHELL: &str = "/bin/zsh";
 const AGENT_GID_PLACEHOLDER: &str = "<gid of tycho-agent>";
 /// Mode a directory is created with before its group and final mode are set on the descriptor.
@@ -43,7 +44,7 @@ const CREATE_MODE: u32 = 0o700;
 const SUDO_RETRY_LINE: &str = "Sorry, try again.";
 
 const OPERATOR_STEPS: [&str; 4] = [
-    "as tycho-agent, from a terminal in that account (`su - tycho-agent` or a login session): `claude` (subscription login) and `codex login` (ChatGPT plan); each login is a flow in that user's session",
+    "as tycho-agent, from a terminal in that account (`sudo -iu tycho-agent` or a login session): `claude` (subscription login) and `codex login` (ChatGPT plan); each login is a flow in that user's session",
     "as tycho-agent: `git config --global credential.helper \"\"`, which clears every credential helper git reads, Apple's osxkeychain included",
     "optional, as the developer, if the entire mirror is the sync remote: `entire auth`",
     "then `mise run setup` as tycho-agent",
@@ -54,6 +55,8 @@ const OPERATOR_STEPS: [&str; 4] = [
 enum Remedy {
     CreateAgentGroup,
     CreateAgentUser,
+    CreateAgentHome,
+    NarrowAgentHomeMode,
     CreateSharedGroup,
     AddDeveloperToSharedGroup,
     AddAgentToSharedGroup,
@@ -63,9 +66,11 @@ enum Remedy {
     PrepareCoreSocketDir,
 }
 
-const REMEDIES: [Remedy; 9] = [
+const REMEDIES: [Remedy; 11] = [
     Remedy::CreateAgentGroup,
     Remedy::CreateAgentUser,
+    Remedy::CreateAgentHome,
+    Remedy::NarrowAgentHomeMode,
     Remedy::CreateSharedGroup,
     Remedy::AddDeveloperToSharedGroup,
     Remedy::AddAgentToSharedGroup,
@@ -95,6 +100,8 @@ impl Remedy {
         match self {
             Self::CreateAgentGroup => "create the agent group",
             Self::CreateAgentUser => "create the agent user bound to the agent group",
+            Self::CreateAgentHome => "create the agent user's home directory",
+            Self::NarrowAgentHomeMode => "narrow the agent home's mode to 0700",
             Self::CreateSharedGroup => "create the shared group",
             Self::AddDeveloperToSharedGroup => "add the developer to the shared group",
             Self::AddAgentToSharedGroup => "add the agent user to the shared group",
@@ -112,6 +119,7 @@ impl Remedy {
         match self {
             Self::CreateAgentGroup => &[Check::AgentGroupExists],
             Self::CreateAgentUser => &[Check::AgentUserExists, Check::AgentPrimaryGroup],
+            Self::CreateAgentHome | Self::NarrowAgentHomeMode => &[Check::AgentHomeDirectory],
             Self::CreateSharedGroup => &[Check::SharedGroupExists],
             Self::AddDeveloperToSharedGroup => &[Check::DeveloperInSharedGroup],
             Self::AddAgentToSharedGroup => &[Check::AgentInSharedGroup],
@@ -130,6 +138,8 @@ pub struct Snapshot {
     findings: Vec<Finding>,
     agent_group_gid: Option<u32>,
     shared_group_gid: Option<u32>,
+    /// The probe the home finding was made from, so the home steps decide on the same facts.
+    agent_home: AgentHome,
     agent_dir_owner: Option<u32>,
     developer_home: Option<PathBuf>,
     core_dir: Option<PathBuf>,
@@ -240,11 +250,42 @@ fn prepare_core_dir_need(snapshot: &Snapshot) -> Need {
     }
 }
 
+/// A home that exists in any form is not created again; what is wrong with it is the mode
+/// step's or the operator's. Like the mode step, it acts only at `AGENT_HOME`.
+fn create_home_need(snapshot: &Snapshot) -> Need {
+    let home = &snapshot.agent_home;
+    match &home.state {
+        AgentHomeState::Missing if home.is_at_agent_home() => Need::Run,
+        AgentHomeState::Ok | AgentHomeState::Missing | AgentHomeState::Wrong(_) => Need::Skip,
+        AgentHomeState::Unreachable(why) => Need::Blocked(why.clone()),
+        AgentHomeState::Unrecognised(what) => Need::Blocked(format!("unrecognised {what}")),
+    }
+}
+
+/// Runs when only the mode is wider than 0700, at the path the chmod names. A missing home is
+/// planned too, since `createhomedir` may make it wider; the step is decided again after it. A
+/// record not yet read is the one the user step creates at that path.
+fn narrow_home_need(snapshot: &Snapshot) -> Need {
+    let home = &snapshot.agent_home;
+    let at_chmod_path = home.is_at_agent_home();
+    match &home.state {
+        AgentHomeState::Missing if at_chmod_path => Need::Run,
+        AgentHomeState::Wrong(mismatch) if at_chmod_path && mismatch.is_only_a_wider_mode() => {
+            Need::Run
+        }
+        AgentHomeState::Ok | AgentHomeState::Missing | AgentHomeState::Wrong(_) => Need::Skip,
+        AgentHomeState::Unreachable(why) => Need::Blocked(why.clone()),
+        AgentHomeState::Unrecognised(what) => Need::Blocked(format!("unrecognised {what}")),
+    }
+}
+
 fn need(remedy: Remedy, snapshot: &Snapshot) -> Need {
     let absence = |check| need_for_absence(&status_of(snapshot, check));
     match remedy {
         Remedy::CreateAgentGroup => absence(Check::AgentGroupExists),
         Remedy::CreateAgentUser => absence(Check::AgentUserExists),
+        Remedy::CreateAgentHome => create_home_need(snapshot),
+        Remedy::NarrowAgentHomeMode => narrow_home_need(snapshot),
         Remedy::CreateSharedGroup => absence(Check::SharedGroupExists),
         Remedy::AddDeveloperToSharedGroup => absence(Check::DeveloperInSharedGroup),
         Remedy::AddAgentToSharedGroup => absence(Check::AgentInSharedGroup),
@@ -355,6 +396,14 @@ fn create_user_command(agent_group_gid: Option<u32>) -> Vec<String> {
     words
 }
 
+fn narrow_home_command() -> Vec<String> {
+    vec![
+        CHMOD.to_string(),
+        format!("{AGENT_HOME_MODE:04o}"),
+        AGENT_HOME.to_string(),
+    ]
+}
+
 fn add_member_command(user: &str) -> Vec<String> {
     strings(&[
         DSEDITGROUP,
@@ -405,6 +454,10 @@ fn action(remedy: Remedy, snapshot: &Snapshot) -> Option<Action> {
             AGENT_GROUP_NAME,
         ])),
         Remedy::CreateAgentUser => Action::Root(create_user_command(snapshot.agent_group_gid)),
+        Remedy::CreateAgentHome => {
+            Action::Root(strings(&[CREATEHOMEDIR, "-c", "-u", AGENT_USER_NAME]))
+        }
+        Remedy::NarrowAgentHomeMode => Action::Root(narrow_home_command()),
         Remedy::CreateSharedGroup => {
             Action::Root(strings(&[DSEDITGROUP, "-o", "create", SHARED_GROUP_NAME]))
         }
@@ -521,10 +574,31 @@ fn decode_sysadminctl_success(stdout: &str, stderr: &str) -> CommandOutcome {
     CommandOutcome::Succeeded
 }
 
+/// `createhomedir` reports `creating home directories for (<user>)`, then `created (<path>)`
+/// per directory it made, or `cannot create '<path>' (<errno>)`. The forms are the binary's
+/// format strings; which stream carries them is not relied on.
+fn decode_createhomedir_success(stdout: &str, stderr: &str) -> CommandOutcome {
+    let announced = format!("creating home directories for ({AGENT_USER_NAME})");
+    for line in meaningful_lines(stdout).chain(meaningful_lines(stderr)) {
+        if line.starts_with("cannot create '") {
+            return CommandOutcome::Failed(line.to_string());
+        }
+        let created = line
+            .strip_prefix("created (")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .is_some_and(|path| path.starts_with('/'));
+        if line != announced && !created {
+            return CommandOutcome::Unrecognised(line.to_string());
+        }
+    }
+    CommandOutcome::Succeeded
+}
+
 fn decode_command(program: &str, captured: &Captured) -> CommandOutcome {
     let (stdout, stderr) = (captured.stdout.as_str(), captured.stderr.as_str());
     match &captured.exit {
         Exit::Code(0) if program == SYSADMINCTL => decode_sysadminctl_success(stdout, stderr),
+        Exit::Code(0) if program == CREATEHOMEDIR => decode_createhomedir_success(stdout, stderr),
         Exit::Code(0)
             if meaningful_lines(stdout)
                 .chain(meaningful_lines(stderr))
@@ -576,7 +650,7 @@ pub struct SystemHost;
 impl Host for SystemHost {
     fn snapshot(&mut self) -> Result<Snapshot, String> {
         let developer = setup::current_identity()?;
-        let mut findings = setup::record_findings(&developer);
+        let (mut findings, agent_home) = setup::record_probe(&developer);
         findings.extend(setup::agent_record_findings());
         let developer_home = setup::resolve_home(&developer.username).ok();
         let core_dir = developer_home
@@ -591,6 +665,7 @@ impl Host for SystemHost {
         Ok(Snapshot {
             agent_group_gid: setup::group_id(AGENT_GROUP_NAME).ok().flatten(),
             shared_group_gid: setup::group_id(SHARED_GROUP_NAME).ok().flatten(),
+            agent_home,
             agent_dir_owner: fs::symlink_metadata(AGENT_SOCKET_DIR)
                 .ok()
                 .map(|metadata| metadata.uid()),
@@ -782,6 +857,18 @@ fn execute(host: &mut impl Host, action: &Action, snapshot: &Snapshot) -> Result
 }
 
 fn verify(remedy: Remedy, snapshot: &Snapshot) -> Result<(), String> {
+    if remedy == Remedy::CreateAgentHome {
+        return match snapshot.agent_home.state {
+            AgentHomeState::Ok | AgentHomeState::Wrong(_) => Ok(()),
+            AgentHomeState::Missing
+            | AgentHomeState::Unreachable(_)
+            | AgentHomeState::Unrecognised(_) => Err(format!(
+                "{} ran, but the home probe reads {}",
+                remedy.label(),
+                status_of(snapshot, Check::AgentHomeDirectory)
+            )),
+        };
+    }
     if remedy == Remedy::RemoveForeignAgentSocketDir {
         return match status_of(snapshot, Check::AgentDirExists) {
             Status::Missing => Ok(()),
@@ -948,14 +1035,16 @@ pub fn run(arguments: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::setup::{Differs, HomeMismatch};
     use std::collections::VecDeque;
 
     const DEVELOPER_UID: u32 = 501;
     const AGENT_GID: u32 = 502;
     const SHARED_GID: u32 = 503;
-    const RECORD_CHECKS: [Check; 17] = [
+    const RECORD_CHECKS: [Check; 18] = [
         Check::AgentGroupExists,
         Check::AgentUserExists,
+        Check::AgentHomeDirectory,
         Check::SharedGroupExists,
         Check::DeveloperInSharedGroup,
         Check::DeveloperHomeClosedToAgent,
@@ -989,6 +1078,10 @@ mod tests {
                 .collect(),
             agent_group_gid: Some(AGENT_GID),
             shared_group_gid: Some(SHARED_GID),
+            agent_home: AgentHome {
+                path: Some(AGENT_HOME.to_string()),
+                state: AgentHomeState::Ok,
+            },
             agent_dir_owner: Some(DEVELOPER_UID),
             developer_home: Some(PathBuf::from("/Users/frits")),
             core_dir: Some(PathBuf::from("/Users/frits/.tycho/zmx")),
@@ -1043,7 +1136,39 @@ mod tests {
         snapshot.shared_group_gid = None;
         snapshot.agent_dir_owner = None;
         snapshot.core_parent_missing = true;
+        with_home(snapshot, None, AgentHomeState::Missing)
+    }
+
+    /// Sets the home probe and the finding made from it, as `setup::record_probe` does.
+    fn with_home(mut snapshot: Snapshot, path: Option<&str>, state: AgentHomeState) -> Snapshot {
+        snapshot.agent_home = AgentHome {
+            path: path.map(str::to_string),
+            state,
+        };
+        let finding = setup::agent_home_finding(&snapshot.agent_home);
         snapshot
+            .findings
+            .retain(|kept| kept.check != Check::AgentHomeDirectory);
+        snapshot.findings.push(finding);
+        snapshot
+    }
+
+    fn home_mode(found: u32) -> AgentHomeState {
+        AgentHomeState::Wrong(HomeMismatch {
+            mode: Some(Differs {
+                found,
+                wanted: AGENT_HOME_MODE,
+            }),
+            ..HomeMismatch::default()
+        })
+    }
+
+    fn createhomedir_words() -> Vec<String> {
+        strings(&[CREATEHOMEDIR, "-c", "-u", "tycho-agent"])
+    }
+
+    fn chmod_home_words() -> Vec<String> {
+        strings(&[CHMOD, "0700", "/Users/tycho-agent"])
     }
 
     fn captured(exit: Exit, stdout: &str, stderr: &str) -> Captured {
@@ -1134,6 +1259,8 @@ mod tests {
             vec![
                 Remedy::CreateAgentGroup,
                 Remedy::CreateAgentUser,
+                Remedy::CreateAgentHome,
+                Remedy::NarrowAgentHomeMode,
                 Remedy::CreateSharedGroup,
                 Remedy::AddDeveloperToSharedGroup,
                 Remedy::AddAgentToSharedGroup,
@@ -1392,7 +1519,7 @@ mod tests {
     }
 
     #[test]
-    fn root_never_changes_the_owner_or_mode_of_a_path() {
+    fn root_runs_only_the_allowlisted_commands_and_changes_one_mode_by_path() {
         let mut stranger = with(
             all_present(),
             &[
@@ -1401,17 +1528,227 @@ mod tests {
             ],
         );
         stranger.agent_dir_owner = Some(503);
-        for snapshot in [all_missing(), stranger, all_present()] {
+        let wide_home = with_home(all_present(), Some(AGENT_HOME), home_mode(0o750));
+        for snapshot in [all_missing(), stranger, all_present(), wide_home] {
             for remedy in REMEDIES {
                 if let Some(Action::Root(words)) = action(remedy, &snapshot) {
                     let program = words.first().map(String::as_str);
                     assert!(
-                        matches!(program, Some(DSEDITGROUP | SYSADMINCTL | RMDIR)),
-                        "{remedy:?} runs {program:?} as root"
+                        matches!(program, Some(DSEDITGROUP | SYSADMINCTL | RMDIR))
+                            || words == createhomedir_words()
+                            || words == chmod_home_words(),
+                        "{remedy:?} runs {words:?} as root"
                     );
                 }
             }
         }
+        assert_eq!(
+            action(Remedy::CreateAgentHome, &all_present()),
+            Some(Action::Root(createhomedir_words()))
+        );
+        assert_eq!(
+            action(Remedy::NarrowAgentHomeMode, &all_present()),
+            Some(Action::Root(chmod_home_words()))
+        );
+    }
+
+    #[test]
+    fn a_missing_home_is_created_then_narrowed_once_and_reads_ok() {
+        let missing = with_home(all_present(), Some(AGENT_HOME), AgentHomeState::Missing);
+        assert_eq!(
+            plan(&missing).steps,
+            vec![Remedy::CreateAgentHome, Remedy::NarrowAgentHomeMode]
+        );
+        let created_wide = with_home(all_present(), Some(AGENT_HOME), home_mode(0o750));
+        let mut host = RecordingHost::new(vec![missing.clone(), created_wide, all_present()]);
+        host.root_results.push_back(captured(
+            Exit::Code(0),
+            "creating home directories for (tycho-agent)\ncreated (/Users/tycho-agent)\n",
+            "",
+        ));
+        assert_eq!(provision(Mode::Apply, true, &mut host), 0);
+        assert_eq!(
+            host.root_calls,
+            vec![createhomedir_words(), chmod_home_words()]
+        );
+        assert_eq!(host.reports, 1);
+
+        let mut created_narrow = RecordingHost::new(vec![missing.clone(), all_present()]);
+        assert_eq!(provision(Mode::Apply, true, &mut created_narrow), 0);
+        assert_eq!(created_narrow.root_calls, vec![createhomedir_words()]);
+
+        let mut still_wide = RecordingHost::new(vec![
+            missing,
+            with_home(all_present(), Some(AGENT_HOME), home_mode(0o750)),
+        ]);
+        assert_eq!(provision(Mode::Apply, true, &mut still_wide), 1);
+        assert_eq!(
+            still_wide.root_calls,
+            vec![createhomedir_words(), chmod_home_words()]
+        );
+        assert_eq!(still_wide.reports, 0);
+    }
+
+    #[test]
+    fn a_createhomedir_that_leaves_no_home_stops_before_the_chmod() {
+        let missing = with_home(all_present(), Some(AGENT_HOME), AgentHomeState::Missing);
+        let mut host = RecordingHost::new(vec![missing.clone(), missing]);
+        assert_eq!(provision(Mode::Apply, true, &mut host), 1);
+        assert_eq!(host.root_calls, vec![createhomedir_words()]);
+        let mut failed = RecordingHost::new(vec![with_home(
+            all_present(),
+            Some(AGENT_HOME),
+            AgentHomeState::Missing,
+        )]);
+        failed.root_results.push_back(captured(
+            Exit::Code(0),
+            "creating home directories for (tycho-agent)\ncannot create '/Users/tycho-agent' (13)\n",
+            "",
+        ));
+        assert_eq!(provision(Mode::Apply, true, &mut failed), 1);
+        assert_eq!(failed.root_calls, vec![createhomedir_words()]);
+        assert_eq!(failed.snapshot_calls, 1);
+    }
+
+    #[test]
+    fn a_home_the_task_must_not_change_is_left_to_the_operator_with_a_hint() {
+        let mut owned_elsewhere = HomeMismatch {
+            owner: Some(Differs {
+                found: 501,
+                wanted: 503,
+            }),
+            ..HomeMismatch::default()
+        };
+        owned_elsewhere.mode = Some(Differs {
+            found: 0o755,
+            wanted: AGENT_HOME_MODE,
+        });
+        let narrows = "mise run provision-agent narrows it";
+        for (snapshot, expected) in [
+            (
+                with_home(
+                    all_present(),
+                    Some(AGENT_HOME),
+                    AgentHomeState::Wrong(owned_elsewhere),
+                ),
+                "/Users/tycho-agent is not a directory the agent owns; inspect it and move it aside by hand, then run mise run provision-agent again".to_string(),
+            ),
+            (
+                with_home(all_present(), Some(AGENT_HOME), home_mode(0o500)),
+                "sudo -u tycho-agent /bin/chmod 0700 /Users/tycho-agent".to_string(),
+            ),
+            (
+                with_home(all_present(), Some("/Users/elsewhere"), home_mode(0o755)),
+                "sudo -u tycho-agent /bin/chmod 0700 /Users/elsewhere".to_string(),
+            ),
+            (
+                with_home(all_present(), Some("/Users/elsewhere"), AgentHomeState::Missing),
+                "the agent user record names /Users/elsewhere, not /Users/tycho-agent, and the task creates only /Users/tycho-agent; point NFSHomeDirectory at /Users/tycho-agent (sudo dscl . -create /Users/tycho-agent NFSHomeDirectory /Users/tycho-agent) and run mise run provision-agent again".to_string(),
+            ),
+        ] {
+            let planned = plan(&snapshot);
+            assert!(planned.steps.is_empty(), "{:?}", snapshot.agent_home);
+            let left = unremedied(&snapshot, &planned.steps);
+            assert_eq!(left.len(), 1);
+            let hint = left
+                .first()
+                .filter(|finding| finding.check == Check::AgentHomeDirectory)
+                .and_then(|finding| finding.hint.clone());
+            assert_eq!(hint.as_deref(), Some(expected.as_str()));
+            assert!(!expected.contains(narrows));
+            let mut host = RecordingHost::new(vec![snapshot]);
+            assert_eq!(provision(Mode::Print, false, &mut host), 1);
+            assert!(!host.acted());
+        }
+    }
+
+    #[test]
+    fn the_narrowing_note_appears_only_where_the_task_narrows() {
+        let wide = with_home(all_present(), Some(AGENT_HOME), home_mode(0o750));
+        let hint = wide
+            .findings
+            .iter()
+            .find(|finding| finding.check == Check::AgentHomeDirectory)
+            .and_then(|finding| finding.hint.clone());
+        assert_eq!(
+            hint.as_deref(),
+            Some("sudo -u tycho-agent /bin/chmod 0700 /Users/tycho-agent (mise run provision-agent narrows it)")
+        );
+        assert_eq!(plan(&wide).steps, vec![Remedy::NarrowAgentHomeMode]);
+    }
+
+    #[test]
+    fn a_home_probe_that_could_not_run_or_read_an_unrecognised_record_blocks_the_run() {
+        for state in [
+            AgentHomeState::Unreachable("dscl is not on PATH".to_string()),
+            AgentHomeState::Unrecognised("UniqueID \"x\" in the agent user record".to_string()),
+        ] {
+            let snapshot = with_home(all_present(), None, state);
+            let planned = plan(&snapshot);
+            let blocked: Vec<Remedy> = planned.blocked.iter().map(|(remedy, _)| *remedy).collect();
+            assert_eq!(
+                blocked,
+                vec![Remedy::CreateAgentHome, Remedy::NarrowAgentHomeMode]
+            );
+            let mut host = RecordingHost::new(vec![snapshot]);
+            assert_eq!(provision(Mode::Apply, true, &mut host), 1);
+            assert!(!host.acted());
+        }
+    }
+
+    #[test]
+    fn decodes_createhomedir_output_and_rejects_the_unrecognised() {
+        let home =
+            |exit, stdout, stderr| decode_command(CREATEHOMEDIR, &captured(exit, stdout, stderr));
+        assert_eq!(
+            home(
+                Exit::Code(0),
+                "creating home directories for (tycho-agent)\ncreated (/Users/tycho-agent)\n",
+                ""
+            ),
+            CommandOutcome::Succeeded
+        );
+        assert_eq!(
+            home(
+                Exit::Code(0),
+                "",
+                "creating home directories for (tycho-agent)\n"
+            ),
+            CommandOutcome::Succeeded
+        );
+        assert_eq!(
+            home(
+                Exit::Code(0),
+                "creating home directories for (tycho-agent)\ncannot create '/Users/tycho-agent' (13)\n",
+                ""
+            ),
+            CommandOutcome::Failed("cannot create '/Users/tycho-agent' (13)".to_string())
+        );
+        for unrecognised in [
+            "creating home directories for (someone-else)\n",
+            "created (relative)\n",
+            "home made\n",
+        ] {
+            assert!(
+                matches!(
+                    home(Exit::Code(0), unrecognised, ""),
+                    CommandOutcome::Unrecognised(_)
+                ),
+                "{unrecognised:?}"
+            );
+        }
+        assert!(matches!(
+            home(Exit::Code(1), "", "sudo: a password is required\n"),
+            CommandOutcome::SudoRefused(_)
+        ));
+        assert!(matches!(
+            home(
+                Exit::Code(1),
+                "",
+                "createhomedir must be executed as root.\n"
+            ),
+            CommandOutcome::Failed(_)
+        ));
     }
 
     #[test]
