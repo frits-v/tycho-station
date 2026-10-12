@@ -92,7 +92,8 @@ The suites that start real processes are ignored tests, run by their mise tasks 
 | Task | Needs |
 |---|---|
 | `kill-tests`, `spine-tests`, `launcher-tests`, `chaos-tests` | the mise tools; they run at the same time, each test core on its own port slot |
-| `worker-tests`, `control-tests` | the developer's Claude login, and `graph-plugin` for the worker suite; one at a time |
+| `worker-tests` | a Claude token in the core's store (`tycho credentials set claude`), which the suite copies into its test core and hands its worker, and `graph-plugin`; never beside `control-tests` |
+| `control-tests` | the developer's Claude login: its sessions start without the credential hand-off; never beside `worker-tests` |
 | `graph-tests` | `mise run graph-plugin` |
 | `boundary-tests` | a terminal and the provisioned agent user: sudo asks for the developer's password on the terminal to run each probe as `tycho-agent` |
 
@@ -248,24 +249,60 @@ or a group the agent is in, search it.
   of it fails.
 - An agent user that exists with another primary group is reported with its fix, not
   changed: rebinding a live account's group is left to the operator.
-- Left to the operator, since each needs a login or a setting of the agent's own: from a
-  terminal, in this order, each run as `tycho-agent` through `sudo` with no login shell, so
-  none of the agent's startup files runs and the environment holds only what is written:
+- Left to the operator: storing the vendor credentials as the developer (Vendor
+  credentials, below), then, from a terminal, in this order, each run as `tycho-agent`
+  through `sudo` with no login shell, so none of the agent's startup files runs and the
+  environment holds only what is written:
 
   ```sh
-  sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent USER=tycho-agent LOGNAME=tycho-agent TERM=xterm-256color PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise /Users/Shared/tycho/mise/installs/claude/2.1.280/claude
-  sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent USER=tycho-agent LOGNAME=tycho-agent TERM=xterm-256color PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise /Users/Shared/tycho/mise/installs/codex/0.160.1/bin/codex login
   sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent PATH=/usr/bin:/bin /usr/bin/git config --global credential.helper ""
   sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent USER=tycho-agent LOGNAME=tycho-agent PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise /Users/Shared/tycho/bin/xtask setup
   ```
 
-  The first is the Claude subscription login and the second the Codex plan login; the empty
-  credential helper clears every helper git reads, Apple's osxkeychain included. A login
-  stores its credential in the agent's keychain; if one cannot reach that keychain from a
-  `sudo` session, the same `/usr/bin/env -i` command run from a login session of the agent
-  should. `entire auth` as the developer is needed only if the entire mirror is the sync
-  remote. The task prints the same commands, with the versions of the pins it was built
-  with.
+  The empty credential helper clears every helper git reads, Apple's osxkeychain included.
+  The agent logs in to no vendor: it has no login session, so no keychain it can read, and
+  every session gets its vendor credential from the core. `entire auth` as the developer is
+  needed only if the entire mirror is the sync remote. The task prints the same commands,
+  with the versions of the pins it was built with.
+
+### Vendor credentials
+
+The core holds one credential per vendor in `~/.tycho/credentials`, a 0700 directory of the
+developer, each file 0600, and hands the session's to each launcher over a socket the spawn
+step serves (design section 7, Vendor credentials). The developer, who owns the Claude
+subscription and the Codex plan, stores them once, from a terminal, with the prefix's
+binaries:
+
+```sh
+/Users/Shared/tycho/mise/installs/claude/2.1.280/claude setup-token
+/Users/Shared/tycho/bin/tycho credentials set claude
+/Users/Shared/tycho/mise/installs/codex/0.160.1/bin/codex login -c 'cli_auth_credentials_store="file"'
+/Users/Shared/tycho/bin/tycho credentials set codex < ~/.codex/auth.json
+/Users/Shared/tycho/bin/tycho credentials status
+```
+
+- `setup-token` opens the browser login and shows the token on its own screen; paste it into
+  `credentials set claude` and end the input with Ctrl-D. `credentials set` reads stdin only,
+  so the value reaches no argument, history or `ps`, and refuses a value of the wrong shape
+  or over its bound (512 bytes for the token, 16 KiB for `auth.json`).
+- The `-c` override makes `codex login` write `~/.codex/auth.json` even where the Codex
+  configuration names the keychain.
+- `credentials status` prints each file's presence, owner, mode and age, never its content,
+  and exits non-zero until both are present and private; `xtask setup` checks the same on
+  the developer's side and, as the agent, that the store refuses it.
+- A launcher spawner refuses a Claude or Codex session whose credential is absent; a session
+  whose launcher got none ends `vendor_credential_unavailable` in the inbox, and one whose
+  vendor refused the credential ends `vendor_login_required`.
+- Rotation: run the same pair of commands again. `credentials set` replaces the file by a
+  rename, and the next session gets the new value; running sessions keep the old one until
+  they end. The Claude token lasts a year. Codex refreshes its tokens after about eight days
+  and the session's copy is discarded, so once Codex sessions end `vendor_login_required`,
+  run `codex login` and `credentials set codex` again.
+- Revocation: removing a vendor's file from the store stops that vendor's new sessions at
+  spawn; running sessions keep their copy until they end. The Claude authentication docs name
+  no command that revokes a `setup-token` token before its year is out, so ending it early is
+  done from the Claude account. `codex logout` removes the developer's local Codex login; the
+  store's copy holds the same refresh token until the plan's account signs it out.
 
 ### The shared tool prefix
 
@@ -327,7 +364,10 @@ station is built, so every binary the agent runs lives in `/Users/Shared/tycho`:
   kernel with `access(W_OK)` whether the agent can write any directory or file, which counts
   access lists and group memberships the mode bits do not show, and reports how many entries
   it examined; checks mise; runs each tool by absolute path at its pin and compares its
-  install digest; and runs the claude and codex login probes by absolute path.
+  install digest; and checks that stat, listing or opening the core's credential store is
+  refused. No login probe runs as the agent: a session authenticates only with the credential
+  the core hands its launcher, which the agent-side setup never holds, so authentication is
+  proven where sessions start, by the worker suite and by a session's exit state.
 - A prefix that is a link, is owned by another user, or sits below an ancestor another user
   can swap is reported with its fix and nothing is installed into it.
 - `LauncherSpawner::for_prefix` builds the spawner from `ToolPrefix`, which reads
