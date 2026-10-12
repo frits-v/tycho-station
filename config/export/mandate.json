@@ -31,7 +31,7 @@
             "pending": false
         },
         "setup": {
-            "what": "xtask provision-agent creates the agent user with its own primary group tycho-agent, the shared group, the socket directories and a deny entry for the agent in the developer's home ACL, each verified by its setup probe. xtask setup checks that the agent cannot search the developer's home (group, mode, ACL), since every local account is in staff, and on the agent's side its primary group, that no credential file exists, and no keychain item for a forbidden service.",
+            "what": "xtask provision-agent creates the agent user and group, the shared group, the socket directories, a deny entry for the agent in the developer's home ACL, and the tool prefix /Users/Shared/tycho with mise, the agent's tools and the station binaries. xtask setup checks the home is closed to the agent; the prefix's owner, mode, ancestors and every entry beneath it; each tool's path, pin and digest; the station binaries; and, as the agent, its group, credentials, keychain, tools and write access.",
             "runs": "on demand, once per side; provisioning once per machine as the developer",
             "record": "not_recorded",
             "pending": false
