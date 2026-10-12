@@ -23,10 +23,33 @@ is a defect.
 | Lints | `Cargo.toml` `[workspace.lints]`, `clippy.toml` | every build, ci, post-edit hook |
 | Repository checks | `xtask` (`check-names`, `check-comments`, `check-rules`, `check-credentials`, `check-figures`, `check-config`, `check-commit-msg`, `check-pr-title`, `opengrep`, `workflows`) | ci, post-edit hook, lefthook |
 | Source rules | `opengrep/rust.yml`, each rule with fixture lines in `opengrep/rust.rs` | `xtask opengrep` in ci |
-| Git hooks | `lefthook.json` | commit-msg, pre-commit, pre-push |
+| Git hooks | `lefthook.json`, each command `cargo run -q -p xtask -- <command>` | commit-msg, pre-commit, pre-push |
 | Host rules | repository ruleset on the default branch | every push and merge |
 | Agent hooks | `.claude/settings.json` | after Edit and Write |
-| Tests | `cargo test` | ci, pre-push |
+| Tests | `xtask test` (`mbx test --workspace --no-fail-fast`) | ci, pre-push |
+
+## Git hooks and the tests
+
+git hands a hook the repository it runs for in `GIT_DIR` and its relatives: `GIT_WORK_TREE`,
+`GIT_INDEX_FILE`, `GIT_COMMON_DIR`, `GIT_CONFIG_PARAMETERS` and the other names
+`git rev-parse --local-env-vars` lists. Every process the hook starts inherits them, and from
+a linked worktree `GIT_DIR` is `.git/worktrees/<name>`. A test that runs `git init` or
+`git commit` in a scratch directory under that environment acts on the repository that ran
+the hook, whatever directory it names with `-C`: it can set `core.bare` on the main
+repository and commit its fixture onto the branch being pushed.
+
+- The xtask is the only entry point a hook calls. `xtask` removes the names in
+  `tycho_types::git_environment::GIT_ENVIRONMENT_REMOVED`, with the numbered
+  `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` pairs, from its own environment before it
+  dispatches, so no test binary, cargo or git it starts sees them. A hook command that starts
+  cargo, a test binary or git directly is a defect.
+- Every git the code starts, production and test, goes through `git_command`,
+  `scrub_git_environment`, or a runner given `git_environment_removed()`; the harness
+  repository builder and setup's credential check clear the whole environment instead. The
+  opengrep rule `rust-git-inherits-hook-environment` refuses any other `Command::new("git")`.
+- A test that spawns git calls `refuse_hook_environment` first. With `GIT_DIR` set in the test
+  process it panics, naming the hook it probably runs under, so `cargo test` started straight
+  from a hook fails those tests instead of writing to the repository.
 
 ## Verifying before claiming done
 
