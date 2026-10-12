@@ -25,6 +25,7 @@ use tycho_types::session::{SessionName, SOCKET_PATH_MAX_BYTES};
 
 use crate::config::AgentDirs;
 use crate::credentials::{wipe, Credential, CredentialVendor, CODEX_AUTH_MAX_BYTES};
+use crate::vendors::claude_control::peer_uid;
 
 /// The spec's name for the socket path; the launcher keeps it from the vendor.
 pub const CREDENTIAL_SOCKET_ENV: &str = "TYCHO_CREDENTIAL_SOCKET";
@@ -146,12 +147,6 @@ fn check_path(path: &Path) -> Result<(), HandoffError> {
         return Err(HandoffError::PathTooLong(length));
     }
     Ok(())
-}
-
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-    nix::unistd::getpeereid(stream)
-        .map(|(uid, _)| uid.as_raw())
-        .map_err(io::Error::from)
 }
 
 /// Reads at most `max` bytes, then one more to tell a full read from an oversized one.

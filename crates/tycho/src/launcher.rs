@@ -1230,7 +1230,7 @@ mod tests {
         let server = serve("codex", &mut settings, credential);
         let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
         let script = format!(
-            r#"stat -f '%Lp' "$CODEX_HOME" > "{0}/home-mode"; stat -f '%Lp' "$CODEX_HOME/auth.json" > "{0}/auth-mode"; cmp -s "$CODEX_HOME/auth.json" "{0}/expected" && echo same > "{0}/auth-same"; mkdir -p "$CODEX_HOME/sessions/x"; echo rollout > "$CODEX_HOME/sessions/x/r.jsonl"; /usr/bin/env > "{0}/env"; printf '{{"state":"failed","envelope":null}}' > "$TYCHO_RESULT_FILE""#,
+            r#"find "$CODEX_HOME" -prune -perm 0700 > "{0}/home-mode"; find "$CODEX_HOME/auth.json" -perm 0600 > "{0}/auth-mode"; cmp -s "$CODEX_HOME/auth.json" "{0}/expected" && echo same > "{0}/auth-same"; mkdir -p "$CODEX_HOME/sessions/x"; echo rollout > "$CODEX_HOME/sessions/x/r.jsonl"; /usr/bin/env > "{0}/env"; printf '{{"state":"failed","envelope":null}}' > "$TYCHO_RESULT_FILE""#,
             dir.display()
         );
         fs::write(dir.join("expected"), CODEX_AUTH).unwrap();
@@ -1238,19 +1238,22 @@ mod tests {
         fs::remove_file(dir.join("expected")).unwrap();
         assert_eq!(end.state, "failed");
         assert_eq!(server.finish(), HandoffOutcome::Answered);
+        let home = files.spool_dir.join(CODEX_HOME_DIR);
+        // `find -perm` with an octal mode matches that exact mode, on BSD and GNU alike.
         assert_eq!(
             fs::read_to_string(dir.join("home-mode")).unwrap().trim(),
-            "700"
+            home.display().to_string(),
+            "the Codex home is not 0700"
         );
         assert_eq!(
             fs::read_to_string(dir.join("auth-mode")).unwrap().trim(),
-            "600"
+            home.join(CODEX_AUTH_FILE).display().to_string(),
+            "auth.json is not 0600"
         );
         assert!(
             dir.join("auth-same").exists(),
             "auth.json is not the core's copy"
         );
-        let home = files.spool_dir.join(CODEX_HOME_DIR);
         let env = fs::read_to_string(dir.join("env")).unwrap();
         assert!(
             env.contains(&format!("{CODEX_HOME_ENV}={}", home.display())),
