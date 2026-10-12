@@ -12,6 +12,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tycho_types::git_environment::git_command;
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use ureq::Agent;
 
@@ -344,7 +345,7 @@ fn write_manifest(prefix: &Prefix, manifest: &Manifest) -> Result<(), String> {
 }
 
 fn git_line(args: &[&str]) -> Result<String, String> {
-    let mut command = Command::new("git");
+    let mut command = git_command();
     command.args(args).current_dir(setup::workspace_root());
     let captured = process::run_bounded_capturing_stderr(&mut command, GIT_TIMEOUT);
     exit_result(&format!("git {}", args.join(" ")), &captured.exit)?;

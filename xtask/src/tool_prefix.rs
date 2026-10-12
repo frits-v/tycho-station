@@ -13,6 +13,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use tycho_types::git_environment::git_command;
+
 use crate::prefix_manifest::{
     install_sha256, is_commit, read_manifest, read_regular, sha256_hex, Manifest, ManifestRead,
     StationRecord, ToolRecord, BINARY_MAX_BYTES,
@@ -906,8 +908,8 @@ fn recorded_tool<'manifest>(
     Ok(record)
 }
 
-/// The pinned install's executable answers by absolute path with its pin, and the install
-/// has the digest `station.json` records. No shim and no mise lookup is involved.
+/// The install has the digest `station.json` records, and only then is its executable run,
+/// by absolute path, to answer with its pin. No shim and no mise lookup is involved.
 pub fn installed_tool_state(
     prefix: &Prefix,
     environment: &ToolEnvironment,
@@ -927,15 +929,12 @@ pub fn installed_tool_state(
         Ok(record) => record,
         Err(state) => return state,
     };
-    match version_state(prefix, environment, tool, pin) {
-        ToolState::Pinned => {}
-        other => return other,
-    }
     match install_sha256(&prefix.installs(tool, pin)) {
-        Ok(digest) if digest == record.install_sha256 => ToolState::Pinned,
-        Ok(digest) => ToolState::Modified(format!("install sha256 {digest}")),
-        Err(why) => ToolState::Unreachable(why),
+        Ok(digest) if digest == record.install_sha256 => {}
+        Ok(digest) => return ToolState::Modified(format!("install sha256 {digest}")),
+        Err(why) => return ToolState::Unreachable(why),
     }
+    version_state(prefix, environment, tool, pin)
 }
 
 const TOOLS_HINT: &str = "mise run provision-agent installs the pins into the prefix";
@@ -1057,8 +1056,10 @@ fn station_finding(binary: StationBinary, state: &StationState) -> Finding {
 
 /// `git rev-parse HEAD` in the checkout this xtask was built from.
 pub fn checkout_head() -> Result<String, String> {
-    let mut command = setup::plain_command("git", &["rev-parse", "HEAD"]);
-    command.current_dir(setup::workspace_root());
+    let mut command = git_command();
+    command
+        .args(["rev-parse", "HEAD"])
+        .current_dir(setup::workspace_root());
     match setup::run_bounded_within(command, TOOL_PROBE_TIMEOUT) {
         Capture::ExecutableNotFound => Err("git is not on PATH".to_string()),
         Capture::Unreachable(why) => Err(why),
@@ -1648,11 +1649,18 @@ mod tests {
             ToolState::WrongSource(_)
         ));
         let binary = prefix.tool_binary(AgentTool::Zmx, "0.8.1");
-        fs::write(&binary, "#!/bin/sh\necho 'zmx\t\t0.8.1'\n# changed\n").expect("write");
+        let ran = prefix.root().join("ran");
+        fs::write(
+            &binary,
+            format!("#!/bin/sh\ntouch {}\necho 'zmx\t\t0.8.1'\n", ran.display()),
+        )
+        .expect("write");
         assert!(matches!(state(&manifest), ToolState::Modified(_)));
+        assert!(!ran.exists(), "a modified install must not run");
         fs::write(&binary, "#!/bin/sh\necho 'zmx\t\t0.9.0'\n").expect("write");
+        let rerecorded = ManifestRead::Present(recorded(&prefix, AgentTool::Zmx, "0.8.1"));
         assert_eq!(
-            state(&manifest),
+            state(&rerecorded),
             ToolState::WrongVersion("0.9.0".to_string())
         );
         fs::remove_dir_all(prefix.root()).expect("clean up");

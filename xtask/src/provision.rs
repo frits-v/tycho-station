@@ -50,11 +50,18 @@ const CREATE_MODE: u32 = 0o700;
 /// What sudo writes to stderr after a mistyped password that a later attempt corrected.
 const SUDO_RETRY_LINE: &str = "Sorry, try again.";
 
-/// The commands the operator types in the agent's shell, from a terminal in that account:
-/// the claude login (subscription), the codex login (its plan login), the cleared credential
-/// helper, then the agent side of setup. Each runs the pinned install by absolute path with
-/// its environment set in full, so nothing in the agent's shell files or working directory
-/// decides what runs.
+/// Runs a command as the agent with no login shell, so none of the agent's startup files
+/// runs, and with an environment that holds only what follows.
+const AS_AGENT: &str = "sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent";
+/// The keychain lookups of the vendor CLIs and of setup go by these names.
+const AGENT_NAMES: &str = "USER=tycho-agent LOGNAME=tycho-agent";
+/// What an interactive login is told about the terminal it draws on.
+const LOGIN_TERMINAL: &str = "TERM=xterm-256color";
+
+/// The commands the operator types from a terminal: the claude login (subscription), the
+/// codex login (its plan login), the cleared credential helper, then the agent side of
+/// setup. Each runs as the agent through `sudo` with no login shell, the pinned install by
+/// absolute path, and its environment set in full.
 fn operator_commands(prefix: &Prefix) -> Result<[String; 4], String> {
     let environment = prefix.agent_environment_words()?;
     let claude = prefix.tool_binary(
@@ -65,12 +72,15 @@ fn operator_commands(prefix: &Prefix) -> Result<[String; 4], String> {
         AgentTool::Codex,
         &tool_prefix::pinned_version(AgentTool::Codex)?,
     );
+    let login = format!("{AS_AGENT} {AGENT_NAMES} {LOGIN_TERMINAL} {environment}");
     Ok([
-        format!("env {environment} {}", claude.display()),
-        format!("env {environment} {} login", codex.display()),
-        "git config --global credential.helper \"\"".to_string(),
+        format!("{login} {}", claude.display()),
+        format!("{login} {} login", codex.display()),
         format!(
-            "{} setup",
+            "{AS_AGENT} PATH=/usr/bin:/bin /usr/bin/git config --global credential.helper \"\""
+        ),
+        format!(
+            "{AS_AGENT} {AGENT_NAMES} {environment} {} setup",
             prefix.binary(tool_prefix::StationBinary::Xtask).display()
         ),
     ])
@@ -1140,7 +1150,7 @@ fn print_plan(plan: &Plan, snapshot: &Snapshot) {
 
 fn print_operator_steps() {
     println!("xtask provision-agent: left to the operator");
-    println!("  in the agent's shell (sudo -iu tycho-agent, or a login session), in this order:");
+    println!("  from your terminal, each as tycho-agent with no login shell, in this order:");
     match operator_commands(&Prefix::production()) {
         Ok(commands) => {
             for command in commands {
@@ -2291,15 +2301,20 @@ mod tests {
     fn the_operator_commands_run_the_pinned_installs_by_path_with_the_whole_environment() {
         let commands = operator_commands(&Prefix::production()).expect("the pins decode");
         let environment = "PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise";
+        let as_agent = "sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent";
+        let login = format!(
+            "{as_agent} USER=tycho-agent LOGNAME=tycho-agent TERM=xterm-256color {environment}"
+        );
         assert_eq!(
             commands,
             [
-                format!("env {environment} /Users/Shared/tycho/mise/installs/claude/2.1.280/claude"),
-                format!("env {environment} /Users/Shared/tycho/mise/installs/codex/0.160.1/bin/codex login"),
-                "git config --global credential.helper \"\"".to_string(),
-                "/Users/Shared/tycho/bin/xtask setup".to_string(),
+                format!("{login} /Users/Shared/tycho/mise/installs/claude/2.1.280/claude"),
+                format!("{login} /Users/Shared/tycho/mise/installs/codex/0.160.1/bin/codex login"),
+                format!("{as_agent} PATH=/usr/bin:/bin /usr/bin/git config --global credential.helper \"\""),
+                format!("{as_agent} USER=tycho-agent LOGNAME=tycho-agent {environment} /Users/Shared/tycho/bin/xtask setup"),
             ]
         );
-        assert!(commands.iter().all(|command| !command.contains("shims")));
+        assert!(commands.iter().all(|command| !command.contains("shims")
+            && command.starts_with("sudo -u tycho-agent -H /usr/bin/env -i ")));
     }
 }
