@@ -96,15 +96,42 @@ pub fn run_status_capped(
     timeout: Duration,
     output_max_bytes: usize,
 ) -> Result<Captured, CommandError> {
-    let name = program.display().to_string();
     let mut command = Command::new(program);
     for variable in removed {
         command.env_remove(variable);
     }
-    let mut child = command
+    command
         .args(arguments)
         .envs(environment.iter().copied())
-        .stdin(Stdio::null())
+        .stdin(Stdio::null());
+    run_piped(command, timeout, output_max_bytes)
+}
+
+/// Runs from `current_dir` with stdin closed, stdout and stderr captured under the cap. sudo
+/// still asks for a password on the controlling terminal, which it opens as `/dev/tty`.
+pub fn run_status_from(
+    program: &Path,
+    arguments: &[&str],
+    current_dir: &Path,
+    timeout: Duration,
+    output_max_bytes: usize,
+) -> Result<Captured, CommandError> {
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .current_dir(current_dir)
+        .stdin(Stdio::null());
+    run_piped(command, timeout, output_max_bytes)
+}
+
+/// Spawns with stdout and stderr piped, then waits and collects both under the deadline.
+fn run_piped(
+    mut command: Command,
+    timeout: Duration,
+    output_max_bytes: usize,
+) -> Result<Captured, CommandError> {
+    let name = command.get_program().to_string_lossy().into_owned();
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -300,6 +327,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(captured.stdout.len(), COMMAND_OUTPUT_MAX_BYTES + 1);
+    }
+
+    #[test]
+    fn a_run_from_a_directory_starts_there_and_captures_both_streams() {
+        let captured = run_status_from(
+            Path::new("/bin/sh"),
+            &["-c", "pwd; echo refused >&2; exit 3"],
+            Path::new("/"),
+            Duration::from_secs(5),
+            COMMAND_OUTPUT_MAX_BYTES,
+        )
+        .unwrap();
+        assert_eq!(captured.stdout, "/\n");
+        assert_eq!(captured.stderr, "refused\n");
+        assert_eq!(captured.status.code(), Some(3));
+        assert!(matches!(
+            run_status_from(
+                Path::new("/bin/sleep"),
+                &["5"],
+                Path::new("/"),
+                Duration::from_millis(300),
+                COMMAND_OUTPUT_MAX_BYTES,
+            ),
+            Err(CommandError::TimedOut(_, _))
+        ));
     }
 
     /// The dump is the test runner's whole environment, which `mbx test` enlarges with about

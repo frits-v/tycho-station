@@ -16,6 +16,8 @@ use crate::content;
 
 /// A patch fixture larger than this is rejected rather than applied.
 pub const PATCH_MAX_BYTES: usize = 65_536;
+/// The reference change that makes the trivial work unit's done criteria pass.
+pub const PATCH_TRIVIAL: &[u8] = include_bytes!("../fixtures/patches/trivial.patch");
 
 const AUTHOR_NAME: &str = "Tycho Synthetic";
 const AUTHOR_EMAIL: &str = "synthetic@tycho.station";
