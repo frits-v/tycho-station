@@ -163,6 +163,8 @@ impl Spawner for LauncherSpawner {
             vendor_dir: dir.as_deref(),
             ports: self.core_ports,
             tool_prefix: &self.prefix,
+            // The control sessions run as the developer and use the developer's own login.
+            credential: None,
         })?;
         println!("evidence: spawn_session({}) -> {outcome:?}", spec.session);
         match outcome {

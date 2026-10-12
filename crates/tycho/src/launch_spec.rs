@@ -15,6 +15,7 @@ use tycho_types::service::Service;
 use crate::agent_files::{read_checked, shred};
 use crate::config::{AgentDirs, CorePorts, AGENT_DIR_ENV, MISE_PREFIX_ENV, ZMX_ENV};
 use crate::config_store::{PortOffset, PortOffsetError, PORT_OFFSET_ENV};
+use crate::credential_handoff::CREDENTIAL_SOCKET_ENV;
 use crate::launch_probe::LAUNCH_PROBE_SERVICE;
 
 pub const HEARTBEAT_TARGET_ENV: &str = "TYCHO_HEARTBEAT_TARGET";
@@ -182,6 +183,8 @@ pub struct LauncherSettings {
     /// The `tycho` binary that runs the vendor as the leader of a session with no controlling
     /// terminal; `None` only in tests, where the vendor gets its own process group instead.
     pub session_leader: Option<PathBuf>,
+    /// The core's hand-off socket for this session's vendor credential, from the spec.
+    pub credential_socket: Option<PathBuf>,
 }
 
 /// A tier is 1 to 32 bytes of letters, digits, `.`, `_` and `-`.
@@ -233,6 +236,11 @@ impl LauncherSettings {
         } else {
             None
         };
+        let credential_socket = if environment.contains_key(CREDENTIAL_SOCKET_ENV) {
+            Some(absolute(environment, CREDENTIAL_SOCKET_ENV)?)
+        } else {
+            None
+        };
         let ports = environment
             .get(PORT_OFFSET_ENV)
             .map(|text| PortOffset::parse(text))
@@ -264,6 +272,7 @@ impl LauncherSettings {
             wall_clock: WALL_CLOCK_MAX,
             output_max_bytes: OUTPUT_FILE_MAX_BYTES,
             session_leader: None,
+            credential_socket,
         })
     }
 
@@ -277,7 +286,8 @@ impl LauncherSettings {
                 pairs.push((name.to_string(), value));
             }
         }
-        // Claude Code finds its keychain login by USER; under `env -i` it reports no login.
+        // Claude Code reads its keychain login under USER; a vendor without a handed-over
+        // credential still finds the launcher user's own login that way.
         if let Some(user) = current_user_name() {
             pairs.push(("USER".to_string(), user.clone()));
             pairs.push(("LOGNAME".to_string(), user));
@@ -544,6 +554,10 @@ pub mod tests {
     fn the_vendor_environment_is_exactly_the_allowlist() {
         let mut spec_environment = environment(Path::new("/agent"));
         spec_environment.insert(PORT_OFFSET_ENV.to_string(), "1056".to_string());
+        spec_environment.insert(
+            CREDENTIAL_SOCKET_ENV.to_string(),
+            "/agent/specs/0123456789abcdef.cred".to_string(),
+        );
         let mut settings = LauncherSettings::from_map(&spec_environment).unwrap();
         settings.tier = Some("t2".to_string());
         let pairs =
@@ -577,6 +591,16 @@ pub mod tests {
         assert!(!pairs
             .iter()
             .any(|(_, value)| value == SECRET || value == "sign_1abc"));
+        assert_eq!(
+            settings.credential_socket,
+            Some(PathBuf::from("/agent/specs/0123456789abcdef.cred"))
+        );
+        let mut relative = spec_environment;
+        relative.insert(CREDENTIAL_SOCKET_ENV.to_string(), "x.cred".to_string());
+        assert!(matches!(
+            LauncherSettings::from_map(&relative),
+            Err(SettingsError::NotAbsolute(CREDENTIAL_SOCKET_ENV))
+        ));
     }
 
     #[test]

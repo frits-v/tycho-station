@@ -31,6 +31,7 @@ use tycho::config::{
     AgentDirs, CoreConfig, CorePorts, CoreRole, PortClaim, ToolPrefix, AGENT_USER_ENV, HOME_ENV,
     MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
 };
+use tycho::credentials::{Credential, CredentialVendor, CLAUDE_TOKEN_ENV};
 use tycho::health::{self, Health};
 use tycho::http::Http;
 use tycho::kill::{kill_session, KillRefusal, KillRequest, KillVerdict};
@@ -49,6 +50,8 @@ use tycho_types::session::SessionName;
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
 const SECRET: &str = "launcher-test-secret-0123456789abcdef";
+/// The shape of a long-lived Claude token; every session here gets it through the hand-off.
+const TEST_TOKEN: &str = "sk-ant-oat01-launcher-suite-test-credential-0123456789";
 const WAIT_LIMIT: Duration = Duration::from_secs(120);
 const VENDOR_SCRIPT: &str = r#"#!/bin/sh
 # $1 lease path, $2 seconds to run, $3 result file content or empty, $4 marker prefix
@@ -74,6 +77,8 @@ struct Harness {
     launcher: PathBuf,
     fixture: PathBuf,
     names: Vec<SessionName>,
+    /// The test credential the spawn step hands each launcher.
+    credential: Credential,
     /// Held until the core is stopped, after the teardown in `drop`.
     _port_claim: PortClaim,
 }
@@ -136,6 +141,7 @@ impl Harness {
             config,
             dirs,
             names: Vec::new(),
+            credential: Credential::parse(CredentialVendor::Claude, TEST_TOKEN.as_bytes()).unwrap(),
         };
         assert!(harness.tycho(&["core", "start"]).status.success());
         harness.probe_endpoint = Some(start_probe_endpoint(harness.config.ports));
@@ -215,6 +221,7 @@ impl Harness {
             vendor_dir: None,
             ports: self.config.ports,
             tool_prefix: &self.prefix,
+            credential: Some(&self.credential),
         })
         .unwrap();
         println!("evidence: spawn_session({name}) -> {outcome:?}");
@@ -457,13 +464,68 @@ fn result_json(name: &SessionName) -> String {
     .to_string()
 }
 
-/// The fake vendor got the tier and none of the launcher's secrets or directories.
+/// The fake vendor got the tier and the handed-over token, and none of the launcher's
+/// secrets or directories.
 fn assert_vendor_saw_only_its_allowlist(harness: &Harness, name: &SessionName, awaitable: &str) {
     let tier = fs::read_to_string(harness.marker(name, ".tier")).unwrap();
     assert_eq!(tier, "t1", "the vendor did not receive the tier");
     let vendor_env = fs::read_to_string(harness.marker(name, ".env")).unwrap();
     assert!(!vendor_env.contains(SECRET) && !vendor_env.contains(awaitable));
     assert!(!vendor_env.contains("ZMX_DIR=") && !vendor_env.contains("TYCHO_AGENT_DIR="));
+    assert!(
+        vendor_env
+            .lines()
+            .any(|line| line == format!("{CLAUDE_TOKEN_ENV}={TEST_TOKEN}")),
+        "the vendor did not receive the handed-over token"
+    );
+    assert!(!vendor_env.contains("TYCHO_CREDENTIAL_SOCKET"));
+    println!("evidence: the vendor's environment holds {CLAUDE_TOKEN_ENV} from the hand-off");
+}
+
+/// The test token is in no file under the agent directory, the saved scrollback, `zmx list`
+/// or the launcher's command line, and the hand-off socket is gone.
+fn assert_token_nowhere(harness: &Harness, name: &SessionName, launcher_pid: u32) {
+    let mut stack = vec![harness.dirs.socket_dir.clone()];
+    let mut examined = 0_u32;
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = fs::symlink_metadata(&path).unwrap();
+            if metadata.is_dir() {
+                stack.push(path);
+            } else if metadata.is_file() {
+                examined = examined.saturating_add(1);
+                let bytes = fs::read(&path).unwrap();
+                assert!(
+                    !String::from_utf8_lossy(&bytes).contains(TEST_TOKEN),
+                    "{} holds the token",
+                    path.display()
+                );
+            } else {
+                assert!(
+                    path.extension().is_none_or(|extension| extension != "cred"),
+                    "the hand-off socket {} outlived the spawn",
+                    path.display()
+                );
+            }
+        }
+    }
+    assert!(examined >= 5, "only {examined} files examined");
+    let scrollback = save_scrollback(&harness.zmx, &harness.config.home, name).unwrap();
+    let text = fs::read_to_string(&scrollback).unwrap();
+    let joined: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+    assert!(
+        !joined.contains(TEST_TOKEN),
+        "the token reached the scrollback"
+    );
+    let list = format!("{:?}", harness.zmx.list().unwrap());
+    assert!(!list.contains(TEST_TOKEN));
+    if let tycho::process::ProcessFacts::Running(facts) =
+        tycho::process::process_facts(launcher_pid)
+    {
+        assert!(!facts.command.contains(TEST_TOKEN));
+    }
+    println!("evidence: the token is in none of {examined} agent-directory files, the scrollback, zmx list or the launcher's argv");
 }
 
 /// The saved scrollback, joined across wrapped lines, holds the typed command but no secret.
@@ -517,6 +579,7 @@ fn launch_spools_resolves_and_ends_its_session() {
         harness.marker(&name, ".lease-seen").exists().then_some(())
     });
     assert_vendor_saw_only_its_allowlist(&harness, &name, &awaitable);
+    assert_token_nowhere(&harness, &name, pid);
     let terminal = fs::read_to_string(harness.marker(&name, ".tty")).unwrap();
     println!(
         "evidence: the vendor's controlling terminal: {}",

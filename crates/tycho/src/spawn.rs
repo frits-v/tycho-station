@@ -25,6 +25,8 @@ use crate::config::{
     SESSION_WAIT_POLLS_MAX, ZMX_ENV,
 };
 use crate::config_store::PORT_OFFSET_ENV;
+use crate::credential_handoff::{socket_path, HandoffServer, CREDENTIAL_SOCKET_ENV};
+use crate::credentials::Credential;
 use crate::launch_spec::CORE_UID_ENV;
 use crate::launcher::{
     check_tier, check_vendor, HeartbeatTarget, LaunchSpec, VendorTerminal, AGENT_TELEMETRY_ENV,
@@ -127,6 +129,9 @@ pub struct SpawnRequest<'a> {
     pub ports: CorePorts,
     /// Where the launcher's `PATH` and the vendor's mise variables point.
     pub tool_prefix: &'a ToolPrefix,
+    /// The vendor credential the spawn step hands the launcher over the session's socket;
+    /// `None` starts the vendor with no credential from the core.
+    pub credential: Option<&'a Credential>,
 }
 
 /// Splits a trailing `--tier <tier>` off the port's argv: the vendor command and the tier.
@@ -252,6 +257,13 @@ pub fn launch_spec(request: &SpawnRequest<'_>) -> Result<LaunchSpec, SpawnerErro
             request.ports.offset.to_string(),
         );
     }
+    if request.credential.is_some() {
+        let socket = socket_path(request.dirs, &request.env.session_name);
+        environment.insert(
+            CREDENTIAL_SOCKET_ENV.to_string(),
+            socket.display().to_string(),
+        );
+    }
     let spec = LaunchSpec {
         schema_version: SPEC_SCHEMA_VERSION,
         environment,
@@ -307,12 +319,14 @@ pub fn typed_words(request: &SpawnRequest<'_>, spec: &Path) -> Result<Vec<String
     Ok(words)
 }
 
-/// Writes the spec privately, runs the launcher detached and returns its pid from `zmx list`.
+/// Writes the spec privately, serves the credential, runs the launcher detached and returns
+/// its pid from `zmx list`.
 pub fn start_detached(request: &SpawnRequest<'_>) -> Result<u32, SpawnerError> {
     let spec = launch_spec(request)?;
     ensure_agent_dirs(request.dirs)?;
     let spec_path = request.dirs.spec_path(&request.env.session_name);
     let words = typed_words(request, &spec_path)?;
+    let handoff = start_handoff(request)?;
     write_spec(&spec_path, &spec)?;
     let name = request.env.session_name.to_string();
     if let Err(error) = request.zmx.run_words(&name, &words) {
@@ -321,15 +335,43 @@ pub fn start_detached(request: &SpawnRequest<'_>) -> Result<u32, SpawnerError> {
         return Err(transient(error));
     }
     let pid = wait_for_pid(request, &name);
-    remove_spec_after_lease(request, &spec_path);
+    remove_spec_after_lease(request, &spec_path, handoff.as_ref());
+    // A launcher that got no credential refuses to start its vendor and reports that as its
+    // exit state, so the outcome here only closes the socket.
+    if let Some(server) = handoff {
+        drop(server.finish());
+    }
     pid
 }
 
-/// The launcher writes its lease only after reading the spec, so the core removes the spec
-/// then; across users the launcher cannot remove a file in a directory only the core writes.
-fn remove_spec_after_lease(request: &SpawnRequest<'_>, spec_path: &Path) {
+/// Binds the session's hand-off socket before the launcher can look for it.
+fn start_handoff(request: &SpawnRequest<'_>) -> Result<Option<HandoffServer>, SpawnerError> {
+    request
+        .credential
+        .map(|credential| {
+            HandoffServer::start(
+                request.dirs,
+                request.agent_uid,
+                &request.env.session_name,
+                &request.env.session_secret,
+                credential.clone(),
+            )
+            .map_err(|error| SpawnerError::Refused(error.to_string()))
+        })
+        .transpose()
+}
+
+/// The launcher asks for its credential before it writes its lease and writes the lease only
+/// after reading the spec, so the core removes the spec and closes the hand-off then; across
+/// users the launcher cannot remove a file in a directory only the core writes.
+fn remove_spec_after_lease(
+    request: &SpawnRequest<'_>,
+    spec_path: &Path,
+    handoff: Option<&HandoffServer>,
+) {
+    let handed = || handoff.is_none_or(HandoffServer::is_finished);
     for _ in 0..SESSION_WAIT_POLLS_MAX {
-        if !spec_path.exists() || matches!(own_lease(request), Some(true)) {
+        if (!spec_path.exists() && handed()) || matches!(own_lease(request), Some(true)) {
             break;
         }
         thread::sleep(POLL_INTERVAL);
@@ -519,6 +561,7 @@ mod tests {
             vendor_dir: None,
             ports: CorePorts::PRODUCTION,
             tool_prefix: &PRODUCTION_PREFIX,
+            credential: None,
         };
         let session = SessionName::parse(NAME).unwrap();
         write_durable(
@@ -576,6 +619,7 @@ mod tests {
             vendor_dir: None,
             ports: CorePorts::PRODUCTION,
             tool_prefix: &PRODUCTION_PREFIX,
+            credential: None,
         }
     }
 
@@ -801,6 +845,72 @@ mod tests {
             ensure_agent_dirs(&dirs),
             Err(SpawnerError::Refused(_))
         ));
+        fs::remove_dir_all(&dirs.socket_dir).unwrap();
+    }
+
+    #[test]
+    fn the_credential_travels_by_socket_never_by_spec_or_typed_line() {
+        use crate::credentials::tests::CLAUDE_TOKEN;
+        use crate::credentials::{CredentialVendor, CLAUDE_TOKEN_ENV};
+        let dirs = AgentDirs::new(PathBuf::from("/Users/Shared/tycho-agent-zmx")).unwrap();
+        let zmx = Zmx::agent(Path::new("/opt/zmx"), &dirs.socket_dir);
+        let env = env();
+        let vendor = ["/bin/sh".to_string()];
+        let credential =
+            Credential::parse(CredentialVendor::Claude, CLAUDE_TOKEN.as_bytes()).unwrap();
+        let request = SpawnRequest {
+            credential: Some(&credential),
+            ..shared_request(&dirs, &zmx, &env, &vendor)
+        };
+        let spec = launch_spec(&request).unwrap();
+        let socket = socket_path(&dirs, &env.session_name);
+        assert_eq!(
+            spec.environment
+                .get(CREDENTIAL_SOCKET_ENV)
+                .map(String::as_str),
+            Some(socket.display().to_string().as_str())
+        );
+        let spec_bytes = String::from_utf8(serde_json::to_vec(&spec).unwrap()).unwrap();
+        assert!(!spec_bytes.contains(CLAUDE_TOKEN) && !spec_bytes.contains(CLAUDE_TOKEN_ENV));
+        let words = typed_words(&request, &dirs.spec_path(&env.session_name)).unwrap();
+        assert!(
+            !words
+                .iter()
+                .any(|word| word.contains(CLAUDE_TOKEN) || word.contains(CLAUDE_TOKEN_ENV)),
+            "{words:?}"
+        );
+        assert!(!format!("{request:?}").contains(CLAUDE_TOKEN));
+        let without = launch_spec(&shared_request(&dirs, &zmx, &env, &vendor)).unwrap();
+        assert!(!without.environment.contains_key(CREDENTIAL_SOCKET_ENV));
+    }
+
+    #[test]
+    fn a_failed_zmx_run_closes_the_credential_socket() {
+        use crate::credentials::tests::CLAUDE_TOKEN;
+        use crate::credentials::CredentialVendor;
+        let dirs =
+            AgentDirs::new(PathBuf::from(format!("/tmp/tsc-{}", std::process::id()))).unwrap();
+        if dirs.socket_dir.exists() {
+            fs::remove_dir_all(&dirs.socket_dir).unwrap();
+        }
+        let zmx = Zmx::agent(Path::new("/usr/bin/false"), &dirs.socket_dir);
+        let env = env();
+        let vendor = ["/bin/true".to_string()];
+        let credential =
+            Credential::parse(CredentialVendor::Claude, CLAUDE_TOKEN.as_bytes()).unwrap();
+        let request = SpawnRequest {
+            credential: Some(&credential),
+            ..shared_request(&dirs, &zmx, &env, &vendor)
+        };
+        assert!(matches!(
+            start_detached(&request),
+            Err(SpawnerError::Transient(_))
+        ));
+        assert!(
+            dirs.spec_dir().exists(),
+            "the spec directory was never made"
+        );
+        assert!(!socket_path(&dirs, &env.session_name).exists());
         fs::remove_dir_all(&dirs.socket_dir).unwrap();
     }
 

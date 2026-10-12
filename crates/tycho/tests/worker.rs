@@ -35,6 +35,7 @@ use tycho::config::{
     RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
+use tycho::credentials::{self, CredentialVendor};
 use tycho::endpoint;
 use tycho::entire_graph::EntireGraph;
 use tycho::launch_spec::HeartbeatTarget;
@@ -364,6 +365,16 @@ fn worker_ports(core: &Core) -> (Arc<WorkerPorts>, CommitSha) {
     (Arc::new(ports), head)
 }
 
+/// The worker reaches the vendor only through the hand-off, so the test core holds the
+/// developer's stored token, which `tycho credentials set claude` put in the core home.
+fn copy_claude_credential(test_home: &Path) {
+    let production = config::core_home().unwrap();
+    let credential = credentials::load(&production, CredentialVendor::Claude)
+        .unwrap_or_else(|error| panic!("the worker suite needs a stored Claude token: {error}"));
+    credentials::store(test_home, &credential).unwrap();
+    println!("evidence: the test core holds the stored Claude token");
+}
+
 fn start(claim: PortClaim) -> (Core, TestEndpoint, Arc<WorkerPorts>) {
     let core = Core::new(claim);
     assert!(
@@ -372,6 +383,7 @@ fn start(claim: PortClaim) -> (Core, TestEndpoint, Arc<WorkerPorts>) {
     );
     let (workers, head) = worker_ports(&core);
     let factory = FactoryConfig::embedded().unwrap();
+    copy_claude_credential(&core.config.home);
     let spawner = LauncherSpawner::for_prefix(
         core.prefix.clone(),
         AgentDirs::new(core.agent.clone()).unwrap(),

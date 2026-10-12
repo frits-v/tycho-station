@@ -11,6 +11,8 @@ pub mod command;
 pub mod config;
 pub mod config_store;
 pub mod core;
+pub mod credential_handoff;
+pub mod credentials;
 pub mod endpoint;
 pub mod entire_graph;
 pub mod epic_command;

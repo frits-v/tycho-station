@@ -5,6 +5,7 @@
 //! result file the launcher decodes when the vendor exits.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,7 @@ use tycho_types::session::{SessionName, Vendor};
 use crate::agent_files::{current_uid, ensure_private_dir, read_checked, write_durable};
 use crate::command::{run_captured, run_captured_without};
 use crate::config::{COMMAND_TIMEOUT, MISE_PREFIX_ENV};
+use crate::credentials::{CLAUDE_TOKEN_ENV, CODEX_HOME_ENV};
 use crate::exit_decode::ChildEnd;
 use crate::launch_spec::{
     AGENT_TELEMETRY_ENV, PROGRESS_FILE_ENV, RESULT_FILE_ENV, VENDOR_SANDBOX_SETTINGS_ENV,
@@ -47,8 +49,9 @@ pub const ESCALATION_FILE: &str = "escalation.json";
 pub const ESCALATION_FILE_ENV: &str = "TYCHO_ESCALATION_FILE";
 pub const WORD_ESCALATION_INVALID: &str = "vendor_escalation_invalid";
 
-/// What the launcher hands the worker in its environment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What the launcher hands the worker in its environment; its `Debug` names the inherited
+/// variables without their values, one of which may be a credential.
+#[derive(Clone, PartialEq, Eq)]
 pub struct WorkerEnvironment {
     pub result: PathBuf,
     pub progress: PathBuf,
@@ -56,6 +59,24 @@ pub struct WorkerEnvironment {
     pub settings: String,
     pub inherited: Vec<(String, String)>,
     pub escalation: PathBuf,
+}
+
+impl fmt::Debug for WorkerEnvironment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<&str> = self
+            .inherited
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        formatter
+            .debug_struct("WorkerEnvironment")
+            .field("result", &self.result)
+            .field("progress", &self.progress)
+            .field("session", &self.session)
+            .field("inherited", &names)
+            .field("escalation", &self.escalation)
+            .finish_non_exhaustive()
+    }
 }
 
 fn required(environment: &BTreeMap<String, String>, name: &str) -> Result<String, WorkerError> {
@@ -69,7 +90,8 @@ impl WorkerEnvironment {
     pub fn from_map(environment: &BTreeMap<String, String>) -> Result<Self, WorkerError> {
         let session = SessionName::parse(&required(environment, ENV_SESSION_NAME)?)
             .map_err(|error| WorkerError::Argument(error.to_string()))?;
-        let inherited_names = ["HOME", "PATH"]
+        // The credential pair the launcher added: Claude's token, or the Codex home.
+        let inherited_names = ["HOME", "PATH", CLAUDE_TOKEN_ENV, CODEX_HOME_ENV]
             .into_iter()
             .chain(MISE_PREFIX_ENV)
             .chain(AGENT_TELEMETRY_ENV.iter().map(|(name, _)| *name));
@@ -99,7 +121,8 @@ impl WorkerEnvironment {
     }
 }
 
-/// HOME, PATH and telemetry from the launcher, the escalation path, USER and LOGNAME.
+/// HOME, PATH, telemetry and the credential pair from the launcher, the escalation path,
+/// USER and LOGNAME.
 #[must_use]
 pub fn vendor_environment(environment: &WorkerEnvironment, user: &str) -> Vec<(String, String)> {
     // The pinned Claude CLI finds its subscription login in the keychain under USER.
@@ -642,6 +665,32 @@ pub mod tests {
         )));
         assert!(names.contains(&"MISE_DATA_DIR") && names.contains(&"MISE_GLOBAL_CONFIG_FILE"));
         assert_eq!(names.len(), 7 + AGENT_TELEMETRY_ENV.len());
+    }
+
+    #[test]
+    fn the_credential_pair_reaches_the_vendor_and_nothing_else_of_the_launchers_does() {
+        let mut launcher = launcher_environment();
+        launcher.insert(
+            CLAUDE_TOKEN_ENV.to_string(),
+            "sk-ant-oat01-worker".to_string(),
+        );
+        launcher.insert(CODEX_HOME_ENV.to_string(), "/spool/codex-home".to_string());
+        launcher.insert(
+            "TYCHO_CREDENTIAL_SOCKET".to_string(),
+            "/a/specs/x.cred".to_string(),
+        );
+        let environment = WorkerEnvironment::from_map(&launcher).unwrap();
+        let pairs = vendor_environment(&environment, "agent");
+        assert!(pairs.contains(&(
+            CLAUDE_TOKEN_ENV.to_string(),
+            "sk-ant-oat01-worker".to_string()
+        )));
+        assert!(pairs.contains(&(CODEX_HOME_ENV.to_string(), "/spool/codex-home".to_string())));
+        assert!(!pairs
+            .iter()
+            .any(|(name, _)| name == "TYCHO_CREDENTIAL_SOCKET"));
+        assert_eq!(pairs.len(), 9 + AGENT_TELEMETRY_ENV.len());
+        assert!(!format!("{environment:?}").contains("sk-ant-oat01-worker"));
     }
 
     #[test]
