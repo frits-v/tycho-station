@@ -76,7 +76,8 @@ missing, a timeout), or unrecognised, which includes a probe that ran under any 
 agent's. Only a denial passes, except the agent's settings write, a listed gap whose outcome
 is printed as a measurement. The run ends with the number of boundaries examined and the
 count of each disposition; zero examined fails. The agent's walk to the canonical
-repository names the first directory that refuses it a search.
+repository names the first directory it cannot search, with `ls`'s line saying whether that
+directory refused it or was absent.
 
 ## Reporting
 

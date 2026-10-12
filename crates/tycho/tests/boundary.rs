@@ -363,11 +363,16 @@ const ADMIN_HEALTH: &str =
 const WRITE_OBJECTS: &str = ": > \"$1/objects/tycho-boundary-probe\" && echo \"wrote $1/objects\"";
 const WRITE_HOOK: &str = "/bin/mkdir -p \"$1/hooks\" && printf '#!/bin/sh\\nexit 0\\n' > \
      \"$1/hooks/pre-receive\" && echo \"wrote $1/hooks/pre-receive\"";
-/// Names the first directory on the way to `$1` that refuses a search, so a refusal of the
-/// canonical repository says which layer gave it.
-const LAYER_WALK: &str = "walked=''; IFS=/; for part in $1; do [ -z \"$part\" ] && continue; \
-     walked=\"$walked/$part\"; /bin/ls -d \"$walked/.\" > /dev/null 2>&1 || \
-     { echo \"first refused layer: $walked\"; exit 0; }; done; echo 'every layer searchable'";
+/// Names the first directory on the way to `$1` that the agent cannot search, with `ls`'s own
+/// line, so a refusal of the canonical repository says which layer gave it and whether that
+/// layer refused or was absent. Globbing is off and `$1` is split by parameter expansion,
+/// never by word splitting; each pass consumes one component.
+const LAYER_WALK: &str = "set -f; rest=${1#/}; walked=''; \
+     while [ -n \"$rest\" ]; do part=${rest%%/*}; \
+     case \"$rest\" in */*) rest=${rest#*/} ;; *) rest='' ;; esac; \
+     [ -z \"$part\" ] && continue; walked=\"$walked/$part\"; \
+     if ! line=$(/bin/ls -d \"$walked/.\" 2>&1 > /dev/null); then \
+     echo \"stopped at $walked: $line\"; exit 0; fi; done; echo 'every layer searchable'";
 /// git reports an unreadable repository as one that does not exist, so a failed push is
 /// followed by a look at the path, whose refusal names the cause. A step before the push that
 /// fails says so in a line that decodes as unrecognised, never as a refusal.
@@ -843,25 +848,58 @@ mod probes {
         );
     }
 
+    /// The walk's line for a path, which the walk reports as a reached outcome.
+    fn walk(path: &str) -> String {
+        match run_as_self(LAYER_WALK, &[path]) {
+            Outcome::Succeeded(line) => line,
+            other => panic!("the walk to {path} did not report: {other:?}"),
+        }
+    }
+
     #[test]
-    fn the_layer_walk_names_the_first_directory_that_refuses_a_search() {
+    fn the_layer_walk_tells_a_refused_layer_from_an_absent_one() {
         let owned = scratch("walk");
-        let inside = owned.0.join("a/b");
-        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir_all(owned.0.join("a/b")).unwrap();
         assert_eq!(
-            run_as_self(LAYER_WALK, &[inside.to_str().unwrap()]),
-            Outcome::Succeeded("every layer searchable".to_string())
+            walk(owned.0.join("a/b").to_str().unwrap()),
+            "every layer searchable"
         );
-        let refused = format!("{}/repositories/widget.git", root_home());
         let resolved_root = fs::canonicalize(root_home()).unwrap();
-        assert_eq!(
-            run_as_self(LAYER_WALK, &[resolved_root.join("x").to_str().unwrap()]),
-            Outcome::Succeeded(format!("first refused layer: {}", resolved_root.display()))
+        let refused = walk(
+            resolved_root
+                .join("repositories/widget.git")
+                .to_str()
+                .unwrap(),
         );
-        assert!(matches!(
-            run_as_self(LAYER_WALK, &[&refused]),
-            Outcome::Succeeded(text) if text.starts_with("first refused layer: ")
-        ));
+        assert!(
+            refused.starts_with(&format!("stopped at {}: ", resolved_root.display()))
+                && refused.contains("Permission denied"),
+            "{refused}"
+        );
+        let missing = owned.0.join("absent");
+        let absent = walk(missing.join("widget.git").to_str().unwrap());
+        assert!(
+            absent.starts_with(&format!("stopped at {}: ", missing.display()))
+                && absent.contains("No such file or directory"),
+            "{absent}"
+        );
+    }
+
+    #[test]
+    fn the_layer_walk_takes_a_glob_character_literally() {
+        let owned = scratch("walk-glob");
+        fs::create_dir_all(owned.0.join("a/c")).unwrap();
+        let star = owned.0.join("*");
+        let line = walk(star.join("c").to_str().unwrap());
+        assert!(
+            line.starts_with(&format!("stopped at {}: ", star.display()))
+                && line.contains("No such file or directory"),
+            "the walk expanded {}: {line}",
+            star.display()
+        );
+        let spaced = owned.0.join("a b");
+        fs::create_dir_all(&spaced).unwrap();
+        assert_eq!(walk(spaced.to_str().unwrap()), "every layer searchable");
     }
 
     #[test]
