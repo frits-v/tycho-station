@@ -45,3 +45,23 @@ rules:
       - metavariable-regex:
           metavariable: $SUBCOMMAND
           regex: '^"(bench|build|check|clippy|doc|install|run|rustc|test)"$'
+
+  - id: rust-git-inherits-hook-environment
+    message: >-
+      A git child inherits GIT_DIR and the rest of a hook's environment and acts on the
+      repository that ran the hook. Start git through `tycho_types::git_environment::git_command`,
+      or a runner given `git_environment_removed()`, or clear the environment.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      exclude:
+        - "crates/tycho-types/src/git_environment.rs"
+    patterns:
+      - pattern-either:
+          - pattern: Command::new("git")
+          - pattern: std::process::Command::new("git")
+      - pattern-not-inside: Command::new("git").env_clear()
+      - pattern-not-inside: |
+          let mut $COMMAND = Command::new("git");
+          $COMMAND.env_clear();
+          ...

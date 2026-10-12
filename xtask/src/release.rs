@@ -12,6 +12,7 @@ use crate::app_token::{
 };
 use crate::process::{run_bounded, Captured, Exit};
 use std::time::Duration;
+use tycho_types::git_environment::git_command;
 
 const RELEASE_PLZ_TIMEOUT: Duration = Duration::from_secs(600);
 const DIST_TIMEOUT: Duration = Duration::from_secs(1800);
@@ -306,7 +307,7 @@ fn report_release_pr(captured: Captured) -> i32 {
 }
 
 fn git_in(dir: &Path, args: &[&str]) -> Captured {
-    run_bounded(Command::new("git").current_dir(dir).args(args), GIT_TIMEOUT)
+    run_bounded(git_command().current_dir(dir).args(args), GIT_TIMEOUT)
 }
 
 fn remove_dry_run_worktree(root: &Path) -> bool {

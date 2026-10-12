@@ -62,3 +62,20 @@ fn let_bound_cargo_commands() {
     // ok: rust-cargo-build-bypasses-mbx
     listing.args(["metadata", "--no-deps"]);
 }
+
+fn git_commands() {
+    // ruleid: rust-git-inherits-hook-environment
+    run(Command::new("git").args(["init", "-q"]));
+    // ruleid: rust-git-inherits-hook-environment
+    let status = std::process::Command::new("git").arg("status").status();
+    // ruleid: rust-git-inherits-hook-environment
+    let mut listing = Command::new("git");
+    listing.args(["ls-files"]);
+    // ok: rust-git-inherits-hook-environment
+    run(git_command().args(["init", "-q"]));
+    // ok: rust-git-inherits-hook-environment
+    run(Command::new("git").env_clear().args(["init", "-q"]));
+    // ok: rust-git-inherits-hook-environment
+    let mut cleared = Command::new("git");
+    cleared.env_clear();
+}

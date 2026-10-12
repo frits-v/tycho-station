@@ -16,11 +16,12 @@ use serde_json::{json, Value};
 use tycho_types::envelope::{
     CommitSha, Envelope, EscalationPayload, Payload, RecordId, ResultPayload, ENVELOPE_MAX_BYTES,
 };
+use tycho_types::git_environment::git_environment_removed;
 use tycho_types::launcher::ENV_SESSION_NAME;
 use tycho_types::session::{SessionName, Vendor};
 
 use crate::agent_files::{current_uid, ensure_private_dir, read_checked, write_durable};
-use crate::command::run_captured;
+use crate::command::{run_captured, run_captured_without};
 use crate::config::COMMAND_TIMEOUT;
 use crate::exit_decode::ChildEnd;
 use crate::launch_spec::{
@@ -284,10 +285,11 @@ fn write_conclusion(path: &Path, conclusion: &Conclusion) -> Result<(), String> 
 /// The worktree's HEAD, read by the worker after the vendor exits.
 pub fn head_commit(worktree: &Path) -> Result<CommitSha, String> {
     let worktree = worktree.display().to_string();
-    let captured = run_captured(
+    let captured = run_captured_without(
         Path::new("git"),
         &["-C", &worktree, "rev-parse", "--verify", "HEAD"],
         &[("GIT_CONFIG_NOSYSTEM", "1")],
+        &git_environment_removed(),
         COMMAND_TIMEOUT,
     )
     .map_err(|error| error.to_string())?;

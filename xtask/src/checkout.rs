@@ -3,8 +3,9 @@
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
+
+use tycho_types::git_environment::git_command;
 
 use crate::process::{run_bounded, Exit};
 
@@ -96,7 +97,7 @@ pub fn describe_revision(commit: &str, uncommitted: usize) -> String {
 /// The commit checked out at `root`.
 pub fn head_commit(root: &Path) -> Result<String, String> {
     let head = run_bounded(
-        Command::new("git")
+        git_command()
             .arg("-C")
             .arg(root)
             .args(["rev-parse", "HEAD"]),
@@ -108,7 +109,7 @@ pub fn head_commit(root: &Path) -> Result<String, String> {
 /// How many paths in `root` differ from its commit.
 pub fn uncommitted(root: &Path) -> Result<usize, String> {
     let status = run_bounded(
-        Command::new("git")
+        git_command()
             .arg("-C")
             .arg(root)
             .args(["status", "--porcelain"]),
@@ -211,7 +212,8 @@ mod tests {
     }
 
     fn git(root: &Path, arguments: &[&str]) {
-        let status = Command::new("git")
+        crate::refuse_hook_environment();
+        let status = git_command()
             .arg("-C")
             .arg(root)
             .args(["-c", "user.name=xtask", "-c", "user.email=xtask@localhost"])

@@ -49,6 +49,7 @@ use tycho::services::{Ports, Timing};
 use tycho::spool::ACKNOWLEDGED_SUFFIX;
 use tycho::zmx::Zmx;
 use tycho_types::envelope::CommitSha;
+use tycho_types::git_environment::git_command;
 use tycho_types::service::handler;
 use tycho_types::session::SessionName;
 use tycho_types::task_packet::RoutingName;
@@ -302,7 +303,7 @@ fn post(core_ports: CorePorts, path: &str, body: &str) -> (u16, String) {
 }
 
 fn git(repository: &Path, arguments: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repository)
         .args(arguments)
