@@ -62,6 +62,8 @@ Steps and the question each one answers:
    directories, write the agent's own settings file, reach the Restate admin port,
    write to the canonical repository, edit its hooks directory, push to its default
    branch. All must fail. Then the positive gate path to a throwaway remote.
+   `crates/tycho/tests/boundary.rs`, run with `mise run boundary-tests` from a terminal,
+   since sudo asks for the developer's password to run each probe as the agent.
 6. Attach tests: a Ghostty tab as the developer attaches to a zmx session owned by the
    agent user through the shared socket directory; the reader opens that tab through
    AppleScript while running under zmx and under launchd, and the Automation consent

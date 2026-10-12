@@ -52,6 +52,30 @@ The developer shell sets `noclobber`: `mise run ci > ci.log` onto an existing `c
 fails with "file exists" before mise starts, and a following `echo $? >> ci.log` appends
 `1` to whatever an earlier run left there. Write a log with `>|` or under a new name.
 
+## Live suites
+
+The suites that start real processes are ignored tests, run by their mise tasks on macOS;
+`xtask ci` builds them and skips them.
+
+| Task | Needs |
+|---|---|
+| `kill-tests`, `spine-tests`, `launcher-tests`, `chaos-tests` | the mise tools; they run at the same time, each test core on its own port slot |
+| `worker-tests`, `control-tests` | the developer's Claude login, and `graph-plugin` for the worker suite; one at a time |
+| `graph-tests` | `mise run graph-plugin` |
+| `boundary-tests` | a terminal and the provisioned agent user: sudo asks for the developer's password on the terminal to run each probe as `tycho-agent` |
+
+The boundary suite refuses to start when stdin is not a terminal, and when `sudo -n` runs as
+the agent with no password after `sudo -k`, since nothing in the station installs such a
+rule; it prints which answer it saw. `run_as_agent` in the suite is the one place the
+identity switch is made. Each probe ends with a line naming the uid it ran as and its exit
+status, and decodes to one of four states: denied (permission denied, not permitted, git
+write refused, or connection refused, named), succeeded (the boundary is open; the line
+shows what the agent reached), could not run (sudo refused, the user or the target is
+missing, a timeout), or unrecognised, which includes a probe that ran under any uid but the
+agent's. Only a denial passes, except the agent's settings write, a listed gap whose outcome
+is printed as a measurement. The run ends with the number of boundaries examined and the
+count of each disposition; zero examined fails.
+
 ## Reporting
 
 A report leads with the outcome. It states what was verified and how, what was not and
