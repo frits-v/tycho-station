@@ -31,7 +31,7 @@ use restate_sdk::prelude::HttpServer;
 use serde_json::{json, Value};
 use tycho::agent_files::current_uid;
 use tycho::config::{
-    self, AgentDirs, CoreConfig, CorePorts, PortClaim, HOME_ENV, MISE_NO_INSTALL,
+    self, AgentDirs, CoreConfig, CorePorts, PortClaim, ToolPrefix, HOME_ENV, MISE_NO_INSTALL,
     RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
@@ -372,6 +372,7 @@ fn start(claim: PortClaim) -> (Core, TestEndpoint, Arc<WorkerPorts>) {
         agent_uid: current_uid(),
         heartbeat: HeartbeatTarget::Session,
         ports: core.config.ports,
+        tool_prefix: ToolPrefix::new(env::temp_dir().join("tycho-test-prefix")).unwrap(),
     };
     let ports = Ports {
         spawner: Arc::new(spawner),

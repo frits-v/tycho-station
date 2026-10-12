@@ -32,8 +32,8 @@ use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tycho::agent_files::current_uid;
 use tycho::config::{
-    AgentDirs, CoreConfig, CorePorts, PortClaim, AGENT_USER_ENV, HOME_ENV, MISE_NO_INSTALL,
-    RESTATE_SERVER_ENV, ZMX_ENV,
+    AgentDirs, CoreConfig, CorePorts, PortClaim, ToolPrefix, AGENT_USER_ENV, HOME_ENV,
+    MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
 use tycho::kill::{kill_session, KillRequest};
@@ -157,6 +157,7 @@ impl Spawner for LauncherSpawner {
             terminal,
             vendor_dir: dir.as_deref(),
             ports: self.core_ports,
+            tool_prefix: &scratch_prefix(),
         })?;
         println!("evidence: spawn_session({}) -> {outcome:?}", spec.session);
         match outcome {
@@ -1062,4 +1063,10 @@ fn claim_ports(home: &Path) -> PortClaim {
     let claim = CorePorts::claim(home).unwrap_or_else(|error| panic!("{error}"));
     println!("evidence: {claim}");
     claim
+}
+
+/// A prefix with no tools recorded, so a test session's `PATH` never reaches the host's
+/// installed prefix; the vendor runs by the absolute path the test hands it.
+fn scratch_prefix() -> ToolPrefix {
+    ToolPrefix::new(std::env::temp_dir().join("tycho-test-prefix")).unwrap()
 }

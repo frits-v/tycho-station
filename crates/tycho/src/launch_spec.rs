@@ -13,7 +13,7 @@ use tycho_types::launcher::{EnvError, LauncherEnv, ENV_SESSION_NAME, ENV_VALUE_M
 use tycho_types::service::Service;
 
 use crate::agent_files::{read_checked, shred};
-use crate::config::{AgentDirs, CorePorts, AGENT_DIR_ENV, ZMX_ENV};
+use crate::config::{AgentDirs, CorePorts, AGENT_DIR_ENV, MISE_PREFIX_ENV, ZMX_ENV};
 use crate::config_store::{PortOffset, PortOffsetError, PORT_OFFSET_ENV};
 use crate::launch_probe::LAUNCH_PROBE_SERVICE;
 
@@ -52,7 +52,8 @@ pub const VENDOR_TERM: &str = "xterm-256color";
 /// The names of the spec's environment that reach the vendor; everything else stays with
 /// the launcher.
 const VENDOR_SPEC_ENV: [&str; 2] = [ENV_SESSION_NAME, VENDOR_SANDBOX_SETTINGS_ENV];
-/// What the vendor inherits from the launcher's own environment.
+/// What the vendor inherits from the launcher's own environment besides the mise variables:
+/// its home and the `PATH` that starts at the tool prefix.
 const VENDOR_PROCESS_ENV: [&str; 2] = ["HOME", "PATH"];
 const GROUP_AND_OTHER_WRITE_BITS: u32 = 0o022;
 const STICKY_BIT: u32 = 0o1000;
@@ -270,7 +271,8 @@ impl LauncherSettings {
     #[must_use]
     pub fn vendor_environment(&self, progress: &Path, result: &Path) -> Vec<(String, String)> {
         let mut pairs = self.vendor_env.clone();
-        for name in VENDOR_PROCESS_ENV {
+        // The mise variables keep any mise the vendor starts on the prefix, offline.
+        for name in VENDOR_PROCESS_ENV.into_iter().chain(MISE_PREFIX_ENV) {
             if let Ok(value) = std::env::var(name) {
                 pairs.push((name.to_string(), value));
             }
@@ -564,6 +566,12 @@ pub mod tests {
             "TYCHO_VENDOR_SANDBOX_SETTINGS",
             "USER",
         ];
+        // The mise variables pass from the launcher's environment when it has them.
+        expected.extend(
+            MISE_PREFIX_ENV
+                .into_iter()
+                .filter(|name| std::env::var_os(name).is_some()),
+        );
         expected.sort_unstable();
         assert_eq!(names, expected);
         assert!(!pairs

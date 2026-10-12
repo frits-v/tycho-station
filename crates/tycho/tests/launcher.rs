@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use restate_sdk::prelude::{Endpoint, HttpServer};
 use tycho::agent_files::current_uid;
 use tycho::config::{
-    AgentDirs, CoreConfig, CorePorts, CoreRole, PortClaim, AGENT_USER_ENV, HOME_ENV,
+    AgentDirs, CoreConfig, CorePorts, CoreRole, PortClaim, ToolPrefix, AGENT_USER_ENV, HOME_ENV,
     MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::health::{self, Health};
@@ -205,6 +205,7 @@ impl Harness {
             terminal: VendorTerminal::Files,
             vendor_dir: None,
             ports: self.config.ports,
+            tool_prefix: &scratch_prefix(),
         })
         .unwrap();
         println!("evidence: spawn_session({name}) -> {outcome:?}");
@@ -669,4 +670,10 @@ fn claim_ports(home: &Path) -> PortClaim {
     let claim = CorePorts::claim(home).unwrap_or_else(|error| panic!("{error}"));
     println!("evidence: {claim}");
     claim
+}
+
+/// A prefix with no tools recorded, so a test session's `PATH` never reaches the host's
+/// installed prefix; the vendor runs by the absolute path the test hands it.
+fn scratch_prefix() -> ToolPrefix {
+    ToolPrefix::new(std::env::temp_dir().join("tycho-test-prefix")).unwrap()
 }

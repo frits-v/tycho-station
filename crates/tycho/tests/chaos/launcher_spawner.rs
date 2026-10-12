@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tycho::agent_files::current_uid;
-use tycho::config::{AgentDirs, CorePorts};
+use tycho::config::{AgentDirs, CorePorts, ToolPrefix};
 use tycho::kill::{kill_session, reap, KillRequest, KillVerdict};
 use tycho::launcher::{HeartbeatTarget, VendorTerminal};
 use tycho::launcher::{SessionFiles, VendorRecord};
@@ -180,6 +180,7 @@ impl LauncherSpawner {
             terminal: VendorTerminal::Files,
             vendor_dir: None,
             ports: self.inner.core_ports,
+            tool_prefix: &scratch_prefix(),
         })
     }
 
@@ -341,4 +342,10 @@ impl Drop for AgentGuard {
             "teardown: {left} agent sessions remain"
         );
     }
+}
+
+/// A prefix with no tools recorded, so a test session's `PATH` never reaches the host's
+/// installed prefix; the vendor runs by the absolute path the test hands it.
+fn scratch_prefix() -> ToolPrefix {
+    ToolPrefix::new(std::env::temp_dir().join("tycho-test-prefix")).unwrap()
 }
