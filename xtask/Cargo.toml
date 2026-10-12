@@ -9,6 +9,7 @@ base64 = "=0.22.1"
 flate2 = "=1.1.10"
 jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 libc = "=0.2.190"
+nix = { version = "=0.31.3", default-features = false, features = ["fs"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
 serde_json = "1"
 sha2 = "=0.10.9"

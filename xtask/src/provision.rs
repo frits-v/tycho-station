@@ -6,6 +6,8 @@
 //! passes a password. Root changes no owner and one mode: the agent home's, whose entry sits in
 //! root-owned `/Users`, where no other user can swap it. In `/Users/Shared`, which every user
 //! can write, the entry's owner could swap it for a link between the probe and the change.
+//! The shared tool prefix needs no root step: the developer creates and fills it
+//! (`prefix_install`).
 
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
 use std::io::{self, IsTerminal};
@@ -14,11 +16,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use crate::prefix_install;
 use crate::process::{self, Captured, Exit};
 use crate::setup::{
     self, AgentHome, AgentHomeState, Check, Finding, Identity, Side, Status, AGENT_GROUP_NAME,
     AGENT_HOME, AGENT_HOME_MODE, AGENT_SOCKET_DIR, AGENT_SOCKET_DIR_MODE, AGENT_USER_NAME,
     CORE_SOCKET_DIR_MODE, HOME_DENY_ENTRY, SHARED_GROUP_NAME,
+};
+use crate::tool_prefix::{
+    self, AgentTool, DirectoryState, Prefix, StationState, ToolState, TreeState,
+    MISE_PINNED_VERSION,
 };
 
 const PROVISION_STEPS_MAX: usize = 16;
@@ -43,12 +50,31 @@ const CREATE_MODE: u32 = 0o700;
 /// What sudo writes to stderr after a mistyped password that a later attempt corrected.
 const SUDO_RETRY_LINE: &str = "Sorry, try again.";
 
-const OPERATOR_STEPS: [&str; 4] = [
-    "as tycho-agent, from a terminal in that account (`sudo -iu tycho-agent` or a login session): `claude` (subscription login) and `codex login` (ChatGPT plan); each login is a flow in that user's session",
-    "as tycho-agent: `git config --global credential.helper \"\"`, which clears every credential helper git reads, Apple's osxkeychain included",
-    "optional, as the developer, if the entire mirror is the sync remote: `entire auth`",
-    "then `mise run setup` as tycho-agent",
-];
+/// The commands the operator types in the agent's shell, from a terminal in that account:
+/// the claude login (subscription), the codex login (its plan login), the cleared credential
+/// helper, then the agent side of setup. Each runs the pinned install by absolute path with
+/// its environment set in full, so nothing in the agent's shell files or working directory
+/// decides what runs.
+fn operator_commands(prefix: &Prefix) -> Result<[String; 4], String> {
+    let environment = prefix.agent_environment_words()?;
+    let claude = prefix.tool_binary(
+        AgentTool::Claude,
+        &tool_prefix::pinned_version(AgentTool::Claude)?,
+    );
+    let codex = prefix.tool_binary(
+        AgentTool::Codex,
+        &tool_prefix::pinned_version(AgentTool::Codex)?,
+    );
+    Ok([
+        format!("env {environment} {}", claude.display()),
+        format!("env {environment} {} login", codex.display()),
+        "git config --global credential.helper \"\"".to_string(),
+        format!(
+            "{} setup",
+            prefix.binary(tool_prefix::StationBinary::Xtask).display()
+        ),
+    ])
+}
 
 /// Every remedy, in the order each one's prerequisites come first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,9 +90,13 @@ enum Remedy {
     RemoveForeignAgentSocketDir,
     PrepareAgentSocketDir,
     PrepareCoreSocketDir,
+    CreateToolPrefix,
+    InstallMise,
+    InstallAgentTools,
+    InstallStationBinaries,
 }
 
-const REMEDIES: [Remedy; 11] = [
+const REMEDIES: [Remedy; 15] = [
     Remedy::CreateAgentGroup,
     Remedy::CreateAgentUser,
     Remedy::CreateAgentHome,
@@ -78,6 +108,10 @@ const REMEDIES: [Remedy; 11] = [
     Remedy::RemoveForeignAgentSocketDir,
     Remedy::PrepareAgentSocketDir,
     Remedy::PrepareCoreSocketDir,
+    Remedy::CreateToolPrefix,
+    Remedy::InstallMise,
+    Remedy::InstallAgentTools,
+    Remedy::InstallStationBinaries,
 ];
 const _: () = assert!(REMEDIES.len() <= PROVISION_STEPS_MAX);
 
@@ -111,6 +145,10 @@ impl Remedy {
             }
             Self::PrepareAgentSocketDir => "prepare the agent socket directory",
             Self::PrepareCoreSocketDir => "prepare the core socket directory",
+            Self::CreateToolPrefix => "create the shared tool prefix",
+            Self::InstallMise => "install the pinned mise into the tool prefix",
+            Self::InstallAgentTools => "install the agent's tools into the tool prefix",
+            Self::InstallStationBinaries => "build and install the station binaries",
         }
     }
 
@@ -127,6 +165,10 @@ impl Remedy {
             Self::RemoveForeignAgentSocketDir => &[Check::AgentDirOwnerUid],
             Self::PrepareAgentSocketDir => &AGENT_DIR_CHECKS,
             Self::PrepareCoreSocketDir => &CORE_DIR_CHECKS,
+            Self::CreateToolPrefix => &[Check::PrefixDirectory, Check::PrefixTree],
+            Self::InstallMise => &[Check::PrefixMise],
+            Self::InstallAgentTools => &[Check::PrefixClaude, Check::PrefixCodex, Check::PrefixZmx],
+            Self::InstallStationBinaries => &[Check::PrefixStationXtask, Check::PrefixStationTycho],
         }
     }
 }
@@ -144,6 +186,8 @@ pub struct Snapshot {
     developer_home: Option<PathBuf>,
     core_dir: Option<PathBuf>,
     core_parent_missing: bool,
+    /// The prefix probe the prefix findings were made from.
+    prefix: tool_prefix::Probe,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,6 +323,57 @@ fn narrow_home_need(snapshot: &Snapshot) -> Need {
     }
 }
 
+/// A prefix another user owns, or that is a link, is left to the operator; nothing is
+/// installed into it.
+fn prefix_need(snapshot: &Snapshot, then: impl FnOnce(&tool_prefix::Probe) -> Need) -> Need {
+    match &snapshot.prefix.directory {
+        DirectoryState::Foreign(_) => Need::Skip,
+        DirectoryState::Unreachable(why) => Need::Blocked(why.clone()),
+        DirectoryState::Settled | DirectoryState::Missing | DirectoryState::WrongMode(_) => {
+            then(&snapshot.prefix)
+        }
+    }
+}
+
+fn create_prefix_need(probe: &tool_prefix::Probe) -> Need {
+    match (&probe.directory, &probe.tree) {
+        (DirectoryState::Settled, TreeState::Unreachable(why)) => Need::Blocked(why.clone()),
+        (DirectoryState::Settled, TreeState::Closed { .. } | TreeState::Open { .. }) => Need::Skip,
+        _ => Need::Run,
+    }
+}
+
+fn tool_need<'state>(states: impl IntoIterator<Item = &'state ToolState>) -> Need {
+    let mut need = Need::Skip;
+    for state in states {
+        match state {
+            ToolState::Pinned => {}
+            ToolState::Absent
+            | ToolState::WrongVersion(_)
+            | ToolState::WrongSource(_)
+            | ToolState::Modified(_) => {
+                need = Need::Run;
+            }
+            ToolState::Unreachable(why) => return Need::Blocked(why.clone()),
+        }
+    }
+    need
+}
+
+fn station_need(probe: &tool_prefix::Probe) -> Need {
+    let mut need = Need::Skip;
+    for (_, state) in &probe.station {
+        match state {
+            StationState::Current => {}
+            StationState::Absent | StationState::Modified(_) | StationState::Stale { .. } => {
+                need = Need::Run;
+            }
+            StationState::Unreachable(why) => return Need::Blocked(why.clone()),
+        }
+    }
+    need
+}
+
 fn need(remedy: Remedy, snapshot: &Snapshot) -> Need {
     let absence = |check| need_for_absence(&status_of(snapshot, check));
     match remedy {
@@ -295,6 +390,12 @@ fn need(remedy: Remedy, snapshot: &Snapshot) -> Need {
         Remedy::RemoveForeignAgentSocketDir => remove_agent_dir_need(snapshot),
         Remedy::PrepareAgentSocketDir => prepare_agent_dir_need(snapshot),
         Remedy::PrepareCoreSocketDir => prepare_core_dir_need(snapshot),
+        Remedy::CreateToolPrefix => prefix_need(snapshot, create_prefix_need),
+        Remedy::InstallMise => prefix_need(snapshot, |probe| tool_need([&probe.mise])),
+        Remedy::InstallAgentTools => prefix_need(snapshot, |probe| {
+            tool_need(probe.tools.iter().map(|(_, _, state)| state))
+        }),
+        Remedy::InstallStationBinaries => prefix_need(snapshot, station_need),
     }
 }
 
@@ -367,6 +468,57 @@ enum Action {
         words: Vec<String>,
         directory: PathBuf,
     },
+    /// A step of the shared tool prefix, as the developer.
+    Prefix(PrefixStep),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrefixStep {
+    CreateDirectories,
+    InstallMise,
+    InstallAgentTools,
+    InstallStation,
+}
+
+/// What a prefix step does, as an operator would read it.
+fn render_prefix(step: PrefixStep, prefix: &Prefix) -> Vec<String> {
+    let root = prefix.root().display();
+    let mut lines = match step {
+        PrefixStep::CreateDirectories => vec![format!(
+            "mkdir -m 0755 {root} {} {}",
+            prefix.bin().display(),
+            prefix.data_dir().display()
+        )],
+        PrefixStep::InstallMise => vec![
+            format!("download mise {MISE_PINNED_VERSION} and SHASUMS256.txt from github.com/jdx/mise releases"),
+            "require the published sha256 and the download's to equal the pinned digest".to_string(),
+            format!("install as {}, mode 0755", prefix.mise().display()),
+        ],
+        PrefixStep::InstallAgentTools => {
+            let pins = tool_prefix::global_config().map_or_else(
+                |why| why,
+                |config| config.lines().skip(1).collect::<Vec<_>>().join(", "),
+            );
+            vec![
+                format!("write {}: {pins}", prefix.global_config().display()),
+                format!(
+                    "umask 022; {} install, from / with only the prefix in the environment",
+                    prefix.mise().display()
+                ),
+                format!(
+                    "record each tool's executable, which mise which must name, and its install's sha256 in {}",
+                    prefix.manifest().display()
+                ),
+            ]
+        }
+        PrefixStep::InstallStation => vec![
+            "mbx build --release --locked -p xtask -p tycho".to_string(),
+            format!("install target/release/xtask and tycho into {}, mode 0755", prefix.bin().display()),
+            format!("record their sha256 and the commit in {}", prefix.manifest().display()),
+        ],
+    };
+    lines.push("(as the developer)".to_string());
+    lines
 }
 
 fn strings(words: &[&str]) -> Vec<String> {
@@ -478,6 +630,10 @@ fn action(remedy: Remedy, snapshot: &Snapshot) -> Option<Action> {
         Remedy::RemoveForeignAgentSocketDir => Action::Root(strings(&[RMDIR, AGENT_SOCKET_DIR])),
         Remedy::PrepareAgentSocketDir => Action::Directory(agent_dir_work(snapshot)),
         Remedy::PrepareCoreSocketDir => Action::Directory(core_dir_work(snapshot)?),
+        Remedy::CreateToolPrefix => Action::Prefix(PrefixStep::CreateDirectories),
+        Remedy::InstallMise => Action::Prefix(PrefixStep::InstallMise),
+        Remedy::InstallAgentTools => Action::Prefix(PrefixStep::InstallAgentTools),
+        Remedy::InstallStationBinaries => Action::Prefix(PrefixStep::InstallStation),
     })
 }
 
@@ -515,6 +671,7 @@ fn render(action: &Action) -> Vec<String> {
             let shown: Vec<String> = words.iter().map(|word| shell_word(word)).collect();
             vec![shown.join(" "), "(as the developer)".to_string()]
         }
+        Action::Prefix(step) => render_prefix(*step, &Prefix::production()),
     }
 }
 
@@ -640,6 +797,8 @@ pub trait Host {
         directory: &Path,
         developer_uid: u32,
     ) -> Result<Captured, String>;
+    /// Runs one step of the shared tool prefix as the developer.
+    fn run_prefix_step(&mut self, step: PrefixStep, developer: &Identity) -> Result<(), String>;
     /// Prints the setup report and returns its exit code.
     fn report(&mut self, developer: &Identity) -> i32;
 }
@@ -652,6 +811,8 @@ impl Host for SystemHost {
         let developer = setup::current_identity()?;
         let (mut findings, agent_home) = setup::record_probe(&developer);
         findings.extend(setup::agent_record_findings());
+        let prefix = tool_prefix::Probe::read(&Prefix::production(), &developer);
+        findings.extend(prefix.findings());
         let developer_home = setup::resolve_home(&developer.username).ok();
         let core_dir = developer_home
             .as_deref()
@@ -674,6 +835,7 @@ impl Host for SystemHost {
             core_parent_missing,
             developer,
             findings,
+            prefix,
         })
     }
 
@@ -712,6 +874,20 @@ impl Host for SystemHost {
         ))
     }
 
+    fn run_prefix_step(&mut self, step: PrefixStep, developer: &Identity) -> Result<(), String> {
+        let prefix = Prefix::production();
+        match step {
+            PrefixStep::CreateDirectories => {
+                prefix_install::create_directories(&prefix, developer.uid)
+            }
+            PrefixStep::InstallMise => prefix_install::install_mise(&prefix),
+            PrefixStep::InstallAgentTools => {
+                prefix_install::install_agent_tools(&prefix, developer)
+            }
+            PrefixStep::InstallStation => prefix_install::install_station(&prefix),
+        }
+    }
+
     fn report(&mut self, developer: &Identity) -> i32 {
         let produced = setup::developer_findings(developer);
         let mut findings = setup::assemble(Side::Developer, &produced);
@@ -731,7 +907,7 @@ impl Host for SystemHost {
 /// Opens a real directory the developer owns. The path is checked without following links,
 /// then opened with `O_NOFOLLOW`, and the opened inode must be the checked one, so a link or
 /// another directory swapped in between is refused rather than followed.
-fn open_own_directory(path: &Path, developer_uid: u32) -> Result<File, String> {
+pub fn open_own_directory(path: &Path, developer_uid: u32) -> Result<File, String> {
     let shown = path.display();
     let checked = fs::symlink_metadata(path).map_err(|error| format!("{shown}: {error}"))?;
     if !checked.file_type().is_dir() {
@@ -758,7 +934,7 @@ fn open_own_directory(path: &Path, developer_uid: u32) -> Result<File, String> {
 }
 
 /// Creates one level; an existing level must already be a real directory the developer owns.
-fn create_level(path: &Path, developer_uid: u32) -> Result<(), String> {
+pub fn create_level(path: &Path, developer_uid: u32) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(_) => open_own_directory(path, developer_uid).map(drop),
         Err(error) if error.kind() == io::ErrorKind::NotFound => DirBuilder::new()
@@ -853,6 +1029,7 @@ fn execute(host: &mut impl Host, action: &Action, snapshot: &Snapshot) -> Result
             }
             host.prepare_directory(work, snapshot.developer.uid)
         }
+        Action::Prefix(step) => host.run_prefix_step(*step, &snapshot.developer),
     }
 }
 
@@ -963,9 +1140,16 @@ fn print_plan(plan: &Plan, snapshot: &Snapshot) {
 
 fn print_operator_steps() {
     println!("xtask provision-agent: left to the operator");
-    for step in OPERATOR_STEPS {
-        println!("  - {step}");
+    println!("  in the agent's shell (sudo -iu tycho-agent, or a login session), in this order:");
+    match operator_commands(&Prefix::production()) {
+        Ok(commands) => {
+            for command in commands {
+                println!("    {command}");
+            }
+        }
+        Err(why) => println!("    the commands cannot be shown: {why}"),
     }
+    println!("  optional, as the developer, if the entire mirror is the sync remote: entire auth");
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1069,8 +1253,35 @@ mod tests {
         }
     }
 
+    fn settled_prefix() -> tool_prefix::Probe {
+        tool_prefix::Probe {
+            directory: DirectoryState::Settled,
+            tree: TreeState::Closed { examined: 93 },
+            mise: ToolState::Pinned,
+            tools: tool_prefix::AgentTool::ALL
+                .iter()
+                .map(|&tool| (tool, tool_prefix::pinned_version(tool), ToolState::Pinned))
+                .collect(),
+            station: tool_prefix::StationBinary::ALL
+                .iter()
+                .map(|&binary| (binary, StationState::Current))
+                .collect(),
+        }
+    }
+
+    /// Sets the prefix probe and the findings made from it, as `SystemHost::snapshot` does.
+    fn with_prefix(mut snapshot: Snapshot, prefix: tool_prefix::Probe) -> Snapshot {
+        let findings = prefix.findings();
+        snapshot
+            .findings
+            .retain(|kept| findings.iter().all(|finding| finding.check != kept.check));
+        snapshot.findings.extend(findings);
+        snapshot.prefix = prefix;
+        snapshot
+    }
+
     fn all_present() -> Snapshot {
-        Snapshot {
+        let snapshot = Snapshot {
             developer: identity("frits", DEVELOPER_UID),
             findings: RECORD_CHECKS
                 .iter()
@@ -1086,7 +1297,9 @@ mod tests {
             developer_home: Some(PathBuf::from("/Users/frits")),
             core_dir: Some(PathBuf::from("/Users/frits/.tycho/zmx")),
             core_parent_missing: false,
-        }
+            prefix: settled_prefix(),
+        };
+        with_prefix(snapshot, settled_prefix())
     }
 
     fn with(mut snapshot: Snapshot, changes: &[(Check, Status)]) -> Snapshot {
@@ -1136,7 +1349,28 @@ mod tests {
         snapshot.shared_group_gid = None;
         snapshot.agent_dir_owner = None;
         snapshot.core_parent_missing = true;
-        with_home(snapshot, None, AgentHomeState::Missing)
+        with_home(
+            with_prefix(snapshot, empty_prefix()),
+            None,
+            AgentHomeState::Missing,
+        )
+    }
+
+    fn empty_prefix() -> tool_prefix::Probe {
+        tool_prefix::Probe {
+            directory: DirectoryState::Missing,
+            tree: TreeState::Absent,
+            mise: ToolState::Absent,
+            tools: settled_prefix()
+                .tools
+                .into_iter()
+                .map(|(tool, pin, _)| (tool, pin, ToolState::Absent))
+                .collect(),
+            station: tool_prefix::StationBinary::ALL
+                .iter()
+                .map(|&binary| (binary, StationState::Absent))
+                .collect(),
+        }
     }
 
     /// Sets the home probe and the finding made from it, as `setup::record_probe` does.
@@ -1188,6 +1422,7 @@ mod tests {
         root_calls: Vec<Vec<String>>,
         developer_calls: Vec<Vec<String>>,
         directory_calls: Vec<DirectoryWork>,
+        prefix_calls: Vec<PrefixStep>,
         snapshot_calls: usize,
         reports: usize,
     }
@@ -1204,6 +1439,7 @@ mod tests {
             !self.root_calls.is_empty()
                 || !self.developer_calls.is_empty()
                 || !self.directory_calls.is_empty()
+                || !self.prefix_calls.is_empty()
         }
     }
 
@@ -1244,6 +1480,15 @@ mod tests {
             Ok(captured(Exit::Code(0), "", ""))
         }
 
+        fn run_prefix_step(
+            &mut self,
+            step: PrefixStep,
+            _developer: &Identity,
+        ) -> Result<(), String> {
+            self.prefix_calls.push(step);
+            Ok(())
+        }
+
         fn report(&mut self, _developer: &Identity) -> i32 {
             self.reports = self.reports.saturating_add(1);
             0
@@ -1267,6 +1512,10 @@ mod tests {
                 Remedy::CloseDeveloperHome,
                 Remedy::PrepareAgentSocketDir,
                 Remedy::PrepareCoreSocketDir,
+                Remedy::CreateToolPrefix,
+                Remedy::InstallMise,
+                Remedy::InstallAgentTools,
+                Remedy::InstallStationBinaries,
             ]
         );
         assert!(planned.blocked.is_empty());
@@ -1943,5 +2192,114 @@ mod tests {
         fs::remove_file(&link).expect("remove link");
         fs::remove_dir(&real).expect("remove real");
         fs::remove_dir(&base).expect("remove base");
+    }
+
+    #[test]
+    fn an_empty_prefix_is_made_by_the_developer_in_order_with_no_root_step() {
+        let initial = with_prefix(all_present(), empty_prefix());
+        let planned = plan(&initial);
+        assert_eq!(
+            planned.steps,
+            vec![
+                Remedy::CreateToolPrefix,
+                Remedy::InstallMise,
+                Remedy::InstallAgentTools,
+                Remedy::InstallStationBinaries,
+            ]
+        );
+        let mut made = empty_prefix();
+        made.directory = DirectoryState::Settled;
+        made.tree = TreeState::Closed { examined: 3 };
+        let after_directories = with_prefix(all_present(), made.clone());
+        made.mise = ToolState::Pinned;
+        let after_mise = with_prefix(all_present(), made.clone());
+        made.tools = settled_prefix().tools;
+        let after_tools = with_prefix(all_present(), made);
+        let mut host = RecordingHost::new(vec![
+            initial,
+            after_directories,
+            after_mise,
+            after_tools,
+            all_present(),
+        ]);
+        assert_eq!(provision(Mode::Apply, true, &mut host), 0);
+        assert_eq!(
+            host.prefix_calls,
+            vec![
+                PrefixStep::CreateDirectories,
+                PrefixStep::InstallMise,
+                PrefixStep::InstallAgentTools,
+                PrefixStep::InstallStation,
+            ]
+        );
+        assert!(host.root_calls.is_empty());
+        assert_eq!(host.reports, 1);
+    }
+
+    #[test]
+    fn a_prefix_another_user_owns_is_left_to_the_operator_and_nothing_goes_into_it() {
+        let mut foreign = empty_prefix();
+        foreign.directory =
+            DirectoryState::Foreign("/Users/Shared/tycho is owned by uid 503".to_string());
+        let snapshot = with_prefix(all_present(), foreign);
+        let planned = plan(&snapshot);
+        assert!(planned.steps.is_empty(), "{:?}", planned.steps);
+        let left: Vec<Check> = unremedied(&snapshot, &planned.steps)
+            .iter()
+            .map(|finding| finding.check)
+            .collect();
+        assert!(left.contains(&Check::PrefixDirectory));
+        assert!(left.contains(&Check::PrefixMise));
+        let mut host = RecordingHost::new(vec![snapshot]);
+        assert_eq!(provision(Mode::Print, false, &mut host), 1);
+        assert!(!host.acted());
+    }
+
+    #[test]
+    fn a_stale_station_build_is_rebuilt_and_a_probe_that_could_not_run_blocks() {
+        let mut stale = settled_prefix();
+        stale.station = vec![(
+            tool_prefix::StationBinary::Tycho,
+            StationState::Stale {
+                installed: "a".repeat(40),
+                checkout: "b".repeat(40),
+            },
+        )];
+        assert_eq!(
+            plan(&with_prefix(all_present(), stale)).steps,
+            vec![Remedy::InstallStationBinaries]
+        );
+        let mut unknown = settled_prefix();
+        unknown.mise = ToolState::Unreachable("mise did not finish".to_string());
+        let planned = plan(&with_prefix(all_present(), unknown));
+        assert_eq!(
+            planned.blocked,
+            vec![(Remedy::InstallMise, "mise did not finish".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_prefix_step_whose_probe_still_fails_stops_the_run() {
+        let initial = with_prefix(all_present(), empty_prefix());
+        let mut host = RecordingHost::new(vec![initial.clone(), initial]);
+        assert_eq!(provision(Mode::Apply, true, &mut host), 1);
+        assert_eq!(host.prefix_calls, vec![PrefixStep::CreateDirectories]);
+        assert_eq!(host.reports, 0);
+    }
+
+    #[test]
+    fn the_operator_commands_run_the_pinned_installs_by_path_with_the_whole_environment() {
+        let commands = operator_commands(&Prefix::production()).expect("the pins decode");
+        let environment = "PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise";
+        assert_eq!(
+            commands,
+            [
+                format!("env {environment} /Users/Shared/tycho/mise/installs/claude/2.1.280/claude"),
+                format!("env {environment} /Users/Shared/tycho/mise/installs/codex/0.160.1/bin/codex login"),
+                "git config --global credential.helper \"\"".to_string(),
+                "/Users/Shared/tycho/bin/xtask setup".to_string(),
+            ]
+        );
+        assert!(commands.iter().all(|command| !command.contains("shims")));
     }
 }

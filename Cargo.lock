@@ -2547,6 +2547,7 @@ dependencies = [
  "flate2",
  "jsonwebtoken 11.1.0",
  "libc",
+ "nix",
  "pem",
  "rustls",
  "serde_json",
