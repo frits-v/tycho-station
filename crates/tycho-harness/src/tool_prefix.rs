@@ -1,8 +1,8 @@
 //! A scratch tool prefix for the integration suites.
 //!
-//! It has the layout and `station.json` of the shared prefix, with the built `tycho` and the developer's pinned tools linked in, so a
-//! test session starts from the prefix the way a production session does without touching
-//! `/Users/Shared/tycho`.
+//! It has the layout and `station.json` of the shared prefix, with the built `tycho` and the
+//! developer's pinned tools linked in, so a test session starts from the prefix the way a
+//! production session does without touching `/Users/Shared/tycho`.
 
 use std::fs;
 use std::io;

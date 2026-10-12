@@ -23,12 +23,13 @@ use crate::zmx::Zmx;
 /// Under the core home's log directory.
 pub const KILL_LOG: &str = "kills.log";
 
+/// Built only by `for_prefix`, so the launcher and zmx are always the prefix's.
 #[derive(Debug, Clone)]
 pub struct LauncherSpawner {
-    pub zmx: Zmx,
+    zmx: Zmx,
     pub dirs: AgentDirs,
     /// The `tycho` binary zmx runs as the launcher.
-    pub tycho: PathBuf,
+    tycho: PathBuf,
     /// `HOME` in the launcher's environment.
     pub home: PathBuf,
     /// Where scrollback is saved.
@@ -38,7 +39,7 @@ pub struct LauncherSpawner {
     /// The ports of the core whose ingress the launchers report to.
     pub ports: CorePorts,
     /// Where each session's binaries and mise installs come from.
-    pub tool_prefix: ToolPrefix,
+    tool_prefix: ToolPrefix,
 }
 
 /// Every spawn outcome maps to a pid or a refusal; only an unreadable state is worth a retry.

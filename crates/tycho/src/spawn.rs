@@ -140,6 +140,15 @@ pub fn split_tier(argv: &[String]) -> (&[String], Option<&str>) {
 
 /// Adopts, re-queues or spawns by the lease, then checks zmx before `run`.
 pub fn spawn_session(request: &SpawnRequest<'_>) -> Result<SpawnOutcome, SpawnerError> {
+    // A launcher from anywhere but the prefix would run a binary nothing checked.
+    let prefix_tycho = request.tool_prefix.tycho();
+    if request.tycho != prefix_tycho {
+        return Err(SpawnerError::Refused(format!(
+            "the launcher {} is not the tool prefix's {}",
+            request.tycho.display(),
+            prefix_tycho.display()
+        )));
+    }
     let session = &request.env.session_name;
     let lease = match read_lease(request.dirs, session, request.agent_uid) {
         LeaseRead::Absent => None,
@@ -499,7 +508,7 @@ mod tests {
         let request = SpawnRequest {
             zmx: &zmx,
             dirs: &dirs,
-            tycho: Path::new("/nonexistent/tycho"),
+            tycho: Path::new("/Users/Shared/tycho/bin/tycho"),
             home: Path::new("/nonexistent"),
             env: &env,
             heartbeat: HeartbeatTarget::Session,
@@ -517,6 +526,14 @@ mod tests {
             &lease(now_unix_ms()).to_bytes().unwrap(),
         )
         .unwrap();
+        let elsewhere = SpawnRequest {
+            tycho: Path::new("/usr/local/bin/tycho"),
+            ..request
+        };
+        assert!(matches!(
+            spawn_session(&elsewhere),
+            Err(SpawnerError::Refused(why)) if why.contains("not the tool prefix's")
+        ));
         assert_eq!(
             spawn_session(&request),
             Ok(SpawnOutcome::Adopted { pid: 4242 })
@@ -548,7 +565,7 @@ mod tests {
         SpawnRequest {
             zmx,
             dirs,
-            tycho: Path::new("/opt/tycho"),
+            tycho: Path::new("/Users/Shared/tycho/bin/tycho"),
             home: Path::new("/Users/agent"),
             env,
             heartbeat: HeartbeatTarget::Session,
