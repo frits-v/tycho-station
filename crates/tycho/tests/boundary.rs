@@ -296,8 +296,7 @@ fn preflight() -> Agent {
         home: agent.dir,
     };
     println!(
-        "boundary: agent {AGENT_USER_DEFAULT} uid {} home {}",
-        agent.uid,
+        "boundary: agent {AGENT_USER_DEFAULT} home {}",
         agent.home.display()
     );
     let forget = Command::new(SUDO).arg("-k").status().unwrap();
