@@ -907,7 +907,9 @@ pub(crate) mod tests {
         "repositories::tests::the_git_runner_under_an_inherited_hook_environment";
 
     /// Runs only in a child process that `the_git_runner_hides_the_hook_environment` starts
-    /// with the hook environment set; the runner spawns `env` in place of git.
+    /// with the hook environment set. The runner spawns a shell in place of git that lists
+    /// variable names only: mbx adds about 50 KiB of values to a test's environment, past the
+    /// runner's 64 KiB output cap.
     #[test]
     #[ignore = "run by the_git_runner_hides_the_hook_environment in a child process"]
     fn the_git_runner_under_an_inherited_hook_environment() {
@@ -915,10 +917,10 @@ pub(crate) mod tests {
             std::env::var_os("GIT_DIR").is_some(),
             "the parent sets GIT_DIR"
         );
-        let repositories =
-            Repositories::new(PathBuf::from("env"), "/core".into(), "/agent/wt".into(), 0).unwrap();
-        let captured = repositories.git(&[]).unwrap();
-        assert!(captured.stdout.contains("GIT_CONFIG_GLOBAL=/dev/null"));
+        let shell = PathBuf::from("/bin/sh");
+        let repositories = Repositories::new(shell, "/core".into(), "/agent/wt".into(), 0).unwrap();
+        let captured = repositories.git(&["-c", "env | sed 's/=.*/=/'"]).unwrap();
+        assert!(captured.stdout.contains("GIT_CONFIG_GLOBAL="));
         assert_eq!(
             git_environment_in(&captured.stdout),
             Vec::<&str>::new(),
