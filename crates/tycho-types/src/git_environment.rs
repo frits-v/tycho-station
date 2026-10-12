@@ -89,24 +89,43 @@ pub fn git_environment_in(listing: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Why a test that spawns git must not run in this process, when `GIT_DIR` is set.
+/// Variables that point git at the repository of the hook a process runs under: a pre-push
+/// hook gets `GIT_DIR`, and a commit hook in a main checkout gets `GIT_INDEX_FILE` alone.
+pub const HOOK_REPOSITORY_VARIABLES: [&str; 4] = [
+    "GIT_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+];
+
+/// Why a test that spawns git must not run in this process, when any of
+/// `HOOK_REPOSITORY_VARIABLES` is set.
 #[must_use]
 pub fn hook_environment_refusal() -> Option<String> {
     refusal_in(|name| env::var_os(name))
 }
 
 fn refusal_in(variable: impl Fn(&str) -> Option<OsString>) -> Option<String> {
-    let git_dir = variable("GIT_DIR")?;
+    let set: Vec<String> = HOOK_REPOSITORY_VARIABLES
+        .iter()
+        .filter_map(|name| {
+            variable(name).map(|value| format!("{name}={}", value.to_string_lossy()))
+        })
+        .collect();
+    if set.is_empty() {
+        return None;
+    }
     let hook = if variable("GIT_INDEX_FILE").is_some() {
         "a pre-commit or commit-msg hook"
     } else {
         "a pre-push hook"
     };
     Some(format!(
-        "GIT_DIR is {} in this test process, which probably runs under {hook}; a git child \
-         would act on that repository. Run the tests through `cargo run -p xtask -- test`, \
-         which removes git's hook environment, or unset GIT_DIR.",
-        git_dir.to_string_lossy()
+        "{} in this test process, which probably runs under {hook}; a git child would act on \
+         that repository. Run the tests through `cargo run -p xtask -- test`, which removes \
+         git's hook environment, or unset {}.",
+        set.join(", "),
+        HOOK_REPOSITORY_VARIABLES.join(", ")
     ))
 }
 
@@ -153,15 +172,22 @@ mod tests {
     fn a_set_git_dir_is_refused_and_names_the_likely_hook() {
         let push = |name: &str| (name == "GIT_DIR").then(|| OsString::from("/repo/.git"));
         let refusal = refusal_in(push).unwrap();
-        assert!(refusal.contains("/repo/.git"), "{refusal}");
+        assert!(refusal.contains("GIT_DIR=/repo/.git"), "{refusal}");
         assert!(refusal.contains("pre-push"), "{refusal}");
-        let commit = |name: &str| {
-            ["GIT_DIR", "GIT_INDEX_FILE"]
-                .contains(&name)
-                .then(|| OsString::from("/repo/.git"))
-        };
-        assert!(refusal_in(commit).unwrap().contains("pre-commit"));
         assert_eq!(refusal_in(|_| None), None);
+    }
+
+    #[test]
+    fn each_hook_repository_variable_alone_is_refused() {
+        for set in HOOK_REPOSITORY_VARIABLES {
+            let refusal = refusal_in(|name| (name == set).then(|| OsString::from("/repo/x")))
+                .unwrap_or_else(|| panic!("{set} alone was not refused"));
+            assert!(refusal.contains(&format!("{set}=/repo/x")), "{refusal}");
+        }
+        let commit = |name: &str| (name == "GIT_INDEX_FILE").then(|| OsString::from("/i"));
+        assert!(refusal_in(commit).unwrap().contains("pre-commit"));
+        let unrelated = |name: &str| (name == "GIT_AUTHOR_NAME").then(|| OsString::from("a"));
+        assert_eq!(refusal_in(unrelated), None);
     }
 
     /// Runs only in a child process that `a_scrubbed_command_hides_the_inherited_hook_environment`

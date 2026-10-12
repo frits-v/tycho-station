@@ -79,3 +79,24 @@ fn git_commands() {
     let mut cleared = Command::new("git");
     cleared.env_clear();
 }
+
+fn git_through_runners(&self) {
+    // ruleid: rust-git-inherits-hook-environment
+    let head = run_captured(Path::new("git"), &["rev-parse", "HEAD"], &[], COMMAND_TIMEOUT);
+    // ruleid: rust-git-inherits-hook-environment
+    let status = command::run_status(&PathBuf::from("git"), &["status"], &[], COMMAND_TIMEOUT);
+    // ruleid: rust-git-inherits-hook-environment
+    let fetched = run_status_capped(&self.git, arguments, &GIT_ENVIRONMENT, &removed, GIT_TIMEOUT, MAX);
+    // ruleid: rust-git-inherits-hook-environment
+    let read = run_captured_without(Path::new("/usr/bin/git"), &["log"], &[], &[], COMMAND_TIMEOUT);
+    // ruleid: rust-git-inherits-hook-environment
+    let gone = command::run_detached(Path::new("git"), &["gc"], &[], &[], COMMAND_TIMEOUT);
+    // ok: rust-git-inherits-hook-environment
+    let scrubbed = run_status_capped(&self.git, arguments, &GIT_ENVIRONMENT, &git_environment_removed(), GIT_TIMEOUT, MAX);
+    // ok: rust-git-inherits-hook-environment
+    let head = run_captured_without(Path::new("git"), &["rev-parse", "HEAD"], &[], &git_environment_removed(), COMMAND_TIMEOUT);
+    // ok: rust-git-inherits-hook-environment
+    let version = run_captured(&run.args.binary, &["--version"], &pairs, COMMAND_TIMEOUT);
+    // ok: rust-git-inherits-hook-environment
+    let digest = run_captured(Path::new("/usr/bin/digest"), &["-a", "sha256"], &[], COMMAND_TIMEOUT);
+}

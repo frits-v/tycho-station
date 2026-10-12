@@ -947,6 +947,47 @@ pub(crate) mod tests {
         );
     }
 
+    const REFUSING_CHILD: &str = "repositories::tests::a_scratch_under_an_inherited_git_dir";
+
+    /// Runs only in a child process that `a_git_spawning_test_refuses_an_inherited_git_dir`
+    /// starts with `GIT_DIR` set; `Scratch::new` must panic before it creates anything.
+    #[test]
+    #[ignore = "run by a_git_spawning_test_refuses_an_inherited_git_dir in a child process"]
+    fn a_scratch_under_an_inherited_git_dir() {
+        assert!(
+            std::env::var_os("GIT_DIR").is_some(),
+            "the parent sets GIT_DIR"
+        );
+        let scratch = Scratch::new("refused");
+        panic!(
+            "Scratch::new returned {} under GIT_DIR",
+            scratch.0.display()
+        );
+    }
+
+    #[test]
+    fn a_git_spawning_test_refuses_an_inherited_git_dir() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", REFUSING_CHILD])
+            .env("GIT_DIR", "/nonexistent/hook/.git")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stdout}{stderr}");
+        assert!(
+            stdout.contains("test result: FAILED. 0 passed; 1 failed"),
+            "the child must run exactly one test: {stdout}"
+        );
+        let report = format!("{stdout}{stderr}");
+        assert!(
+            report.contains("GIT_DIR=/nonexistent/hook/.git in this test process")
+                && report.contains("probably runs under a pre-push hook"),
+            "{report}"
+        );
+        assert!(!report.contains("Scratch::new returned"), "{report}");
+    }
+
     #[test]
     fn a_worktree_is_a_clone_of_the_canonical_repository_on_its_own_branch() {
         let scratch = Scratch::new("clone");

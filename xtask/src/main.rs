@@ -10,7 +10,8 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output};
+use std::process::{Command, Output};
+use std::time::Duration;
 
 mod app_token;
 mod checkout;
@@ -36,6 +37,7 @@ const TYPES: [&str; 11] = [
     "feat", "fix", "docs", "chore", "refactor", "test", "build", "ci", "perf", "style", "revert",
 ];
 const SUBJECT_MAX: usize = 72;
+const FMT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const HOOK_INPUT_MAX_BYTES: u64 = 1 << 20;
 const HOOK_REPORT_MAX_LINES: usize = 40;
 const WALK_MAX_FILES: usize = 4096;
@@ -289,17 +291,6 @@ fn report(what: &str, line: &str, verdict: &Verdict) -> i32 {
     }
 }
 
-fn run(program: &str, args: &[&str]) -> ExitStatus {
-    println!("xtask: {program} {}", args.join(" "));
-    Command::new(program)
-        .args(args)
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!("xtask: failed to start {program}: {e}");
-            std::process::exit(2)
-        })
-}
-
 fn step_passed(name: &str, outcome: Result<String, String>) -> bool {
     match outcome {
         Ok(summary) => {
@@ -403,8 +394,20 @@ fn ci() -> i32 {
     code
 }
 
+/// `cargo fmt --check` with its diff echoed as it arrives, bounded like every other step.
 fn format_checked() -> bool {
-    run("cargo", &["fmt", "--all", "--", "--check"]).success()
+    let captured = process::run_bounded_merged(
+        Command::new("cargo").args(["fmt", "--all", "--", "--check"]),
+        FMT_TIMEOUT,
+    );
+    match captured.exit {
+        process::Exit::Code(0) => true,
+        process::Exit::Code(_) => false,
+        other => {
+            eprintln!("xtask fmt: cargo fmt ended {other:?}");
+            false
+        }
+    }
 }
 
 /// Whether every test passed, with the counts when every binary was accounted for.
@@ -933,7 +936,6 @@ pub fn refuse_hook_environment() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
     use tycho_types::git_environment::{git_environment_in, scrub_git_environment};
 
     const INHERITED_CHILD: &str = "tests::git_children_under_an_inherited_hook_environment";

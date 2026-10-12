@@ -46,11 +46,15 @@ repository and commit its fixture onto the branch being pushed.
 - Every git the code starts, production and test, goes through `git_command`,
   `scrub_git_environment`, or a runner given `git_environment_removed()`; the harness
   repository builder and setup's credential check clear the whole environment instead. The
-  opengrep rule `rust-git-inherits-hook-environment` refuses any other `Command::new("git")`
-  outside `tests/` directories, which opengrep skips by default; there it is review.
-- A test that spawns git calls `refuse_hook_environment` first. With `GIT_DIR` set in the test
-  process it panics, naming the hook it probably runs under, so `cargo test` started straight
-  from a hook fails those tests instead of writing to the repository.
+  opengrep rule `rust-git-inherits-hook-environment` refuses any other `Command::new("git")`,
+  and any `run_captured`, `run_status`, `run_status_capped`, `run_captured_without` or
+  `run_detached` call given git without `&git_environment_removed()`, outside `tests/`
+  directories, which opengrep skips by default; there it is review.
+- A test that spawns git calls `refuse_hook_environment` first. With any of `GIT_DIR`,
+  `GIT_INDEX_FILE`, `GIT_WORK_TREE` or `GIT_COMMON_DIR` set in the test process it panics,
+  naming the variables and the hook it probably runs under, so `cargo test` started straight
+  from a hook fails those tests instead of writing to the repository. A commit hook in a main
+  checkout gets `GIT_INDEX_FILE` without `GIT_DIR`.
 
 ## Verifying before claiming done
 

@@ -50,18 +50,31 @@ rules:
     message: >-
       A git child inherits GIT_DIR and the rest of a hook's environment and acts on the
       repository that ran the hook. Start git through `tycho_types::git_environment::git_command`,
-      or a runner given `git_environment_removed()`, or clear the environment.
+      or a runner given `&git_environment_removed()`, or clear the environment.
     languages: [rust]
     severity: ERROR
     paths:
       exclude:
         - "crates/tycho-types/src/git_environment.rs"
-    patterns:
-      - pattern-either:
-          - pattern: Command::new("git")
-          - pattern: std::process::Command::new("git")
-      - pattern-not-inside: Command::new("git").env_clear()
-      - pattern-not-inside: |
-          let mut $COMMAND = Command::new("git");
-          $COMMAND.env_clear();
-          ...
+    pattern-either:
+      - patterns:
+          - pattern-either:
+              - pattern: Command::new("git")
+              - pattern: std::process::Command::new("git")
+          - pattern-not-inside: Command::new("git").env_clear()
+          - pattern-not-inside: |
+              let mut $COMMAND = Command::new("git");
+              $COMMAND.env_clear();
+              ...
+      # The bounded runners in `crates/tycho/src/command.rs`, given git by literal path or
+      # through a binary field named for it. metavariable-regex anchors at the start. Only `run_status_capped`, `run_captured_without`
+      # and `run_detached` take a removal list; a call passing the git one is exempt.
+      - patterns:
+          - pattern: $RUNNER($PROGRAM, ...)
+          - metavariable-regex:
+              metavariable: $RUNNER
+              regex: '^(?:\w+(?:::|\s+))*run_(?:captured|status|status_capped|captured_without|detached)$'
+          - metavariable-regex:
+              metavariable: $PROGRAM
+              regex: '.*(?:"(?:[^"]*/)?git"|\.git\b)'
+          - pattern-not: $RUNNER($PROGRAM, $ARGUMENTS, $ENVIRONMENT, &git_environment_removed(), ...)
