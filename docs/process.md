@@ -66,15 +66,17 @@ The suites that start real processes are ignored tests, run by their mise tasks 
 
 The boundary suite refuses to start when stdin is not a terminal, and when `sudo -n` runs as
 the agent with no password after `sudo -k`, since nothing in the station installs such a
-rule; it prints which answer it saw. `run_as_agent` in the suite is the one place the
-identity switch is made. Each probe ends with a line naming the uid it ran as and its exit
+rule; it prints which answer it saw, and runs `sudo -k` again when it ends. `run_as_agent`
+in the suite is the one place the identity switch is made; probes run with stdin closed,
+since sudo reads the password from `/dev/tty`. Each probe ends with a line naming the uid it ran as and its exit
 status, and decodes to one of four states: denied (permission denied, not permitted, git
 write refused, or connection refused, named), succeeded (the boundary is open; the line
 shows what the agent reached), could not run (sudo refused, the user or the target is
 missing, a timeout), or unrecognised, which includes a probe that ran under any uid but the
 agent's. Only a denial passes, except the agent's settings write, a listed gap whose outcome
 is printed as a measurement. The run ends with the number of boundaries examined and the
-count of each disposition; zero examined fails.
+count of each disposition; zero examined fails. The agent's walk to the canonical
+repository names the first directory that refuses it a search.
 
 ## Reporting
 
