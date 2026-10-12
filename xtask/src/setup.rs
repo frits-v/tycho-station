@@ -1547,9 +1547,9 @@ fn first_allow(entries: &[AclEntry]) -> Option<String> {
         .map(|entry| format!("{} allow {}", entry.principal, entry.permissions.join(",")))
 }
 
-/// The ACL of a home that is a directory; `ls -lde` reads it without opening the directory.
-fn home_acl_allow(home: &str) -> Result<Option<String>, AgentHomeState> {
-    match home_acl(home) {
+/// The ACL of a home that is a directory, as `ls -lde` lists it without opening the directory.
+fn home_acl_allow(listing: Result<AclListing, String>) -> Result<Option<String>, AgentHomeState> {
+    match listing {
         Ok(AclListing::Entries(entries)) => Ok(first_allow(&entries)),
         Ok(AclListing::Unrecognised(line)) => Err(AgentHomeState::Unrecognised(format!(
             "ls -lde line {line:?} for the agent home"
@@ -1560,14 +1560,18 @@ fn home_acl_allow(home: &str) -> Result<Option<String>, AgentHomeState> {
 
 /// Reads the entry without following a link rather than opening it: the developer cannot open
 /// another user's 0700 directory, so an open would fail on the home in its wanted state.
-fn measure_agent_home(record: &AgentRecord) -> AgentHomeState {
+/// `read_acl` is `home_acl` outside tests; `ls -e` and ACLs are macOS's own.
+fn measure_agent_home(
+    record: &AgentRecord,
+    read_acl: impl Fn(&str) -> Result<AclListing, String>,
+) -> AgentHomeState {
     let metadata = match fs::symlink_metadata(&record.home) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return AgentHomeState::Missing,
         Err(error) => return AgentHomeState::Unreachable(format!("{}: {error}", record.home)),
     };
     let acl_allow = if metadata.is_dir() {
-        match home_acl_allow(&record.home) {
+        match home_acl_allow(read_acl(&record.home)) {
             Ok(allow) => allow,
             Err(state) => return state,
         }
@@ -1592,7 +1596,7 @@ pub fn agent_home() -> AgentHome {
     let lookup = dscl_read_keys(&format!("/Users/{AGENT_USER_NAME}"), &AGENT_HOME_KEYS);
     match decode_agent_record(&lookup) {
         Ok(record) => AgentHome {
-            state: measure_agent_home(&record),
+            state: measure_agent_home(&record, home_acl),
             path: Some(record.home),
         },
         Err(state) => AgentHome { path: None, state },
@@ -3147,7 +3151,7 @@ mod tests {
         let base = home_scratch("ok");
         let home = home_dir(&base, 0o700);
         let record = record_for(&home);
-        assert_eq!(measure_agent_home(&record), AgentHomeState::Ok);
+        assert_eq!(measure(&record), AgentHomeState::Ok);
         let finding = agent_home_finding(&AgentHome {
             path: Some(record.home),
             state: AgentHomeState::Ok,
@@ -3162,7 +3166,7 @@ mod tests {
     fn an_agent_home_the_record_names_but_nobody_created_is_missing() {
         let base = home_scratch("missing");
         let record = record_for(&base.join("never-created"));
-        assert_eq!(measure_agent_home(&record), AgentHomeState::Missing);
+        assert_eq!(measure(&record), AgentHomeState::Missing);
         assert_eq!(
             decode_agent_record(&DsclLookup::NotFound),
             Err(AgentHomeState::Missing)
@@ -3185,33 +3189,26 @@ mod tests {
         fs::remove_dir(&base).expect("remove the base");
     }
 
-    /// The deny-delete entry would keep the scratch directory from being removed.
-    fn chmod_clear_acl(path: &Path) {
-        let status = Command::new("/bin/chmod")
-            .arg("-N")
-            .arg(path)
-            .status()
-            .expect("run chmod -N");
-        assert!(status.success(), "chmod -N");
+    /// Measures with an empty ACL, so the stat checks run where `ls -e` does not exist.
+    fn measure(record: &AgentRecord) -> AgentHomeState {
+        measure_agent_home(record, |_: &str| Ok(AclListing::Entries(Vec::new())))
     }
+
+    /// A created home's listing, with an allow entry after its deny entry.
+    const HOME_WITH_ALLOW: &str = "drwx------+ 11 tycho-agent  tycho-agent  352 Oct 12 09:39 /Users/tycho-agent\n 0: group:everyone deny delete\n 1: group:staff allow list,search\n";
 
     #[test]
     fn an_acl_allow_entry_on_the_agent_home_is_wrong_and_a_deny_entry_passes() {
         let base = home_scratch("acl");
         let home = home_dir(&base, 0o700);
         let record = record_for(&home);
-        let chmod = |entry: &str| {
-            let status = Command::new("/bin/chmod")
-                .args(["+a", entry])
-                .arg(&home)
-                .status()
-                .expect("run chmod");
-            assert!(status.success(), "chmod +a {entry}");
-        };
-        chmod("group:everyone deny delete");
-        assert_eq!(measure_agent_home(&record), AgentHomeState::Ok);
-        chmod("group:staff allow list,search");
-        let AgentHomeState::Wrong(mismatch) = measure_agent_home(&record) else {
+        let listing = |text: &'static str| move |_: &str| Ok(decode_acl_listing(text));
+        assert_eq!(
+            measure_agent_home(&record, listing(HOME_LISTING)),
+            AgentHomeState::Ok
+        );
+        let AgentHomeState::Wrong(mismatch) = measure_agent_home(&record, listing(HOME_WITH_ALLOW))
+        else {
             panic!("an allow entry is wrong");
         };
         assert_eq!(
@@ -3223,7 +3220,7 @@ mod tests {
         );
         assert!(!mismatch.is_only_a_wider_mode());
         let finding = agent_home_finding(&AgentHome {
-            path: Some(record.home),
+            path: Some(record.home.clone()),
             state: AgentHomeState::Wrong(mismatch),
         });
         assert!(matches!(
@@ -3233,6 +3230,53 @@ mod tests {
         assert!(finding
             .hint
             .is_some_and(|hint| hint.contains("chmod -a \"group:staff allow list,search\"")));
+        assert!(matches!(
+            measure_agent_home(&record, listing("total 0\n")),
+            AgentHomeState::Unrecognised(_)
+        ));
+        assert!(matches!(
+            measure_agent_home(&record, |_: &str| Err("/bin/ls is not present".to_string())),
+            AgentHomeState::Unreachable(why) if why == "/bin/ls is not present"
+        ));
+        fs::remove_dir(&home).expect("remove the home");
+        fs::remove_dir(&base).expect("remove the base");
+    }
+
+    /// The deny-delete entry would keep the scratch directory from being removed.
+    #[cfg(target_os = "macos")]
+    fn chmod_clear_acl(path: &Path) {
+        let status = Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(path)
+            .status()
+            .expect("run chmod -N");
+        assert!(status.success(), "chmod -N");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_acl_of_a_real_home_is_read_and_only_an_allow_entry_fails() {
+        let base = home_scratch("real-acl");
+        let home = home_dir(&base, 0o700);
+        let record = record_for(&home);
+        let chmod = |entry: &str| {
+            let status = Command::new("/bin/chmod")
+                .args(["+a", entry])
+                .arg(&home)
+                .status()
+                .expect("run chmod");
+            assert!(status.success(), "chmod +a {entry}");
+        };
+        chmod("group:everyone deny delete");
+        assert_eq!(measure_agent_home(&record, home_acl), AgentHomeState::Ok);
+        chmod("group:staff allow list,search");
+        assert_eq!(
+            measure_agent_home(&record, home_acl),
+            AgentHomeState::Wrong(HomeMismatch {
+                acl_allow: Some("group:staff allow list,search".to_string()),
+                ..HomeMismatch::default()
+            })
+        );
         let entries = vec![
             AclEntry {
                 principal: "group:everyone".to_string(),
@@ -3262,7 +3306,7 @@ mod tests {
         let mut record = record_for(&home);
         let (uid, gid) = (record.uid, record.gid);
         assert_eq!(
-            measure_agent_home(&record),
+            measure(&record),
             AgentHomeState::Wrong(HomeMismatch {
                 mode: Some(Differs {
                     found: 0o755,
@@ -3273,7 +3317,7 @@ mod tests {
         );
         record.uid = uid.wrapping_add(1);
         record.gid = gid.wrapping_add(1);
-        let AgentHomeState::Wrong(mismatch) = measure_agent_home(&record) else {
+        let AgentHomeState::Wrong(mismatch) = measure(&record) else {
             panic!("a home owned by another uid and gid is wrong");
         };
         assert_eq!(
@@ -3316,7 +3360,7 @@ mod tests {
         let target = home_dir(&base, 0o700);
         let link = base.join("link");
         std::os::unix::fs::symlink(&target, &link).expect("plant the link");
-        let AgentHomeState::Wrong(mismatch) = measure_agent_home(&record_for(&link)) else {
+        let AgentHomeState::Wrong(mismatch) = measure(&record_for(&link)) else {
             panic!("a symlink is not a home");
         };
         assert_eq!(mismatch.kind, Some("symlink"));
@@ -3351,7 +3395,7 @@ mod tests {
         let file = base.join("file");
         fs::write(&file, b"").expect("create the file");
         assert!(matches!(
-            measure_agent_home(&record_for(&file.join("home"))),
+            measure(&record_for(&file.join("home"))),
             AgentHomeState::Unreachable(why) if why.contains("Not a directory")
         ));
         let failed = DsclLookup::Unreachable("dscl is not on PATH".to_string());
