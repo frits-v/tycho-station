@@ -488,11 +488,12 @@ mod tests {
     }
 
     /// Design section 11's test plan: a fixture one past each key's maximum, and one below
-    /// its minimum, fails `cue vet`; the committed `config/petitions.cue` passes. Dropping a
-    /// bound from `#Petitions` (for example `<=8` on `open_max`) turns one of the refused
-    /// cases clean and fails this test.
+    /// its minimum, fails `cue vet`; one at each limit and the committed
+    /// `config/petitions.cue` pass. A bound dropped (`<=8` on `open_max`) or tightened (`<=4`)
+    /// fails this test.
     #[test]
-    fn every_petition_bound_is_refused_one_past_its_limit_and_the_committed_file_is_accepted() {
+    fn every_petition_bound_accepts_its_limits_refuses_one_past_them_and_the_committed_file_passes()
+    {
         let workspace = crate::setup::workspace_root();
         let schema = workspace.join(CONFIG_SCHEMA);
         let defaults = vet_petitions_fixture(&schema, &petitions_fixture("", 0), "defaults");
@@ -502,20 +503,32 @@ mod tests {
         );
         let mut examined = 0_usize;
         for (field, _default, min, max) in PETITIONS_BOUNDS {
-            for (case, value) in [("below_min", min - 1), ("above_max", max + 1)] {
+            for (case, value, accepted) in [
+                ("below_min", min - 1, false),
+                ("at_min", min, true),
+                ("at_max", max, true),
+                ("above_max", max + 1, false),
+            ] {
                 examined += 1;
                 let outcome = vet_petitions_fixture(
                     &schema,
                     &petitions_fixture(field, value),
                     &format!("{field}-{case}"),
                 );
-                assert!(
-                    matches!(outcome, CueOutcome::Rejected),
+                assert_eq!(
+                    matches!(outcome, CueOutcome::Clean(_)),
+                    accepted,
                     "{field} = {value} ({case}): {outcome:?}"
                 );
+                if !accepted {
+                    assert!(
+                        matches!(outcome, CueOutcome::Rejected),
+                        "{field} = {value}: {outcome:?}"
+                    );
+                }
             }
         }
-        assert_eq!(examined, 14, "zero or a short run is a failure");
+        assert_eq!(examined, 28, "zero or a short run is a failure");
 
         let committed = workspace.join("config/petitions.cue");
         let accepted = cue(&[
