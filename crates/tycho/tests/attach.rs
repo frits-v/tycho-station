@@ -22,15 +22,17 @@
 
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use nix::fcntl::OFlag;
-use nix::unistd::{access, AccessFlags, Group, User};
+use nix::sys::termios::{tcgetattr, tcsetattr, InputFlags, LocalFlags, SetArg, Termios};
+use nix::unistd::{access, getpgrp, tcgetpgrp, AccessFlags, Group, User};
 use tycho::agent_files::current_uid;
 use tycho::command::{self, CommandError};
 use tycho::config::{
@@ -85,18 +87,23 @@ const DETACH_KEY: u8 = 0x1c;
 /// path, then sleeps, so a session the teardown never reaches ends on its own.
 const READ_ONE_LINE: &str =
     "IFS= read -r line && printf \"%s\\n\" \"$line\" > \"$1\"; exec /bin/sleep 600";
-/// Creates each named session as the agent in the shared directory. sudo leaves the umask at
+/// Creates each named session as the agent in the shared directory. zmx's own output goes to a
+/// file, never to the caller's capture, which a session daemon would otherwise inherit. sudo leaves the umask at
 /// 022, under which zmx creates the socket 0755 and the developer cannot connect.
 const SPAWN_SESSIONS: &str = "umask 007; zmx=$1; export ZMX_DIR=\"$2\" ZMX_DIR_MODE=\"$3\" \
      ZMX_LOG_MODE=\"$4\"; program=$5; shift 5; status=0; \
+     log=$(/usr/bin/mktemp) || exit 125; \
      while [ $# -ge 2 ]; do \"$zmx\" run \"$1\" -d exec /bin/sh -c \"$program\" sh \"$2\" \
-     < /dev/null || status=$?; shift 2; done; exit $status";
+     < /dev/null >> \"$log\" 2>&1 || status=$?; shift 2; done; \
+     /bin/cat \"$log\" >&2; /bin/rm -f \"$log\"; exit $status";
 /// Ends each named session by name, never by pid, and removes its log; with the spawn's modes,
 /// so a missing `logs/` or `zmx.log` is never made 0750 or 0640 by the kill.
 const KILL_SESSIONS: &str = "umask 007; zmx=$1; dir=$2; export ZMX_DIR=\"$2\" \
      ZMX_DIR_MODE=\"$3\" ZMX_LOG_MODE=\"$4\"; shift 4; status=0; \
-     for name in \"$@\"; do \"$zmx\" kill \"$name\" --force < /dev/null || status=$?; \
-     /bin/rm -f \"$dir/logs/$name.log\"; done; exit $status";
+     log=$(/usr/bin/mktemp) || exit 125; \
+     for name in \"$@\"; do \"$zmx\" kill \"$name\" --force < /dev/null >> \"$log\" 2>&1 \
+     || status=$?; /bin/rm -f \"$dir/logs/$name.log\"; done; \
+     /bin/cat \"$log\" >&2; /bin/rm -f \"$log\"; exit $status";
 /// Runs inside the developer's zmx session: osascript's output and exit status land in files.
 const OSASCRIPT_IN_SESSION: &str =
     "/usr/bin/osascript \"$1\" \"$2\" \"$3\" \"$4\" > \"$5\" 2> \"$6\"; echo $? > \"$7\"";
@@ -221,6 +228,177 @@ struct Agent {
     home: PathBuf,
 }
 
+/// How a command run with its output in files ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileRun {
+    Finished { stdout: String, stderr: String },
+    TimedOut(String),
+    CouldNotStart(String),
+    Unreadable(String),
+}
+
+static FILE_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Runs `program` from `/` with stdin closed and stdout and stderr in files, bounded by the
+/// direct child's exit alone: a daemon the child leaves behind may keep its output open, which
+/// a reader of a pipe would wait out to the timeout.
+fn run_to_files(program: &Path, arguments: &[&str], timeout: Duration) -> FileRun {
+    let run = FILE_RUNS.fetch_add(1, Ordering::Relaxed);
+    let dir = env::temp_dir().join(format!("tycho-attach-run-{}-{run}", std::process::id()));
+    if let Err(error) = fs::DirBuilder::new().mode(0o700).create(&dir) {
+        return FileRun::CouldNotStart(format!("{}: {error}", dir.display()));
+    }
+    let outcome = run_in(&dir, program, arguments, timeout);
+    if let Err(error) = fs::remove_dir_all(&dir) {
+        eprintln!("attach: cannot remove {}: {error}", dir.display());
+    }
+    outcome
+}
+
+fn run_in(dir: &Path, program: &Path, arguments: &[&str], timeout: Duration) -> FileRun {
+    let create = |name: &str| {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dir.join(name))
+    };
+    let (stdout, stderr) = match (create("stdout"), create("stderr")) {
+        (Ok(stdout), Ok(stderr)) => (stdout, stderr),
+        (Err(error), _) | (_, Err(error)) => return FileRun::CouldNotStart(error.to_string()),
+    };
+    let mut child = match Command::new(program)
+        .args(arguments)
+        .current_dir("/")
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return FileRun::CouldNotStart(format!("{}: {error}", program.display())),
+    };
+    if let Err(error) = wait_for_exit(&mut child, timeout) {
+        return FileRun::TimedOut(format!("{}: {error}", program.display()));
+    }
+    match (
+        read_bounded(&dir.join("stdout")),
+        read_bounded(&dir.join("stderr")),
+    ) {
+        (Ok(stdout), Ok(stderr)) => FileRun::Finished { stdout, stderr },
+        (Err(error), _) | (_, Err(error)) => FileRun::Unreadable(error),
+    }
+}
+
+/// Waits for the child itself within `timeout`; past it the child is killed and reaped.
+fn wait_for_exit(child: &mut Child, timeout: Duration) -> Result<(), String> {
+    let deadline = deadline_after(timeout);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    drop(child.kill());
+    drop(child.wait());
+    Err(format!("did not finish within {timeout:?}; killed"))
+}
+
+/// A file's text; over `OUTPUT_FILE_MAX_BYTES` is an error, never a cut.
+fn read_bounded(path: &Path) -> Result<String, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.len() > OUTPUT_FILE_MAX_BYTES => Err(format!(
+            "{} is over {OUTPUT_FILE_MAX_BYTES} bytes",
+            path.display()
+        )),
+        Ok(_) => fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display())),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+/// The controlling terminal's settings, put back when dropped, a panic's unwinding included.
+struct TerminalState {
+    tty: File,
+    saved: Termios,
+}
+
+impl TerminalState {
+    fn save(tty: File) -> Result<Self, String> {
+        let saved = tcgetattr(&tty).map_err(|error| format!("tcgetattr: {error}"))?;
+        Ok(Self { tty, saved })
+    }
+
+    fn restore(&self) -> Result<(), String> {
+        tcsetattr(&self.tty, SetArg::TCSADRAIN, &self.saved)
+            .map_err(|error| format!("tcsetattr: {error}"))
+    }
+}
+
+impl Drop for TerminalState {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            eprintln!("attach: could not restore the terminal: {error}");
+        }
+    }
+}
+
+fn controlling_terminal() -> Result<File, String> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|error| format!("/dev/tty: {error}"))
+}
+
+/// The settings a password prompt on `/dev/tty` needs, the relevant part of `stty sane`:
+/// canonical line input with echo, erase, signals and carriage return read as newline. `None`
+/// when the terminal already has them.
+fn prompt_repair(current: &Termios) -> Option<Termios> {
+    let mut wanted = current.clone();
+    wanted
+        .local_flags
+        .insert(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ECHOE | LocalFlags::ISIG);
+    wanted.input_flags.insert(InputFlags::ICRNL);
+    (wanted != *current).then_some(wanted)
+}
+
+/// Why a prompt on the terminal cannot be answered from this process group, if it cannot.
+fn foreground_refusal(terminal_group: i32, own_group: i32) -> Option<String> {
+    (terminal_group != own_group).then(|| {
+        format!(
+            "attach: the suite runs in process group {own_group} and the terminal's foreground \
+             group is {terminal_group}; sudo could show its prompt but never read the password"
+        )
+    })
+}
+
+/// Puts the terminal in the modes a password prompt needs and checks this process group owns
+/// it; prints what it found and returns the state to restore when the test ends.
+fn prepare_for_prompt() -> TerminalState {
+    let tty = controlling_terminal().unwrap_or_else(|error| panic!("attach: {error}"));
+    let terminal_group = tcgetpgrp(&tty)
+        .unwrap_or_else(|error| panic!("attach: tcgetpgrp: {error}"))
+        .as_raw();
+    if let Some(refusal) = foreground_refusal(terminal_group, getpgrp().as_raw()) {
+        panic!("{refusal}");
+    }
+    let current = tcgetattr(&tty).unwrap_or_else(|error| panic!("attach: tcgetattr: {error}"));
+    match prompt_repair(&current) {
+        Some(wanted) => {
+            tcsetattr(&tty, SetArg::TCSADRAIN, &wanted)
+                .unwrap_or_else(|error| panic!("attach: tcsetattr: {error}"));
+            println!(
+                "attach: terminal before sudo: was {:?}, set canonical input with echo",
+                current.local_flags
+            );
+        }
+        None => println!("attach: terminal before sudo: canonical input with echo, foreground"),
+    }
+    TerminalState::save(tty).unwrap_or_else(|error| panic!("attach: {error}"))
+}
+
 /// Runs `script` with `arguments` as `$1`.. in a shell of the agent user, with an empty
 /// environment, from `/`. The one place the identity switch is made: today through sudo,
 /// which prompts on the terminal.
@@ -242,18 +420,10 @@ fn run_as_agent(agent: &Agent, script: &str, arguments: &[&str]) -> AgentRun {
         RUN_MARKER,
     ];
     words.extend_from_slice(arguments);
-    match command::run_status_from(
-        Path::new(SUDO),
-        &words,
-        Path::new("/"),
-        SUDO_TIMEOUT,
-        OUTPUT_MAX_BYTES,
-    ) {
-        Ok(captured) => decode_agent_run(&captured.stdout, &captured.stderr, agent.uid),
-        Err(error @ (CommandError::OutputTooLarge(..) | CommandError::NotUtf8(_))) => {
-            AgentRun::Unrecognised(error.to_string())
-        }
-        Err(error) => AgentRun::CouldNotRun(error.to_string()),
+    match run_to_files(Path::new(SUDO), &words, SUDO_TIMEOUT) {
+        FileRun::Finished { stdout, stderr } => decode_agent_run(&stdout, &stderr, agent.uid),
+        FileRun::TimedOut(text) | FileRun::CouldNotStart(text) => AgentRun::CouldNotRun(text),
+        FileRun::Unreadable(text) => AgentRun::Unrecognised(text),
     }
 }
 
@@ -1011,10 +1181,11 @@ impl LaunchdJob {
 
 /// Refuses to start without a terminal, the agent user, the prefix's zmx, or the shared
 /// directory, or with a sudo answer the station does not expect; prints what it saw.
-fn preflight() -> (Agent, SharedZmx) {
+fn preflight() -> (Agent, SharedZmx, TerminalState) {
     if let Some(refusal) = terminal_refusal(std::io::stdin().is_terminal()) {
         panic!("{refusal}");
     }
+    let terminal = prepare_for_prompt();
     let agent = User::from_name(AGENT_USER_DEFAULT)
         .unwrap_or_else(|error| panic!("attach: cannot look up {AGENT_USER_DEFAULT}: {error}"))
         .unwrap_or_else(|| {
@@ -1065,6 +1236,7 @@ fn preflight() -> (Agent, SharedZmx) {
             binary,
             dir: AGENT_SOCKET_DIR_DEFAULT.to_string(),
         },
+        terminal,
     )
 }
 
@@ -1188,6 +1360,8 @@ fn spawn_agent_sessions(scratch: &mut Scratch, targets: &[Target]) -> Result<(),
 /// Attaches as the developer through a pty from `script`, types the line, detaches, and
 /// checks the session still runs.
 fn attach_by_pty(shared: &SharedZmx, owner_uid: u32, target: &Target) -> PathOutcome {
+    // Put back whatever the client does to the controlling terminal before the next prompt.
+    let _terminal = controlling_terminal().and_then(TerminalState::save);
     match shared.listed(&target.session) {
         Listed::Running { .. } => {}
         Listed::AccessDenied(text) => return PathOutcome::CouldNotRun(format!("zmx list: {text}")),
@@ -1404,16 +1578,7 @@ fn wait_for_job(job: &str) -> Result<i32, PathOutcome> {
 /// The osascript's answer from its exit status and its output files; an output file over
 /// `OUTPUT_FILE_MAX_BYTES` is unrecognised, never cut.
 fn answer_from_files(exit: i32, stdout: &Path, stderr: &Path) -> Answer {
-    let read = |path: &Path| match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.len() > OUTPUT_FILE_MAX_BYTES => Err(format!(
-            "{} is over {OUTPUT_FILE_MAX_BYTES} bytes",
-            path.display()
-        )),
-        Ok(_) => fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(format!("{}: {error}", path.display())),
-    };
-    match (read(stdout), read(stderr)) {
+    match (read_bounded(stdout), read_bounded(stderr)) {
         (Ok(out), Ok(err)) => decode_osascript(Some(exit), &out, &err),
         (Err(error), _) | (_, Err(error)) => Answer::Unrecognised(error),
     }
@@ -1484,7 +1649,7 @@ fn record_shared_modes(scratch: &Scratch) {
 #[test]
 #[ignore = "creates sessions as the agent user through sudo and drives Ghostty; run with mise run attach-tests from a Ghostty terminal"]
 fn a_developer_tab_attaches_to_an_agent_owned_session() {
-    let (agent, shared) = preflight();
+    let (agent, shared, _terminal) = preflight();
     let _forget = ForgetSudo;
     let mut scratch = scratch(agent, shared);
     let targets = targets(&scratch.drop);
@@ -1613,6 +1778,132 @@ mod decoders {
     use super::*;
 
     const AGENT: u32 = 503;
+
+    fn pty_slave() -> File {
+        File::from(nix::pty::openpty(None, None).unwrap().slave)
+    }
+
+    /// The settings as set, read from nix's flag fields: macOS raises `PENDIN` on its own when
+    /// canonical mode comes back, to retype pending input, so it is not part of what was saved.
+    fn as_set(
+        tty: &File,
+    ) -> (
+        InputFlags,
+        nix::sys::termios::OutputFlags,
+        nix::sys::termios::ControlFlags,
+        LocalFlags,
+        Vec<u8>,
+    ) {
+        let termios = tcgetattr(tty).unwrap();
+        let mut local = termios.local_flags;
+        local.remove(LocalFlags::PENDIN);
+        (
+            termios.input_flags,
+            termios.output_flags,
+            termios.control_flags,
+            local,
+            termios.control_chars.to_vec(),
+        )
+    }
+
+    fn raw_mode(tty: &File) {
+        let mut raw = tcgetattr(tty).unwrap();
+        nix::sys::termios::cfmakeraw(&mut raw);
+        tcsetattr(tty, SetArg::TCSANOW, &raw).unwrap();
+    }
+
+    #[test]
+    fn the_saved_terminal_state_comes_back_after_a_raw_mode_client_and_a_panic() {
+        let tty = pty_slave();
+        let other = tty.try_clone().unwrap();
+        let saved = as_set(&tty);
+        let guard = TerminalState::save(tty).unwrap();
+        raw_mode(&other);
+        assert_ne!(as_set(&other), saved, "the client changed the terminal");
+        drop(guard);
+        assert_eq!(as_set(&other), saved);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = TerminalState::save(other.try_clone().unwrap()).unwrap();
+            raw_mode(&other);
+            panic!("a failing path");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(as_set(&other), saved, "restored while unwinding");
+    }
+
+    #[test]
+    fn a_raw_terminal_is_repaired_for_the_prompt_and_a_sane_one_left_alone() {
+        let tty = pty_slave();
+        raw_mode(&tty);
+        let wanted = prompt_repair(&tcgetattr(&tty).unwrap()).unwrap();
+        assert!(wanted
+            .local_flags
+            .contains(LocalFlags::ICANON | LocalFlags::ECHO));
+        assert!(wanted.input_flags.contains(InputFlags::ICRNL));
+        tcsetattr(&tty, SetArg::TCSANOW, &wanted).unwrap();
+        assert_eq!(prompt_repair(&tcgetattr(&tty).unwrap()), None);
+    }
+
+    #[test]
+    fn a_background_process_group_is_refused_before_the_prompt() {
+        assert_eq!(foreground_refusal(42, 42), None);
+        let refusal = foreground_refusal(41, 42).unwrap();
+        assert!(refusal.contains("never read the password"), "{refusal}");
+    }
+
+    #[test]
+    fn a_daemon_holding_the_output_does_not_hold_the_runner() {
+        let script = "(/bin/sleep 5 &); echo done";
+        let started = Instant::now();
+        let run = run_to_files(
+            Path::new("/bin/sh"),
+            &["-c", script],
+            Duration::from_secs(4),
+        );
+        assert_eq!(
+            run,
+            FileRun::Finished {
+                stdout: "done\n".to_string(),
+                stderr: String::new()
+            }
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        let piped = command::run_status_from(
+            Path::new("/bin/sh"),
+            &["-c", script],
+            Path::new("/"),
+            Duration::from_secs(1),
+            OUTPUT_MAX_BYTES,
+        );
+        assert!(
+            matches!(piped, Err(CommandError::TimedOut(..))),
+            "a pipe reader waits for the grandchild: {piped:?}"
+        );
+    }
+
+    #[test]
+    fn a_runner_past_its_bound_kills_the_child_and_says_so() {
+        let run = run_to_files(Path::new("/bin/sleep"), &["5"], Duration::from_millis(300));
+        assert!(matches!(run, FileRun::TimedOut(_)), "{run:?}");
+        let missing = run_to_files(
+            Path::new("/nonexistent/program"),
+            &[],
+            Duration::from_secs(1),
+        );
+        assert!(matches!(missing, FileRun::CouldNotStart(_)), "{missing:?}");
+    }
+
+    #[test]
+    fn the_agent_scripts_keep_zmx_output_off_the_callers_capture() {
+        for script in [SPAWN_SESSIONS, KILL_SESSIONS] {
+            assert!(script.contains("< /dev/null >> \"$log\" 2>&1"), "{script}");
+            assert!(script.contains("/bin/cat \"$log\" >&2"), "{script}");
+        }
+    }
 
     #[test]
     fn the_suite_refuses_to_start_without_a_terminal() {

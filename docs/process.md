@@ -142,6 +142,15 @@ kills by name any session of the run's prefix the developer owns, which `zmx att
 missing name creates, and prints what the shared directory still lists. A second ignored
 test runs the pty path against a developer session in a private directory, with no sudo.
 
+Before the first sudo the attach suite checks that its process group is the terminal's
+foreground group, and refuses with a line naming both groups when it is not, since sudo
+could then show its prompt but never read the password. It puts the terminal in canonical
+mode with echo when it finds it otherwise, prints which it found, and restores the
+terminal's settings after each pty client and when the test ends, a panic included. Each
+agent-side command runs with its output in files and is bounded by sudo's own exit, and the
+agent's scripts send zmx's output to a file of their own, so a session daemon that inherits a
+descriptor cannot hold the run open.
+
 ## Reporting
 
 A report leads with the outcome. It states what was verified and how, what was not and
