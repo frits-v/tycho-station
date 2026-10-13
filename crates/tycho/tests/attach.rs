@@ -1779,8 +1779,11 @@ mod decoders {
 
     const AGENT: u32 = 503;
 
-    fn pty_slave() -> File {
-        File::from(nix::pty::openpty(None, None).unwrap().slave)
+    /// A pty's terminal side, with its master kept open beside it: Linux answers `EIO` on a
+    /// slave whose master is closed.
+    fn pty_slave() -> (std::os::fd::OwnedFd, File) {
+        let pty = nix::pty::openpty(None, None).unwrap();
+        (pty.master, File::from(pty.slave))
     }
 
     /// The settings as set, read from nix's flag fields: macOS raises `PENDIN` on its own when
@@ -1814,7 +1817,7 @@ mod decoders {
 
     #[test]
     fn the_saved_terminal_state_comes_back_after_a_raw_mode_client_and_a_panic() {
-        let tty = pty_slave();
+        let (_master, tty) = pty_slave();
         let other = tty.try_clone().unwrap();
         let saved = as_set(&tty);
         let guard = TerminalState::save(tty).unwrap();
@@ -1833,7 +1836,7 @@ mod decoders {
 
     #[test]
     fn a_raw_terminal_is_repaired_for_the_prompt_and_a_sane_one_left_alone() {
-        let tty = pty_slave();
+        let (_master, tty) = pty_slave();
         raw_mode(&tty);
         let wanted = prompt_repair(&tcgetattr(&tty).unwrap()).unwrap();
         assert!(wanted
