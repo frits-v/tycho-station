@@ -36,7 +36,7 @@ pub fn select(
         .as_ref()
         .map(InstallationToken::expose)
         .into_iter()
-        .chain(minted.iter().map(String::as_str))
+        .chain(minted.iter().map(anthropic_token::Secret::expose))
         .collect();
     let posted: BTreeSet<&str> = context
         .posted

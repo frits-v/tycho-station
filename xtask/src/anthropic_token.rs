@@ -33,7 +33,7 @@ const CLAIM_SHOWN_MAX_CHARS: usize = 200;
 const EXPIRES_IN_MAX_SECONDS: u64 = 86_400;
 
 /// A token value; it leaves this module only through [`Secret::expose`].
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
 
 impl Secret {
@@ -82,18 +82,16 @@ impl Minter {
         self.minted
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(Secret(token.value.expose().to_string()));
+            .push(token.value.clone());
         Ok(token)
     }
 
     /// Every token this minter issued, for the check that a posted text names none.
-    pub fn minted(&self) -> Vec<String> {
+    pub fn minted(&self) -> Vec<Secret> {
         self.minted
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .map(|token| token.expose().to_string())
-            .collect()
+            .clone()
     }
 
     #[cfg(test)]
