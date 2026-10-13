@@ -1,0 +1,242 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$defs": {
+        "ContentRef": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "ConventionHoldBaseline": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "counter": {
+                    "const": "convention_hold"
+                },
+                "decided": {
+                    "type": "string",
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+                },
+                "verified_citations": {
+                    "$ref": "#/$defs/U32"
+                }
+            },
+            "required": [
+                "counter",
+                "decided",
+                "verified_citations"
+            ]
+        },
+        "PetitionArticle": {
+            "type": "string",
+            "description": "The article number of the clause the petition would amend, or \"new\" for a new article.",
+            "pattern": "^([1-9][0-9]?|new)$"
+        },
+        "PetitionBaseline": {
+            "anyOf": [
+                {
+                    "$ref": "#/$defs/RepeatedRulingBaseline"
+                },
+                {
+                    "$ref": "#/$defs/ConventionHoldBaseline"
+                },
+                {
+                    "$ref": "#/$defs/VoidFindingBaseline"
+                }
+            ]
+        },
+        "PetitionCounter": {
+            "enum": [
+                "repeated_ruling",
+                "convention_hold",
+                "void_finding",
+                "dormancy",
+                "early"
+            ]
+        },
+        "PetitionState": {
+            "description": "open and amend count toward the open maximum and block a second petition with the same\nfingerprint; merged, closed and reject are terminal. A dormancy petition whose pull request\ncloses without a merge goes from amend back to open.",
+            "enum": [
+                "open",
+                "amend",
+                "merged",
+                "closed",
+                "reject"
+            ]
+        },
+        "RecordId": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "RepeatedRulingBaseline": {
+            "type": "object",
+            "description": "What a suppressing case records, per counter: the counter's value when the case is written\n(design section 11). Dormancy and early petitions record none.",
+            "additionalProperties": false,
+            "properties": {
+                "count": {
+                    "$ref": "#/$defs/U32"
+                },
+                "counter": {
+                    "const": "repeated_ruling"
+                }
+            },
+            "required": [
+                "count",
+                "counter"
+            ]
+        },
+        "ShortText": {
+            "type": "string",
+            "$ref": "#/$defs/Text",
+            "maxLength": 512
+        },
+        "Text": {
+            "type": "string",
+            "description": "No control characters (Unicode category Cc), so text cannot carry terminal escapes.",
+            "pattern": "^[^\\x00-\\x1f\\x7f-\\x9f]+$"
+        },
+        "U32": {
+            "allOf": [
+                {
+                    "type": "number"
+                },
+                {
+                    "type": "integer",
+                    "maximum": 4294967295,
+                    "minimum": 0
+                }
+            ]
+        },
+        "VoidFindingBaseline": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "count": {
+                    "$ref": "#/$defs/U32"
+                },
+                "counter": {
+                    "const": "void_finding"
+                }
+            },
+            "required": [
+                "count",
+                "counter"
+            ]
+        }
+    },
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+        "article": {
+            "$ref": "#/$defs/PetitionArticle"
+        },
+        "baseline": {
+            "type": "object",
+            "description": "The superseded case's baseline, when raised on new evidence. CUE holds its counter to\nthe petition's; the JSON Schema export carries the per-counter shapes only.",
+            "properties": {
+                "counter": true
+            },
+            "$ref": "#/$defs/PetitionBaseline",
+            "required": [
+                "counter"
+            ]
+        },
+        "cases": {
+            "type": "array",
+            "items": {
+                "$ref": "#/$defs/RecordId"
+            },
+            "maxItems": 16
+        },
+        "cases_total": {
+            "$ref": "#/$defs/U32"
+        },
+        "counter": {
+            "$ref": "#/$defs/PetitionCounter"
+        },
+        "evidence": {
+            "description": "The counter's value when the petition was raised; null for an early petition.",
+            "anyOf": [
+                {
+                    "$ref": "#/$defs/U32"
+                },
+                {
+                    "type": "null"
+                }
+            ]
+        },
+        "fingerprint": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+        },
+        "key": {
+            "description": "The counter key: question fingerprint and ruling digest, case id, article, clause or\nmechanism id, or escalation id.",
+            "$ref": "#/$defs/ShortText"
+        },
+        "mandate": {
+            "description": "Content hash of the mandate copy the pass pinned.",
+            "$ref": "#/$defs/ContentRef"
+        },
+        "sequence": {
+            "allOf": [
+                {
+                    "type": "number"
+                },
+                {
+                    "type": "integer",
+                    "maximum": 9999,
+                    "minimum": 1
+                }
+            ]
+        },
+        "state": {
+            "$ref": "#/$defs/PetitionState"
+        },
+        "supersedes": {
+            "description": "The latest suppressing case holding this fingerprint, when raised on new evidence.",
+            "$ref": "#/$defs/RecordId"
+        },
+        "thresholds": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "convention_citations_min": {
+                    "$ref": "#/$defs/U32"
+                },
+                "convention_hold_days": {
+                    "$ref": "#/$defs/U32"
+                },
+                "digest": {
+                    "description": "Digest of config/export/petitions.json, so the reader can match the values.",
+                    "$ref": "#/$defs/ContentRef"
+                },
+                "repeated_ruling_count": {
+                    "$ref": "#/$defs/U32"
+                },
+                "review_period_days": {
+                    "$ref": "#/$defs/U32"
+                }
+            },
+            "required": [
+                "convention_citations_min",
+                "convention_hold_days",
+                "digest",
+                "repeated_ruling_count",
+                "review_period_days"
+            ]
+        }
+    },
+    "required": [
+        "article",
+        "cases",
+        "cases_total",
+        "counter",
+        "evidence",
+        "fingerprint",
+        "key",
+        "mandate",
+        "sequence",
+        "state",
+        "thresholds"
+    ]
+}

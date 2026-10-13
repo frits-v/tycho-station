@@ -17,11 +17,12 @@ const EXPORT_DIR: &str = "config/export";
 const SCHEMA_EXPORT_SUBDIR: &str = "schema";
 const SCHEMAS_DIR: &str = "schemas";
 const CHECK_DIR: &str = "target/check-config";
-const VALUES: [&str; 4] = ["adapters", "mandate", "routing", "thresholds"];
-const SCHEMAS: [(&str, &str); 5] = [
+const VALUES: [&str; 5] = ["adapters", "mandate", "petitions", "routing", "thresholds"];
+const SCHEMAS: [(&str, &str); 6] = [
     ("envelope", "#Envelope"),
     ("task_packet", "#TaskPacketPayload"),
     ("exit_state", "#ExitState"),
+    ("petition", "#Petition"),
     ("review_findings", "#ReviewFindings"),
     ("review_verdict", "#ReviewVerdict"),
 ];

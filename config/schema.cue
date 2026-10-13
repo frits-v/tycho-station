@@ -65,13 +65,25 @@ import (
 		// Fraction of the context window at which a control session rolls over.
 		rollover_fraction!: number & >0 & <1
 	}
-	// Article 14.3 to 15.3 thresholds; null until the operator sets them.
-	mandate!: {
-		convention_citations_min!:    null | int & >=1 & <=10000
-		petition_repeat_count!:       null | int & >=1 & <=10000
-		convention_held_period_days!: null | int & >=1 & <=3650
-		review_period_days!:          null | int & >=1 & <=3650
-	}
+}
+
+// Every threshold and period of mandate articles 14 and 15, with the petition mechanism's
+// own bounds (design section 11); reported with every petition. Each key is bounded.
+#Petitions: {
+	// Consecutive human rulings with one ruling on one question fingerprint.
+	repeated_ruling_count!: int & >=2 & <=50
+	// Verified citations without a failed one before a case becomes a convention (14.3).
+	convention_citations_min!: int & >=1 & <=1000
+	// Days a convention holds without a failed citation.
+	convention_hold_days!: int & >=7 & <=730
+	// Days without a citation or a firing before a rule is listed as dormant.
+	review_period_days!: int & >=7 & <=730
+	// Petitions open or amending at once; a crossing past it waits for a later pass.
+	open_max!: int & >=1 & <=8
+	// Seconds between passes of the Petitions tick.
+	evaluation_interval_seconds!: #Seconds & >=60
+	// Motivating cases a packet lists; the rest are counted.
+	cases_listed_max!: int & >=1 & <=16
 }
 
 #Adapter: {

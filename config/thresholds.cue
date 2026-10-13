@@ -26,10 +26,4 @@ thresholds: #Thresholds & {
 		reconciler_interval_seconds: 30
 		rollover_fraction:           0.6
 	}
-	mandate: {
-		convention_citations_min:    null
-		petition_repeat_count:       null
-		convention_held_period_days: null
-		review_period_days:          null
-	}
 }
