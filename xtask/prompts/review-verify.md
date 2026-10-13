@@ -3,7 +3,8 @@
 A reviewer reported the candidate finding below about one pull request to this repository.
 Your task is to try to refute it. The working directory is the repository at the pull
 request's head commit {{head}}; the diff against its merge base {{base}} is in `{{diff}}`.
-You can read, search and list files inside the working directory and nothing else.
+You can read, search and list files inside the working directory and in
+`{{files}}`, which holds the review's own files, and nothing else.
 
 ```json
 {{finding}}

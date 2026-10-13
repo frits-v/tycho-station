@@ -13,7 +13,8 @@ mod pull_request;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::io::{ErrorKind, Write as _};
+use std::io::Write as _;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -31,7 +32,6 @@ use diff::DiffMap;
 use findings::{Finding, Verdict};
 use pull_request::{PostOutcome, Posted, PullRequest};
 
-const REVIEW_DIR: &str = "target/review";
 const FIND_SCHEMA: &str = include_str!("../../config/export/schema/review_findings.json");
 const VERDICT_SCHEMA: &str = include_str!("../../config/export/schema/review_verdict.json");
 const FIND_INSTRUCTIONS: &str = include_str!("../prompts/review-find.md");
@@ -62,6 +62,8 @@ const RUN_TIME_MIN: Duration = Duration::from_secs(10 * 60);
 const ONE_RUN_MIN: Duration = Duration::from_secs(60);
 const DRY_RUN_BASE: &str = "origin/main";
 const SHORT_COMMIT_CHARS: usize = 12;
+/// The diff, the earlier findings and one instructions file per pass.
+const FILES_MAX: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -87,6 +89,9 @@ struct Context {
     posted: Vec<Posted>,
     run_time: Duration,
     user: Option<String>,
+    /// A directory private to this run, outside the checkout: the CLI refuses reads of
+    /// gitignored paths under `dontAsk`, so `target/` cannot hold what the model reads.
+    files: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -134,11 +139,17 @@ fn run(mode: Mode) -> Result<i32, String> {
         Mode::Post => post_context(root)?,
         Mode::DryRun => dry_run_context(root)?,
     };
+    let reviewed = review_in(&context);
+    remove_files(&context.files);
+    reviewed
+}
+
+fn review_in(context: &Context) -> Result<i32, String> {
     let started = Instant::now();
     let deadline = started
         .checked_add(context.run_time)
         .ok_or("the run deadline overflows")?;
-    let map = diff::parse_diff(&prepare(&context)?)?;
+    let map = diff::parse_diff(&prepare(context)?)?;
     if map.commentable.is_empty() {
         return Err(format!(
             "the diff {}...{} has no file with head-side lines to review once {} are excluded",
@@ -152,9 +163,9 @@ fn run(mode: Mode) -> Result<i32, String> {
         hunks: map.hunks,
         ..Tally::default()
     };
-    let candidates = find(&context, deadline, &mut tally)?;
-    let confirmed = verify(&context, candidates, deadline, &mut tally);
-    publish(&context, &map, confirmed, &mut tally)
+    let candidates = find(context, deadline, &mut tally)?;
+    let confirmed = verify(context, candidates, deadline, &mut tally);
+    publish(context, &map, confirmed, &mut tally)
 }
 
 fn required(name: &str) -> Result<String, String> {
@@ -239,6 +250,7 @@ fn post_context(root: PathBuf) -> Result<Context, String> {
         }),
         posted,
         user: current_user(),
+        files: create_files()?,
     })
 }
 
@@ -273,6 +285,7 @@ fn dry_run_context(root: PathBuf) -> Result<Context, String> {
         posted: Vec::new(),
         run_time: RUN_TIME_MAX,
         user: current_user(),
+        files: create_files()?,
     })
 }
 
@@ -280,8 +293,31 @@ fn short(commit: &str) -> &str {
     commit.get(..SHORT_COMMIT_CHARS).unwrap_or(commit)
 }
 
-fn review_dir(context: &Context) -> PathBuf {
-    context.root.join(REVIEW_DIR)
+/// A new 0700 directory under the runner's temporary directory, or the system's outside
+/// Actions; one left by an earlier run with the same pid is an error, not reused.
+fn create_files() -> Result<PathBuf, String> {
+    let base = env::var_os("RUNNER_TEMP")
+        .filter(|value| !value.is_empty())
+        .map_or_else(env::temp_dir, PathBuf::from);
+    let dir = base.join(format!("tycho-review-{}", std::process::id()));
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Removes the files this run wrote and their directory; a failure is reported, not fatal.
+fn remove_files(dir: &Path) {
+    let removed = fs::read_dir(dir).and_then(|entries| {
+        for entry in entries.take(FILES_MAX) {
+            fs::remove_file(entry?.path())?;
+        }
+        fs::remove_dir(dir)
+    });
+    if let Err(error) = removed {
+        eprintln!("xtask review: cannot remove {}: {error}", dir.display());
+    }
 }
 
 fn write_file(path: &Path, text: &str) -> Result<(), String> {
@@ -310,14 +346,11 @@ fn prepare(context: &Context) -> Result<String, String> {
             captured.stdout.len()
         ));
     }
-    let dir = review_dir(context);
-    match fs::create_dir(&dir) {
-        Ok(()) => {}
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(format!("cannot create {}: {error}", dir.display())),
-    }
-    write_file(&dir.join("diff.patch"), &captured.stdout)?;
-    write_file(&dir.join("posted.json"), &posted_listing(&context.posted))?;
+    write_file(&context.files.join("diff.patch"), &captured.stdout)?;
+    write_file(
+        &context.files.join("posted.json"),
+        &posted_listing(&context.posted),
+    )?;
     Ok(captured.stdout)
 }
 
@@ -336,8 +369,15 @@ fn render(template: &str, context: &Context, finding: Option<&Finding>) -> Strin
     template
         .replace("{{head}}", &context.head)
         .replace("{{base}}", &context.base)
-        .replace("{{diff}}", &format!("{REVIEW_DIR}/diff.patch"))
-        .replace("{{posted}}", &format!("{REVIEW_DIR}/posted.json"))
+        .replace("{{files}}", &context.files.display().to_string())
+        .replace(
+            "{{diff}}",
+            &context.files.join("diff.patch").display().to_string(),
+        )
+        .replace(
+            "{{posted}}",
+            &context.files.join("posted.json").display().to_string(),
+        )
         .replace("{{finding}}", &finding)
 }
 
@@ -374,14 +414,15 @@ fn run_claude(
             .as_ref()
             .map(|token| token.value.expose()),
     );
-    let mut command = claude_run::command(instructions, schema, limits, environment);
+    let mut command =
+        claude_run::command(instructions, &context.files, schema, limits, environment);
     command.current_dir(&context.root);
     let captured = run_bounded(&mut command, remaining);
     claude_run::decode(captured.exit, &captured.stdout)
 }
 
 fn find(context: &Context, deadline: Instant, tally: &mut Tally) -> Result<Vec<Finding>, String> {
-    let instructions = review_dir(context).join("find.md");
+    let instructions = context.files.join("find.md");
     write_file(&instructions, &render(FIND_INSTRUCTIONS, context, None))?;
     let outcome = run_claude(
         context,
@@ -409,7 +450,7 @@ fn verify_one(
     schema: &str,
     deadline: Instant,
 ) -> (Result<Verdict, String>, u64) {
-    let instructions = review_dir(context).join(format!("verify-{index}.md"));
+    let instructions = context.files.join(format!("verify-{index}.md"));
     if let Err(reason) = write_file(
         &instructions,
         &render(VERIFY_INSTRUCTIONS, context, Some(finding)),
@@ -683,12 +724,100 @@ mod tests {
             assert!(!handed.contains("$schema"), "{handed}");
             assert!(handed.contains("\"$defs\""));
         }
-        for placeholder in ["{{head}}", "{{base}}", "{{diff}}", "{{posted}}"] {
+        for placeholder in [
+            "{{head}}",
+            "{{base}}",
+            "{{files}}",
+            "{{diff}}",
+            "{{posted}}",
+        ] {
             assert!(FIND_INSTRUCTIONS.contains(placeholder), "{placeholder}");
         }
-        for placeholder in ["{{head}}", "{{base}}", "{{diff}}", "{{finding}}"] {
+        for placeholder in [
+            "{{head}}",
+            "{{base}}",
+            "{{files}}",
+            "{{diff}}",
+            "{{finding}}",
+        ] {
             assert!(VERIFY_INSTRUCTIONS.contains(placeholder), "{placeholder}");
         }
+    }
+
+    fn finding(path: &str, line: u32, summary: &str) -> Finding {
+        Finding {
+            path: path.to_string(),
+            line,
+            severity: findings::Severity::Medium,
+            category: findings::Category::Correctness,
+            summary: summary.to_string(),
+            failure_scenario: "Given x, y happens.".to_string(),
+        }
+    }
+
+    fn context(posted: Vec<Posted>, github_token: &str) -> Context {
+        Context {
+            root: PathBuf::from("/r"),
+            base: "b".repeat(40),
+            head: "a".repeat(40),
+            access_token: None,
+            destination: Some(Destination {
+                token: github_token.to_string(),
+                repository: "o/r".to_string(),
+                pull_request: PullRequest {
+                    number: 1,
+                    base: "b".repeat(40),
+                    head: "a".repeat(40),
+                    head_repository: "o/r".to_string(),
+                },
+            }),
+            posted,
+            run_time: RUN_TIME_MAX,
+            user: None,
+            files: PathBuf::from("/t/tycho-review-1"),
+        }
+    }
+
+    #[test]
+    fn select_withholds_skips_and_splits_the_confirmed_findings() {
+        let map =
+            diff::parse_diff("diff --git a/a.rs b/a.rs\n+++ b/a.rs\n@@ -1,0 +1,2 @@\n+x\n+y\n")
+                .unwrap();
+        let seen = finding("a.rs", 2, "posted before");
+        let posted = vec![Posted {
+            fingerprint: findings::fingerprint(&seen),
+            excerpt: String::new(),
+        }];
+        let confirmed = vec![
+            finding("a.rs", 1, "anchors"),
+            finding("a.rs", 9, "outside the hunk"),
+            finding("a.rs", 2, "token sk-ant-oat01-x in a message"),
+            finding("a.rs", 1, "Posted   before"),
+        ];
+        let mut tally = Tally::default();
+        let (inline, outside) =
+            select(&context(posted, "ghs_job"), &map, confirmed, &mut tally).unwrap();
+        assert_eq!(inline, [finding("a.rs", 1, "anchors")]);
+        assert_eq!(outside, [finding("a.rs", 9, "outside the hunk")]);
+        assert_eq!((tally.withheld, tally.already_posted), (1, 1));
+        assert_eq!((tally.inline, tally.outside), (1, 1));
+    }
+
+    #[test]
+    fn a_finding_holding_the_job_token_stops_the_whole_post() {
+        let map = DiffMap::default();
+        let confirmed = vec![
+            finding("a.rs", 1, "fine"),
+            finding("a.rs", 1, "leaks job-token-value"),
+        ];
+        let error = select(
+            &context(Vec::new(), "job-token-value"),
+            &map,
+            confirmed,
+            &mut Tally::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("nothing is posted"), "{error}");
     }
 
     #[test]

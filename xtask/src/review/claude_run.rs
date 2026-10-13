@@ -53,8 +53,10 @@ impl RunOutcome {
 
 /// The command line of a run. Setting sources are empty so the checkout's
 /// `.claude/settings.json`, which the pull request controls, adds no hook or permission.
+/// `--add-dir` takes several values, so another flag always follows it.
 pub fn command(
     instructions: &Path,
+    files: &Path,
     schema: &str,
     limits: Limits,
     environment: Vec<(OsString, OsString)>,
@@ -65,6 +67,8 @@ pub fn command(
         .args(["--tools", TOOLS, "--permission-mode", "dontAsk"])
         .args(["--setting-sources", "", "--strict-mcp-config"])
         .arg("--no-session-persistence")
+        .arg("--add-dir")
+        .arg(files)
         .args(["--max-turns", &limits.max_turns.to_string()])
         .args(["--max-budget-usd", &limits.max_budget_usd.to_string()])
         .args(["--json-schema", schema])
@@ -183,7 +187,8 @@ mod tests {
     #[test]
     fn the_command_line_has_exact_text() {
         let command = command(
-            Path::new("/r/target/review/find.md"),
+            Path::new("/t/tycho-review-7/find.md"),
+            Path::new("/t/tycho-review-7"),
             "{}",
             Limits {
                 max_turns: 80,
@@ -212,6 +217,8 @@ mod tests {
                 "",
                 "--strict-mcp-config",
                 "--no-session-persistence",
+                "--add-dir",
+                "/t/tycho-review-7",
                 "--max-turns",
                 "80",
                 "--max-budget-usd",
@@ -219,7 +226,7 @@ mod tests {
                 "--json-schema",
                 "{}",
                 "--append-system-prompt-file",
-                "/r/target/review/find.md",
+                "/t/tycho-review-7/find.md",
                 PROMPT,
             ]
         );

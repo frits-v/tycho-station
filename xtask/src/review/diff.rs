@@ -32,7 +32,8 @@ fn hunk_start(header: &str) -> Option<(u32, u32)> {
 }
 
 fn head_path(line: &str) -> Result<Option<String>, String> {
-    let target = line.trim_start_matches("+++ ");
+    // git ends the label with a tab when the path holds a space.
+    let target = line.trim_start_matches("+++ ").trim_end_matches('\t');
     if target == "/dev/null" {
         return Ok(None);
     }
@@ -150,6 +151,15 @@ new file mode 100644
         assert!(parse_diff("diff --git a/x b/x\n+++ b/x\n@@ nonsense @@\n").is_err());
         assert!(parse_diff("diff --git a/x b/x\n+++ b/x\n@@ -1,2 +1,2 @@\n a\n").is_err());
         assert!(parse_diff("diff --git a/x b/x\n+++ b/x\n@@ -1,2 +1,2 @@\n a\nzzz\n").is_err());
+    }
+
+    #[test]
+    fn a_path_with_a_space_loses_the_tab_git_appends() {
+        let map = parse_diff(
+            "diff --git a/my notes.md b/my notes.md\n--- a/my notes.md\t\n+++ b/my notes.md\t\n@@ -1 +1 @@\n-a\n+b\n",
+        )
+        .unwrap();
+        assert!(map.anchors("my notes.md", 1));
     }
 
     #[test]

@@ -8,6 +8,8 @@ use crate::github_api::{github_message, Client, Method, Reply};
 const PER_PAGE: usize = 30;
 const PAGES_MAX: usize = 10;
 const BODY_EXCERPT_CHARS: usize = 300;
+/// The account the job's `GITHUB_TOKEN` posts as; markers in anyone else's text are ignored.
+const REVIEWER_LOGIN: &str = "github-actions[bot]";
 
 /// The fields of a `pull_request` event the review reads.
 #[derive(Debug, PartialEq, Eq)]
@@ -76,8 +78,15 @@ fn excerpt(prefix: &str, text: &str) -> String {
     format!("{prefix}{}", text.chars().skip(skipped).collect::<String>())
 }
 
+fn ours(item: &Value) -> bool {
+    item.pointer("/user/login").and_then(Value::as_str) == Some(REVIEWER_LOGIN)
+}
+
 /// Our findings in one inline comment, located by its path and line.
 fn from_comment(comment: &Value) -> Vec<Posted> {
+    if !ours(comment) {
+        return Vec::new();
+    }
     let body = comment
         .get("body")
         .and_then(Value::as_str)
@@ -101,6 +110,9 @@ fn from_comment(comment: &Value) -> Vec<Posted> {
 
 /// Our findings in one review's body, each located by its own entry.
 fn from_review(review: &Value) -> Vec<Posted> {
+    if !ours(review) {
+        return Vec::new();
+    }
     let body = review
         .get("body")
         .and_then(Value::as_str)
@@ -254,22 +266,36 @@ mod tests {
     }
 
     fn comment(body: &str) -> Value {
-        serde_json::json!({"body": body, "path": "a.rs", "line": 3})
+        serde_json::json!({"body": body, "path": "a.rs", "line": 3,
+            "user": {"login": REVIEWER_LOGIN}})
     }
 
     #[test]
     fn our_marked_findings_are_collected_from_comments_and_review_bodies() {
         let ours = "x\n<!-- tycho-review 0123456789abcdef -->";
         let full: Vec<Value> = (0..PER_PAGE).map(|_| comment("someone else")).collect();
-        let last = vec![comment(ours), comment("<!-- tycho-review nothex -->")];
-        let review = serde_json::json!({"body":
+        let planted = serde_json::json!({"body": "<!-- tycho-review 1111111111111111 -->",
+            "path": "a.rs", "line": 3, "user": {"login": "someone"}});
+        let last = vec![
+            comment(ours),
+            comment("<!-- tycho-review nothex -->"),
+            planted,
+        ];
+        let planted_review = serde_json::json!({"user": {"login": "someone"},
+            "body": "<!-- tycho-review 2222222222222222 -->"});
+        let review = serde_json::json!({"user": {"login": REVIEWER_LOGIN}, "body":
             "- `b.rs:9` (Low, correctness): s\n  f\n  <!-- tycho-review fedcba9876543210 -->"});
         let (base, seen) = listener(vec![
             (200, Value::Array(full).to_string()),
             (200, Value::Array(last).to_string()),
             (
                 200,
-                Value::Array(vec![review, serde_json::json!({"body": null})]).to_string(),
+                Value::Array(vec![
+                    review,
+                    planted_review,
+                    serde_json::json!({"body": null}),
+                ])
+                .to_string(),
             ),
         ]);
         let posted = posted_findings(&Client::loopback(&base), "t", "o/r", 12).unwrap();
