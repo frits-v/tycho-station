@@ -584,7 +584,9 @@ check out, build and run it.
   `gh workflow run review-dry-run.yml --ref <branch>`. It runs that branch's xtask with
   `xtask review --dry-run` against `origin/main`, prints the verdict it would give and the
   findings, writes them to the step summary, and posts nothing; it holds no App key. It is
-  how a change to the reviewer is tried before it reaches the base branch. `mise run review`
+  how a change to the reviewer is tried before it reaches the base branch. On `main` itself
+  the merge base is the head, so the diff is empty and the run fails with nothing to review;
+  dispatch it on a branch that differs from `main`. `mise run review`
   does the same locally with the developer's Claude login and refuses a tree with
   uncommitted changes, since the model reads the working tree.
 
