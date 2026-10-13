@@ -151,12 +151,23 @@ fn one_line(text: &str) -> String {
         .join(" ")
 }
 
+/// One character of model text outside a code span, written so it renders as itself: an
+/// entity for each character that could start HTML, a mention, a code span, an escape or
+/// emphasis, so the text around the review's own code spans holds none of them.
 fn push_inert(out: &mut String, character: char) {
     match character {
         '&' => out.push_str("&amp;"),
         '<' => out.push_str("&lt;"),
         '>' => out.push_str("&gt;"),
         '@' => out.push_str("&#64;"),
+        '\\' => out.push_str("&#92;"),
+        '`' => out.push_str("&#96;"),
+        '*' => out.push_str("&#42;"),
+        '_' => out.push_str("&#95;"),
+        '[' => out.push_str("&#91;"),
+        ']' => out.push_str("&#93;"),
+        '~' => out.push_str("&#126;"),
+        '|' => out.push_str("&#124;"),
         _ => out.push(character),
     }
 }
@@ -184,19 +195,62 @@ fn closing_run(characters: &[char], from: usize, length: usize) -> Option<usize>
     None
 }
 
-/// Model text as one line of GitHub markdown that reads as written and does nothing: a code
-/// span is kept as written, since GitHub shows it literally, and everything else is escaped,
-/// so it makes no HTML, no marker and no mention. A backtick after a backslash, or one with no
-/// closing run, opens no span; where this reading and the spec could differ, the text is
-/// escaped.
+fn longest_run(characters: &[char]) -> usize {
+    characters
+        .split(|character| *character != '`')
+        .map(<[char]>::len)
+        .max()
+        .unwrap_or_default()
+}
+
+/// A code span the review writes around `content`, which GitHub shows as written: the spec
+/// takes one space off each side of content that has one on both, the fence is longer than
+/// any backtick run inside, and a pad keeps a backtick or an edge space off the fence.
+fn push_code_span(out: &mut String, content: &[char]) {
+    let blank = content.iter().all(|character| *character == ' ');
+    let edged = |content: &[char], character: char| {
+        content.first() == Some(&character) && content.last() == Some(&character)
+    };
+    let content = if !blank && edged(content, ' ') {
+        content
+            .get(1..content.len().saturating_sub(1))
+            .unwrap_or_default()
+    } else {
+        content
+    };
+    let fence = "`".repeat(longest_run(content).saturating_add(1));
+    let pad = if content.first() == Some(&'`')
+        || content.last() == Some(&'`')
+        || (!blank && edged(content, ' '))
+    {
+        " "
+    } else {
+        ""
+    };
+    out.push_str(&fence);
+    out.push_str(pad);
+    out.extend(content);
+    out.push_str(pad);
+    out.push_str(&fence);
+}
+
+/// Model text as one line of GitHub markdown that reads as written and does nothing. Its code
+/// spans are found by the spec's rules (a backslash escapes the punctuation after it, a run
+/// of backticks closes at the next run of the same length) and each is written again inside
+/// a span the review builds; every other character that markdown or GitHub acts on becomes an
+/// entity. Only the review's own fences open a span, so a reading that differs from GitHub's
+/// changes how the text looks, never what it does: no HTML, no marker and no mention.
 fn inert(text: &str) -> String {
     let characters: Vec<char> = one_line(text).chars().collect();
     let mut out = String::with_capacity(characters.len());
     let mut at: usize = 0;
     while let Some(&character) = characters.get(at) {
         let next = at.saturating_add(1);
-        if character == '\\' && characters.get(next) == Some(&'`') {
-            out.push_str("\\`");
+        let escaped = characters
+            .get(next)
+            .filter(|literal| character == '\\' && literal.is_ascii_punctuation());
+        if let Some(&literal) = escaped {
+            push_inert(&mut out, literal);
             at = next.saturating_add(1);
             continue;
         }
@@ -207,10 +261,16 @@ fn inert(text: &str) -> String {
         }
         let run = backtick_run(&characters, at);
         let opened_end = at.saturating_add(run);
-        let end = closing_run(&characters, opened_end, run)
-            .map_or(opened_end, |close| close.saturating_add(run));
-        out.extend(characters.get(at..end).unwrap_or_default());
-        at = end;
+        if let Some(close) = closing_run(&characters, opened_end, run) {
+            push_code_span(
+                &mut out,
+                characters.get(opened_end..close).unwrap_or_default(),
+            );
+            at = close.saturating_add(run);
+        } else {
+            (0..run).for_each(|_| push_inert(&mut out, '`'));
+            at = opened_end;
+        }
     }
     out
 }
@@ -407,11 +467,81 @@ mod tests {
 
     #[test]
     fn an_escaped_or_unclosed_backtick_opens_no_code_span() {
-        assert_eq!(inert("\\`<b>\\`"), "\\`&lt;b&gt;\\`");
-        assert_eq!(inert("`<b>"), "`&lt;b&gt;");
+        assert_eq!(inert("\\`<b>\\`"), "&#96;&lt;b&gt;&#96;");
+        assert_eq!(inert("`<b>"), "&#96;&lt;b&gt;");
         assert_eq!(inert("``a`<b>`` <c>"), "``a`<b>`` &lt;c&gt;");
-        assert_eq!(inert("`<b>`` <c>"), "`&lt;b&gt;`` &lt;c&gt;");
+        assert_eq!(inert("`<b>`` <c>"), "&#96;&lt;b&gt;&#96;&#96; &lt;c&gt;");
         assert_eq!(inert("a\r- `x\n<b>`"), "a - `x <b>`");
+        assert_eq!(inert("a\\b *c*"), "a&#92;b &#42;c&#42;");
+    }
+
+    #[test]
+    fn an_escaped_backslash_leaves_the_backtick_after_it_to_open_a_span() {
+        assert_eq!(
+            inert("\\\\` x `@octocat` <b>"),
+            "&#92;`x`&#64;octocat&#96; &lt;b&gt;"
+        );
+        assert_eq!(inert("\\\\`<b>`"), "&#92;`<b>`");
+    }
+
+    #[test]
+    fn a_rewritten_span_shows_its_content_with_the_spec_s_spacing() {
+        assert_eq!(inert("`` `a ``"), "`` `a ``");
+        assert_eq!(inert("`  x  `"), "`  x  `");
+        assert_eq!(inert("` x `"), "`x`");
+        assert_eq!(inert("```a``b```"), "```a``b```");
+    }
+
+    /// The text outside the code spans of posted text. With no backslash outside a span, the
+    /// spec finds the same openers, and a closer never depends on a backslash.
+    fn outside_code(posted: &str) -> String {
+        let characters: Vec<char> = posted.chars().collect();
+        let mut outside = String::new();
+        let mut at = 0_usize;
+        while let Some(&character) = characters.get(at) {
+            let run = backtick_run(&characters, at);
+            let close = (run > 0)
+                .then(|| closing_run(&characters, at.saturating_add(run), run))
+                .flatten();
+            if let Some(close) = close {
+                at = close.saturating_add(run);
+            } else {
+                outside.push(character);
+                at = at.saturating_add(1);
+            }
+        }
+        outside
+    }
+
+    #[test]
+    fn no_short_string_of_markdown_characters_posts_live_html_a_mention_or_a_stray_backtick() {
+        let alphabet = ['`', '\\', '<', '@', 'a', ' ', '\n', '*'];
+        let mut examined = 0_usize;
+        let mut indices = vec![0_usize; 0];
+        for length in 0..=5_u32 {
+            let count = alphabet.len().pow(length);
+            for number in 0..count {
+                indices.clear();
+                let mut rest = number;
+                for _ in 0..length {
+                    indices.push(rest % alphabet.len());
+                    rest /= alphabet.len();
+                }
+                let text: String = indices
+                    .iter()
+                    .filter_map(|index| alphabet.get(*index))
+                    .collect();
+                let posted = inert(&text);
+                assert!(!posted.contains(['\n', '\r']), "{text:?} -> {posted:?}");
+                let outside = outside_code(&posted);
+                assert!(
+                    !outside.contains(['<', '@', '`', '\\']),
+                    "{text:?} -> {posted:?}"
+                );
+                examined = examined.saturating_add(1);
+            }
+        }
+        assert_eq!(examined, 37_449);
     }
 
     #[test]
