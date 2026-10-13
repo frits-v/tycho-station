@@ -495,6 +495,11 @@ mod tests {
     fn every_petition_bound_is_refused_one_past_its_limit_and_the_committed_file_is_accepted() {
         let workspace = crate::setup::workspace_root();
         let schema = workspace.join(CONFIG_SCHEMA);
+        let defaults = vet_petitions_fixture(&schema, &petitions_fixture("", 0), "defaults");
+        assert!(
+            matches!(defaults, CueOutcome::Clean(_)),
+            "the fixture refuses its own defaults, so no case below tests a bound: {defaults:?}"
+        );
         let mut examined = 0_usize;
         for (field, _default, min, max) in PETITIONS_BOUNDS {
             for (case, value) in [("below_min", min - 1), ("above_max", max + 1)] {
