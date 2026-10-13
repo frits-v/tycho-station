@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tycho::agent_files::current_uid;
-use tycho::config::{AgentDirs, CorePorts};
+use tycho::config::{AgentDirs, CorePorts, ToolPrefix};
 use tycho::kill::{kill_session, reap, KillRequest, KillVerdict};
 use tycho::launcher::{HeartbeatTarget, VendorTerminal};
 use tycho::launcher::{SessionFiles, VendorRecord};
@@ -18,6 +18,7 @@ use tycho::spawn::{
     read_lease, save_scrollback, spawn_session, split_tier, SpawnOutcome, SpawnRequest,
 };
 use tycho::zmx::{count_named, presence, Zmx};
+use tycho_harness::tool_prefix::link_scratch_prefix;
 use tycho_types::envelope::ShortText;
 use tycho_types::launcher::LauncherEnv;
 use tycho_types::session::SessionName;
@@ -53,6 +54,10 @@ pub struct LauncherLog {
 
 struct Inner {
     zmx: Zmx,
+    /// A scratch prefix holding the built `tycho` and the pinned tools, where sessions start.
+    prefix: ToolPrefix,
+    /// The prefix's `tycho`, which zmx types as the launcher.
+    launcher: PathBuf,
     dirs: AgentDirs,
     home: PathBuf,
     core_ports: CorePorts,
@@ -72,15 +77,20 @@ impl LauncherSpawner {
     pub fn new(core_home: &Path, core_ports: CorePorts, tag: &str, plan: VendorPlan) -> Self {
         let user_home = PathBuf::from(env::var_os("HOME").unwrap());
         let agent = user_home.join(format!(".tca-{tag}-{}", std::process::id()));
-        if agent.exists() {
-            fs::remove_dir_all(&agent).unwrap();
+        let prefix_root = user_home.join(format!(".tcx-{tag}-{}", std::process::id()));
+        for dir in [&agent, &prefix_root] {
+            if dir.exists() {
+                fs::remove_dir_all(dir).unwrap();
+            }
         }
         let fixture = core_home.join("vendor.sh");
         fs::write(&fixture, VENDOR_SCRIPT).unwrap();
-        let zmx_binary = mise_which("zmx");
+        let prefix = scratch_prefix(&prefix_root, &mise_which("zmx"));
         Self {
             inner: Arc::new(Inner {
-                zmx: Zmx::agent(&zmx_binary, &agent),
+                zmx: Zmx::agent(prefix.tool("zmx").unwrap(), &agent),
+                launcher: prefix.tycho(),
+                prefix,
                 dirs: AgentDirs::new(agent).unwrap(),
                 home: core_home.to_path_buf(),
                 core_ports,
@@ -170,7 +180,7 @@ impl LauncherSpawner {
         spawn_session(&SpawnRequest {
             zmx: &self.inner.zmx,
             dirs: &self.inner.dirs,
-            tycho: Path::new(TYCHO),
+            tycho: &self.inner.launcher,
             home: &user_home,
             env: environment,
             heartbeat: HeartbeatTarget::Session,
@@ -180,6 +190,9 @@ impl LauncherSpawner {
             terminal: VendorTerminal::Files,
             vendor_dir: None,
             ports: self.inner.core_ports,
+            tool_prefix: &self.inner.prefix,
+            // The chaos vendor is a script; the hand-off is the launcher suite's.
+            credential: None,
         })
     }
 
@@ -199,8 +212,9 @@ impl LauncherSpawner {
                 println!("teardown: killed the orphaned vendor of {name}");
             }
         }
-        let left = clear_sessions(&self.inner.zmx, "agent");
+        let left = clear_sessions(&self.inner.zmx, "agent", &self.inner.launcher);
         drop(fs::remove_dir_all(&self.inner.dirs.socket_dir));
+        drop(fs::remove_dir_all(self.inner.prefix.root()));
         left
     }
 }
@@ -289,7 +303,7 @@ impl Spawner for LauncherSpawner {
             session,
             pid,
             agent_uid: current_uid(),
-            tycho: Path::new(TYCHO),
+            tycho: &self.inner.launcher,
         });
         println!("evidence: port kill({session}, {pid}) -> {report:?}");
         self.record(|log| {
@@ -341,4 +355,26 @@ impl Drop for AgentGuard {
             "teardown: {left} agent sessions remain"
         );
     }
+}
+
+/// A scratch prefix at `root` with the built `tycho` as its launcher and the developer's
+/// pinned tools as its installs, so a session starts from a prefix the way production does.
+fn scratch_prefix(root: &Path, zmx: &Path) -> ToolPrefix {
+    link_scratch_prefix(
+        root,
+        Path::new(TYCHO),
+        &[
+            ("claude", &mise_which("claude")),
+            ("codex", &mise_which("codex")),
+            ("zmx", zmx),
+        ],
+    )
+    .unwrap();
+    let prefix = ToolPrefix::load(root.to_path_buf()).unwrap();
+    println!(
+        "evidence: sessions start from {} under zmx {}",
+        prefix.tycho().display(),
+        prefix.tool("zmx").unwrap().display()
+    );
+    prefix
 }

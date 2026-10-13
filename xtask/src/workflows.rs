@@ -1,19 +1,22 @@
-//! `xtask workflows`: zizmor and jactionlint over the workflow files at pedantic, with their
-//! online audits, or without them under `--offline`. Both write SARIF under `target/sarif`,
-//! and their findings are read from it.
+//! `xtask workflows`: the CUE workflow policy, then zizmor and jactionlint over the workflow
+//! files at pedantic, with their online audits, or without them under `--offline`. zizmor and
+//! jactionlint write SARIF under `target/sarif`, and their findings are read from it.
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::config::CueOutcome;
 use crate::process::{run_bounded, run_bounded_capturing_stderr, Captured, Exit};
 use crate::sarif::{self, Finding, Results};
 
 const WORKFLOW_DIR: &str = ".github/workflows";
+const POLICY: &str = ".github/workflow-policy.cue";
+const POLICY_TIMEOUT: Duration = Duration::from_secs(60);
 const WORKFLOW_FILES_MAX: usize = 64;
 const AUDIT_TIMEOUT: Duration = Duration::from_secs(300);
 const REPORTED_FINDINGS_MAX: usize = 40;
@@ -148,6 +151,35 @@ fn report(tool: &str, output: &str, outcome: AuditOutcome) -> Result<(), String>
     }
 }
 
+/// `cue vet -c` of one workflow file against the policy; cue prints a refusal's reasons.
+fn policy_outcome(policy: &Path, file: &Path) -> CueOutcome {
+    let captured = run_bounded(
+        Command::new("cue")
+            .args(["vet", "-c"])
+            .arg(policy)
+            .arg(file),
+        POLICY_TIMEOUT,
+    );
+    crate::config::decode(&captured.exit, captured.stdout)
+}
+
+/// Every workflow file against `.github/workflow-policy.cue`; returns how many it examined.
+fn policy(files: &[PathBuf]) -> Result<usize, String> {
+    let refused: Vec<String> = files
+        .iter()
+        .filter_map(|file| match policy_outcome(Path::new(POLICY), file) {
+            CueOutcome::Clean(_) => None,
+            CueOutcome::Rejected => Some(format!("{} breaks the policy", file.display())),
+            other => Some(format!("{}: cue {other:?}", file.display())),
+        })
+        .collect();
+    if refused.is_empty() {
+        Ok(files.len())
+    } else {
+        Err(format!("{POLICY}: {}", refused.join("; ")))
+    }
+}
+
 fn zizmor_arguments(network: Network) -> Vec<&'static str> {
     let mut arguments = vec!["--persona=pedantic", "--format", "sarif", "--no-progress"];
     if network == Network::Offline {
@@ -214,6 +246,7 @@ fn audits(network: Network) -> Result<String, String> {
     if files.is_empty() {
         return Err(format!("no workflow files under {WORKFLOW_DIR}"));
     }
+    let vetted = policy(&files)?;
     let zizmor_result = zizmor(&files, network);
     let linted = jactionlint(network)?;
     zizmor_result?;
@@ -222,9 +255,21 @@ fn audits(network: Network) -> Result<String, String> {
         Network::Offline => " offline",
     };
     Ok(format!(
-        "zizmor examined {} files{mode}, jactionlint {linted}, no findings",
+        "the policy examined {vetted} files, zizmor {}{mode}, jactionlint {linted}, no findings",
         files.len()
     ))
+}
+
+/// `xtask workflows [--offline]`.
+pub fn command(argument: Option<&str>) -> i32 {
+    match argument {
+        None => workflows(Network::Online),
+        Some("--offline") => workflows(Network::Offline),
+        Some(other) => {
+            eprintln!("usage: xtask workflows [--offline]; got {other}");
+            2
+        }
+    }
 }
 
 pub fn workflows(network: Network) -> i32 {
@@ -243,6 +288,34 @@ pub fn workflows(network: Network) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each fixture under `xtask/fixtures/workflow-policy` is named for what the policy does
+    /// with it; the cases are a privileged workflow checking out a ref or a repository, one
+    /// with workflow-level concurrency, a privileged base checkout, and an unprivileged ref.
+    #[test]
+    fn the_policy_refuses_a_privileged_checkout_of_the_author_s_code_and_nothing_else() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let policy_file = crate_dir.join("..").join(POLICY);
+        let fixtures = crate_dir.join("fixtures/workflow-policy");
+        let mut names: Vec<PathBuf> = fs::read_dir(&fixtures)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 5, "{names:?}");
+        for fixture in names {
+            let name = fixture.file_name().unwrap().to_string_lossy().into_owned();
+            let outcome = policy_outcome(&policy_file, &fixture);
+            if name.starts_with("refused-") {
+                assert_eq!(outcome, CueOutcome::Rejected, "{name}");
+            } else {
+                assert!(
+                    matches!(outcome, CueOutcome::Clean(_)),
+                    "{name}: {outcome:?}"
+                );
+            }
+        }
+    }
 
     const CLEAN: &str =
         r#"{"version": "2.1.0", "runs": [{"tool": {"driver": {"name": "z"}}, "results": []}]}"#;

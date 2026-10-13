@@ -9,7 +9,8 @@ use tycho_types::session::SessionName;
 use std::io::Write;
 
 use crate::agent_files::open_append;
-use crate::config::{AgentDirs, CorePorts, LOG_DIR};
+use crate::config::{AgentDirs, ConfigError, CorePorts, ToolPrefix, LOG_DIR};
+use crate::credentials::{self, Credential, CredentialVendor};
 use crate::kill::{kill_by_name, kill_session, KillReport, KillRequest};
 use crate::launch_spec::{HeartbeatTarget, VendorTerminal};
 use crate::private_dir;
@@ -23,20 +24,23 @@ use crate::zmx::Zmx;
 /// Under the core home's log directory.
 pub const KILL_LOG: &str = "kills.log";
 
+/// Built only by `for_prefix`, so the launcher and zmx are always the prefix's.
 #[derive(Debug, Clone)]
 pub struct LauncherSpawner {
-    pub zmx: Zmx,
+    zmx: Zmx,
     pub dirs: AgentDirs,
     /// The `tycho` binary zmx runs as the launcher.
-    pub tycho: PathBuf,
+    tycho: PathBuf,
     /// `HOME` in the launcher's environment.
     pub home: PathBuf,
-    /// Where scrollback is saved.
+    /// Where scrollback is saved and the vendor credentials are kept.
     pub core_home: PathBuf,
     pub agent_uid: u32,
     pub heartbeat: HeartbeatTarget,
     /// The ports of the core whose ingress the launchers report to.
     pub ports: CorePorts,
+    /// Where each session's binaries and mise installs come from.
+    tool_prefix: ToolPrefix,
 }
 
 /// Every spawn outcome maps to a pid or a refusal; only an unreadable state is worth a retry.
@@ -68,6 +72,44 @@ pub fn kill_line(session: &SessionName, pid: u32, report: &KillReport) -> String
 }
 
 impl LauncherSpawner {
+    /// A spawner whose launcher is the prefix's `tycho` and whose sessions run under the
+    /// prefix's recorded zmx, so a session starts from the prefix and from nothing else.
+    pub fn for_prefix(
+        tool_prefix: ToolPrefix,
+        dirs: AgentDirs,
+        home: PathBuf,
+        core_home: PathBuf,
+        agent_uid: u32,
+        heartbeat: HeartbeatTarget,
+        ports: CorePorts,
+    ) -> Result<Self, ConfigError> {
+        let zmx_binary = tool_prefix.tool("zmx").ok_or_else(|| {
+            ConfigError::ToolPrefixManifest("station.json records no zmx".to_string())
+        })?;
+        Ok(Self {
+            zmx: Zmx::agent(zmx_binary, &dirs.socket_dir),
+            tycho: tool_prefix.tycho(),
+            dirs,
+            home,
+            core_home,
+            agent_uid,
+            heartbeat,
+            ports,
+            tool_prefix,
+        })
+    }
+
+    /// The core's stored credential for the session's vendor; a vendor that needs one and has
+    /// none refuses the spawn with the command that stores it.
+    fn credential_for(&self, session: &SessionName) -> Result<Option<Credential>, SpawnerError> {
+        CredentialVendor::for_session(session.vendor())
+            .map(|vendor| {
+                credentials::load(&self.core_home, vendor)
+                    .map_err(|error| SpawnerError::Refused(error.to_string()))
+            })
+            .transpose()
+    }
+
     fn log_kill(&self, line: &str) -> Result<(), SpawnerError> {
         let dir = self.core_home.join(LOG_DIR);
         let path = dir.join(KILL_LOG);
@@ -99,6 +141,7 @@ impl Spawner for LauncherSpawner {
             .working_dir
             .as_ref()
             .map(|dir| PathBuf::from(dir.as_str()));
+        let credential = self.credential_for(&spec.environment.session_name)?;
         spawn_session(&SpawnRequest {
             zmx: &self.zmx,
             dirs: &self.dirs,
@@ -112,6 +155,8 @@ impl Spawner for LauncherSpawner {
             terminal,
             vendor_dir: vendor_dir.as_deref(),
             ports: self.ports,
+            tool_prefix: &self.tool_prefix,
+            credential: credential.as_ref(),
         })
         .and_then(spawned_pid)
     }
@@ -161,6 +206,40 @@ mod tests {
     use tycho_types::lease::RequeueReason;
 
     #[test]
+    fn a_prefix_spawner_launches_the_prefix_tycho_under_the_recorded_zmx() {
+        let prefix = crate::config::tool_prefix::tests::production();
+        let spawner = LauncherSpawner::for_prefix(
+            prefix,
+            AgentDirs::new(PathBuf::from("/Users/Shared/tycho-agent-zmx")).unwrap(),
+            PathBuf::from("/Users/tycho-agent"),
+            PathBuf::from("/core"),
+            1,
+            HeartbeatTarget::Session,
+            CorePorts::PRODUCTION,
+        )
+        .unwrap();
+        assert_eq!(
+            spawner.tycho,
+            PathBuf::from("/Users/Shared/tycho/bin/tycho")
+        );
+        assert_eq!(
+            spawner.zmx.binary(),
+            Path::new("/Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx")
+        );
+        let bare = ToolPrefix::new(PathBuf::from("/tmp/prefix")).unwrap();
+        assert!(LauncherSpawner::for_prefix(
+            bare,
+            AgentDirs::new(PathBuf::from("/a")).unwrap(),
+            PathBuf::from("/h"),
+            PathBuf::from("/c"),
+            1,
+            HeartbeatTarget::Session,
+            CorePorts::PRODUCTION,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn a_kill_logs_both_verdicts() {
         use crate::kill::{KillRefusal, KillVerdict};
         let home = std::env::temp_dir().join(format!("tycho-kill-log-{}", std::process::id()));
@@ -175,6 +254,7 @@ mod tests {
             agent_uid: 1,
             heartbeat: HeartbeatTarget::Session,
             ports: CorePorts::PRODUCTION,
+            tool_prefix: ToolPrefix::new(home.join("prefix")).unwrap(),
         };
         let report = KillReport {
             zmx_kill: Ok(()),
@@ -192,6 +272,38 @@ mod tests {
             log.contains("launcher Refused(CoreUid)") && log.contains("vendor Some(Signalled)"),
             "{log}"
         );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_vendor_session_needs_the_cores_credential_and_names_how_to_store_it() {
+        use crate::credentials::tests::CLAUDE_TOKEN;
+        let home = std::env::temp_dir().join(format!("tycho-spawner-cred-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&home));
+        std::fs::create_dir_all(&home).unwrap();
+        let spawner = LauncherSpawner {
+            zmx: Zmx::agent(Path::new("/usr/bin/true"), &home),
+            dirs: AgentDirs::new(home.join("agent")).unwrap(),
+            tycho: PathBuf::from("/opt/tycho"),
+            home: home.clone(),
+            core_home: home.join("core"),
+            agent_uid: 1,
+            heartbeat: HeartbeatTarget::Session,
+            ports: CorePorts::PRODUCTION,
+            tool_prefix: ToolPrefix::new(home.join("prefix")).unwrap(),
+        };
+        let claude = SessionName::parse("cf7a.wu01.wrk.claude.a1f3").unwrap();
+        let refusal = spawner.credential_for(&claude).unwrap_err();
+        assert!(
+            matches!(&refusal, SpawnerError::Refused(why) if why.contains("tycho credentials set claude")),
+            "{refusal:?}"
+        );
+        let stored = Credential::parse(CredentialVendor::Claude, CLAUDE_TOKEN.as_bytes()).unwrap();
+        credentials::store(&spawner.core_home, &stored).unwrap();
+        let loaded = spawner.credential_for(&claude).unwrap().unwrap();
+        assert_eq!(loaded.vendor(), CredentialVendor::Claude);
+        let amp = SessionName::parse("cf7a.wu01.wrk.amp.a1f3").unwrap();
+        assert!(spawner.credential_for(&amp).unwrap().is_none());
         std::fs::remove_dir_all(&home).unwrap();
     }
 

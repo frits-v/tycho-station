@@ -7,9 +7,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::app_token::{self, AppCredentials, Repository, APP_ID_VARIABLE, APP_KEY_VARIABLE};
+use crate::app_token::{self, AppCredentials, Repository, RELEASE};
 use crate::process::{run_bounded, Captured, Exit};
 use std::time::Duration;
+use tycho_types::git_environment::git_command;
 
 const RELEASE_PLZ_TIMEOUT: Duration = Duration::from_secs(600);
 const DIST_TIMEOUT: Duration = Duration::from_secs(1800);
@@ -235,8 +236,10 @@ fn valid_tag(tag: &str) -> bool {
 
 fn release_pr_inputs() -> Result<(AppCredentials, Repository), String> {
     let credentials = app_token::read_credentials(
-        env::var(APP_ID_VARIABLE).ok(),
-        env::var(APP_KEY_VARIABLE).ok(),
+        &RELEASE,
+        env::var(RELEASE.client_id_variable).ok(),
+        env::var(RELEASE.app_id_variable).ok(),
+        crate::secrets::read(RELEASE.key_variable),
     )?;
     let repository = app_token::read_repository(env::var("GITHUB_REPOSITORY").ok())?;
     Ok((credentials, repository))
@@ -271,7 +274,7 @@ pub fn release_pr(dry_run: bool) -> i32 {
     }
 }
 
-/// release-plz and the cargo and git processes it starts never see the App id or key.
+/// release-plz and the cargo and git processes it starts never see the App's ids or key.
 fn release_plz_command(
     args: &[&str],
     parent: impl IntoIterator<Item = (OsString, OsString)>,
@@ -280,7 +283,7 @@ fn release_plz_command(
     command
         .args(args)
         .env_clear()
-        .envs(app_token::without_app_credentials(parent));
+        .envs(app_token::without_app_credentials(&RELEASE, parent));
     command
 }
 
@@ -303,7 +306,7 @@ fn report_release_pr(captured: Captured) -> i32 {
 }
 
 fn git_in(dir: &Path, args: &[&str]) -> Captured {
-    run_bounded(Command::new("git").current_dir(dir).args(args), GIT_TIMEOUT)
+    run_bounded(git_command().current_dir(dir).args(args), GIT_TIMEOUT)
 }
 
 fn remove_dry_run_worktree(root: &Path) -> bool {
@@ -731,8 +734,9 @@ mod tests {
     fn release_plz_never_receives_the_app_credentials() {
         let parent: Vec<(OsString, OsString)> = [
             ("PATH", "/usr/bin"),
-            (APP_ID_VARIABLE, "1"),
-            (APP_KEY_VARIABLE, "key-material"),
+            (RELEASE.client_id_variable, "Iv23liExample"),
+            (RELEASE.app_id_variable, "1"),
+            (RELEASE.key_variable, "key-material"),
         ]
         .into_iter()
         .map(|(name, value)| (name.into(), value.into()))
@@ -749,7 +753,7 @@ mod tests {
         let key_lines: Vec<usize> = lines
             .iter()
             .enumerate()
-            .filter(|(_, line)| line.contains(&format!("secrets.{APP_KEY_VARIABLE}")))
+            .filter(|(_, line)| line.contains(&format!("secrets.{}", RELEASE.key_variable)))
             .map(|(index, _)| index)
             .collect();
         assert_eq!(key_lines.len(), 1, "{key_lines:?}");

@@ -369,9 +369,8 @@ pub fn remove_relay_dir(dirs: &AgentDirs, session: &SessionName) -> Result<(), S
 mod tests {
     use super::*;
     use crate::agent_files::current_uid;
+    use crate::test_sockets::{listener, listener_for};
     use crate::vendors::claude_control::instruction_line;
-    use std::io::{BufRead, BufReader};
-    use std::os::unix::net::UnixListener;
     use std::thread;
 
     fn scratch(test: &str) -> AgentDirs {
@@ -452,17 +451,7 @@ mod tests {
         let dirs = scratch("poll");
         let dir = relay_dir(&dirs, &session());
         let socket = dirs.socket_dir.join("i.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = thread::spawn(move || {
-            let mut lines = Vec::new();
-            for _ in 0..2 {
-                let (stream, _) = listener.accept().unwrap();
-                let mut line = String::new();
-                BufReader::new(stream).read_line(&mut line).unwrap();
-                lines.push(line);
-            }
-            lines
-        });
+        let server = listener_for(&socket, 2, b"");
         for (key, text) in [("k1", "first"), ("k2", "second")] {
             let key = ShortText::parse(key).unwrap();
             write_instruction(&dirs, &session(), &key, &line(text)).unwrap();
@@ -542,13 +531,7 @@ mod tests {
         let name = write_instruction(&dirs, &session(), &key, &line("go")).unwrap();
         let file = dir.join(&name);
         let socket = dirs.socket_dir.join("i.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut line = String::new();
-            BufReader::new(stream).read_line(&mut line).unwrap();
-            line
-        });
+        let server = listener(&socket, b"");
         let outcomes = relay_once(&dir, current_uid(), &session(), &socket).unwrap();
         assert!(
             matches!(outcomes.as_slice(), [Delivery::Posted { .. }]),
@@ -637,13 +620,7 @@ mod tests {
         assert!(fs::read_dir(&dir).unwrap().count() > RELAY_PENDING_MAX);
         assert!(pending(&dir).unwrap().is_empty());
         let socket = dirs.socket_dir.join("i.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut line = String::new();
-            BufReader::new(stream).read_line(&mut line).unwrap();
-            line
-        });
+        let server = listener(&socket, b"");
         let key = ShortText::parse("k130").unwrap();
         write_instruction(&dirs, &session(), &key, &line("new")).unwrap();
         let outcomes = relay_once(&dir, current_uid(), &session(), &socket).unwrap();

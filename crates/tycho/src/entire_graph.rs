@@ -29,6 +29,7 @@ use crate::config::{
     GRAPH_DIFF_BUDGET_SECONDS, GRAPH_OUTPUT_MAX_BYTES, GRAPH_QUERY_TIMEOUT, MISE_NO_INSTALL,
 };
 use crate::private_dir;
+use tycho_types::git_environment::git_environment_removed;
 
 pub const PROVIDER: &str = "entire-graph";
 pub const DATA_DIR_ENV: &str = "ENTIRE_PLUGIN_DATA_DIR";
@@ -535,7 +536,9 @@ fn run_plugin(
     if let Some(data_dir) = data_dir {
         environment.push((DATA_DIR_ENV, data_dir));
     }
-    let removed = entire_variables(env::vars_os().map(|(name, _)| name));
+    // The plugin runs git over the checkout; a hook's GIT_DIR would point it elsewhere.
+    let mut removed = entire_variables(env::vars_os().map(|(name, _)| name));
+    removed.extend(git_environment_removed());
     command::run_status_capped(
         binary,
         arguments,

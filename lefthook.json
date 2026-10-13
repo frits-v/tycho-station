@@ -6,14 +6,16 @@
   },
   "pre-commit": {
     "commands": {
-      "fmt": { "run": "cargo fmt --all -- --check" }
+      "fmt": { "run": "cargo run -q -p xtask -- fmt" }
     }
   },
   "pre-push": {
     "commands": {
-      "clippy": { "run": "cargo clippy --workspace --all-targets -- -D warnings" },
-      "test": { "run": "cargo test --workspace" },
-      "workflows": { "glob": ".github/**", "run": "cargo run -q -p xtask -- workflows --offline" }
+      "clippy": { "run": "cargo run -q -p xtask -- clippy" },
+      "test": { "run": "cargo run -q -p xtask -- test" },
+      "workflows": { "glob": ".github/**", "run": "cargo run -q -p xtask -- workflows --offline" },
+      "codeql": { "glob": ".github/**", "run": "cargo run -q -p xtask -- codeql" },
+      "opengrep": { "glob": ["**/*.rs", "opengrep/**"], "run": "cargo run -q -p xtask -- opengrep" }
     }
   }
 }

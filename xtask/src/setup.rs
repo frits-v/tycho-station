@@ -11,13 +11,15 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use tycho_types::session::{SESSION_NAME_MAX_BYTES, SOCKET_PATH_MAX_BYTES};
+
+use crate::tool_prefix;
 
 pub const AGENT_USER_NAME: &str = "tycho-agent";
 pub const AGENT_GROUP_NAME: &str = "tycho-agent";
@@ -26,8 +28,8 @@ const STAFF_GID: u32 = 20;
 pub const SHARED_GROUP_NAME: &str = "tycho-zmx";
 pub const AGENT_SOCKET_DIR: &str = "/Users/Shared/tycho-agent-zmx";
 const CORE_SOCKET_DIR_RELATIVE: &str = ".tycho/zmx";
-const AGENT_SOCKET_DIR_MODE: u32 = 0o2770;
-const CORE_SOCKET_DIR_MODE: u32 = 0o0700;
+pub const AGENT_SOCKET_DIR_MODE: u32 = 0o2770;
+pub const CORE_SOCKET_DIR_MODE: u32 = 0o0700;
 /// What a socket path leaves for the directory once the name and separator are in it.
 const SOCKET_DIR_MAX_BYTES: usize = SOCKET_PATH_MAX_BYTES
     .saturating_sub(1)
@@ -39,14 +41,18 @@ const PROBE_OUTPUT_MAX_BYTES: usize = 1 << 17;
 const SECURITY_ITEM_NOT_FOUND_EXIT: i32 = 44;
 /// `dsmemberutil checkmembership` exit code when the user or group does not exist.
 const DSMEMBERUTIL_NOT_FOUND_EXIT: i32 = 7;
-/// `claude auth status` exit code when no login is stored.
-const CLAUDE_LOGGED_OUT_EXIT: i32 = 1;
-/// `codex login status` exit code when no login is stored.
-const CODEX_LOGGED_OUT_EXIT: i32 = 1;
+/// The core home tycho resolves when `TYCHO_HOME` is unset, under the developer's home.
+const CORE_HOME_RELATIVE: &str = ".tycho";
+/// The variable that moves the core home, as `tycho::config::core_home` reads it.
+const CORE_HOME_ENV: &str = "TYCHO_HOME";
+/// The vendor credential store under the core home.
+const CREDENTIALS_DIR: &str = "credentials";
+const CREDENTIAL_STORE_MODE: u32 = 0o700;
+const CREDENTIAL_FILE_MODE: u32 = 0o600;
 /// `git config --get-all` exit code when the key is not set.
 const GIT_CONFIG_KEY_UNSET_EXIT: i32 = 1;
 
-fn workspace_root() -> &'static Path {
+pub fn workspace_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -54,7 +60,7 @@ fn workspace_root() -> &'static Path {
 
 /// Who a check can be performed as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Side {
+pub enum Side {
     Developer,
     Agent,
 }
@@ -80,6 +86,14 @@ impl Side {
             Self::Agent => AGENT_USER_NAME,
         }
     }
+
+    /// The agent runs the prefix's xtask, which needs neither mise nor a checkout.
+    const fn setup_command(self) -> &'static str {
+        match self {
+            Self::Developer => "mise run setup",
+            Self::Agent => "/Users/Shared/tycho/bin/xtask setup",
+        }
+    }
 }
 
 fn mode_for(username: &str) -> Side {
@@ -91,10 +105,13 @@ fn mode_for(username: &str) -> Side {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Check {
+pub enum Check {
+    AgentGroupExists,
     AgentUserExists,
+    AgentHomeDirectory,
     SharedGroupExists,
     DeveloperInSharedGroup,
+    DeveloperHomeClosedToAgent,
     AgentDirExists,
     AgentDirIsDirectory,
     AgentDirOwnerUid,
@@ -113,6 +130,14 @@ enum Check {
     PinEntire,
     PinCue,
     EntireLogin,
+    PrefixDirectory,
+    PrefixTree,
+    PrefixMise,
+    PrefixClaude,
+    PrefixCodex,
+    PrefixZmx,
+    PrefixStationXtask,
+    PrefixStationTycho,
     AgentInSharedGroup,
     AgentPrimaryGroup,
     CredentialSsh,
@@ -125,8 +150,14 @@ enum Check {
     KeychainAws,
     KeychainSsh,
     KeychainGhCli,
-    ClaudeLogin,
-    CodexLogin,
+    ClaudeCredential,
+    CodexCredential,
+    AgentCredentialStoreClosed,
+    AgentPrefixWritable,
+    AgentPrefixMise,
+    AgentPrefixClaude,
+    AgentPrefixCodex,
+    AgentPrefixZmx,
 }
 
 #[derive(Debug)]
@@ -141,8 +172,18 @@ const fn spec(check: Check, name: &'static str, side: Side) -> CheckSpec {
 }
 
 /// Every check, in print order; each one runs on exactly one side.
-const CATALOGUE: [CheckSpec; 35] = [
+const CATALOGUE: [CheckSpec; 52] = [
+    spec(
+        Check::AgentGroupExists,
+        "agent group exists",
+        Side::Developer,
+    ),
     spec(Check::AgentUserExists, "agent user exists", Side::Developer),
+    spec(
+        Check::AgentHomeDirectory,
+        "agent home directory",
+        Side::Developer,
+    ),
     spec(
         Check::SharedGroupExists,
         "shared group exists",
@@ -151,6 +192,11 @@ const CATALOGUE: [CheckSpec; 35] = [
     spec(
         Check::DeveloperInSharedGroup,
         "developer is a member of the shared group",
+        Side::Developer,
+    ),
+    spec(
+        Check::DeveloperHomeClosedToAgent,
+        "agent user cannot search the developer's home",
         Side::Developer,
     ),
     spec(
@@ -244,6 +290,56 @@ const CATALOGUE: [CheckSpec; 35] = [
         Side::Developer,
     ),
     spec(
+        Check::ClaudeCredential,
+        "vendor credential: claude token in the core's store, the developer's, mode 0600",
+        Side::Developer,
+    ),
+    spec(
+        Check::CodexCredential,
+        "vendor credential: codex auth.json in the core's store, the developer's, mode 0600",
+        Side::Developer,
+    ),
+    spec(
+        Check::PrefixDirectory,
+        "tool prefix: a real directory the developer owns, mode 0755",
+        Side::Developer,
+    ),
+    spec(
+        Check::PrefixTree,
+        "tool prefix: every entry the developer's, closed to group and other writes, links inside",
+        Side::Developer,
+    ),
+    spec(
+        Check::PrefixMise,
+        "tool prefix: mise is the pinned version",
+        Side::Developer,
+    ),
+    spec(
+        Check::PrefixClaude,
+        "tool prefix: claude is the pinned install, run by path, at its recorded digest",
+        Side::Developer,
+    ),
+    spec(
+        Check::PrefixCodex,
+        "tool prefix: codex is the pinned install, run by path, at its recorded digest",
+        Side::Developer,
+    ),
+    spec(
+        Check::PrefixZmx,
+        "tool prefix: zmx is the pinned install, run by path, at its recorded digest",
+        Side::Developer,
+    ),
+    spec(
+        Check::PrefixStationXtask,
+        "tool prefix: xtask is the recorded build of this checkout's commit",
+        Side::Developer,
+    ),
+    spec(
+        Check::PrefixStationTycho,
+        "tool prefix: tycho is the recorded build of this checkout's commit",
+        Side::Developer,
+    ),
+    spec(
         Check::AgentInSharedGroup,
         "agent user is a member of the shared group",
         Side::Agent,
@@ -304,18 +400,38 @@ const CATALOGUE: [CheckSpec; 35] = [
         Side::Agent,
     ),
     spec(
-        Check::ClaudeLogin,
-        "claude logged in as the agent",
+        Check::AgentCredentialStoreClosed,
+        "as the agent: the core's credential store cannot be reached",
         Side::Agent,
     ),
     spec(
-        Check::CodexLogin,
-        "codex logged in as the agent",
+        Check::AgentPrefixWritable,
+        "as the agent: nothing in the tool prefix is writable",
+        Side::Agent,
+    ),
+    spec(
+        Check::AgentPrefixMise,
+        "as the agent: mise in the tool prefix is the pinned version",
+        Side::Agent,
+    ),
+    spec(
+        Check::AgentPrefixClaude,
+        "as the agent: claude runs by path at its pin and recorded digest",
+        Side::Agent,
+    ),
+    spec(
+        Check::AgentPrefixCodex,
+        "as the agent: codex runs by path at its pin and recorded digest",
+        Side::Agent,
+    ),
+    spec(
+        Check::AgentPrefixZmx,
+        "as the agent: zmx runs by path at its pin and recorded digest",
         Side::Agent,
     ),
 ];
 
-fn check_name(check: Check) -> &'static str {
+pub fn check_name(check: Check) -> &'static str {
     CATALOGUE
         .iter()
         .find(|entry| entry.check == check)
@@ -323,7 +439,7 @@ fn check_name(check: Check) -> &'static str {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Status {
+pub enum Status {
     Present,
     Missing,
     Wrong { found: String, wanted: String },
@@ -332,7 +448,7 @@ enum Status {
 }
 
 impl Status {
-    const fn is_pass(&self) -> bool {
+    pub const fn is_pass(&self) -> bool {
         matches!(self, Self::Present)
     }
 
@@ -356,14 +472,14 @@ impl fmt::Display for Status {
 }
 
 #[derive(Debug, Clone)]
-struct Finding {
-    check: Check,
-    status: Status,
-    hint: Option<String>,
+pub struct Finding {
+    pub check: Check,
+    pub status: Status,
+    pub hint: Option<String>,
 }
 
 impl Finding {
-    const fn new(check: Check, status: Status) -> Self {
+    pub const fn new(check: Check, status: Status) -> Self {
         Self {
             check,
             status,
@@ -371,7 +487,7 @@ impl Finding {
         }
     }
 
-    fn with_hint(check: Check, status: Status, hint: impl Into<String>) -> Self {
+    pub fn with_hint(check: Check, status: Status, hint: impl Into<String>) -> Self {
         Self {
             check,
             status,
@@ -379,14 +495,14 @@ impl Finding {
         }
     }
 
-    fn unreachable(check: Check, why: impl Into<String>) -> Self {
+    pub fn unreachable(check: Check, why: impl Into<String>) -> Self {
         Self::new(check, Status::Unreachable { why: why.into() })
     }
 }
 
 /// What running an external probe produced; every decoder reads this, never the raw `Output`.
 #[derive(Debug)]
-enum Capture {
+pub enum Capture {
     Ran {
         success: bool,
         /// `None` when a signal ended the process.
@@ -398,11 +514,11 @@ enum Capture {
     Unreachable(String),
 }
 
-fn first_line(text: &str) -> &str {
+pub fn first_line(text: &str) -> &str {
     text.lines().next().unwrap_or_default().trim()
 }
 
-fn plain_command(program: &str, args: &[&str]) -> Command {
+pub fn plain_command(program: &str, args: &[&str]) -> Command {
     let mut command = Command::new(program);
     command.args(args);
     command
@@ -448,8 +564,12 @@ fn recv_by<T>(receiver: &mpsc::Receiver<T>, deadline: Instant) -> Option<T> {
     receiver.recv_timeout(remaining).ok()
 }
 
+fn run_bounded(command: Command) -> Capture {
+    run_bounded_within(command, PROBE_TIMEOUT)
+}
+
 /// Runs `command` bounded: stdout/stderr read on separate threads, timeout kills by pid.
-fn run_bounded(mut command: Command) -> Capture {
+pub fn run_bounded_within(mut command: Command, timeout: Duration) -> Capture {
     let program = command.get_program().to_string_lossy().into_owned();
     command
         .stdin(Stdio::null())
@@ -469,7 +589,7 @@ fn run_bounded(mut command: Command) -> Capture {
     thread::spawn(move || drop(wait_sender.send(child.wait())));
 
     let deadline = Instant::now()
-        .checked_add(PROBE_TIMEOUT)
+        .checked_add(timeout)
         .unwrap_or_else(Instant::now);
     let stdout = recv_by(&stdout_receiver, deadline);
     let stderr = recv_by(&stderr_receiver, deadline);
@@ -481,7 +601,7 @@ fn run_bounded(mut command: Command) -> Capture {
     ) = (stdout, stderr, status)
     else {
         drop(Command::new("kill").args(["-9", &pid.to_string()]).status());
-        return Capture::Unreachable(format!("{program} did not finish within {PROBE_TIMEOUT:?}"));
+        return Capture::Unreachable(format!("{program} did not finish within {timeout:?}"));
     };
     if stdout_overflow || stderr_overflow {
         return Capture::Unreachable(format!(
@@ -499,7 +619,7 @@ fn run_bounded(mut command: Command) -> Capture {
     }
 }
 
-fn decode_zmx_version(stdout: &str) -> Option<String> {
+pub fn decode_zmx_version(stdout: &str) -> Option<String> {
     let mut tokens = stdout.lines().next().unwrap_or_default().split_whitespace();
     if tokens.next()? != "zmx" {
         return None;
@@ -539,7 +659,7 @@ fn decode_entire_version(stdout: &str) -> Option<String> {
     tokens.next().map(str::to_string)
 }
 
-fn decode_claude_version(stdout: &str) -> Option<String> {
+pub fn decode_claude_version(stdout: &str) -> Option<String> {
     let mut tokens = stdout.lines().next().unwrap_or_default().split_whitespace();
     let version = tokens.next()?;
     if tokens.next()? != "(Claude" || tokens.next()? != "Code)" {
@@ -548,7 +668,7 @@ fn decode_claude_version(stdout: &str) -> Option<String> {
     Some(version.to_string())
 }
 
-fn decode_codex_version(stdout: &str) -> Option<String> {
+pub fn decode_codex_version(stdout: &str) -> Option<String> {
     let mut tokens = stdout.lines().next().unwrap_or_default().split_whitespace();
     if tokens.next()? != "codex-cli" {
         return None;
@@ -778,28 +898,11 @@ fn json_bool(text: &str, field: &str) -> Option<bool> {
     value.get(field)?.as_bool()
 }
 
-/// `claude auth status --json` prints `loggedIn` either way and exits 1 when logged out.
-fn decode_claude_auth_status(code: Option<i32>, stdout: &str, _stderr: &str) -> AuthStatus {
-    match (code, json_bool(stdout, "loggedIn")) {
-        (Some(0), Some(true)) => AuthStatus::LoggedIn,
-        (Some(CLAUDE_LOGGED_OUT_EXIT), Some(false)) => AuthStatus::LoggedOut,
-        _ => AuthStatus::Unrecognised,
-    }
-}
-
 /// `entire auth status --json` exits 0 logged in or out; a non-zero exit is a failure to look.
 fn decode_entire_auth_status(code: Option<i32>, stdout: &str, _stderr: &str) -> AuthStatus {
     match (code, json_bool(stdout, "logged_in")) {
         (Some(0), Some(true)) => AuthStatus::LoggedIn,
         (Some(0), Some(false)) => AuthStatus::LoggedOut,
-        _ => AuthStatus::Unrecognised,
-    }
-}
-
-/// `codex login status` exits 1 with `Not logged in` on stderr when logged out; the logged-in output is unsampled until the agent's first `codex login`, so it decodes as unrecognised.
-fn decode_codex_login_status(code: Option<i32>, _stdout: &str, stderr: &str) -> AuthStatus {
-    match (code, first_line(stderr)) {
-        (Some(CODEX_LOGGED_OUT_EXIT), "Not logged in") => AuthStatus::LoggedOut,
         _ => AuthStatus::Unrecognised,
     }
 }
@@ -819,22 +922,8 @@ const ENTIRE_LOGIN: LoginProbe = LoginProbe {
     decode: decode_entire_auth_status,
     login_hint: "log in once from a terminal: entire auth login",
 };
-const CLAUDE_LOGIN: LoginProbe = LoginProbe {
-    check: Check::ClaudeLogin,
-    tool: "claude",
-    args: &["auth", "status", "--json"],
-    decode: decode_claude_auth_status,
-    login_hint: "log in once from a terminal: claude auth login",
-};
-const CODEX_LOGIN: LoginProbe = LoginProbe {
-    check: Check::CodexLogin,
-    tool: "codex",
-    args: &["login", "status"],
-    decode: decode_codex_login_status,
-    login_hint: "log in once from a terminal: codex login",
-};
 
-/// Claude and entire answer on stdout and codex on stderr, so both first lines are shown.
+/// A tool may answer on stdout or stderr, so both first lines are shown.
 fn unrecognised_login(probe: &LoginProbe, code: Option<i32>, stdout: &str, stderr: &str) -> String {
     format!(
         "unrecognised {} {} result (exit {code:?}): stdout {:?}, stderr {:?}",
@@ -853,6 +942,15 @@ fn login_finding(probe: &LoginProbe, ls: &MiseLs) -> Finding {
     args.extend_from_slice(probe.args);
     match run_bounded(mise_command(&args)) {
         Capture::ExecutableNotFound => Finding::unreachable(probe.check, "mise is not on PATH"),
+        capture => decoded_login(probe, capture),
+    }
+}
+
+fn decoded_login(probe: &LoginProbe, capture: Capture) -> Finding {
+    match capture {
+        Capture::ExecutableNotFound => {
+            Finding::unreachable(probe.check, format!("{} is not installed", probe.tool))
+        }
         Capture::Unreachable(why) => Finding::unreachable(probe.check, why),
         Capture::Ran {
             code,
@@ -949,9 +1047,9 @@ fn keychain_findings() -> Vec<Finding> {
 
 /// From `id -u`/`id -un`, never `$HOME`/`$USER`, so this is whoever is actually running.
 #[derive(Debug, Clone)]
-struct Identity {
-    uid: u32,
-    username: String,
+pub struct Identity {
+    pub uid: u32,
+    pub username: String,
 }
 
 fn decode_id_output(stdout: &str) -> Option<String> {
@@ -980,7 +1078,7 @@ fn id_output(args: &[&str]) -> Result<String, String> {
     }
 }
 
-fn current_identity() -> Result<Identity, String> {
+pub fn current_identity() -> Result<Identity, String> {
     let uid_text = id_output(&["-u"])?;
     let uid: u32 = uid_text
         .parse()
@@ -1012,10 +1110,12 @@ fn decode_dscl_failure(stderr: &str) -> DsclFailure {
 }
 
 fn dscl_read(path: &str, key: Option<&str>) -> DsclLookup {
+    dscl_read_keys(path, key.as_slice())
+}
+
+fn dscl_read_keys(path: &str, keys: &[&str]) -> DsclLookup {
     let mut args = vec![".", "-read", path];
-    if let Some(key) = key {
-        args.push(key);
-    }
+    args.extend_from_slice(keys);
     match run_bounded(plain_command("dscl", &args)) {
         Capture::ExecutableNotFound => DsclLookup::Unreachable("dscl is not on PATH".to_string()),
         Capture::Unreachable(why) => DsclLookup::Unreachable(why),
@@ -1089,7 +1189,7 @@ fn group_gid(lookup: &DsclLookup) -> Result<u32, String> {
     }
 }
 
-fn resolve_home(username: &str) -> Result<String, String> {
+pub fn resolve_home(username: &str) -> Result<String, String> {
     match dscl_read(&format!("/Users/{username}"), Some("NFSHomeDirectory")) {
         DsclLookup::Found(stdout) => dscl_value(&stdout, "NFSHomeDirectory")
             .ok_or_else(|| "NFSHomeDirectory missing from the user record".to_string()),
@@ -1136,6 +1236,219 @@ fn membership_status(user: &str, group: &str) -> Status {
                 why: format!("unrecognised dsmemberutil result (exit {code:?}): {stdout:?}"),
             },
         },
+    }
+}
+
+/// The entry in the developer's home ACL that keeps the agent out, as `chmod +a` takes it.
+/// The agent's own primary group does not: macOS makes every local account a member of
+/// `staff` through `localaccounts`, and a home is commonly `staff` at 0750.
+pub const HOME_DENY_ENTRY: &str = "user:tycho-agent deny search,list,readattr,readextattr";
+const HOME_DENY_PRINCIPAL: &str = "user:tycho-agent";
+/// The most entries macOS keeps in one ACL (`KAUTH_ACL_MAX_ENTRIES`).
+const ACL_ENTRIES_MAX: usize = 128;
+const HOME_CLOSED_HINT: &str = "as the developer: chmod +a \"user:tycho-agent deny search,list,readattr,readextattr\" ~ (mise run provision-agent runs it)";
+
+/// One ACL entry as `ls -le` prints it: `<n>: <principal> [inherited] <allow|deny> <perms>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AclEntry {
+    principal: String,
+    allows: bool,
+    permissions: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AclListing {
+    Entries(Vec<AclEntry>),
+    Unrecognised(String),
+}
+
+fn decode_acl_entry(line: &str) -> Option<AclEntry> {
+    let (index, rest) = line.trim_start().split_once(": ")?;
+    if index.is_empty() || !index.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    let mut tokens = rest.split_whitespace();
+    let principal = tokens.next().filter(|principal| principal.contains(':'))?;
+    let mut kind = tokens.next()?;
+    if kind == "inherited" {
+        kind = tokens.next()?;
+    }
+    let allows = match kind {
+        "allow" => true,
+        "deny" => false,
+        _ => return None,
+    };
+    let permissions = tokens.next()?.split(',').map(str::to_string).collect();
+    if tokens.next().is_some() {
+        return None;
+    }
+    Some(AclEntry {
+        principal: principal.to_string(),
+        allows,
+        permissions,
+    })
+}
+
+/// `ls -lde <dir>` prints the directory's long line, then one line per ACL entry.
+fn decode_acl_listing(stdout: &str) -> AclListing {
+    let mut lines = stdout.lines();
+    let Some(head) = lines.next() else {
+        return AclListing::Unrecognised("no output".to_string());
+    };
+    if !head.starts_with('d') {
+        return AclListing::Unrecognised(head.to_string());
+    }
+    let mut entries = Vec::new();
+    for line in lines {
+        if entries.len() >= ACL_ENTRIES_MAX {
+            return AclListing::Unrecognised(format!("more than {ACL_ENTRIES_MAX} ACL entries"));
+        }
+        match decode_acl_entry(line) {
+            Some(entry) => entries.push(entry),
+            None => return AclListing::Unrecognised(line.to_string()),
+        }
+    }
+    AclListing::Entries(entries)
+}
+
+/// Whether the agent belongs to the group a home is owned by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentInGroup {
+    Member,
+    NotMember,
+    NoAgent,
+}
+
+/// The ACL is read in order and its first entry about search decides; only then do the mode
+/// bits count. An allow entry for anyone but the developer is taken as reaching the agent. An
+/// `only_inherit` entry applies to what is created inside the home, not to the home itself.
+fn home_search_status(
+    entries: &[AclEntry],
+    mode: u32,
+    developer: &str,
+    agent: AgentInGroup,
+) -> Status {
+    let developer_principal = format!("user:{developer}");
+    for entry in entries {
+        let names = |wanted: &str| {
+            entry
+                .permissions
+                .iter()
+                .any(|permission| permission == wanted)
+        };
+        if !names("search") || names("only_inherit") {
+            continue;
+        }
+        if !entry.allows && entry.principal == HOME_DENY_PRINCIPAL {
+            return Status::Present;
+        }
+        if entry.allows && entry.principal != developer_principal {
+            return Status::Wrong {
+                found: format!("an ACL entry allowing search to {} first", entry.principal),
+                wanted: format!("{HOME_DENY_PRINCIPAL} denied search first"),
+            };
+        }
+    }
+    let wanted = format!("{HOME_DENY_PRINCIPAL} denied search");
+    match agent {
+        AgentInGroup::NoAgent => Status::Missing,
+        _ if mode & 0o001 != 0 => Status::Wrong {
+            found: format!("mode {mode:04o}, which lets every user search it"),
+            wanted,
+        },
+        AgentInGroup::Member if mode & 0o010 != 0 => Status::Wrong {
+            found: format!("mode {mode:04o}, and {AGENT_USER_NAME} is in the home's group"),
+            wanted,
+        },
+        AgentInGroup::Member | AgentInGroup::NotMember => Status::Present,
+    }
+}
+
+/// The home's ACL listing; `Err` when `ls` could not run or failed.
+fn home_acl(home: &str) -> Result<AclListing, String> {
+    let mut command = plain_command("/bin/ls", &["-lde", home]);
+    command.env_remove("CLICOLOR").env_remove("CLICOLOR_FORCE");
+    match run_bounded(command) {
+        Capture::ExecutableNotFound => Err("/bin/ls is not present".to_string()),
+        Capture::Unreachable(why) => Err(why),
+        Capture::Ran {
+            success: false,
+            stderr,
+            ..
+        } => Err(format!("ls -lde {home}: {}", first_line(&stderr))),
+        Capture::Ran {
+            success: true,
+            stdout,
+            ..
+        } => Ok(decode_acl_listing(&stdout)),
+    }
+}
+
+/// `dsmemberutil` answers "not a member" for a user's own primary group, so that is compared
+/// first from the user record.
+fn agent_in_group(gid: u32) -> Result<AgentInGroup, String> {
+    let record = dscl_read(&format!("/Users/{AGENT_USER_NAME}"), Some("PrimaryGroupID"));
+    match primary_gid(&record, "agent user") {
+        Ok(primary) if primary == gid => return Ok(AgentInGroup::Member),
+        Ok(_) => {}
+        Err(Status::Missing) => return Ok(AgentInGroup::NoAgent),
+        Err(status) => return Err(status.to_string()),
+    }
+    let gid_text = gid.to_string();
+    match run_bounded(plain_command(
+        "dsmemberutil",
+        &["checkmembership", "-U", AGENT_USER_NAME, "-g", &gid_text],
+    )) {
+        Capture::ExecutableNotFound => Err("dsmemberutil is not on PATH".to_string()),
+        Capture::Unreachable(why) => Err(why),
+        Capture::Ran { code, stdout, .. } => match decode_membership(code, &stdout) {
+            MembershipOutcome::Member => Ok(AgentInGroup::Member),
+            MembershipOutcome::NotMember | MembershipOutcome::GroupNotFound => {
+                Ok(AgentInGroup::NotMember)
+            }
+            MembershipOutcome::UserNotFound => Ok(AgentInGroup::NoAgent),
+            MembershipOutcome::Unrecognised => Err(format!(
+                "unrecognised dsmemberutil result (exit {code:?}): {stdout:?}"
+            )),
+        },
+    }
+}
+
+fn home_closed_status(username: &str) -> Status {
+    let unreachable = |why: String| Status::Unreachable { why };
+    let home = match resolve_home(username) {
+        Ok(home) => home,
+        Err(why) => return unreachable(why),
+    };
+    let metadata = match fs::symlink_metadata(&home) {
+        Ok(metadata) if metadata.is_dir() => metadata,
+        Ok(metadata) => return unreachable(format!("{home} is a {}", file_kind(&metadata))),
+        Err(error) => return unreachable(format!("{home}: {error}")),
+    };
+    let entries = match home_acl(&home) {
+        Ok(AclListing::Entries(entries)) => entries,
+        Ok(AclListing::Unrecognised(line)) => {
+            return unreachable(format!("unrecognised ls -lde line: {line:?}"))
+        }
+        Err(why) => return unreachable(why),
+    };
+    match agent_in_group(metadata.gid()) {
+        Ok(agent) => home_search_status(
+            &entries,
+            metadata.permissions().mode() & 0o7777,
+            username,
+            agent,
+        ),
+        Err(why) => unreachable(why),
+    }
+}
+
+fn home_closed_finding(identity: &Identity) -> Finding {
+    let status = home_closed_status(&identity.username);
+    if status.is_pass() {
+        Finding::new(Check::DeveloperHomeClosedToAgent, status)
+    } else {
+        Finding::with_hint(Check::DeveloperHomeClosedToAgent, status, HOME_CLOSED_HINT)
     }
 }
 
@@ -1195,6 +1508,269 @@ fn primary_group_finding(username: &str) -> Finding {
         Finding::new(Check::AgentPrimaryGroup, status)
     } else {
         Finding::with_hint(Check::AgentPrimaryGroup, status, AGENT_GROUP_HINT)
+    }
+}
+
+/// The home `sysadminctl -addUser -home` records for the agent. The record alone creates no
+/// directory; macOS makes one at a first login through the login window.
+pub const AGENT_HOME: &str = "/Users/tycho-agent";
+/// Nobody but the agent searches or lists its home.
+pub const AGENT_HOME_MODE: u32 = 0o700;
+const AGENT_HOME_KEYS: [&str; 3] = ["NFSHomeDirectory", "UniqueID", "PrimaryGroupID"];
+const AGENT_HOME_CREATE_HINT: &str = "sudo /usr/sbin/createhomedir -c -u tycho-agent, then sudo /bin/chmod 0700 /Users/tycho-agent if its mode is wider (mise run provision-agent runs both)";
+
+/// The facts in the agent's user record that its home is measured against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentRecord {
+    home: String,
+    uid: u32,
+    gid: u32,
+}
+
+/// One attribute of the home that differs from the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Differs {
+    pub found: u32,
+    pub wanted: u32,
+}
+
+/// Each attribute of the home that differs from the record; `None` matches.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HomeMismatch {
+    /// What sits at the path when it is not a directory.
+    pub kind: Option<&'static str>,
+    pub owner: Option<Differs>,
+    pub group: Option<Differs>,
+    pub mode: Option<Differs>,
+    /// The first ACL entry that allows anything, as `chmod -a` takes it.
+    pub acl_allow: Option<String>,
+}
+
+impl HomeMismatch {
+    /// Only the mode differs, and it grants a bit beyond the agent's own.
+    pub fn is_only_a_wider_mode(&self) -> bool {
+        self.kind.is_none()
+            && self.owner.is_none()
+            && self.group.is_none()
+            && self.acl_allow.is_none()
+            && self
+                .mode
+                .is_some_and(|mode| mode.found & !AGENT_HOME_MODE != 0)
+    }
+}
+
+/// What the agent home probe found; an unrecognised record is never taken as usable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentHomeState {
+    Ok,
+    Missing,
+    Wrong(HomeMismatch),
+    Unreachable(String),
+    Unrecognised(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentHome {
+    /// The record's `NFSHomeDirectory`, once the record is read and recognised.
+    pub path: Option<String>,
+    pub state: AgentHomeState,
+}
+
+impl AgentHome {
+    /// The record names `AGENT_HOME`, or is not read yet, so it is the one the user step
+    /// creates there: the only path the home steps act on.
+    pub fn is_at_agent_home(&self) -> bool {
+        self.path.as_deref().is_none_or(|path| path == AGENT_HOME)
+    }
+}
+
+fn record_number(stdout: &str, key: &str) -> Result<u32, AgentHomeState> {
+    let value = dscl_value(stdout, key)
+        .ok_or_else(|| AgentHomeState::Unrecognised(format!("agent user record without {key}")))?;
+    value.parse().map_err(|_| {
+        AgentHomeState::Unrecognised(format!("{key} {value:?} in the agent user record"))
+    })
+}
+
+/// A record that does not exist has no home either, so it reads missing.
+fn decode_agent_record(lookup: &DsclLookup) -> Result<AgentRecord, AgentHomeState> {
+    let stdout = match lookup {
+        DsclLookup::Found(stdout) => stdout,
+        DsclLookup::NotFound => return Err(AgentHomeState::Missing),
+        DsclLookup::Unreachable(why) => return Err(AgentHomeState::Unreachable(why.clone())),
+    };
+    let home = dscl_value(stdout, "NFSHomeDirectory").ok_or_else(|| {
+        AgentHomeState::Unrecognised("agent user record without NFSHomeDirectory".to_string())
+    })?;
+    if !home.starts_with('/') || home.contains('\n') {
+        return Err(AgentHomeState::Unrecognised(format!(
+            "NFSHomeDirectory {home:?} in the agent user record"
+        )));
+    }
+    Ok(AgentRecord {
+        uid: record_number(stdout, "UniqueID")?,
+        gid: record_number(stdout, "PrimaryGroupID")?,
+        home,
+    })
+}
+
+fn differs(found: u32, wanted: u32) -> Option<Differs> {
+    (found != wanted).then_some(Differs { found, wanted })
+}
+
+/// A deny entry, such as the `group:everyone deny delete` a created home carries, only takes
+/// access away; an allow entry grants what the 0700 mode withholds.
+fn first_allow(entries: &[AclEntry]) -> Option<String> {
+    entries
+        .iter()
+        .find(|entry| entry.allows)
+        .map(|entry| format!("{} allow {}", entry.principal, entry.permissions.join(",")))
+}
+
+/// The ACL of a home that is a directory, as `ls -lde` lists it without opening the directory.
+fn home_acl_allow(listing: Result<AclListing, String>) -> Result<Option<String>, AgentHomeState> {
+    match listing {
+        Ok(AclListing::Entries(entries)) => Ok(first_allow(&entries)),
+        Ok(AclListing::Unrecognised(line)) => Err(AgentHomeState::Unrecognised(format!(
+            "ls -lde line {line:?} for the agent home"
+        ))),
+        Err(why) => Err(AgentHomeState::Unreachable(why)),
+    }
+}
+
+/// Reads the entry without following a link rather than opening it: the developer cannot open
+/// another user's 0700 directory, so an open would fail on the home in its wanted state.
+/// `read_acl` is `home_acl` outside tests; `ls -e` and ACLs are macOS's own.
+fn measure_agent_home(
+    record: &AgentRecord,
+    read_acl: impl Fn(&str) -> Result<AclListing, String>,
+) -> AgentHomeState {
+    let metadata = match fs::symlink_metadata(&record.home) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return AgentHomeState::Missing,
+        Err(error) => return AgentHomeState::Unreachable(format!("{}: {error}", record.home)),
+    };
+    let acl_allow = if metadata.is_dir() {
+        match home_acl_allow(read_acl(&record.home)) {
+            Ok(allow) => allow,
+            Err(state) => return state,
+        }
+    } else {
+        None
+    };
+    let mismatch = HomeMismatch {
+        kind: (!metadata.is_dir()).then(|| file_kind(&metadata)),
+        owner: differs(metadata.uid(), record.uid),
+        group: differs(metadata.gid(), record.gid),
+        mode: differs(metadata.permissions().mode() & 0o7777, AGENT_HOME_MODE),
+        acl_allow,
+    };
+    if mismatch == HomeMismatch::default() {
+        AgentHomeState::Ok
+    } else {
+        AgentHomeState::Wrong(mismatch)
+    }
+}
+
+pub fn agent_home() -> AgentHome {
+    let lookup = dscl_read_keys(&format!("/Users/{AGENT_USER_NAME}"), &AGENT_HOME_KEYS);
+    match decode_agent_record(&lookup) {
+        Ok(record) => AgentHome {
+            state: measure_agent_home(&record, home_acl),
+            path: Some(record.home),
+        },
+        Err(state) => AgentHome { path: None, state },
+    }
+}
+
+fn mismatch_status(mismatch: &HomeMismatch) -> Status {
+    let mut found = Vec::new();
+    let mut wanted = Vec::new();
+    if let Some(kind) = mismatch.kind {
+        found.push(format!("a {kind}"));
+        wanted.push("a directory".to_string());
+    }
+    if let Some(owner) = mismatch.owner {
+        found.push(format!("owner uid {}", owner.found));
+        wanted.push(format!("owner uid {} ({AGENT_USER_NAME})", owner.wanted));
+    }
+    if let Some(group) = mismatch.group {
+        found.push(format!("group gid {}", group.found));
+        wanted.push(format!("group gid {}", group.wanted));
+    }
+    if let Some(mode) = mismatch.mode {
+        found.push(format!("mode {:04o}", mode.found));
+        wanted.push(format!("mode {:04o}", mode.wanted));
+    }
+    if let Some(entry) = &mismatch.acl_allow {
+        found.push(format!("ACL entry {entry}"));
+        wanted.push("no ACL allow entry".to_string());
+    }
+    Status::Wrong {
+        found: found.join(", "),
+        wanted: wanted.join(", "),
+    }
+}
+
+const NARROWS_NOTE: &str = "mise run provision-agent narrows it";
+
+/// A home that is not the agent's own is left to the operator: root does not change its owner
+/// by path. A group, mode or ACL entry on the agent's own home the agent can set itself.
+/// The note that the task narrows the mode appears only where `provision-agent` would.
+fn mismatch_hint(mismatch: &HomeMismatch, home: &AgentHome) -> String {
+    let path = home.path.as_deref().unwrap_or(AGENT_HOME);
+    if mismatch.kind.is_some() || mismatch.owner.is_some() {
+        return format!("{path} is not a directory the agent owns; inspect it and move it aside by hand, then run mise run provision-agent again");
+    }
+    let mut steps = Vec::new();
+    if let Some(group) = mismatch.group {
+        steps.push(format!(
+            "sudo -u {AGENT_USER_NAME} /usr/bin/chgrp {} {path}",
+            group.wanted
+        ));
+    }
+    if let Some(entry) = &mismatch.acl_allow {
+        steps.push(format!(
+            "sudo -u {AGENT_USER_NAME} /bin/chmod -a \"{entry}\" {path}"
+        ));
+    }
+    if mismatch.mode.is_some() {
+        let chmod = format!("sudo -u {AGENT_USER_NAME} /bin/chmod {AGENT_HOME_MODE:04o} {path}");
+        if home.is_at_agent_home() && mismatch.is_only_a_wider_mode() {
+            steps.push(format!("{chmod} ({NARROWS_NOTE})"));
+        } else {
+            steps.push(chmod);
+        }
+    }
+    steps.join("; ")
+}
+
+/// The home steps act only on `AGENT_HOME`; a record naming another path is the operator's.
+fn missing_home_hint(home: &AgentHome) -> String {
+    match home.path.as_deref() {
+        Some(path) if !home.is_at_agent_home() => format!(
+            "the agent user record names {path}, not {AGENT_HOME}, and the task creates only {AGENT_HOME}; point NFSHomeDirectory at {AGENT_HOME} (sudo dscl . -create /Users/{AGENT_USER_NAME} NFSHomeDirectory {AGENT_HOME}) and run mise run provision-agent again"
+        ),
+        _ => AGENT_HOME_CREATE_HINT.to_string(),
+    }
+}
+
+pub fn agent_home_finding(home: &AgentHome) -> Finding {
+    let check = Check::AgentHomeDirectory;
+    match &home.state {
+        AgentHomeState::Ok => Finding::new(check, Status::Present),
+        AgentHomeState::Missing => {
+            Finding::with_hint(check, Status::Missing, missing_home_hint(home))
+        }
+        AgentHomeState::Wrong(mismatch) => Finding::with_hint(
+            check,
+            mismatch_status(mismatch),
+            mismatch_hint(mismatch, home),
+        ),
+        AgentHomeState::Unreachable(why) => Finding::unreachable(check, why.clone()),
+        AgentHomeState::Unrecognised(what) => {
+            Finding::unreachable(check, format!("unrecognised {what}"))
+        }
     }
 }
 
@@ -1467,7 +2043,7 @@ fn agent_socket_dir_findings(group_gid: Result<u32, String>, developer_uid: u32)
     ]
 }
 
-fn core_socket_dir_path(home: &str) -> String {
+pub fn core_socket_dir_path(home: &str) -> String {
     format!("{home}/{CORE_SOCKET_DIR_RELATIVE}")
 }
 
@@ -1515,26 +2091,265 @@ fn core_socket_findings(identity: &Identity) -> Vec<Finding> {
 }
 
 /// Runs only checks the developer can perform: nothing here reads the agent's home or keychain.
-fn developer_findings(identity: &Identity) -> Vec<Finding> {
+pub fn developer_findings(identity: &Identity) -> Vec<Finding> {
+    let mut findings = record_findings(identity);
+    let ls = mise_ls();
+    findings.extend(vendor_findings(&ls));
+    findings.push(login_finding(&ENTIRE_LOGIN, &ls));
+    findings.extend(stored_credential_findings(identity));
+    findings
+        .extend(tool_prefix::Probe::read(&tool_prefix::Prefix::production(), identity).findings());
+    findings
+}
+
+/// A vendor's stored credential as setup reports it: the check, the file name in the store,
+/// and how the operator stores it.
+struct StoredCredential {
+    check: Check,
+    vendor: &'static str,
+    hint: &'static str,
+}
+
+const STORED_CREDENTIALS: [StoredCredential; 2] = [
+    StoredCredential {
+        check: Check::ClaudeCredential,
+        vendor: "claude",
+        hint: "as the subscription's owner run claude setup-token, then /Users/Shared/tycho/bin/tycho credentials set claude and paste the token (docs/process.md, Vendor credentials)",
+    },
+    StoredCredential {
+        check: Check::CodexCredential,
+        vendor: "codex",
+        hint: "as the plan's owner run codex login, then /Users/Shared/tycho/bin/tycho credentials set codex < ~/.codex/auth.json (docs/process.md, Vendor credentials)",
+    },
+];
+
+/// The core home the way `tycho` resolves it: `TYCHO_HOME` when it names a directory strictly
+/// inside the user's home with no link on the way, else `.tycho` under the user's home.
+fn core_home(user_home: &Path, moved: Option<&std::ffi::OsStr>) -> Result<PathBuf, String> {
+    let Some(moved) = moved else {
+        return Ok(user_home.join(CORE_HOME_RELATIVE));
+    };
+    let home = PathBuf::from(moved);
+    let inside = home.is_absolute()
+        && home != user_home
+        && home.starts_with(user_home)
+        && home.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        });
+    if !inside {
+        return Err(format!(
+            "{CORE_HOME_ENV}={} is not a directory inside {}",
+            home.display(),
+            user_home.display()
+        ));
+    }
+    let mut walked = user_home.to_path_buf();
+    for component in home.strip_prefix(user_home).unwrap_or(&home).components() {
+        walked.push(component);
+        if fs::symlink_metadata(&walked).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(format!("{} is a symbolic link", walked.display()));
+        }
+    }
+    Ok(home)
+}
+
+fn stored_credential_findings(identity: &Identity) -> Vec<Finding> {
+    let moved = std::env::var_os(CORE_HOME_ENV);
+    let store = resolve_home(&identity.username)
+        .and_then(|home| core_home(Path::new(&home), moved.as_deref()))
+        .map(|home| home.join(CREDENTIALS_DIR));
+    STORED_CREDENTIALS
+        .iter()
+        .map(|stored| {
+            let status = store.as_ref().map_or_else(
+                |why| Status::Unreachable { why: why.clone() },
+                |store| stored_credential_status(store, stored.vendor, identity.uid),
+            );
+            if status.is_pass() {
+                Finding::new(stored.check, status)
+            } else {
+                Finding::with_hint(stored.check, status, stored.hint)
+            }
+        })
+        .collect()
+}
+
+/// An entry of the store as lstat sees it: never through a link, contents never read.
+fn store_entry_status(path: &Path, directory: bool, uid: u32, mode: u32) -> Status {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Status::Missing,
+        Err(error) => {
+            return Status::Unreachable {
+                why: format!("{}: {error}", path.display()),
+            }
+        }
+    };
+    let kind_ok = if directory {
+        metadata.file_type().is_dir()
+    } else {
+        metadata.file_type().is_file()
+    };
+    if !kind_ok {
+        return Status::Wrong {
+            found: format!("{} at {}", file_kind(&metadata), path.display()),
+            wanted: if directory {
+                "directory"
+            } else {
+                "regular file"
+            }
+            .to_string(),
+        };
+    }
+    if metadata.uid() != uid {
+        return Status::Wrong {
+            found: format!("{} owned by uid {}", path.display(), metadata.uid()),
+            wanted: format!("uid {uid}"),
+        };
+    }
+    match mode_status(metadata.permissions().mode() & 0o7777, mode) {
+        Status::Wrong { found, wanted } => Status::Wrong {
+            found: format!("{} at mode {found}", path.display()),
+            wanted,
+        },
+        other => other,
+    }
+}
+
+/// The store is a 0700 directory of the developer and the vendor's file a 0600 regular file
+/// of the developer: nothing in the group or other bits, no link.
+fn stored_credential_status(store: &Path, vendor: &str, developer_uid: u32) -> Status {
+    match store_entry_status(store, true, developer_uid, CREDENTIAL_STORE_MODE) {
+        Status::Present => store_entry_status(
+            &store.join(vendor),
+            false,
+            developer_uid,
+            CREDENTIAL_FILE_MODE,
+        ),
+        other => other,
+    }
+}
+
+/// Where the agent looks for the core's store: the default core home of the user who owns the
+/// tool prefix, the developer, read from the password database rather than any environment.
+/// The agent cannot see a core home the developer moved with `TYCHO_HOME`, so a moved home is
+/// checked on the developer's side only.
+fn developer_store() -> Result<PathBuf, String> {
+    let metadata = fs::symlink_metadata(tool_prefix::PREFIX_ROOT)
+        .map_err(|error| format!("{}: {error}", tool_prefix::PREFIX_ROOT))?;
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(metadata.uid()))
+        .map_err(|error| format!("uid {}: {error}", metadata.uid()))?
+        .ok_or_else(|| {
+            format!(
+                "no user has uid {}, the tool prefix's owner",
+                metadata.uid()
+            )
+        })?;
+    Ok(user.dir.join(CORE_HOME_RELATIVE).join(CREDENTIALS_DIR))
+}
+
+/// Run as the agent: a denial at any step of the walk passes; reaching the store, listing it
+/// or opening a vendor file is the boundary answering.
+fn agent_store_status(store: &Path) -> Status {
+    let denied = |error: &io::Error| error.kind() == io::ErrorKind::PermissionDenied;
+    match fs::metadata(store) {
+        Err(error) if denied(&error) => return Status::Present,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Status::Unreachable {
+                why: format!(
+                    "{} does not exist and every directory above it let the agent search, so the store's own mode is untested",
+                    store.display()
+                ),
+            }
+        }
+        Err(error) => {
+            return Status::Unreachable {
+                why: format!("{}: {error}", store.display()),
+            }
+        }
+        Ok(_) => {}
+    }
+    if fs::read_dir(store).is_ok() {
+        return Status::Wrong {
+            found: format!("the agent lists {}", store.display()),
+            wanted: "permission denied".to_string(),
+        };
+    }
+    for stored in &STORED_CREDENTIALS {
+        let path = store.join(stored.vendor);
+        match fs::File::open(&path) {
+            Ok(_) => {
+                return Status::Wrong {
+                    found: format!("the agent opens {}", path.display()),
+                    wanted: "permission denied".to_string(),
+                }
+            }
+            Err(error) if denied(&error) => {}
+            Err(error) => {
+                return Status::Unreachable {
+                    why: format!("{}: {error}", path.display()),
+                }
+            }
+        }
+    }
+    Status::Present
+}
+
+/// The developer-side checks of directory records and socket directories, which read no
+/// tool and no network.
+pub fn record_findings(identity: &Identity) -> Vec<Finding> {
+    record_probe(identity).0
+}
+
+/// The record findings with the agent home they were measured from, so a remedy decides on
+/// the same probe the finding reports.
+pub fn record_probe(identity: &Identity) -> (Vec<Finding>, AgentHome) {
+    let agent_group_lookup = dscl_read(&format!("/Groups/{AGENT_GROUP_NAME}"), None);
     let agent_lookup = dscl_read(&format!("/Users/{AGENT_USER_NAME}"), Some("RecordName"));
     let group_lookup = dscl_read(&format!("/Groups/{SHARED_GROUP_NAME}"), None);
+    let home = agent_home();
     let mut findings = vec![
+        Finding::new(Check::AgentGroupExists, lookup_status(&agent_group_lookup)),
         Finding::new(Check::AgentUserExists, lookup_status(&agent_lookup)),
+        agent_home_finding(&home),
         Finding::new(Check::SharedGroupExists, lookup_status(&group_lookup)),
         Finding::new(
             Check::DeveloperInSharedGroup,
             membership_status(&identity.username, SHARED_GROUP_NAME),
         ),
+        home_closed_finding(identity),
     ];
     findings.extend(agent_socket_dir_findings(
         group_gid(&group_lookup),
         identity.uid,
     ));
     findings.extend(core_socket_findings(identity));
-    let ls = mise_ls();
-    findings.extend(vendor_findings(&ls));
-    findings.push(login_finding(&ENTIRE_LOGIN, &ls));
-    findings
+    (findings, home)
+}
+
+/// The agent's membership and primary group, read from directory services by name, which the
+/// developer can do as well as the agent.
+pub fn agent_record_findings() -> Vec<Finding> {
+    vec![
+        Finding::new(
+            Check::AgentInSharedGroup,
+            membership_status(AGENT_USER_NAME, SHARED_GROUP_NAME),
+        ),
+        primary_group_finding(AGENT_USER_NAME),
+    ]
+}
+
+/// A group's gid; `Ok(None)` when the group does not exist.
+pub fn group_id(group: &str) -> Result<Option<u32>, String> {
+    let lookup = dscl_read(&format!("/Groups/{group}"), Some("PrimaryGroupID"));
+    match primary_gid(&lookup, group) {
+        Ok(gid) => Ok(Some(gid)),
+        Err(Status::Missing) => Ok(None),
+        Err(status) => Err(status.to_string()),
+    }
 }
 
 /// Runs only checks the agent can perform on itself: nothing here resolves the developer's home, the core directory or the developer's logins.
@@ -1547,14 +2362,20 @@ fn agent_findings(identity: &Identity) -> Vec<Finding> {
     findings.push(primary_group_finding(&identity.username));
     findings.extend(credential_findings(&home));
     findings.extend(keychain_findings());
-    let ls = mise_ls();
-    findings.push(login_finding(&CLAUDE_LOGIN, &ls));
-    findings.push(login_finding(&CODEX_LOGIN, &ls));
+    let prefix = tool_prefix::agent_findings(identity);
+    findings.push(Finding::new(
+        Check::AgentCredentialStoreClosed,
+        developer_store().map_or_else(
+            |why| Status::Unreachable { why },
+            |store| agent_store_status(&store),
+        ),
+    ));
+    findings.extend(prefix);
     findings
 }
 
 /// One finding per catalogue entry: the produced result, `Deferred` for the other side, `Unreachable` for a gap.
-fn assemble(mode: Side, produced: &[Finding]) -> Vec<Finding> {
+pub fn assemble(mode: Side, produced: &[Finding]) -> Vec<Finding> {
     let mut findings: Vec<Finding> = CATALOGUE
         .iter()
         .map(|entry| {
@@ -1596,7 +2417,7 @@ fn unknown_mode_findings(why: &str) -> Vec<Finding> {
         .collect()
 }
 
-fn print_findings(findings: &[Finding]) {
+pub fn print_findings(findings: &[Finding]) {
     for finding in findings {
         let label = if finding.status.is_pass() {
             "ok"
@@ -1616,7 +2437,7 @@ fn print_findings(findings: &[Finding]) {
 }
 
 /// Exit 0 when every check on this run's side passed; deferred checks count on their own line only.
-fn summarize(mode: Option<Side>, findings: &[Finding]) -> i32 {
+pub fn summarize(mode: Option<Side>, findings: &[Finding]) -> i32 {
     let examined = findings
         .iter()
         .filter(|finding| !finding.status.is_deferred())
@@ -1636,8 +2457,9 @@ fn summarize(mode: Option<Side>, findings: &[Finding]) -> i32 {
     );
     match mode {
         Some(mode) => println!(
-            "xtask setup: {deferred} deferred to the {} run (run `mise run setup` as {})",
+            "xtask setup: {deferred} deferred to the {} run (run `{}` as {})",
             mode.other().label(),
+            mode.other().setup_command(),
             mode.other().run_as()
         ),
         None => println!("xtask setup: {deferred} deferred; no side could run"),
@@ -1669,10 +2491,16 @@ pub fn run() -> i32 {
 mod tests {
     use super::*;
 
-    const EXPECTED_SIDES: [(&str, Side); 35] = [
+    const EXPECTED_SIDES: [(&str, Side); 52] = [
+        ("agent group exists", Side::Developer),
         ("agent user exists", Side::Developer),
+        ("agent home directory", Side::Developer),
         ("shared group exists", Side::Developer),
         ("developer is a member of the shared group", Side::Developer),
+        (
+            "agent user cannot search the developer's home",
+            Side::Developer,
+        ),
         ("agent socket directory: exists", Side::Developer),
         ("agent socket directory: is a directory", Side::Developer),
         ("agent socket directory: owner uid", Side::Developer),
@@ -1715,6 +2543,43 @@ mod tests {
             Side::Developer,
         ),
         ("entire logged in as the developer", Side::Developer),
+        (
+            "vendor credential: claude token in the core's store, the developer's, mode 0600",
+            Side::Developer,
+        ),
+        (
+            "vendor credential: codex auth.json in the core's store, the developer's, mode 0600",
+            Side::Developer,
+        ),
+        (
+            "tool prefix: a real directory the developer owns, mode 0755",
+            Side::Developer,
+        ),
+        (
+            "tool prefix: every entry the developer's, closed to group and other writes, links inside",
+            Side::Developer,
+        ),
+        ("tool prefix: mise is the pinned version", Side::Developer),
+        (
+            "tool prefix: claude is the pinned install, run by path, at its recorded digest",
+            Side::Developer,
+        ),
+        (
+            "tool prefix: codex is the pinned install, run by path, at its recorded digest",
+            Side::Developer,
+        ),
+        (
+            "tool prefix: zmx is the pinned install, run by path, at its recorded digest",
+            Side::Developer,
+        ),
+        (
+            "tool prefix: xtask is the recorded build of this checkout's commit",
+            Side::Developer,
+        ),
+        (
+            "tool prefix: tycho is the recorded build of this checkout's commit",
+            Side::Developer,
+        ),
         ("agent user is a member of the shared group", Side::Agent),
         ("agent user's primary group is tycho-agent", Side::Agent),
         ("agent credential: ~/.ssh", Side::Agent),
@@ -1727,8 +2592,27 @@ mod tests {
         ("agent keychain: no item for aws", Side::Agent),
         ("agent keychain: no item for ssh", Side::Agent),
         ("agent keychain: no item for gh:github.com", Side::Agent),
-        ("claude logged in as the agent", Side::Agent),
-        ("codex logged in as the agent", Side::Agent),
+        ("as the agent: the core's credential store cannot be reached", Side::Agent),
+        (
+            "as the agent: nothing in the tool prefix is writable",
+            Side::Agent,
+        ),
+        (
+            "as the agent: mise in the tool prefix is the pinned version",
+            Side::Agent,
+        ),
+        (
+            "as the agent: claude runs by path at its pin and recorded digest",
+            Side::Agent,
+        ),
+        (
+            "as the agent: codex runs by path at its pin and recorded digest",
+            Side::Agent,
+        ),
+        (
+            "as the agent: zmx runs by path at its pin and recorded digest",
+            Side::Agent,
+        ),
     ];
 
     fn checks_run(findings: &[Finding]) -> Vec<Check> {
@@ -1779,8 +2663,108 @@ mod tests {
             developer_checks.len().saturating_add(agent_checks.len()),
             CATALOGUE.len()
         );
-        assert_eq!(developer_checks.len(), 21);
-        assert_eq!(agent_checks.len(), 14);
+        assert_eq!(developer_checks.len(), 34);
+        assert_eq!(agent_checks.len(), 18);
+    }
+
+    /// `ls -lde` on this machine's home and on a directory carrying the deny entry and an
+    /// inherited allow.
+    const HOME_LISTING: &str = "drwxr-x---+ 93 frits  staff  2976 Oct  9 21:13 /Users/frits\n 0: group:everyone deny delete\n";
+    const DENIED_LISTING: &str = "drwxr-xr-x@ 3 frits  wheel  96 Oct  9 21:16 acltest\n 0: user:tycho-agent deny list,search,readattr,readextattr\n 1: group:staff inherited allow list,search,directory_inherit\n";
+
+    fn entries(listing: &str) -> Vec<AclEntry> {
+        match decode_acl_listing(listing) {
+            AclListing::Entries(entries) => entries,
+            AclListing::Unrecognised(line) => panic!("unrecognised {line}"),
+        }
+    }
+
+    #[test]
+    fn decodes_acl_listings_and_rejects_the_unrecognised() {
+        assert_eq!(
+            entries(HOME_LISTING),
+            vec![AclEntry {
+                principal: "group:everyone".to_string(),
+                allows: false,
+                permissions: vec!["delete".to_string()],
+            }]
+        );
+        let denied = entries(DENIED_LISTING);
+        assert_eq!(denied.len(), 2);
+        assert!(denied.get(1).is_some_and(|entry| entry.allows));
+        assert_eq!(
+            entries("drwx------  3 frits  staff  96 Oct  9 21:16 /Users/frits\n"),
+            Vec::new()
+        );
+        for unrecognised in [
+            "",
+            "-rw-r--r--  1 frits  staff  0 Oct  9 21:16 file\n",
+            "drwx------  3 frits  staff  96 Oct  9 21:16 d\n 0: user:tycho-agent maybe search\n",
+            "drwx------  3 frits  staff  96 Oct  9 21:16 d\nsomething else\n",
+        ] {
+            assert!(matches!(
+                decode_acl_listing(unrecognised),
+                AclListing::Unrecognised(_)
+            ));
+        }
+        let lines = (0..=ACL_ENTRIES_MAX)
+            .map(|index| format!(" {index}: group:staff deny delete"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let long = format!("drwx------  3 frits  staff  96 Oct  9 21:16 d\n{lines}");
+        assert!(matches!(
+            decode_acl_listing(&long),
+            AclListing::Unrecognised(_)
+        ));
+    }
+
+    #[test]
+    fn the_agent_is_kept_out_of_the_home_by_the_deny_entry_not_its_primary_group() {
+        let staff_home = entries(HOME_LISTING);
+        assert!(matches!(
+            home_search_status(&staff_home, 0o750, "frits", AgentInGroup::Member),
+            Status::Wrong { .. }
+        ));
+        assert!(matches!(
+            home_search_status(&staff_home, 0o755, "frits", AgentInGroup::NotMember),
+            Status::Wrong { .. }
+        ));
+        assert_eq!(
+            home_search_status(&staff_home, 0o750, "frits", AgentInGroup::NotMember),
+            Status::Present
+        );
+        assert_eq!(
+            home_search_status(&staff_home, 0o700, "frits", AgentInGroup::Member),
+            Status::Present
+        );
+        assert_eq!(
+            home_search_status(&staff_home, 0o750, "frits", AgentInGroup::NoAgent),
+            Status::Missing
+        );
+        assert_eq!(
+            home_search_status(
+                &entries(DENIED_LISTING),
+                0o755,
+                "frits",
+                AgentInGroup::Member
+            ),
+            Status::Present
+        );
+        let allow_first = "drwxr-x---+ 3 frits  staff  96 Oct  9 21:16 d\n 0: group:staff allow list,search\n 1: user:tycho-agent deny list,search,readattr,readextattr\n";
+        assert!(matches!(
+            home_search_status(&entries(allow_first), 0o700, "frits", AgentInGroup::Member),
+            Status::Wrong { .. }
+        ));
+        let inherit_only = "drwxr-x---+ 3 frits  staff  96 Oct  9 21:16 d\n 0: user:tycho-agent deny list,search,readattr,readextattr,directory_inherit,only_inherit\n";
+        assert!(matches!(
+            home_search_status(&entries(inherit_only), 0o750, "frits", AgentInGroup::Member),
+            Status::Wrong { .. }
+        ));
+        let owner_allow = "drwxr-x---+ 3 frits  staff  96 Oct  9 21:16 d\n 0: user:frits allow list,search\n 1: user:tycho-agent deny list,search,readattr,readextattr\n";
+        assert_eq!(
+            home_search_status(&entries(owner_allow), 0o750, "frits", AgentInGroup::Member),
+            Status::Present
+        );
     }
 
     #[test]
@@ -1795,10 +2779,11 @@ mod tests {
     fn assemble_keeps_produced_results_and_fails_closed_on_gaps() {
         let produced = [Finding::new(Check::AgentUserExists, Status::Present)];
         let findings = assemble(Side::Developer, &produced);
-        assert_eq!(
-            findings.first().map(|finding| &finding.status),
-            Some(&Status::Present)
-        );
+        let agent_user = findings
+            .iter()
+            .find(|finding| finding.check == Check::AgentUserExists)
+            .map(|finding| &finding.status);
+        assert_eq!(agent_user, Some(&Status::Present));
         let shared_group = findings
             .iter()
             .find(|finding| finding.check == Check::SharedGroupExists)
@@ -1810,7 +2795,10 @@ mod tests {
             })
         );
 
-        let stray = [Finding::new(Check::ClaudeLogin, Status::Present)];
+        let stray = [Finding::new(
+            Check::AgentCredentialStoreClosed,
+            Status::Present,
+        )];
         let findings = assemble(Side::Developer, &stray);
         assert_eq!(findings.len(), CATALOGUE.len().saturating_add(1));
         assert!(findings
@@ -1833,16 +2821,16 @@ mod tests {
         assert_eq!(summarize(Some(Side::Developer), &[]), 1);
         let own_side_green = [
             Finding::new(Check::AgentUserExists, Status::Present),
-            Finding::new(Check::ClaudeLogin, Status::Deferred { to: Side::Agent }),
+            Finding::new(Check::KeychainSsh, Status::Deferred { to: Side::Agent }),
         ];
         assert_eq!(summarize(Some(Side::Developer), &own_side_green), 0);
         let own_side_red = [
             Finding::new(Check::AgentUserExists, Status::Missing),
-            Finding::new(Check::ClaudeLogin, Status::Deferred { to: Side::Agent }),
+            Finding::new(Check::KeychainSsh, Status::Deferred { to: Side::Agent }),
         ];
         assert_eq!(summarize(Some(Side::Developer), &own_side_red), 1);
         let only_deferred = [Finding::new(
-            Check::ClaudeLogin,
+            Check::KeychainSsh,
             Status::Deferred { to: Side::Agent },
         )];
         assert_eq!(summarize(Some(Side::Developer), &only_deferred), 1);
@@ -1899,30 +2887,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_auth_status_with_exit_code_per_tool() {
-        let claude_logged_in = r#"{"loggedIn": true, "authMethod": "claude.ai"}"#;
-        let claude_logged_out = "{\n  \"loggedIn\": false,\n  \"authMethod\": \"none\",\n  \"apiProvider\": \"firstParty\"\n}\n";
-        assert_eq!(
-            decode_claude_auth_status(Some(0), claude_logged_in, ""),
-            AuthStatus::LoggedIn
-        );
-        assert_eq!(
-            decode_claude_auth_status(Some(1), claude_logged_out, ""),
-            AuthStatus::LoggedOut
-        );
-        assert_eq!(
-            decode_claude_auth_status(Some(0), claude_logged_out, ""),
-            AuthStatus::Unrecognised
-        );
-        assert_eq!(
-            decode_claude_auth_status(Some(1), claude_logged_in, ""),
-            AuthStatus::Unrecognised
-        );
-        assert_eq!(
-            decode_claude_auth_status(Some(1), "not json", ""),
-            AuthStatus::Unrecognised
-        );
-
+    fn decodes_entire_auth_status_with_its_exit_code() {
         let entire_logged_in = r#"{"logged_in": true, "token_source": "macOS Keychain"}"#;
         let entire_logged_out = "{\n  \"logged_in\": false,\n  \"available_contexts\": 0\n}\n";
         assert_eq!(
@@ -1941,48 +2906,158 @@ mod tests {
             decode_entire_auth_status(Some(0), "not json", ""),
             AuthStatus::Unrecognised
         );
-
-        assert_eq!(
-            decode_codex_login_status(Some(1), "", "Not logged in\n"),
-            AuthStatus::LoggedOut
-        );
-        assert_eq!(
-            decode_codex_login_status(Some(1), "Not logged in\n", ""),
-            AuthStatus::Unrecognised
-        );
-        assert_eq!(
-            decode_codex_login_status(Some(0), "", "Not logged in\n"),
-            AuthStatus::Unrecognised
-        );
-        assert_eq!(
-            decode_codex_login_status(Some(0), "Logged in", ""),
-            AuthStatus::Unrecognised
-        );
-        assert_eq!(
-            decode_codex_login_status(Some(1), "", "error: something else\n"),
-            AuthStatus::Unrecognised
-        );
     }
 
     #[test]
     fn an_unrecognised_login_names_both_first_lines() {
         let message = unrecognised_login(
-            &CLAUDE_LOGIN,
+            &ENTIRE_LOGIN,
             Some(2),
             "{\"error\": true}\nmore\n",
             "warning\n",
         );
         assert_eq!(
             message,
-            "unrecognised claude auth status --json result (exit Some(2)): stdout \"{\\\"error\\\": true}\", stderr \"warning\""
+            "unrecognised entire auth status --json result (exit Some(2)): stdout \"{\\\"error\\\": true}\", stderr \"warning\""
         );
     }
 
     #[test]
     fn login_hints_name_each_tools_own_login_command() {
-        assert!(CODEX_LOGIN.login_hint.ends_with("codex login"));
-        assert!(CLAUDE_LOGIN.login_hint.ends_with("claude auth login"));
         assert!(ENTIRE_LOGIN.login_hint.ends_with("entire auth login"));
+        let [claude, codex] = &STORED_CREDENTIALS;
+        assert!(
+            claude.hint.contains("claude setup-token")
+                && claude.hint.contains("credentials set claude")
+        );
+        assert!(
+            codex.hint.contains("codex login")
+                && codex
+                    .hint
+                    .contains("credentials set codex < ~/.codex/auth.json")
+        );
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the scratch directory is this test's own, under the temporary directory"
+    )]
+    fn remove_scratch(dir: &Path) {
+        drop(fs::remove_dir_all(dir));
+    }
+
+    fn credential_scratch(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xtask-store-{test}-{}", std::process::id()));
+        remove_scratch(&dir);
+        fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn uid_of(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().uid()
+    }
+
+    #[test]
+    fn a_credential_store_must_be_a_private_directory_of_the_developer() {
+        let root = credential_scratch("store");
+        let store = root.join("credentials");
+        let me = uid_of(&root);
+        assert_eq!(
+            stored_credential_status(&store, "claude", me),
+            Status::Missing
+        );
+        fs::create_dir(&store).unwrap();
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(matches!(
+            stored_credential_status(&store, "claude", me),
+            Status::Wrong { wanted, .. } if wanted == "0700"
+        ));
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            stored_credential_status(&store, "claude", me),
+            Status::Missing
+        );
+        assert!(matches!(
+            stored_credential_status(&store, "claude", me.wrapping_add(1)),
+            Status::Wrong { wanted, .. } if wanted.starts_with("uid ")
+        ));
+        remove_scratch(&root);
+    }
+
+    #[test]
+    fn a_stored_credential_must_be_a_private_file_of_the_developer() {
+        let root = credential_scratch("file");
+        let store = root.join("credentials");
+        let me = uid_of(&root);
+        fs::create_dir(&store).unwrap();
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+        let file = store.join("claude");
+        fs::write(&file, "sk-ant-oat01-x").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+        let wrong = stored_credential_status(&store, "claude", me);
+        assert!(
+            matches!(&wrong, Status::Wrong { found, wanted } if found.ends_with("mode 0640") && wanted == "0600"),
+            "{wrong}"
+        );
+        assert!(!wrong.to_string().contains("sk-ant-oat01-x"));
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            stored_credential_status(&store, "claude", me),
+            Status::Present
+        );
+        fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), &file).unwrap();
+        assert!(matches!(
+            stored_credential_status(&store, "claude", me),
+            Status::Wrong { wanted, .. } if wanted == "regular file"
+        ));
+        remove_scratch(&root);
+    }
+
+    #[test]
+    fn the_store_follows_the_core_home_tycho_resolves() {
+        let root = credential_scratch("home");
+        assert_eq!(core_home(&root, None).unwrap(), root.join(".tycho"));
+        let moved = root.join("test-core");
+        assert_eq!(core_home(&root, Some(moved.as_os_str())).unwrap(), moved);
+        for refused in [
+            PathBuf::from("relative"),
+            root.clone(),
+            PathBuf::from("/elsewhere/core"),
+            root.join("a/../b"),
+        ] {
+            assert!(
+                core_home(&root, Some(refused.as_os_str())).is_err(),
+                "{}",
+                refused.display()
+            );
+        }
+        std::os::unix::fs::symlink("/tmp", root.join("linked")).unwrap();
+        assert!(core_home(&root, Some(root.join("linked/core").as_os_str())).is_err());
+        remove_scratch(&root);
+    }
+
+    #[test]
+    fn the_agents_store_probe_passes_only_on_a_denial() {
+        let root = credential_scratch("agent");
+        let store = root.join("credentials");
+        assert!(matches!(
+            agent_store_status(&store),
+            Status::Unreachable { .. }
+        ));
+        fs::create_dir(&store).unwrap();
+        fs::write(store.join("claude"), "x").unwrap();
+        assert!(matches!(
+            agent_store_status(&store),
+            Status::Wrong { found, .. } if found.starts_with("the agent lists")
+        ));
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(agent_store_status(&store), Status::Present);
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(agent_store_status(&store), Status::Present);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        remove_scratch(&root);
     }
 
     #[test]
@@ -2098,14 +3173,14 @@ mod tests {
             .to_string(),
         );
         assert!(matches!(
-            installed_gate(Check::ClaudeLogin, "claude", &ls),
+            installed_gate(Check::EntireLogin, "claude", &ls),
             Some(Finding {
                 status: Status::Unreachable { .. },
                 ..
             })
         ));
         assert!(matches!(
-            installed_gate(Check::CodexLogin, "codex", &ls),
+            installed_gate(Check::EntireLogin, "codex", &ls),
             Some(Finding {
                 status: Status::Unreachable { .. },
                 ..
@@ -2477,5 +3552,330 @@ mod tests {
                 wanted: "501 or 0".to_string()
             }
         );
+    }
+
+    fn home_scratch(name: &str) -> std::path::PathBuf {
+        let base =
+            std::env::temp_dir().join(format!("xtask-setup-home-{}-{name}", std::process::id()));
+        fs::create_dir(&base).expect("create the scratch directory");
+        base
+    }
+
+    /// A record naming `path`, owned as `path`'s parent is, so only what a test changes differs.
+    fn record_for(path: &Path) -> AgentRecord {
+        let parent = fs::metadata(path.parent().expect("a parent")).expect("stat the parent");
+        AgentRecord {
+            home: path.display().to_string(),
+            uid: parent.uid(),
+            gid: parent.gid(),
+        }
+    }
+
+    fn home_dir(base: &Path, mode: u32) -> std::path::PathBuf {
+        let home = base.join("home");
+        fs::create_dir(&home).expect("create the home");
+        fs::set_permissions(&home, fs::Permissions::from_mode(mode)).expect("set the mode");
+        home
+    }
+
+    #[test]
+    fn an_agent_home_at_the_records_owner_group_and_0700_is_ok() {
+        let base = home_scratch("ok");
+        let home = home_dir(&base, 0o700);
+        let record = record_for(&home);
+        assert_eq!(measure(&record), AgentHomeState::Ok);
+        let finding = agent_home_finding(&AgentHome {
+            path: Some(record.home),
+            state: AgentHomeState::Ok,
+        });
+        assert_eq!(finding.status, Status::Present);
+        assert!(finding.hint.is_none());
+        fs::remove_dir(&home).expect("remove the home");
+        fs::remove_dir(&base).expect("remove the base");
+    }
+
+    #[test]
+    fn an_agent_home_the_record_names_but_nobody_created_is_missing() {
+        let base = home_scratch("missing");
+        let record = record_for(&base.join("never-created"));
+        assert_eq!(measure(&record), AgentHomeState::Missing);
+        assert_eq!(
+            decode_agent_record(&DsclLookup::NotFound),
+            Err(AgentHomeState::Missing)
+        );
+        let elsewhere = agent_home_finding(&AgentHome {
+            path: Some(record.home),
+            state: AgentHomeState::Missing,
+        });
+        assert_eq!(elsewhere.status, Status::Missing);
+        assert!(elsewhere.hint.is_some_and(|hint| hint
+            .contains("point NFSHomeDirectory at /Users/tycho-agent")
+            && !hint.contains("createhomedir")));
+        for path in [Some(AGENT_HOME.to_string()), None] {
+            let at_agent_home = agent_home_finding(&AgentHome {
+                path,
+                state: AgentHomeState::Missing,
+            });
+            assert_eq!(at_agent_home.hint.as_deref(), Some(AGENT_HOME_CREATE_HINT));
+        }
+        fs::remove_dir(&base).expect("remove the base");
+    }
+
+    /// Measures with an empty ACL, so the stat checks run where `ls -e` does not exist.
+    fn measure(record: &AgentRecord) -> AgentHomeState {
+        measure_agent_home(record, |_: &str| Ok(AclListing::Entries(Vec::new())))
+    }
+
+    /// A created home's listing, with an allow entry after its deny entry.
+    const HOME_WITH_ALLOW: &str = "drwx------+ 11 tycho-agent  tycho-agent  352 Oct 12 09:39 /Users/tycho-agent\n 0: group:everyone deny delete\n 1: group:staff allow list,search\n";
+
+    #[test]
+    fn an_acl_allow_entry_on_the_agent_home_is_wrong_and_a_deny_entry_passes() {
+        let base = home_scratch("acl");
+        let home = home_dir(&base, 0o700);
+        let record = record_for(&home);
+        let listing = |text: &'static str| move |_: &str| Ok(decode_acl_listing(text));
+        assert_eq!(
+            measure_agent_home(&record, listing(HOME_LISTING)),
+            AgentHomeState::Ok
+        );
+        let AgentHomeState::Wrong(mismatch) = measure_agent_home(&record, listing(HOME_WITH_ALLOW))
+        else {
+            panic!("an allow entry is wrong");
+        };
+        assert_eq!(
+            mismatch,
+            HomeMismatch {
+                acl_allow: Some("group:staff allow list,search".to_string()),
+                ..HomeMismatch::default()
+            }
+        );
+        assert!(!mismatch.is_only_a_wider_mode());
+        let finding = agent_home_finding(&AgentHome {
+            path: Some(record.home.clone()),
+            state: AgentHomeState::Wrong(mismatch),
+        });
+        assert!(matches!(
+            &finding.status,
+            Status::Wrong { found, .. } if found == "ACL entry group:staff allow list,search"
+        ));
+        assert!(finding
+            .hint
+            .is_some_and(|hint| hint.contains("chmod -a \"group:staff allow list,search\"")));
+        assert!(matches!(
+            measure_agent_home(&record, listing("total 0\n")),
+            AgentHomeState::Unrecognised(_)
+        ));
+        assert!(matches!(
+            measure_agent_home(&record, |_: &str| Err("/bin/ls is not present".to_string())),
+            AgentHomeState::Unreachable(why) if why == "/bin/ls is not present"
+        ));
+        fs::remove_dir(&home).expect("remove the home");
+        fs::remove_dir(&base).expect("remove the base");
+    }
+
+    /// The deny-delete entry would keep the scratch directory from being removed.
+    #[cfg(target_os = "macos")]
+    fn chmod_clear_acl(path: &Path) {
+        let status = Command::new("/bin/chmod")
+            .arg("-N")
+            .arg(path)
+            .status()
+            .expect("run chmod -N");
+        assert!(status.success(), "chmod -N");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_acl_of_a_real_home_is_read_and_only_an_allow_entry_fails() {
+        let base = home_scratch("real-acl");
+        let home = home_dir(&base, 0o700);
+        let record = record_for(&home);
+        let chmod = |entry: &str| {
+            let status = Command::new("/bin/chmod")
+                .args(["+a", entry])
+                .arg(&home)
+                .status()
+                .expect("run chmod");
+            assert!(status.success(), "chmod +a {entry}");
+        };
+        chmod("group:everyone deny delete");
+        assert_eq!(measure_agent_home(&record, home_acl), AgentHomeState::Ok);
+        chmod("group:staff allow list,search");
+        assert_eq!(
+            measure_agent_home(&record, home_acl),
+            AgentHomeState::Wrong(HomeMismatch {
+                acl_allow: Some("group:staff allow list,search".to_string()),
+                ..HomeMismatch::default()
+            })
+        );
+        let entries = vec![
+            AclEntry {
+                principal: "group:everyone".to_string(),
+                allows: false,
+                permissions: vec!["delete".to_string()],
+            },
+            AclEntry {
+                principal: "user:frits".to_string(),
+                allows: true,
+                permissions: vec!["search".to_string(), "list".to_string()],
+            },
+        ];
+        assert_eq!(
+            first_allow(&entries),
+            Some("user:frits allow search,list".to_string())
+        );
+        assert_eq!(first_allow(entries.get(..1).unwrap_or_default()), None);
+        chmod_clear_acl(&home);
+        fs::remove_dir(&home).expect("remove the home");
+        fs::remove_dir(&base).expect("remove the base");
+    }
+
+    #[test]
+    fn an_agent_home_with_another_owner_group_or_mode_is_wrong_and_names_each() {
+        let base = home_scratch("wrong");
+        let home = home_dir(&base, 0o755);
+        let mut record = record_for(&home);
+        let (uid, gid) = (record.uid, record.gid);
+        assert_eq!(
+            measure(&record),
+            AgentHomeState::Wrong(HomeMismatch {
+                mode: Some(Differs {
+                    found: 0o755,
+                    wanted: 0o700
+                }),
+                ..HomeMismatch::default()
+            })
+        );
+        record.uid = uid.wrapping_add(1);
+        record.gid = gid.wrapping_add(1);
+        let AgentHomeState::Wrong(mismatch) = measure(&record) else {
+            panic!("a home owned by another uid and gid is wrong");
+        };
+        assert_eq!(
+            mismatch.owner,
+            Some(Differs {
+                found: uid,
+                wanted: uid.wrapping_add(1)
+            })
+        );
+        assert_eq!(
+            mismatch.group,
+            Some(Differs {
+                found: gid,
+                wanted: gid.wrapping_add(1)
+            })
+        );
+        assert!(!mismatch.is_only_a_wider_mode());
+        let finding = agent_home_finding(&AgentHome {
+            path: Some(record.home),
+            state: AgentHomeState::Wrong(mismatch),
+        });
+        let Status::Wrong { found, wanted } = &finding.status else {
+            panic!("the finding is wrong");
+        };
+        assert_eq!(
+            found,
+            &format!("owner uid {uid}, group gid {gid}, mode 0755")
+        );
+        assert!(wanted.contains("mode 0700"));
+        assert!(finding
+            .hint
+            .is_some_and(|hint| hint.contains("move it aside by hand")));
+        fs::remove_dir(&home).expect("remove the home");
+        fs::remove_dir(&base).expect("remove the base");
+    }
+
+    #[test]
+    fn a_symlink_at_the_agent_home_is_wrong_and_its_target_is_not_measured() {
+        let base = home_scratch("symlink");
+        let target = home_dir(&base, 0o700);
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("plant the link");
+        let AgentHomeState::Wrong(mismatch) = measure(&record_for(&link)) else {
+            panic!("a symlink is not a home");
+        };
+        assert_eq!(mismatch.kind, Some("symlink"));
+        fs::remove_file(&link).expect("remove the link");
+        fs::remove_dir(&target).expect("remove the target");
+        fs::remove_dir(&base).expect("remove the base");
+    }
+
+    #[test]
+    fn only_a_mode_beyond_the_agents_own_bits_is_wider() {
+        let mode = |found| HomeMismatch {
+            mode: Some(Differs {
+                found,
+                wanted: AGENT_HOME_MODE,
+            }),
+            ..HomeMismatch::default()
+        };
+        assert!(mode(0o750).is_only_a_wider_mode());
+        assert!(mode(0o1700).is_only_a_wider_mode());
+        assert!(!mode(0o500).is_only_a_wider_mode());
+        let mut owned_elsewhere = mode(0o755);
+        owned_elsewhere.owner = Some(Differs {
+            found: 0,
+            wanted: 503,
+        });
+        assert!(!owned_elsewhere.is_only_a_wider_mode());
+    }
+
+    #[test]
+    fn an_agent_home_that_cannot_be_read_is_unreachable() {
+        let base = home_scratch("unreachable");
+        let file = base.join("file");
+        fs::write(&file, b"").expect("create the file");
+        assert!(matches!(
+            measure(&record_for(&file.join("home"))),
+            AgentHomeState::Unreachable(why) if why.contains("Not a directory")
+        ));
+        let failed = DsclLookup::Unreachable("dscl is not on PATH".to_string());
+        assert_eq!(
+            decode_agent_record(&failed),
+            Err(AgentHomeState::Unreachable(
+                "dscl is not on PATH".to_string()
+            ))
+        );
+        let finding = agent_home_finding(&AgentHome {
+            path: None,
+            state: AgentHomeState::Unreachable("dscl is not on PATH".to_string()),
+        });
+        assert!(matches!(finding.status, Status::Unreachable { .. }));
+        fs::remove_file(&file).expect("remove the file");
+        fs::remove_dir(&base).expect("remove the base");
+    }
+
+    #[test]
+    fn decodes_the_agent_record_and_rejects_the_unrecognised() {
+        let found = |stdout: &str| decode_agent_record(&DsclLookup::Found(stdout.to_string()));
+        assert_eq!(
+            found("NFSHomeDirectory: /Users/tycho-agent\nPrimaryGroupID: 502\nUniqueID: 503\n"),
+            Ok(AgentRecord {
+                home: "/Users/tycho-agent".to_string(),
+                uid: 503,
+                gid: 502,
+            })
+        );
+        for unrecognised in [
+            "PrimaryGroupID: 502\nUniqueID: 503\n",
+            "NFSHomeDirectory: tycho-agent\nPrimaryGroupID: 502\nUniqueID: 503\n",
+            "NFSHomeDirectory:\n /Users/a\n /Users/b\nPrimaryGroupID: 502\nUniqueID: 503\n",
+            "NFSHomeDirectory: /Users/tycho-agent\nPrimaryGroupID: 502\n",
+            "NFSHomeDirectory: /Users/tycho-agent\nPrimaryGroupID: staff\nUniqueID: 503\n",
+        ] {
+            assert!(
+                matches!(found(unrecognised), Err(AgentHomeState::Unrecognised(_))),
+                "{unrecognised:?}"
+            );
+        }
+        let finding = agent_home_finding(&AgentHome {
+            path: None,
+            state: AgentHomeState::Unrecognised("agent user record without UniqueID".to_string()),
+        });
+        assert!(matches!(
+            finding.status,
+            Status::Unreachable { ref why } if why.starts_with("unrecognised")
+        ));
     }
 }

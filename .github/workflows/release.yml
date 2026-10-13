@@ -87,11 +87,12 @@ jobs:
         with:
           version: 2026.9.13
           cache: false
-          install_args: rust mr-boxington release-plz gh
+          install_args: rust mr-boxington release-plz
       # Built before the key is mapped; the build scripts of xtask's locked dependencies run in
       # this job and are trusted with the App key.
       - run: cargo build --locked -p xtask
       - run: target/debug/xtask release-pr
         env:
+          TYCHO_RELEASE_CLIENT_ID: ${{ vars.TYCHO_RELEASE_CLIENT_ID }}
           TYCHO_RELEASE_APP_ID: ${{ vars.TYCHO_RELEASE_APP_ID }}
           TYCHO_RELEASE_APP_PRIVATE_KEY: ${{ secrets.TYCHO_RELEASE_APP_PRIVATE_KEY }}

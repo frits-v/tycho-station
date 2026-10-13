@@ -8,18 +8,30 @@ The design is `docs/design.html`. Section numbers below refer to it.
 
 ## Operator prerequisites
 
-These need a human with sudo or an account login and are not automated:
-
 - A dedicated macOS user for agents with its own primary group, not `staff` (design
-  section 7, trust boundaries). No credentials of any kind in that account. The core
-  runs as the developer.
-- Vendor logins for that user, done once from a terminal: Claude Code (subscription),
-  Codex (ChatGPT plan). Antigravity is optional in slice zero.
+  section 7, trust boundaries), and a deny entry for it in the developer's home ACL, since
+  every local account is in `staff` through `localaccounts`. No credentials of any kind in
+  that account. The core runs as the developer.
 - A group shared by the developer and the agent user, for the zmx socket directory.
+- The shared tool prefix `/Users/Shared/tycho`, owned by the developer and closed to group
+  and other writes, holding every binary the agent runs: the pinned mise, claude, codex and
+  zmx, and release builds of the station (design section 7). The agent cannot search the
+  developer's home, where mise otherwise installs them.
+- Vendor credentials in the core's store, set once by the developer from a terminal: a
+  Claude Code subscription token from `claude setup-token` and the Codex `auth.json` of a
+  ChatGPT plan login, each through `tycho credentials set` (design section 7, vendor
+  credentials). The agent user logs in to no vendor; the core hands each session its
+  credential. Antigravity is optional in slice zero.
 - The entire CLI logged in as the developer if the entire mirror is the sync remote.
 
-The xtask gains a `setup` command that checks every precondition above and prints what is
-missing, so the state of the machine is never guessed.
+`mise run provision-agent`, run as the developer from a terminal, creates the user, both
+groups, the home ACL entry and the socket directories, asking for sudo on the terminal, and
+creates and fills the tool prefix with no root step
+([provisioning](process.md#provisioning-the-agent-user)). The vendor credentials need a
+browser login by the plans' owner and stay with the operator, who stores them with the
+commands the task prints ([vendor credentials](process.md#vendor-credentials)). `mise run setup` as the developer and
+`/Users/Shared/tycho/bin/xtask setup` as the agent check every precondition above and print
+what is missing, so the state of the machine is never guessed.
 
 ## Slice zero: the spine
 
@@ -59,10 +71,14 @@ Steps and the question each one answers:
    directories, write the agent's own settings file, reach the Restate admin port,
    write to the canonical repository, edit its hooks directory, push to its default
    branch. All must fail. Then the positive gate path to a throwaway remote.
+   `crates/tycho/tests/boundary.rs`, run with `mise run boundary-tests` from a terminal,
+   since sudo asks for the developer's password to run each probe as the agent.
 6. Attach tests: a Ghostty tab as the developer attaches to a zmx session owned by the
    agent user through the shared socket directory; the reader opens that tab through
    AppleScript while running under zmx and under launchd, and the Automation consent
-   prompt is recorded for each.
+   prompt is recorded for each. `crates/tycho/tests/attach.rs`, run with
+   `mise run attach-tests` from a Ghostty terminal, since sudo asks for the developer's
+   password to create the agent's sessions.
 7. A planted contradiction makes the worker reject its awaitable with a certified
    question; the packet lands in a directory; a verdict typed into a file resumes the
    unit.

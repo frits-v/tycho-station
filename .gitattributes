@@ -1,0 +1,3 @@
+# The ledger is an append-only table: every branch adds rows at its end, so a merge keeps
+# both sides' rows instead of conflicting on the same last line.
+notes/ledger.md merge=union

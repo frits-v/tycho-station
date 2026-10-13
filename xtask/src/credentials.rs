@@ -4,8 +4,8 @@
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
+use tycho_types::git_environment::git_command;
 
 use crate::finish_findings;
 use crate::process::{run_bounded, Exit};
@@ -22,6 +22,18 @@ const MARKERS: [&str; 10] = [
     "ghr_",
     "github_pat_",
     "release_plz_token",
+];
+/// Credential prefixes a review comment must never carry onto a pull request: Anthropic keys
+/// and OAuth tokens, GitHub installation, user and refresh tokens. Kept here, the one file
+/// the scan skips.
+pub const POSTED_TEXT_PREFIXES: [&str; 7] = [
+    "sk-ant-",
+    "ghs_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghr_",
+    "github_pat_",
 ];
 const EXCLUDED_PATHS: [&str; 1] = ["xtask/src/credentials.rs"];
 const STYLE_PATH: &str = "docs/style.md";
@@ -62,7 +74,7 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// `base`. A listing over the bound or a git that cannot run is an error, never an empty scan.
 fn listed_files(base: &Path) -> Result<Vec<PathBuf>, String> {
     let listed = run_bounded(
-        Command::new("git").current_dir(base).args([
+        git_command().current_dir(base).args([
             "ls-files",
             "-z",
             "--cached",
@@ -378,6 +390,7 @@ mod tests {
 
     #[test]
     fn the_repository_scan_lists_every_tracked_file_and_skips_only_this_one() {
+        crate::refuse_hook_environment();
         let files = listed_files(repository_root()).unwrap();
         for expected in [
             "README.md",

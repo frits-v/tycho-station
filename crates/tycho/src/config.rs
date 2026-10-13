@@ -13,8 +13,10 @@ use nix::unistd::{Uid, User};
 use tycho_types::session::{SessionName, SOCKET_PATH_MAX_BYTES};
 
 mod port_claim;
+pub mod tool_prefix;
 
 pub use port_claim::{claim_in, ClaimError, PortClaim, PORT_SLOT_DIR};
+pub use tool_prefix::{ToolPrefix, MISE_PREFIX_ENV, TOOL_PREFIX_DEFAULT, TOOL_PREFIX_ENV};
 
 use crate::command::{self, CommandError};
 use crate::config_store::{
@@ -325,6 +327,8 @@ pub enum ConfigError {
     CurrentExe(std::io::Error),
     RelativePath(&'static str, PathBuf),
     PortOffset(PortOffsetError),
+    ProductionOverride(&'static str),
+    ToolPrefixManifest(String),
 }
 
 impl fmt::Display for ConfigError {
@@ -368,6 +372,11 @@ impl fmt::Display for ConfigError {
                 write!(formatter, "{variable}={} is not absolute", path.display())
             }
             Self::PortOffset(error) => write!(formatter, "{error}"),
+            Self::ProductionOverride(variable) => write!(
+                formatter,
+                "{variable} is honoured only for a test core home ({HOME_ENV} other than ~/{HOME_DEFAULT_DIR})"
+            ),
+            Self::ToolPrefixManifest(why) => write!(formatter, "tool prefix: {why}"),
         }
     }
 }

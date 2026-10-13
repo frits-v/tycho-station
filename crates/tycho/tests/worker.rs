@@ -31,13 +31,14 @@ use restate_sdk::prelude::HttpServer;
 use serde_json::{json, Value};
 use tycho::agent_files::current_uid;
 use tycho::config::{
-    self, AgentDirs, CoreConfig, CorePorts, PortClaim, HOME_ENV, MISE_NO_INSTALL,
+    self, AgentDirs, CoreConfig, CorePorts, PortClaim, ToolPrefix, HOME_ENV, MISE_NO_INSTALL,
     RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
+use tycho::credentials::{self, CredentialVendor};
 use tycho::endpoint;
 use tycho::entire_graph::EntireGraph;
-use tycho::launch_spec::HeartbeatTarget;
+use tycho::launch_spec::{HeartbeatTarget, VendorTerminal, TIER_MAX_BYTES};
 use tycho::launcher::SessionFiles;
 use tycho::repositories::{ProjectName, Repositories};
 use tycho::services::doubles::FixedGate;
@@ -46,9 +47,13 @@ use tycho::services::merge_gate::GateVerdict;
 use tycho::services::operator::read_secret_file;
 use tycho::services::workers::WorkerPorts;
 use tycho::services::{Ports, Timing};
+use tycho::spawn::{typed_words, SpawnRequest};
 use tycho::spool::ACKNOWLEDGED_SUFFIX;
 use tycho::zmx::Zmx;
+use tycho_harness::tool_prefix::link_scratch_prefix;
 use tycho_types::envelope::CommitSha;
+use tycho_types::git_environment::git_command;
+use tycho_types::launcher::{LauncherEnv, ENV_AWAITABLE_ID, ENV_SESSION_NAME, ENV_SESSION_SECRET};
 use tycho_types::service::handler;
 use tycho_types::session::SessionName;
 use tycho_types::task_packet::RoutingName;
@@ -64,6 +69,8 @@ struct Core {
     config: CoreConfig,
     environment: Vec<(&'static str, String)>,
     agent: PathBuf,
+    /// A scratch prefix holding the built `tycho` and the pinned tools, where sessions start.
+    prefix: ToolPrefix,
     /// Held until the core is stopped, after the teardown in `drop`.
     _port_claim: PortClaim,
 }
@@ -86,13 +93,67 @@ fn claim_ports(home: &Path) -> PortClaim {
     claim
 }
 
+/// Fails before any vendor seat is spent when the launcher's typed line would not fit: the
+/// scratch prefix appears in it nine times, and the spawn step refuses a line over 1000 bytes.
+fn assert_typed_line_fits(prefix: &ToolPrefix, agent: &Path) {
+    let dirs = AgentDirs::new(agent.to_path_buf()).unwrap();
+    let zmx = Zmx::agent(prefix.tool("zmx").unwrap(), agent);
+    let env = LauncherEnv::from_map(&std::collections::BTreeMap::from([
+        (ENV_AWAITABLE_ID.to_string(), "sign_1abc".to_string()),
+        (ENV_SESSION_SECRET.to_string(), "0".repeat(64)),
+        (
+            ENV_SESSION_NAME.to_string(),
+            "cf7a.wu01.wrk.claude.e7c7f6d06ca1".to_string(),
+        ),
+    ]))
+    .unwrap();
+    let tycho = prefix.tycho();
+    let home = PathBuf::from(env::var_os("HOME").unwrap());
+    let vendor = [tycho.display().to_string()];
+    let tier = "t".repeat(TIER_MAX_BYTES);
+    let request = SpawnRequest {
+        zmx: &zmx,
+        dirs: &dirs,
+        tycho: &tycho,
+        home: &home,
+        env: &env,
+        heartbeat: HeartbeatTarget::Session,
+        vendor: &vendor,
+        agent_uid: current_uid(),
+        tier: Some(&tier),
+        terminal: VendorTerminal::Files,
+        vendor_dir: None,
+        ports: CorePorts::PRODUCTION,
+        tool_prefix: prefix,
+        credential: None,
+    };
+    if let Err(refused) = typed_words(&request, &dirs.spec_path(&env.session_name)) {
+        panic!(
+            "the scratch prefix {} is too long: {refused:?}",
+            prefix.root().display()
+        );
+    }
+}
+
 impl Core {
     fn new(claim: PortClaim) -> Self {
         let home = claim.home.clone();
-        if home.exists() {
-            fs::remove_dir_all(&home).unwrap();
+        // Short: the prefix appears nine times in the typed line, which holds 1000 bytes.
+        let tag = home
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(".tycho-worker-"))
+            .unwrap()
+            .to_string();
+        let prefix_root = home.with_file_name(format!(".twp-{tag}"));
+        for dir in [&home, &prefix_root] {
+            if dir.exists() {
+                fs::remove_dir_all(dir).unwrap();
+            }
         }
         let zmx = mise_which("zmx");
+        let prefix = scratch_prefix(&prefix_root, &zmx);
+        assert_typed_line_fits(&prefix, &home.join("agent"));
         let restate_server = mise_which("restate-server");
         let config = CoreConfig::new(
             home.clone(),
@@ -113,6 +174,7 @@ impl Core {
         Self {
             _port_claim: claim,
             agent: home.join("agent"),
+            prefix,
             config,
             environment,
         }
@@ -146,11 +208,11 @@ impl Core {
 /// Kills what zmx still lists in a socket directory and reports how many remain.
 /// Ends what a socket directory still lists; a pid is signalled only while `ps` shows it
 /// running restate-server, the endpoint or a launcher.
-fn clear_sessions(zmx: &Zmx, label: &str) -> usize {
+fn clear_sessions(zmx: &Zmx, label: &str, launcher: &Path) -> usize {
     let programs = vec![
         mise_which("restate-server").display().to_string(),
         format!("{TYCHO} endpoint"),
-        format!("{TYCHO} launch"),
+        format!("{} launch", launcher.display()),
     ];
     match zmx.clear(&programs) {
         Ok(report) => {
@@ -190,9 +252,13 @@ impl Drop for Core {
     fn drop(&mut self) {
         self.tycho(&["core", "stop"]);
         let core_zmx = Zmx::new(&self.config.zmx, &self.config.socket_dir());
-        let agent_zmx = Zmx::agent(&self.config.zmx, &self.agent);
-        let left =
-            clear_sessions(&core_zmx, "core").saturating_add(clear_sessions(&agent_zmx, "agent"));
+        let agent_zmx = Zmx::agent(self.prefix.tool("zmx").unwrap(), &self.agent);
+        let left = clear_sessions(&core_zmx, "core", Path::new(TYCHO))
+            .saturating_add(clear_sessions(&agent_zmx, "agent", &self.prefix.tycho()));
+        drop(fs::remove_dir_all(self.prefix.root()));
+        // The copied token goes whatever else the teardown finds.
+        let shredded = credentials::shred_store(&self.config.home);
+        println!("teardown: shredded the test core's credential store: {shredded:?}");
         let mut outcome = (left == 0)
             .then_some(())
             .ok_or_else(|| format!("{left} sessions remain"));
@@ -302,7 +368,7 @@ fn post(core_ports: CorePorts, path: &str, body: &str) -> (u16, String) {
 }
 
 fn git(repository: &Path, arguments: &[&str]) -> String {
-    let output = Command::new("git")
+    let output = git_command()
         .arg("-C")
         .arg(repository)
         .args(arguments)
@@ -347,11 +413,21 @@ fn worker_ports(core: &Core) -> (Arc<WorkerPorts>, CommitSha) {
         repositories,
         graph: Arc::new(graph),
         project: ProjectName::parse(PROJECT).unwrap(),
-        tycho: PathBuf::from(TYCHO),
-        claude: mise_which("claude"),
-        codex: mise_which("codex"),
+        tycho: core.prefix.tycho(),
+        claude: core.prefix.tool("claude").unwrap().to_path_buf(),
+        codex: core.prefix.tool("codex").unwrap().to_path_buf(),
     };
     (Arc::new(ports), head)
+}
+
+/// The worker reaches the vendor only through the hand-off, so the test core holds the
+/// developer's stored token, which `tycho credentials set claude` put in the core home.
+fn copy_claude_credential(test_home: &Path) {
+    let production = config::core_home().unwrap();
+    let credential = credentials::load(&production, CredentialVendor::Claude)
+        .unwrap_or_else(|error| panic!("the worker suite needs a stored Claude token: {error}"));
+    credentials::store(test_home, &credential).unwrap();
+    println!("evidence: the test core holds the stored Claude token");
 }
 
 fn start(claim: PortClaim) -> (Core, TestEndpoint, Arc<WorkerPorts>) {
@@ -362,16 +438,17 @@ fn start(claim: PortClaim) -> (Core, TestEndpoint, Arc<WorkerPorts>) {
     );
     let (workers, head) = worker_ports(&core);
     let factory = FactoryConfig::embedded().unwrap();
-    let spawner = LauncherSpawner {
-        zmx: Zmx::agent(&core.config.zmx, &core.agent),
-        dirs: AgentDirs::new(core.agent.clone()).unwrap(),
-        tycho: PathBuf::from(TYCHO),
-        home: PathBuf::from(env::var_os("HOME").unwrap()),
-        core_home: core.config.home.clone(),
-        agent_uid: current_uid(),
-        heartbeat: HeartbeatTarget::Session,
-        ports: core.config.ports,
-    };
+    copy_claude_credential(&core.config.home);
+    let spawner = LauncherSpawner::for_prefix(
+        core.prefix.clone(),
+        AgentDirs::new(core.agent.clone()).unwrap(),
+        PathBuf::from(env::var_os("HOME").unwrap()),
+        core.config.home.clone(),
+        current_uid(),
+        HeartbeatTarget::Session,
+        core.config.ports,
+    )
+    .unwrap();
     let ports = Ports {
         spawner: Arc::new(spawner),
         vendor: Arc::new(tycho::vendors::control::NoVendor),
@@ -753,4 +830,26 @@ fn a_headless_worker_rejects_on_the_planted_contradiction() {
     fs::write(&verdict, "abandon\nthe policy stands\n").unwrap();
     assert!(core.tycho(&["verdicts", "once"]).status.success());
     assert_eq!(attach(&core, &invocation)["lifecycle"], "abandoned");
+}
+
+/// A scratch prefix at `root` with the built `tycho` as its launcher and the developer's
+/// pinned tools as its installs, so a session starts from a prefix the way production does.
+fn scratch_prefix(root: &Path, zmx: &Path) -> ToolPrefix {
+    link_scratch_prefix(
+        root,
+        Path::new(TYCHO),
+        &[
+            ("claude", &mise_which("claude")),
+            ("codex", &mise_which("codex")),
+            ("zmx", zmx),
+        ],
+    )
+    .unwrap();
+    let prefix = ToolPrefix::load(root.to_path_buf()).unwrap();
+    println!(
+        "evidence: sessions start from {} under zmx {}",
+        prefix.tycho().display(),
+        prefix.tool("zmx").unwrap().display()
+    );
+    prefix
 }

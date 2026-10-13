@@ -1,46 +1,72 @@
-//! GitHub App installation tokens for the release pull request.
+//! GitHub App installation tokens: the release App's for the release pull request, the
+//! review App's for the code review.
 //!
-//! The App's private key signs a short JWT; `gh api` trades it for an installation token
-//! scoped to one repository and two permissions. Credentials travel only through child
-//! process environments (`GH_TOKEN`), never through arguments, output or error text.
+//! The App's private key signs a short JWT, sent as a bearer token to trade for an installation
+//! token scoped to one repository and two permissions. Every call is made in process
+//! (`github_api`), so the JWT and the token never reach a child process, its arguments, output
+//! or error text.
 
-use std::env;
 use std::ffi::OsString;
 use std::fmt;
-use std::fs;
-use std::os::unix::fs::DirBuilderExt;
-use std::path::{Path, PathBuf};
-use std::process::{self, Command};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 
-use crate::process::{run_bounded, Exit};
+use crate::github_api::{github_message, Client, Method, Reply};
 
-pub const APP_ID_VARIABLE: &str = "TYCHO_RELEASE_APP_ID";
-pub const APP_KEY_VARIABLE: &str = "TYCHO_RELEASE_APP_PRIVATE_KEY";
+/// One GitHub App: where its credentials come from, and the grant its tokens are limited to.
+#[derive(Debug)]
+pub struct AppSpec {
+    pub client_id_variable: &'static str,
+    pub app_id_variable: &'static str,
+    pub key_variable: &'static str,
+    /// Where the credentials live and why, for the error that names them missing.
+    pub setup: &'static str,
+    /// The grant requested; GitHub adds `metadata: read` to every installation token.
+    pub permissions: &'static [(&'static str, &'static str)],
+}
+
+pub const RELEASE: AppSpec = AppSpec {
+    client_id_variable: "TYCHO_RELEASE_CLIENT_ID",
+    app_id_variable: "TYCHO_RELEASE_APP_ID",
+    key_variable: "TYCHO_RELEASE_APP_PRIVATE_KEY",
+    setup: "of the `release` environment must be set: the release pull request is opened with \
+            a GitHub App installation token (Releases in docs/process.md)",
+    permissions: &[("contents", "write"), ("pull_requests", "write")],
+};
+
+pub const REVIEW: AppSpec = AppSpec {
+    client_id_variable: "FRITS_CODE_REVIEW_CLIENT_ID",
+    app_id_variable: "FRITS_CODE_REVIEW_APP_ID",
+    key_variable: "FRITS_CODE_REVIEW_APP_PRIVATE_KEY",
+    setup: "must be set: the review is posted with a GitHub App installation token (Code \
+            review in docs/process.md)",
+    permissions: &[
+        ("checks", "read"),
+        ("pull_requests", "write"),
+        ("statuses", "read"),
+    ],
+};
 const REPOSITORY_VARIABLE: &str = "GITHUB_REPOSITORY";
 const APP_ID_MAX_DIGITS: usize = 20;
+/// GitHub App client ids are `Iv` and a short alphanumeric suffix, about twenty characters.
+const CLIENT_ID_MAX_CHARS: usize = 64;
 const PRIVATE_KEY_MAX_BYTES: usize = 16 * 1024;
 const REPOSITORY_MAX_CHARS: usize = 140;
 const TOKEN_MAX_CHARS: usize = 1024;
+const SLUG_MAX_CHARS: usize = 64;
 /// GitHub rejects an `iat` ahead of its clock; backdating absorbs runner clock drift.
 const JWT_BACKDATE_SECONDS: u64 = 60;
 /// GitHub refuses an `exp` more than ten minutes ahead; with the backdate, `exp` lands nine
 /// minutes ahead of now.
 pub const JWT_MAX_LIFETIME_SECONDS: u64 = 600;
-const GH_TIMEOUT: Duration = Duration::from_secs(60);
-/// The grant requested for the token; GitHub adds `metadata: read` to every installation token.
-const REQUESTED_PERMISSIONS: [(&str, &str); 2] =
-    [("contents", "write"), ("pull_requests", "write")];
 const IMPLICIT_PERMISSION: (&str, &str) = ("metadata", "read");
-static CONFIG_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-const GH_INHERITED_VARIABLES: [&str; 4] = ["PATH", "TMPDIR", "LANG", "LC_ALL"];
 
-/// The App's identity and signing key, read from the environment.
+/// The App's identity and signing key, read from the environment. `issuer` is the JWT `iss`:
+/// the App's client id, or its numeric App id when no client id is set.
 pub struct AppCredentials {
-    app_id: u64,
+    spec: &'static AppSpec,
+    issuer: String,
     key: EncodingKey,
 }
 
@@ -48,7 +74,8 @@ impl fmt::Debug for AppCredentials {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("AppCredentials")
-            .field("app_id", &self.app_id)
+            .field("app", &self.spec.client_id_variable)
+            .field("issuer", &self.issuer)
             .field("key", &"[redacted]")
             .finish()
     }
@@ -61,6 +88,11 @@ pub struct InstallationToken(String);
 impl InstallationToken {
     pub fn expose(&self) -> &str {
         &self.0
+    }
+
+    #[cfg(test)]
+    pub fn for_tests(value: &str) -> Self {
+        Self(value.to_string())
     }
 }
 
@@ -76,10 +108,18 @@ pub struct Repository {
     name: String,
 }
 
+impl Repository {
+    /// `owner/name`, as API paths name it.
+    pub fn full_name(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum InstallationOutcome {
     Found(u64),
-    Failed(Exit),
+    /// A non-2xx status and GitHub's message when it reads as plain text.
+    Failed(u16, Option<String>),
     Unrecognised(&'static str),
 }
 
@@ -89,48 +129,81 @@ enum InstallationOutcome {
 #[derive(Debug, PartialEq, Eq)]
 enum TokenOutcome {
     Issued(InstallationToken),
-    Failed(Exit),
+    Failed(u16, Option<String>),
     Overgranted(InstallationToken),
     UnreadableGrant(InstallationToken),
     Unrecognised(&'static str),
 }
 
-fn missing_credentials() -> String {
+fn missing_credentials(spec: &AppSpec) -> String {
     format!(
-        "{APP_ID_VARIABLE} (variable) and {APP_KEY_VARIABLE} (secret) of the `release` \
-         environment must both be set: the release pull request is opened with a GitHub App \
-         installation token (Releases in docs/process.md)"
+        "{} (variable, preferred) or {} (variable, accepted), and {} (secret), {}",
+        spec.client_id_variable, spec.app_id_variable, spec.key_variable, spec.setup
     )
 }
 
-/// Reads the App id and private key; neither value appears in an error.
+fn non_empty(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// The JWT issuer: the client id when set, else the numeric App id. A client id that is set
+/// but malformed is an error, not a reason to fall back.
+fn read_issuer(
+    spec: &AppSpec,
+    client_id: Option<String>,
+    app_id: Option<String>,
+) -> Result<String, String> {
+    if let Some(client_id) = non_empty(client_id) {
+        let valid = client_id.len() <= CLIENT_ID_MAX_CHARS
+            && client_id.chars().all(|c| c.is_ascii_alphanumeric());
+        return if valid {
+            Ok(client_id)
+        } else {
+            Err(format!(
+                "{} is not a GitHub App client id: letters and digits, at most \
+                 {CLIENT_ID_MAX_CHARS}",
+                spec.client_id_variable
+            ))
+        };
+    }
+    let Some(app_id) = non_empty(app_id) else {
+        return Err(missing_credentials(spec));
+    };
+    let digits = app_id.len() <= APP_ID_MAX_DIGITS && app_id.chars().all(|c| c.is_ascii_digit());
+    match app_id.parse::<u64>() {
+        Ok(number) if digits && number > 0 => Ok(number.to_string()),
+        _ => Err(format!("{} is not a GitHub App id", spec.app_id_variable)),
+    }
+}
+
+/// Reads the App's client id (or its App id) and private key; the key never appears in an
+/// error.
 pub fn read_credentials(
+    spec: &'static AppSpec,
+    client_id: Option<String>,
     app_id: Option<String>,
     key: Option<String>,
 ) -> Result<AppCredentials, String> {
-    let (Some(app_id), Some(key)) = (app_id, key) else {
-        return Err(missing_credentials());
+    let Some(key) = non_empty(key) else {
+        return Err(missing_credentials(spec));
     };
-    let (app_id, key) = (app_id.trim(), key.trim());
-    if app_id.is_empty() || key.is_empty() {
-        return Err(missing_credentials());
-    }
-    let digits = app_id.len() <= APP_ID_MAX_DIGITS && app_id.chars().all(|c| c.is_ascii_digit());
-    let app_id = match app_id.parse::<u64>() {
-        Ok(number) if digits && number > 0 => number,
-        _ => return Err(format!("{APP_ID_VARIABLE} is not a GitHub App id")),
-    };
+    let issuer = read_issuer(spec, client_id, app_id)?;
+    let key = key.as_str();
     if key.len() > PRIVATE_KEY_MAX_BYTES {
         return Err(format!(
-            "{APP_KEY_VARIABLE} is larger than {PRIVATE_KEY_MAX_BYTES} bytes"
+            "{} is larger than {PRIVATE_KEY_MAX_BYTES} bytes",
+            spec.key_variable
         ));
     }
     let Ok(key) = EncodingKey::from_rsa_pem(key.as_bytes()) else {
         return Err(format!(
-            "{APP_KEY_VARIABLE} is not an RSA private key in PEM form"
+            "{} is not an RSA private key in PEM form",
+            spec.key_variable
         ));
     };
-    Ok(AppCredentials { app_id, key })
+    Ok(AppCredentials { spec, issuer, key })
 }
 
 /// `owner/name` from the Actions environment, bounded and limited to GitHub's name characters:
@@ -171,7 +244,7 @@ fn unix_now() -> Result<u64, String> {
 }
 
 /// The App JWT: `iat` backdated, `exp` exactly [`JWT_MAX_LIFETIME_SECONDS`] after `iat`, and
-/// `iss` the App id as a string, the JSON web token `StringOrURI` form.
+/// `iss` the client id, or the App id as a string, the JSON web token `StringOrURI` form.
 fn app_jwt(credentials: &AppCredentials, now: u64) -> Result<String, String> {
     let issued = now
         .checked_sub(JWT_BACKDATE_SECONDS)
@@ -182,101 +255,49 @@ fn app_jwt(credentials: &AppCredentials, now: u64) -> Result<String, String> {
     let claims = serde_json::json!({
         "iat": issued,
         "exp": expires,
-        "iss": credentials.app_id.to_string(),
+        "iss": credentials.issuer,
     });
     jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &credentials.key).map_err(|_| {
-        format!("{APP_KEY_VARIABLE} could not sign the App JWT; it is not a usable RSA key")
+        format!(
+            "{} could not sign the App JWT; it is not a usable RSA key",
+            credentials.spec.key_variable
+        )
     })
 }
 
-/// The parent variables gh may see: where to find itself, a temporary directory and the locale.
-/// Everything else, the App id and key, `HOME`, proxies and certificate overrides included,
-/// stays out of its environment.
-fn gh_environment(
-    parent: impl IntoIterator<Item = (OsString, OsString)>,
-) -> Vec<(OsString, OsString)> {
-    parent
-        .into_iter()
-        .filter(|(name, _)| GH_INHERITED_VARIABLES.iter().any(|allowed| name == allowed))
-        .collect()
-}
-
-/// The parent environment minus the App id and key, for a child that needs the rest of it.
+/// The parent environment minus the App's ids and key, for a child that needs the rest of it.
 pub fn without_app_credentials(
+    spec: &AppSpec,
     parent: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Vec<(OsString, OsString)> {
     parent
         .into_iter()
-        .filter(|(name, _)| name != APP_ID_VARIABLE && name != APP_KEY_VARIABLE)
+        .filter(|(name, _)| {
+            name != spec.client_id_variable
+                && name != spec.app_id_variable
+                && name != spec.key_variable
+        })
         .collect()
 }
 
-/// A command run in an empty private directory, which is also its `GH_CONFIG_DIR`, with the
-/// allowlisted parent variables, telemetry off and the credential in `GH_TOKEN`; the arguments
-/// carry no secret. Without `HOME`, gh 2.102.0 resolves its state directory relative to the
-/// working directory and, with telemetry on, writes a device id there; the private working
-/// directory keeps any such write out of the checkout.
-fn credentialed_command(
-    program: &str,
-    credential: &str,
-    args: &[&str],
-    parent: impl IntoIterator<Item = (OsString, OsString)>,
-    config_dir: &Path,
-) -> Command {
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .env_clear()
-        .envs(gh_environment(parent))
-        .current_dir(config_dir)
-        .env("GH_CONFIG_DIR", config_dir)
-        .env("GH_TELEMETRY", "disabled")
-        .env("GH_TOKEN", credential)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("GH_NO_UPDATE_NOTIFIER", "1");
-    command
-}
-
-/// A new directory private to this process, so gh reads no configuration that could redirect
-/// its requests; created with `create_dir`, which fails rather than reuse an existing path.
-fn fresh_config_dir() -> Result<PathBuf, String> {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos());
-    let sequence = CONFIG_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let dir = env::temp_dir().join(format!("tycho-gh-{}-{nanos}-{sequence}", process::id()));
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
-    Ok(dir)
-}
-
-/// Runs `gh api` in an empty private directory, removed afterwards. gh 2.102.0 writes nothing
-/// there for an API call with telemetry off; a directory left behind is reported, not fatal, so
-/// a token already issued still reaches its revocation.
-fn gh_api(credential: &str, args: &[&str]) -> Result<crate::process::Captured, String> {
-    let mut gh_args = vec!["api"];
-    gh_args.extend_from_slice(args);
-    let config_dir = fresh_config_dir()?;
-    let captured = run_bounded(
-        &mut credentialed_command("gh", credential, &gh_args, env::vars_os(), &config_dir),
-        GH_TIMEOUT,
-    );
-    if let Err(error) = fs::remove_dir(&config_dir) {
-        eprintln!(
-            "xtask: gh left files in {}; not removed: {error}",
-            config_dir.display()
-        );
+/// Reduces a reply to a status and body, or to a fixed reason it could not be read.
+fn response(reply: Reply) -> Result<(u16, String), &'static str> {
+    match reply {
+        Reply::Response { status, body } => Ok((status, body)),
+        Reply::BodyTooLarge => Err("the response is over its size limit"),
+        Reply::Failed(reason) => Err(reason),
     }
-    Ok(captured)
 }
 
-fn decode_installation(exit: Exit, stdout: &str) -> InstallationOutcome {
-    if exit != Exit::Code(0) {
-        return InstallationOutcome::Failed(exit);
+const fn succeeded(status: u16) -> bool {
+    status >= 200 && status < 300
+}
+
+fn decode_installation(status: u16, body: &str) -> InstallationOutcome {
+    if !succeeded(status) {
+        return InstallationOutcome::Failed(status, github_message(body));
     }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
         return InstallationOutcome::Unrecognised("installation response is not JSON");
     };
     match value.get("id").and_then(serde_json::Value::as_u64) {
@@ -286,13 +307,16 @@ fn decode_installation(exit: Exit, stdout: &str) -> InstallationOutcome {
 }
 
 /// The granted permissions must be the requested ones plus GitHub's implicit metadata read.
-fn grant_is_exact(permissions: &serde_json::Map<String, serde_json::Value>) -> bool {
-    let requested_present = REQUESTED_PERMISSIONS.iter().all(|(name, level)| {
+fn grant_is_exact(
+    spec: &AppSpec,
+    permissions: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let requested_present = spec.permissions.iter().all(|(name, level)| {
         permissions.get(*name).and_then(serde_json::Value::as_str) == Some(level)
     });
     let nothing_else = permissions.iter().all(|(name, level)| {
         let level = level.as_str();
-        REQUESTED_PERMISSIONS
+        spec.permissions
             .iter()
             .chain(std::iter::once(&IMPLICIT_PERMISSION))
             .any(|(allowed, allowed_level)| name == allowed && level == Some(allowed_level))
@@ -316,11 +340,16 @@ fn single_repository(value: &serde_json::Value, repository: &Repository) -> bool
     selected && names.is_some_and(|names| names == [repository.name.as_str()])
 }
 
-fn decode_access_token(exit: Exit, stdout: &str, repository: &Repository) -> TokenOutcome {
-    if exit != Exit::Code(0) {
-        return TokenOutcome::Failed(exit);
+fn decode_access_token(
+    spec: &AppSpec,
+    status: u16,
+    body: &str,
+    repository: &Repository,
+) -> TokenOutcome {
+    if !succeeded(status) {
+        return TokenOutcome::Failed(status, github_message(body));
     }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim()) else {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body.trim()) else {
         return TokenOutcome::Unrecognised("token response is not JSON");
     };
     let token = match value.get("token").and_then(serde_json::Value::as_str) {
@@ -340,33 +369,42 @@ fn decode_access_token(exit: Exit, stdout: &str, repository: &Repository) -> Tok
     else {
         return TokenOutcome::UnreadableGrant(token);
     };
-    if !grant_is_exact(permissions) || !single_repository(&value, repository) {
+    if !grant_is_exact(spec, permissions) || !single_repository(&value, repository) {
         return TokenOutcome::Overgranted(token);
     }
     TokenOutcome::Issued(token)
 }
 
-fn access_token_args(installation: u64, repository: &Repository) -> Vec<String> {
-    let mut args = vec![
-        "--method".to_string(),
-        "POST".to_string(),
-        format!("/app/installations/{installation}/access_tokens"),
-        "-f".to_string(),
-        format!("repositories[]={}", repository.name),
-    ];
-    for (name, level) in REQUESTED_PERMISSIONS {
-        args.push("-f".to_string());
-        args.push(format!("permissions[{name}]={level}"));
-    }
-    args
+/// The request body that down-scopes the token to this repository and the App's grant.
+fn access_token_body(spec: &AppSpec, repository: &Repository) -> String {
+    let permissions: serde_json::Map<String, serde_json::Value> = spec
+        .permissions
+        .iter()
+        .map(|(name, level)| ((*name).to_string(), serde_json::Value::from(*level)))
+        .collect();
+    serde_json::json!({
+        "repositories": [repository.name],
+        "permissions": permissions,
+    })
+    .to_string()
+}
+
+fn with_message(status: u16, message: Option<&String>) -> String {
+    message.map_or_else(
+        || format!("HTTP {status}"),
+        |message| format!("HTTP {status}, {message}"),
+    )
 }
 
 fn describe_token_failure(outcome: &TokenOutcome) -> String {
     match outcome {
         TokenOutcome::Issued(_) => "token issued".to_string(),
-        TokenOutcome::Failed(exit) => format!("gh api for the installation token ended {exit:?}"),
-        TokenOutcome::Overgranted(_) => "the issued token's grant is not exactly contents and \
-                                         pull requests write on this repository; refusing it"
+        TokenOutcome::Failed(status, message) => format!(
+            "the installation token request ended {}",
+            with_message(*status, message.as_ref())
+        ),
+        TokenOutcome::Overgranted(_) => "the issued token's grant is not exactly the requested \
+                                         one on this repository; refusing it"
             .to_string(),
         TokenOutcome::UnreadableGrant(_) => {
             "the token response has no `permissions` object; refusing the token".to_string()
@@ -380,53 +418,97 @@ pub fn mint(
     credentials: &AppCredentials,
     repository: &Repository,
 ) -> Result<InstallationToken, String> {
-    let jwt = app_jwt(credentials, unix_now()?)?;
+    mint_at(&Client::github(), credentials, repository, unix_now()?)
+}
+
+fn mint_at(
+    client: &Client,
+    credentials: &AppCredentials,
+    repository: &Repository,
+    now: u64,
+) -> Result<InstallationToken, String> {
+    let jwt = app_jwt(credentials, now)?;
     let lookup_path = format!(
         "/repos/{}/{}/installation",
         repository.owner, repository.name
     );
-    let found = gh_api(&jwt, &[lookup_path.as_str()])?;
-    let installation = match decode_installation(found.exit, &found.stdout) {
+    let (status, body) = response(client.request(Method::Get, &lookup_path, &jwt, None))
+        .map_err(|reason| format!("the installation lookup failed: {reason}"))?;
+    let installation = match decode_installation(status, &body) {
         InstallationOutcome::Found(id) => id,
-        InstallationOutcome::Failed(exit) => {
+        InstallationOutcome::Failed(status, message) => {
             return Err(format!(
-                "the installation lookup for {}/{} ended {exit:?}; the App must be installed on \
-                 this repository and the key must belong to the App id",
-                repository.owner, repository.name
+                "the installation lookup for {}/{} ended {}; the App must be installed on this \
+                 repository and the key must belong to the App the id names",
+                repository.owner,
+                repository.name,
+                with_message(status, message.as_ref())
             ))
         }
         InstallationOutcome::Unrecognised(reason) => return Err(reason.to_string()),
     };
-    let args = access_token_args(installation, repository);
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let issued = gh_api(&jwt, &arg_refs)?;
-    let outcome = decode_access_token(issued.exit, &issued.stdout, repository);
+    let token_path = format!("/app/installations/{installation}/access_tokens");
+    let request_body = access_token_body(credentials.spec, repository);
+    let (status, body) =
+        response(client.request(Method::Post, &token_path, &jwt, Some(&request_body)))
+            .map_err(|reason| format!("the installation token request failed: {reason}"))?;
+    let outcome = decode_access_token(credentials.spec, status, &body, repository);
     let reason = describe_token_failure(&outcome);
     match outcome {
         TokenOutcome::Issued(token) => Ok(token),
         TokenOutcome::Overgranted(token) | TokenOutcome::UnreadableGrant(token) => {
-            Err(match revoke(&token) {
+            Err(match revoke_at(client, &token) {
                 Ok(()) => format!("{reason}; the token is revoked"),
                 Err(revocation) => format!("{reason}; {revocation}"),
             })
         }
-        TokenOutcome::Failed(_) | TokenOutcome::Unrecognised(_) => Err(reason),
+        TokenOutcome::Failed(..) | TokenOutcome::Unrecognised(_) => Err(reason),
     }
+}
+
+/// The login the App posts as, `<slug>[bot]`, from `GET /app` with the App JWT.
+pub fn bot_login(credentials: &AppCredentials) -> Result<String, String> {
+    bot_login_at(&Client::github(), credentials, unix_now()?)
+}
+
+fn bot_login_at(client: &Client, credentials: &AppCredentials, now: u64) -> Result<String, String> {
+    let jwt = app_jwt(credentials, now)?;
+    let (status, body) = response(client.request(Method::Get, "/app", &jwt, None))
+        .map_err(|reason| format!("the App lookup failed: {reason}"))?;
+    if !succeeded(status) {
+        return Err(format!(
+            "the App lookup ended {}",
+            with_message(status, github_message(&body).as_ref())
+        ));
+    }
+    let slug = serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value.get("slug")?.as_str().map(str::to_string))
+        .filter(|slug| {
+            !slug.is_empty()
+                && slug.len() <= SLUG_MAX_CHARS
+                && slug
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        })
+        .ok_or("the App response has no usable `slug`")?;
+    Ok(format!("{slug}[bot]"))
 }
 
 /// Revokes the token so it does not outlive the job that minted it.
 pub fn revoke(token: &InstallationToken) -> Result<(), String> {
-    let revoked = gh_api(
-        token.expose(),
-        &["--method", "DELETE", "/installation/token"],
-    )?;
-    if revoked.exit == Exit::Code(0) {
-        Ok(())
-    } else {
-        Err(format!(
-            "revoking the installation token ended {:?}",
-            revoked.exit
-        ))
+    revoke_at(&Client::github(), token)
+}
+
+fn revoke_at(client: &Client, token: &InstallationToken) -> Result<(), String> {
+    let revoked = client.request(Method::Delete, "/installation/token", token.expose(), None);
+    match response(revoked) {
+        Ok((status, _)) if succeeded(status) => Ok(()),
+        Ok((status, body)) => Err(format!(
+            "revoking the installation token ended {}",
+            with_message(status, github_message(&body).as_ref())
+        )),
+        Err(reason) => Err(format!("revoking the installation token failed: {reason}")),
     }
 }
 
@@ -443,6 +525,13 @@ mod tests {
 
     /// A fresh key per run, in the `RSA PRIVATE KEY` form GitHub downloads, and its public half.
     fn test_key() -> (String, String) {
+        let (pkcs1, _, public) = test_key_forms();
+        (pkcs1, public)
+    }
+
+    /// One fresh key as `RSA PRIVATE KEY` (the form GitHub downloads), as `PRIVATE KEY`, both
+    /// with LF line ends as downloaded, and its public half.
+    fn test_key_forms() -> (String, String, String) {
         let pair = KeyPair::generate(KeySize::Rsa2048).unwrap();
         let pkcs8 = pem::encode(&pem::Pem::new(
             "PRIVATE KEY",
@@ -452,7 +541,8 @@ mod tests {
         let pkcs1 = pem::encode(&pem::Pem::new("RSA PRIVATE KEY", pkcs1_der.as_bytes()));
         let public_der = pair.public_key().as_der().unwrap();
         let public = pem::encode(&pem::Pem::new("PUBLIC KEY", public_der.as_ref()));
-        (pkcs1, public)
+        let lf = |text: String| text.replace("\r\n", "\n");
+        (lf(pkcs1), lf(pkcs8), public)
     }
 
     fn repository() -> Repository {
@@ -469,7 +559,8 @@ mod tests {
     fn app_jwt_header_and_claims_decode_and_verify_against_the_public_key() {
         let (private, public) = test_key();
         assert!(private.starts_with("-----BEGIN RSA PRIVATE KEY-----"));
-        let credentials = read_credentials(Some("123456".into()), Some(private)).unwrap();
+        let credentials =
+            read_credentials(&RELEASE, None, Some("123456".into()), Some(private)).unwrap();
         let jwt = app_jwt(&credentials, NOW).unwrap();
         let header = jsonwebtoken::decode_header(&jwt).unwrap();
         assert_eq!(header.alg, Algorithm::RS256);
@@ -501,7 +592,8 @@ mod tests {
     fn app_jwt_does_not_verify_against_another_key() {
         let (private, _) = test_key();
         let (_, other_public) = test_key();
-        let credentials = read_credentials(Some("7".into()), Some(private)).unwrap();
+        let credentials =
+            read_credentials(&RELEASE, None, Some("7".into()), Some(private)).unwrap();
         let jwt = app_jwt(&credentials, NOW).unwrap();
         let mut validation = Validation::new(Algorithm::RS256);
         validation.validate_exp = false;
@@ -523,26 +615,113 @@ mod tests {
             (Some("  ".to_string()), Some(private.clone())),
             (Some("1".to_string()), Some(" ".to_string())),
         ] {
-            let error = read_credentials(app_id, key).unwrap_err();
-            assert!(error.contains(APP_ID_VARIABLE), "{error}");
-            assert!(error.contains(APP_KEY_VARIABLE), "{error}");
+            let error = read_credentials(&RELEASE, None, app_id, key).unwrap_err();
+            assert!(error.contains(RELEASE.client_id_variable), "{error}");
+            assert!(error.contains("preferred"), "{error}");
+            assert!(error.contains(RELEASE.app_id_variable), "{error}");
+            assert!(error.contains(RELEASE.key_variable), "{error}");
             assert!(error.contains("Releases"), "{error}");
             assert!(error.contains("`release` environment"), "{error}");
         }
-        assert!(read_credentials(Some("1".into()), Some(private)).is_ok());
+        assert!(read_credentials(&RELEASE, None, Some("1".into()), Some(private)).is_ok());
+    }
+
+    fn signed_issuer(credentials: &AppCredentials, public: &str) -> Option<String> {
+        let jwt = app_jwt(credentials, NOW).unwrap();
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_exp = false;
+        let decoded = jsonwebtoken::decode::<serde_json::Value>(
+            &jwt,
+            &DecodingKey::from_rsa_pem(public.as_bytes()).unwrap(),
+            &validation,
+        )
+        .unwrap();
+        decoded
+            .claims
+            .get("iss")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn the_client_id_is_the_issuer_when_set_and_the_app_id_is_the_fallback() {
+        let (private, public) = test_key();
+        let both = read_credentials(
+            &RELEASE,
+            Some(" Iv23liAbC123 ".into()),
+            Some("123456".into()),
+            Some(private.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            signed_issuer(&both, &public).as_deref(),
+            Some("Iv23liAbC123")
+        );
+        let client_only = read_credentials(
+            &RELEASE,
+            Some("Iv23liAbC123".into()),
+            None,
+            Some(private.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            signed_issuer(&client_only, &public).as_deref(),
+            Some("Iv23liAbC123")
+        );
+        for empty_client_id in [None, Some(String::new()), Some("  ".to_string())] {
+            let fallback = read_credentials(
+                &RELEASE,
+                empty_client_id,
+                Some("123456".into()),
+                Some(private.clone()),
+            )
+            .unwrap();
+            assert_eq!(signed_issuer(&fallback, &public).as_deref(), Some("123456"));
+        }
+    }
+
+    #[test]
+    fn a_malformed_client_id_is_refused_without_falling_back() {
+        let (private, _) = test_key();
+        let too_long = "a".repeat(CLIENT_ID_MAX_CHARS.saturating_add(1));
+        for client_id in [
+            "Iv23-li",
+            "Iv23 li",
+            "Iv23li\u{e9}",
+            "Iv23li\"x",
+            "Iv.23",
+            too_long.as_str(),
+        ] {
+            let error = read_credentials(
+                &RELEASE,
+                Some(client_id.into()),
+                Some("123456".into()),
+                Some(private.clone()),
+            )
+            .unwrap_err();
+            assert!(
+                error.contains(RELEASE.client_id_variable),
+                "{client_id}: {error}"
+            );
+            assert!(!error.contains(client_id), "{error}");
+        }
+        let longest = "a".repeat(CLIENT_ID_MAX_CHARS);
+        assert!(read_credentials(&RELEASE, Some(longest), None, Some(private)).is_ok());
     }
 
     #[test]
     fn refuses_a_key_that_is_not_pem_and_an_app_id_that_is_not_a_number() {
         let not_pem = "MIIEowIBAAKCAQEA-not-a-pem-key";
-        let error = read_credentials(Some("1".into()), Some(not_pem.into())).unwrap_err();
+        let error =
+            read_credentials(&RELEASE, None, Some("1".into()), Some(not_pem.into())).unwrap_err();
         assert!(error.contains("PEM"), "{error}");
         assert!(!error.contains(not_pem));
         let oversized = "x".repeat(PRIVATE_KEY_MAX_BYTES.saturating_add(1));
-        assert!(read_credentials(Some("1".into()), Some(oversized)).is_err());
+        assert!(read_credentials(&RELEASE, None, Some("1".into()), Some(oversized)).is_err());
         let (private, _) = test_key();
         for app_id in ["abc", "0", "-1", "123456789012345678901"] {
-            let refused = read_credentials(Some(app_id.into()), Some(private.clone()));
+            let refused =
+                read_credentials(&RELEASE, None, Some(app_id.into()), Some(private.clone()));
             assert!(refused.is_err(), "{app_id}");
         }
     }
@@ -579,17 +758,17 @@ mod tests {
     #[test]
     fn installation_decoder_covers_each_state() {
         assert_eq!(
-            decode_installation(Exit::Code(0), r#"{"id":42,"app_id":7}"#),
+            decode_installation(200, r#"{"id":42,"app_id":7}"#),
             InstallationOutcome::Found(42)
         );
         assert_eq!(
-            decode_installation(Exit::Code(1), r#"{"message":"Not Found"}"#),
-            InstallationOutcome::Failed(Exit::Code(1))
+            decode_installation(404, r#"{"message":"Not Found"}"#),
+            InstallationOutcome::Failed(404, Some("Not Found".into()))
         );
         for unrecognised in ["", "not json", "{}", r#"{"id":"42"}"#, r#"{"id":0}"#] {
             assert!(
                 matches!(
-                    decode_installation(Exit::Code(0), unrecognised),
+                    decode_installation(200, unrecognised),
                     InstallationOutcome::Unrecognised(_)
                 ),
                 "{unrecognised}"
@@ -603,7 +782,8 @@ mod tests {
         let one_repository = r#"[{"name":"tycho-station"}]"#;
         assert_eq!(
             decode_access_token(
-                Exit::Code(0),
+                &RELEASE,
+                201,
                 &token_response(exact, one_repository),
                 &repository()
             ),
@@ -625,7 +805,8 @@ mod tests {
         ] {
             assert_eq!(
                 decode_access_token(
-                    Exit::Code(0),
+                    &RELEASE,
+                    201,
                     &token_response(permissions, repositories),
                     &repository()
                 ),
@@ -635,7 +816,7 @@ mod tests {
         }
         let all = token_response(exact, one_repository).replace("selected", "all");
         assert_eq!(
-            decode_access_token(Exit::Code(0), &all, &repository()),
+            decode_access_token(&RELEASE, 201, &all, &repository()),
             TokenOutcome::Overgranted(InstallationToken(TOKEN.into()))
         );
     }
@@ -646,11 +827,11 @@ mod tests {
             r#"{{"token":"{TOKEN}","repository_selection":"selected","repositories":[{{"name":"tycho-station"}}]}}"#
         );
         assert_eq!(
-            decode_access_token(Exit::Code(0), &without_permissions, &repository()),
+            decode_access_token(&RELEASE, 201, &without_permissions, &repository()),
             TokenOutcome::UnreadableGrant(InstallationToken(TOKEN.into()))
         );
         let permissions_not_an_object = format!(r#"{{"token":"{TOKEN}","permissions":"all"}}"#);
-        let refused = decode_access_token(Exit::Code(0), &permissions_not_an_object, &repository());
+        let refused = decode_access_token(&RELEASE, 201, &permissions_not_an_object, &repository());
         assert!(
             matches!(&refused, TokenOutcome::UnreadableGrant(token) if token.expose() == TOKEN),
             "{refused:?}"
@@ -659,7 +840,7 @@ mod tests {
             r#"{"contents":"write","pull_requests":"write","metadata":"read","administration":"write"}"#,
             r#"[{"name":"tycho-station"}]"#,
         );
-        let refused = decode_access_token(Exit::Code(0), &wider, &repository());
+        let refused = decode_access_token(&RELEASE, 201, &wider, &repository());
         assert!(
             matches!(&refused, TokenOutcome::Overgranted(token) if token.expose() == TOKEN),
             "{refused:?}"
@@ -677,14 +858,14 @@ mod tests {
         let malformed_success = format!(r#"{{"token":"{TOKEN}","permissions":"all"}}"#);
         let bad_token = r#"{"token":"has space","permissions":{}}"#;
         let cases = [
-            (Exit::Code(1), leaky_failure.as_str()),
-            (Exit::TimedOut, leaky_failure.as_str()),
-            (Exit::Code(0), malformed_success.as_str()),
-            (Exit::Code(0), bad_token),
-            (Exit::Code(0), "not json"),
+            (401, leaky_failure.as_str()),
+            (500, leaky_failure.as_str()),
+            (201, malformed_success.as_str()),
+            (201, bad_token),
+            (201, "not json"),
         ];
-        for (exit, stdout) in cases {
-            let outcome = decode_access_token(exit, stdout, &repository());
+        for (status, stdout) in cases {
+            let outcome = decode_access_token(&RELEASE, status, stdout, &repository());
             assert!(!matches!(outcome, TokenOutcome::Issued(_)), "{stdout}");
             let shown = format!("{} {outcome:?}", describe_token_failure(&outcome));
             assert!(!shown.contains(TOKEN), "{shown}");
@@ -693,25 +874,21 @@ mod tests {
         }
         let issued = InstallationToken(TOKEN.into());
         assert!(!format!("{issued:?}").contains(TOKEN));
-        let credentials = read_credentials(Some("1".into()), Some(private)).unwrap();
+        let credentials =
+            read_credentials(&RELEASE, None, Some("1".into()), Some(private)).unwrap();
         assert!(!format!("{credentials:?}").contains(&key_line));
     }
 
     #[test]
     fn token_request_scopes_to_one_repository_and_two_permissions() {
+        let body: serde_json::Value =
+            serde_json::from_str(&access_token_body(&RELEASE, &repository())).unwrap();
         assert_eq!(
-            access_token_args(42, &repository()),
-            [
-                "--method",
-                "POST",
-                "/app/installations/42/access_tokens",
-                "-f",
-                "repositories[]=tycho-station",
-                "-f",
-                "permissions[contents]=write",
-                "-f",
-                "permissions[pull_requests]=write",
-            ]
+            body,
+            serde_json::json!({
+                "repositories": ["tycho-station"],
+                "permissions": {"contents": "write", "pull_requests": "write"},
+            })
         );
     }
 
@@ -719,9 +896,10 @@ mod tests {
         [
             ("PATH", "/usr/bin:/bin"),
             ("HOME", "/home/runner"),
-            (APP_ID_VARIABLE, "123456"),
+            (RELEASE.client_id_variable, "Iv23liExample"),
+            (RELEASE.app_id_variable, "123456"),
             (
-                APP_KEY_VARIABLE,
+                RELEASE.key_variable,
                 "-----BEGIN RSA PRIVATE KEY-----\nkey-material",
             ),
             ("GITHUB_TOKEN", "workflow-token"),
@@ -734,68 +912,8 @@ mod tests {
     }
 
     #[test]
-    fn gh_sees_only_allowlisted_variables_and_the_credential() {
-        let names: Vec<OsString> = gh_environment(parent_with_credentials())
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect();
-        assert_eq!(names, [OsString::from("PATH")]);
-        // `env` stands in for gh: this proves what the command builder hands a child, not how
-        // gh treats the variables it receives.
-        let config_dir = fresh_config_dir().unwrap();
-        let mut command = credentialed_command(
-            "env",
-            "the-credential",
-            &[],
-            parent_with_credentials(),
-            &config_dir,
-        );
-        assert_eq!(command.get_current_dir(), Some(config_dir.as_path()));
-        let shown = run_bounded(&mut command, Duration::from_secs(60));
-        fs::remove_dir(&config_dir).unwrap();
-        let config_line = format!("GH_CONFIG_DIR={}", config_dir.display());
-        assert!(shown.stdout.contains(&config_line), "{}", shown.stdout);
-        assert_eq!(shown.exit, Exit::Code(0));
-        for present in ["GH_TOKEN=the-credential", "GH_TELEMETRY=disabled"] {
-            assert!(
-                shown.stdout.contains(present),
-                "{present}: {}",
-                shown.stdout
-            );
-        }
-        for absent in [
-            APP_ID_VARIABLE,
-            APP_KEY_VARIABLE,
-            "key-material",
-            "GITHUB_TOKEN",
-            "CARGO_HOME",
-            "HOME=",
-            "HTTPS_PROXY",
-        ] {
-            assert!(!shown.stdout.contains(absent), "{absent}: {}", shown.stdout);
-        }
-    }
-
-    #[test]
-    fn each_gh_configuration_directory_is_new_empty_and_private() {
-        let first = fresh_config_dir().unwrap();
-        let second = fresh_config_dir().unwrap();
-        assert_ne!(first, second);
-        for dir in [&first, &second] {
-            let metadata = fs::symlink_metadata(dir).unwrap();
-            assert!(metadata.is_dir());
-            assert_eq!(
-                std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o777,
-                0o700
-            );
-            assert_eq!(fs::read_dir(dir).unwrap().count(), 0);
-            fs::remove_dir(dir).unwrap();
-        }
-    }
-
-    #[test]
     fn other_children_inherit_everything_but_the_app_credentials() {
-        let names: Vec<OsString> = without_app_credentials(parent_with_credentials())
+        let names: Vec<OsString> = without_app_credentials(&RELEASE, parent_with_credentials())
             .into_iter()
             .map(|(name, _)| name)
             .collect();
@@ -803,5 +921,199 @@ mod tests {
             names,
             ["PATH", "HOME", "GITHUB_TOKEN", "CARGO_HOME", "HTTPS_PROXY"].map(OsString::from)
         );
+    }
+
+    #[test]
+    fn both_private_key_forms_sign_with_or_without_surrounding_newlines() {
+        let (pkcs1, pkcs8, public) = test_key_forms();
+        assert!(pkcs1.starts_with("-----BEGIN RSA PRIVATE KEY-----\n"));
+        assert!(pkcs8.starts_with("-----BEGIN PRIVATE KEY-----\n"));
+        for key in [
+            pkcs1.clone(),
+            pkcs8.clone(),
+            pkcs1.replace('\n', "\r\n"),
+            pkcs8.replace('\n', "\r\n"),
+            format!("\n{pkcs1}\n\n"),
+            format!("\r\n{pkcs8}"),
+        ] {
+            let credentials =
+                read_credentials(&RELEASE, Some("Iv23liAbC123".into()), None, Some(key)).unwrap();
+            assert_eq!(
+                signed_issuer(&credentials, &public).as_deref(),
+                Some("Iv23liAbC123")
+            );
+        }
+    }
+
+    fn bearer_of(raw: &str) -> String {
+        raw.lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(": ")?;
+                name.eq_ignore_ascii_case("authorization")
+                    .then(|| value.strip_prefix("Bearer ").unwrap().to_string())
+            })
+            .unwrap()
+    }
+
+    fn client_credentials() -> (AppCredentials, String) {
+        let (private, public) = test_key();
+        let credentials =
+            read_credentials(&RELEASE, Some("Iv23liAbC123".into()), None, Some(private)).unwrap();
+        (credentials, public)
+    }
+
+    #[test]
+    fn mint_sends_the_jwt_as_a_bearer_token_and_scopes_the_request() {
+        let (credentials, public) = client_credentials();
+        let exact = r#"{"contents":"write","pull_requests":"write","metadata":"read"}"#;
+        let (base, seen) = crate::github_api::tests::listener(vec![
+            (200, r#"{"id":42}"#.to_string()),
+            (201, token_response(exact, r#"[{"name":"tycho-station"}]"#)),
+        ]);
+        let token = mint_at(&Client::loopback(&base), &credentials, &repository(), NOW).unwrap();
+        assert_eq!(token.expose(), TOKEN);
+        let requests = seen.recv().unwrap();
+        let [lookup, issue] = requests.as_slice() else {
+            panic!("{requests:?}");
+        };
+        assert!(lookup.starts_with("GET /repos/frits-v/tycho-station/installation HTTP/1.1\r\n"));
+        assert!(issue.starts_with("POST /app/installations/42/access_tokens HTTP/1.1\r\n"));
+        let jwt = bearer_of(lookup);
+        assert_eq!(bearer_of(issue), jwt);
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.validate_exp = false;
+        let claims = jsonwebtoken::decode::<serde_json::Value>(
+            &jwt,
+            &DecodingKey::from_rsa_pem(public.as_bytes()).unwrap(),
+            &validation,
+        )
+        .unwrap()
+        .claims;
+        assert_eq!(
+            claims.get("iss").and_then(serde_json::Value::as_str),
+            Some("Iv23liAbC123")
+        );
+        for raw in [lookup, issue] {
+            assert_eq!(raw.matches(jwt.as_str()).count(), 1, "{raw}");
+        }
+        let (_, body) = issue.split_once("\r\n\r\n").unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "repositories": ["tycho-station"],
+                "permissions": {"contents": "write", "pull_requests": "write"},
+            })
+        );
+    }
+
+    #[test]
+    fn the_review_app_asks_for_its_own_grant_and_refuses_the_release_grant() {
+        let (private, _) = test_key();
+        let credentials =
+            read_credentials(&REVIEW, Some("Iv23liReview".into()), None, Some(private)).unwrap();
+        let exact =
+            r#"{"checks":"read","pull_requests":"write","statuses":"read","metadata":"read"}"#;
+        let release_grant = r#"{"contents":"write","pull_requests":"write","metadata":"read"}"#;
+        let one = r#"[{"name":"tycho-station"}]"#;
+        let (base, seen) = crate::github_api::tests::listener(vec![
+            (200, r#"{"id":42}"#.to_string()),
+            (201, token_response(exact, one)),
+            (200, r#"{"id":42}"#.to_string()),
+            (201, token_response(release_grant, one)),
+            (204, String::new()),
+        ]);
+        let client = Client::loopback(&base);
+        assert!(mint_at(&client, &credentials, &repository(), NOW).is_ok());
+        let refused = mint_at(&client, &credentials, &repository(), NOW).unwrap_err();
+        assert!(refused.contains("the token is revoked"), "{refused}");
+        let requests = seen.recv().unwrap();
+        let (_, body) = requests.get(1).unwrap().split_once("\r\n\r\n").unwrap();
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            body.get("permissions"),
+            Some(
+                &serde_json::json!({"checks": "read", "pull_requests": "write", "statuses": "read"})
+            )
+        );
+        let missing = read_credentials(&REVIEW, None, None, None).unwrap_err();
+        assert!(
+            missing.contains("FRITS_CODE_REVIEW_APP_PRIVATE_KEY"),
+            "{missing}"
+        );
+        assert!(
+            missing.contains("Code review in docs/process.md"),
+            "{missing}"
+        );
+    }
+
+    #[test]
+    fn the_bot_login_is_the_app_slug_and_a_bad_slug_is_refused() {
+        let (credentials, _) = client_credentials();
+        let (base, seen) = crate::github_api::tests::listener(vec![
+            (200, r#"{"id":1,"slug":"frits-code-review"}"#.to_string()),
+            (200, r#"{"id":1,"slug":"Bad Slug"}"#.to_string()),
+            (
+                401,
+                r#"{"message":"A JSON web token could not be decoded"}"#.to_string(),
+            ),
+        ]);
+        let client = Client::loopback(&base);
+        assert_eq!(
+            bot_login_at(&client, &credentials, NOW),
+            Ok("frits-code-review[bot]".to_string())
+        );
+        assert!(bot_login_at(&client, &credentials, NOW).is_err());
+        let refused = bot_login_at(&client, &credentials, NOW).unwrap_err();
+        assert!(refused.contains("HTTP 401"), "{refused}");
+        let requests = seen.recv().unwrap();
+        assert!(requests
+            .first()
+            .unwrap()
+            .starts_with("GET /app HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn mint_revokes_a_wider_token_with_the_token_as_bearer() {
+        let (credentials, _) = client_credentials();
+        let wider =
+            r#"{"contents":"write","pull_requests":"write","metadata":"read","workflows":"write"}"#;
+        let (base, seen) = crate::github_api::tests::listener(vec![
+            (200, r#"{"id":42}"#.to_string()),
+            (201, token_response(wider, r#"[{"name":"tycho-station"}]"#)),
+            (204, String::new()),
+        ]);
+        let error =
+            mint_at(&Client::loopback(&base), &credentials, &repository(), NOW).unwrap_err();
+        assert!(
+            error.contains("refusing it; the token is revoked"),
+            "{error}"
+        );
+        assert!(!error.contains(TOKEN), "{error}");
+        let requests = seen.recv().unwrap();
+        let revocation = requests.get(2).unwrap();
+        assert!(
+            revocation.starts_with("DELETE /installation/token HTTP/1.1\r\n"),
+            "{revocation}"
+        );
+        assert_eq!(bearer_of(revocation), TOKEN);
+    }
+
+    #[test]
+    fn a_rejected_lookup_reports_githubs_message_and_no_credential() {
+        let (credentials, _) = client_credentials();
+        let (base, seen) = crate::github_api::tests::listener(vec![(
+            401,
+            r#"{"message":"A JSON web token could not be decoded","status":"401"}"#.to_string(),
+        )]);
+        let error =
+            mint_at(&Client::loopback(&base), &credentials, &repository(), NOW).unwrap_err();
+        let jwt = bearer_of(seen.recv().unwrap().first().unwrap());
+        assert!(
+            error.contains("ended HTTP 401, A JSON web token could not be decoded"),
+            "{error}"
+        );
+        assert!(!error.contains(&jwt), "{error}");
+        assert!(!error.contains("eyJ"), "{error}");
     }
 }

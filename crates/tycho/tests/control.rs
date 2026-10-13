@@ -1,7 +1,8 @@
 //! Control session tests: a real interactive `claude` under zmx, spawned through the launcher
 //! by the Session service and instructed over its inbox socket from a handler step, against
-//! a throwaway core. macOS only, run by `mise run control-tests`; uses the developer's Claude
-//! login, so each case is one short haiku turn.
+//! a throwaway core. macOS only, run by `mise run control-tests`; each session authenticates
+//! with the developer's stored Claude token through the hand-off, so each case is one short
+//! haiku turn.
 #![allow(
     clippy::disallowed_methods,
     reason = "fixtures live in throwaway directories no other user can write"
@@ -32,10 +33,11 @@ use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tycho::agent_files::current_uid;
 use tycho::config::{
-    AgentDirs, CoreConfig, CorePorts, PortClaim, AGENT_USER_ENV, HOME_ENV, MISE_NO_INSTALL,
-    RESTATE_SERVER_ENV, ZMX_ENV,
+    self, AgentDirs, CoreConfig, CorePorts, PortClaim, ToolPrefix, AGENT_USER_ENV, HOME_ENV,
+    MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
+use tycho::credentials::{self, Credential, CredentialVendor, CLAUDE_TOKEN_ENV};
 use tycho::kill::{kill_session, KillRequest};
 use tycho::launch_probe::LaunchProbe;
 use tycho::launcher::{HeartbeatTarget, SessionFiles, VendorRecord, VendorTerminal};
@@ -59,6 +61,7 @@ use tycho::vendors::control::{
     PermissionMode, SessionVendor, VendorError, VendorSessionId, WaitingFor,
 };
 use tycho::zmx::Zmx;
+use tycho_harness::tool_prefix::link_scratch_prefix;
 use tycho_types::envelope::ShortText;
 use tycho_types::launcher::AwaitableId;
 use tycho_types::session::{SessionName, Vendor};
@@ -110,6 +113,33 @@ struct LauncherSpawner {
     dirs: AgentDirs,
     core_home: PathBuf,
     core_ports: CorePorts,
+    /// A scratch prefix holding the built `tycho` and the pinned tools, where sessions start.
+    prefix: ToolPrefix,
+    /// The prefix's `tycho`, which zmx types as the launcher.
+    launcher: PathBuf,
+    /// The stored Claude token, copied into the test core and handed to every session.
+    credential: Credential,
+}
+
+/// Production sessions get their credential from the core, so the test core holds the
+/// developer's stored token, which `tycho credentials set claude` put in the core home.
+fn copy_claude_credential(test_home: &Path) -> Credential {
+    let production = config::core_home().unwrap();
+    let credential = credentials::load(&production, CredentialVendor::Claude)
+        .unwrap_or_else(|error| panic!("the control suite needs a stored Claude token: {error}"));
+    credentials::store(test_home, &credential).unwrap();
+    println!("evidence: the test core holds the stored Claude token");
+    credentials::load(test_home, CredentialVendor::Claude).unwrap()
+}
+
+/// Whether the vendor's environment, read with `ps -E` as its own user may, names the token
+/// variable; the value is never printed.
+fn vendor_holds_token(pid: u32) -> bool {
+    let output = Command::new("/bin/ps")
+        .args(["-wwE", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&output.stdout).contains(&format!("{CLAUDE_TOKEN_ENV}="))
 }
 
 impl LauncherSpawner {
@@ -122,7 +152,7 @@ impl LauncherSpawner {
                 session,
                 pid,
                 agent_uid: current_uid(),
-                tycho: Path::new(TYCHO),
+                tycho: &self.launcher,
             })
         )
     }
@@ -147,7 +177,7 @@ impl Spawner for LauncherSpawner {
         let outcome = spawn_session(&SpawnRequest {
             zmx: &self.zmx,
             dirs: &self.dirs,
-            tycho: Path::new(TYCHO),
+            tycho: &self.launcher,
             home: &home,
             env: &spec.environment,
             heartbeat: HeartbeatTarget::Session,
@@ -157,6 +187,8 @@ impl Spawner for LauncherSpawner {
             terminal,
             vendor_dir: dir.as_deref(),
             ports: self.core_ports,
+            tool_prefix: &self.prefix,
+            credential: Some(&self.credential),
         })?;
         println!("evidence: spawn_session({}) -> {outcome:?}", spec.session);
         match outcome {
@@ -339,13 +371,11 @@ impl Harness {
         let home = user_home().join(format!(".tycho-test-control-{tag}-{pid}"));
         let claim = claim_ports(&home);
         let agent = user_home().join(format!(".tcc-{tag}-{pid}"));
-        for dir in [&home, &agent] {
-            if dir.exists() {
-                fs::remove_dir_all(dir).unwrap();
-            }
-        }
+        let prefix_root = user_home().join(format!(".tcp-{tag}-{pid}"));
+        remove_stale(&[&home, &agent, &prefix_root]);
         let zmx_binary = mise_which("zmx");
         let restate_server = mise_which("restate-server");
+        let prefix = scratch_prefix(&prefix_root, &zmx_binary);
         let config = CoreConfig::new(
             home.clone(),
             zmx_binary.clone(),
@@ -360,8 +390,11 @@ impl Harness {
             fs::remove_dir_all(&work).unwrap();
         }
         let dirs = AgentDirs::new(agent.clone()).unwrap();
-        let claude =
-            ClaudeControl::new(claude_binary(), user_home().join(".claude"), current_uid());
+        let claude = ClaudeControl::new(
+            prefix.tool("claude").unwrap().to_path_buf(),
+            user_home().join(".claude"),
+            current_uid(),
+        );
         let force_relay = Arc::new(AtomicBool::new(false));
         let harness = Self {
             _port_claim: claim,
@@ -376,10 +409,13 @@ impl Harness {
             .chain(config.port_offset_pair())
             .collect(),
             spawner: LauncherSpawner {
-                zmx: Zmx::agent(&zmx_binary, &agent),
+                credential: copy_claude_credential(&home),
+                zmx: Zmx::agent(prefix.tool("zmx").unwrap(), &agent),
                 dirs: dirs.clone(),
                 core_home: home,
                 core_ports: config.ports,
+                launcher: prefix.tycho(),
+                prefix,
             },
             vendor: ForcedRelay {
                 relay: claude.clone().with_relay(dirs.clone(), RelayMode::Always),
@@ -671,11 +707,11 @@ fn start_wait(core_ports: CorePorts, key: &str) -> String {
 /// Kills every session left in a socket directory by pid and by name; returns how many remain.
 /// Ends what a socket directory still lists; a pid is signalled only while `ps` shows it
 /// running restate-server, the endpoint or a launcher.
-fn clear_sessions(zmx: &Zmx, label: &str) -> usize {
+fn clear_sessions(zmx: &Zmx, label: &str, launcher: &Path) -> usize {
     let programs = vec![
         mise_which("restate-server").display().to_string(),
         format!("{TYCHO} endpoint"),
-        format!("{TYCHO} launch"),
+        format!("{} launch", launcher.display()),
     ];
     match zmx.clear(&programs) {
         Ok(report) => {
@@ -761,7 +797,7 @@ impl Drop for Harness {
         if let Some(runtime) = self.endpoint.take() {
             runtime.shutdown_background();
         }
-        let agent_left = clear_sessions(&self.spawner.zmx, "agent");
+        let agent_left = clear_sessions(&self.spawner.zmx, "agent", &self.spawner.launcher);
         if agent_left != 0 {
             problems.push(format!("{agent_left} agent sessions remain"));
         }
@@ -769,17 +805,20 @@ impl Drop for Harness {
         let core_left = clear_sessions(
             &Zmx::new(&self.config.zmx, &self.config.socket_dir()),
             "core",
+            Path::new(TYCHO),
         );
         if core_left != 0 {
             problems.push(format!("{core_left} core sessions remain"));
         }
+        let shredded = credentials::shred_store(&self.config.home);
+        println!("teardown: shredded the test core's credential store: {shredded:?}");
         let removed = remove_vendor_state(&self.work, &self.controls);
         println!("teardown: removed vendor state {removed:?}");
-        for dir in [&self.config.home, &self.spawner.dirs.socket_dir, &self.work] {
-            if let Err(error) = fs::remove_dir_all(dir) {
-                problems.push(format!("cannot remove {}: {error}", dir.display()));
-            }
-        }
+        let prefix_root = self.spawner.prefix.root();
+        let dirs = [&self.config.home, &self.spawner.dirs.socket_dir, &self.work];
+        problems.extend(remove_dirs(
+            dirs.iter().map(|dir| dir.as_path()).chain([prefix_root]),
+        ));
         let left: Vec<&Control> = self
             .controls
             .iter()
@@ -845,12 +884,18 @@ impl Harness {
 }
 
 #[test]
-#[ignore = "spawns a real claude session with the developer's login; run with mise run control-tests"]
+#[ignore = "spawns a real claude session with the stored Claude token; run with mise run control-tests"]
 fn an_instruction_posted_from_a_handler_step_reaches_the_session_over_its_socket() {
     let mut harness = Harness::new("socket");
     let core_ports = harness.config.ports;
     let control = new_control("s1");
     let pid = harness.spawn(&control, PermissionMode::AcceptEdits, false);
+    let holds = vendor_holds_token(pid);
+    println!("evidence: the control vendor's environment names {CLAUDE_TOKEN_ENV}: {holds}");
+    assert!(
+        holds,
+        "the control session did not get the handed-over token"
+    );
     let record = instruct(
         core_ports,
         &control,
@@ -962,7 +1007,7 @@ fn dont_ask_never_waits(harness: &mut Harness) {
 }
 
 #[test]
-#[ignore = "spawns real claude sessions with the developer's login; run with mise run control-tests"]
+#[ignore = "spawns real claude sessions with the stored Claude token; run with mise run control-tests"]
 fn a_permission_prompt_stalls_the_session_and_queues_the_inbox_while_dont_ask_does_not() {
     let mut harness = Harness::new("stall");
     let core_ports = harness.config.ports;
@@ -1011,7 +1056,7 @@ fn a_permission_prompt_stalls_the_session_and_queues_the_inbox_while_dont_ask_do
 }
 
 #[test]
-#[ignore = "spawns real claude sessions with the developer's login; run with mise run control-tests"]
+#[ignore = "spawns real claude sessions with the stored Claude token; run with mise run control-tests"]
 fn a_killed_session_resumes_under_its_id_with_the_settings_passed_again() {
     let mut harness = Harness::new("resume");
     let core_ports = harness.config.ports;
@@ -1062,4 +1107,46 @@ fn claim_ports(home: &Path) -> PortClaim {
     let claim = CorePorts::claim(home).unwrap_or_else(|error| panic!("{error}"));
     println!("evidence: {claim}");
     claim
+}
+
+/// A scratch prefix at `root` with the built `tycho` as its launcher, the claude on `PATH`
+/// and the developer's pinned codex and zmx as its installs, so a session starts from a
+/// prefix the way production does.
+fn scratch_prefix(root: &Path, zmx: &Path) -> ToolPrefix {
+    link_scratch_prefix(
+        root,
+        Path::new(TYCHO),
+        &[
+            ("claude", &claude_binary()),
+            ("codex", &mise_which("codex")),
+            ("zmx", zmx),
+        ],
+    )
+    .unwrap();
+    let prefix = ToolPrefix::load(root.to_path_buf()).unwrap();
+    println!(
+        "evidence: sessions start from {} under zmx {}",
+        prefix.tycho().display(),
+        prefix.tool("zmx").unwrap().display()
+    );
+    prefix
+}
+
+/// Removes what an earlier run of the same case left behind.
+fn remove_stale(dirs: &[&PathBuf]) {
+    for dir in dirs {
+        if dir.exists() {
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+/// Removes each directory and names the ones that could not be removed.
+fn remove_dirs<'a>(dirs: impl Iterator<Item = &'a Path>) -> Vec<String> {
+    dirs.filter_map(|dir| {
+        fs::remove_dir_all(dir)
+            .err()
+            .map(|error| format!("cannot remove {}: {error}", dir.display()))
+    })
+    .collect()
 }

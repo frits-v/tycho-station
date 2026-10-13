@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tycho_types::envelope::{BranchName, CommitSha};
+use tycho_types::git_environment::git_environment_removed;
 use tycho_types::service::{Attempt, EpicId, WorkUnitId};
 use tycho_types::session::SessionName;
 use tycho_types::token::check_slug;
@@ -38,6 +39,8 @@ pub const WORKER_NAME: &str = "Tycho Worker";
 pub const WORKER_EMAIL: &str = "worker@tycho.invalid";
 /// A worktree's `origin` push URL: a path that cannot exist, so a push from the worktree fails.
 pub const PUSH_DISABLED: &str = "/dev/null/push-disabled";
+/// A sync remote's URL or path.
+pub const REMOTE_MAX_BYTES: usize = 2048;
 /// Levels below a worktree a removal enters; each level holds one descriptor open.
 pub const WORKTREE_DEPTH_MAX: usize = 64;
 /// Entries a removal deletes: a large checkout with its `.git` and build output fits.
@@ -52,12 +55,6 @@ const GIT_ENVIRONMENT: [(&str, &str); 3] = [
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_TERMINAL_PROMPT", "0"),
 ];
-const GIT_REMOVED: [&str; 4] = [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepositoryError {
@@ -71,6 +68,8 @@ pub enum RepositoryError {
     Git(String),
     /// The worker's head is not on the branch the fetch brought in.
     NotFetched(String),
+    /// The branch's commit is not an ancestor of the verified one.
+    NotFastForward(String),
     Unrecognised(String),
 }
 
@@ -84,6 +83,7 @@ impl RepositoryError {
             | Self::Refused(..)
             | Self::Git(_)
             | Self::NotFetched(_)
+            | Self::NotFastForward(_)
             | Self::Unrecognised(_) => false,
         }
     }
@@ -98,6 +98,7 @@ impl fmt::Display for RepositoryError {
             Self::CouldNotRun(reason) => write!(formatter, "git could not run: {reason}"),
             Self::Git(reason) => write!(formatter, "git {reason}"),
             Self::NotFetched(reason) => write!(formatter, "not from the fetched branch: {reason}"),
+            Self::NotFastForward(reason) => write!(formatter, "not a fast-forward: {reason}"),
             Self::Unrecognised(reason) => write!(formatter, "git output not recognised: {reason}"),
         }
     }
@@ -217,6 +218,7 @@ fn text(path: &Path) -> String {
 }
 
 /// A clone in the staging directory, named relative to that directory's descriptor.
+#[derive(Debug)]
 struct Staged {
     directory: OwnedFd,
     root: PathBuf,
@@ -235,6 +237,25 @@ impl Staged {
             WORKTREE_BOUNDS,
         )
         .is_err();
+    }
+}
+
+/// A detached checkout of one commit in the core's staging directory; dropping it removes it.
+#[derive(Debug)]
+pub struct FreshCheckout {
+    staged: Staged,
+}
+
+impl FreshCheckout {
+    #[must_use]
+    pub fn path(&self) -> PathBuf {
+        self.staged.root.join(&self.staged.name)
+    }
+}
+
+impl Drop for FreshCheckout {
+    fn drop(&mut self) {
+        self.staged.discard();
     }
 }
 
@@ -345,12 +366,11 @@ impl Repositories {
 
     /// Runs git and returns whatever exit status it ends with.
     fn git_status(&self, arguments: &[&str]) -> Result<Captured, RepositoryError> {
-        let removed: Vec<OsString> = GIT_REMOVED.iter().map(OsString::from).collect();
         run_status_capped(
             &self.git,
             arguments,
             &GIT_ENVIRONMENT,
-            &removed,
+            &git_environment_removed(),
             GIT_TIMEOUT,
             COMMAND_OUTPUT_MAX_BYTES,
         )
@@ -495,12 +515,8 @@ impl Repositories {
         Ok((root, directory, core_only))
     }
 
-    /// Clones and configures the worktree under a fresh name in the staging directory.
-    fn stage(
-        &self,
-        project: &ProjectName,
-        branch: &BranchName,
-    ) -> Result<(Staged, CommitSha), RepositoryError> {
+    /// A fresh, empty name in the staging directory.
+    fn staging_slot(&self, project: &ProjectName) -> Result<Staged, RepositoryError> {
         let (root, directory, owners) = self.staging_root()?;
         let count = STAGING_COUNTER.fetch_add(1, Ordering::SeqCst);
         let name = OsString::from(format!(
@@ -510,12 +526,21 @@ impl Repositories {
         ));
         // A name reused from an earlier process with the same pid may still hold its clone.
         agent_tree::remove_dir(directory.as_fd(), &root, &name, owners, WORKTREE_BOUNDS)?;
-        let staged = Staged {
+        Ok(Staged {
             directory,
             root,
             name,
             owners,
-        };
+        })
+    }
+
+    /// Clones and configures the worktree under a fresh name in the staging directory.
+    fn stage(
+        &self,
+        project: &ProjectName,
+        branch: &BranchName,
+    ) -> Result<(Staged, CommitSha), RepositoryError> {
+        let staged = self.staging_slot(project)?;
         match self.configure_clone(project, &staged.root.join(&staged.name), branch) {
             Ok(base) => Ok((staged, base)),
             Err(error) => {
@@ -597,7 +622,9 @@ impl Repositories {
             &text(&worktree.path),
             &refspec,
         ])?;
-        self.check_fetched(&canonical, head)?;
+        if !self.is_ancestor(&canonical, head, "FETCH_HEAD")? {
+            return Err(RepositoryError::NotFetched(head.to_string()));
+        }
         self.git(&["-C", &canonical, "update-ref", pin, head.as_str()])?;
         let pinned = self.rev_parse(Path::new(&canonical), pin)?;
         if pinned != *head {
@@ -608,25 +635,133 @@ impl Repositories {
         Ok(())
     }
 
-    /// `merge-base --is-ancestor <head> FETCH_HEAD`: exit 0 is on the branch, 1 is not, and
-    /// anything else is unrecognised.
-    fn check_fetched(&self, canonical: &str, head: &CommitSha) -> Result<(), RepositoryError> {
+    /// `merge-base --is-ancestor <ancestor> <descendant>`: exit 0 is an ancestor, 1 is not,
+    /// and anything else is unrecognised.
+    fn is_ancestor(
+        &self,
+        canonical: &str,
+        ancestor: &CommitSha,
+        descendant: &str,
+    ) -> Result<bool, RepositoryError> {
         let captured = self.git_status(&[
             "-C",
             canonical,
             "merge-base",
             "--is-ancestor",
-            head.as_str(),
-            "FETCH_HEAD",
+            ancestor.as_str(),
+            descendant,
         ])?;
         match captured.status.code() {
-            Some(0) => Ok(()),
-            Some(1) => Err(RepositoryError::NotFetched(head.to_string())),
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
             other => Err(RepositoryError::Unrecognised(format!(
                 "merge-base exited {other:?}: {}",
                 captured.stderr.trim()
             ))),
         }
+    }
+
+    /// Checks `head` out, detached, in a fresh clone of the canonical repository in the
+    /// staging directory, where the done criteria run.
+    pub fn fresh_checkout(
+        &self,
+        project: &ProjectName,
+        head: &CommitSha,
+    ) -> Result<FreshCheckout, RepositoryError> {
+        let checkout = FreshCheckout {
+            staged: self.staging_slot(project)?,
+        };
+        let path = checkout.path();
+        // A clone of a local path copies every object, so a commit only a pin ref holds arrives.
+        self.git(&[
+            "clone",
+            "--quiet",
+            "--no-hardlinks",
+            "--no-checkout",
+            "--template=",
+            &text(&self.canonical(project)),
+            &text(&path),
+        ])?;
+        self.git(&[
+            "-C",
+            &text(&path),
+            "checkout",
+            "--quiet",
+            "--detach",
+            head.as_str(),
+        ])?;
+        let checked = self.rev_parse(&path, "HEAD")?;
+        if checked != *head {
+            return Err(RepositoryError::Unrecognised(format!(
+                "checked out {checked}, not {head}"
+            )));
+        }
+        Ok(checkout)
+    }
+
+    /// Points `branch` of the canonical repository at `to` when its commit is an ancestor of
+    /// `to`. A branch already at `to` is left alone, so a replayed step gives the same answer;
+    /// the update names the commit it replaces, so a concurrent move fails it.
+    pub fn fast_forward(
+        &self,
+        project: &ProjectName,
+        branch: &BranchName,
+        to: &CommitSha,
+    ) -> Result<(), RepositoryError> {
+        let canonical = self.canonical(project);
+        let reference = format!("refs/heads/{branch}");
+        let current = self.rev_parse(&canonical, &reference)?;
+        if current == *to {
+            return Ok(());
+        }
+        let repository = text(&canonical);
+        if !self.is_ancestor(&repository, &current, to.as_str())? {
+            return Err(RepositoryError::NotFastForward(format!(
+                "{branch} is at {current}, which {to} does not contain"
+            )));
+        }
+        self.git(&[
+            "-C",
+            &repository,
+            "update-ref",
+            &reference,
+            to.as_str(),
+            current.as_str(),
+        ])?;
+        let moved = self.rev_parse(&canonical, &reference)?;
+        if moved != *to {
+            return Err(RepositoryError::Unrecognised(format!(
+                "{reference} points at {moved}, not {to}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Pushes `branch` of the canonical repository to the same name on `remote`, never
+    /// forced. The refspec names that one branch, so pin refs stay in the canonical repository.
+    pub fn sync(
+        &self,
+        project: &ProjectName,
+        remote: &str,
+        branch: &BranchName,
+    ) -> Result<(), RepositoryError> {
+        if remote.is_empty() || remote.starts_with('-') || remote.len() > REMOTE_MAX_BYTES {
+            return Err(RepositoryError::Input(format!(
+                "remote {:?} is empty, an option, or over {REMOTE_MAX_BYTES} bytes",
+                remote.chars().take(80).collect::<String>()
+            )));
+        }
+        let refspec = format!("refs/heads/{branch}:refs/heads/{branch}");
+        self.git(&[
+            "-C",
+            &text(&self.canonical(project)),
+            "push",
+            "--quiet",
+            "--end-of-options",
+            remote,
+            &refspec,
+        ])?;
+        Ok(())
     }
 
     /// The commit a ref of the canonical repository points at.
@@ -647,12 +782,22 @@ impl Repositories {
 pub(crate) mod tests {
     use super::*;
     use std::process::Command;
+    use tycho_types::git_environment::{git_command, git_environment_in, hook_environment_refusal};
+
+    /// Panics when this test process inherited a git hook's environment; every test that
+    /// spawns git calls it first.
+    pub fn refuse_hook_environment() {
+        if let Some(refusal) = hook_environment_refusal() {
+            panic!("{refusal}");
+        }
+    }
 
     #[derive(Debug)]
     pub struct Scratch(pub PathBuf);
 
     impl Scratch {
         pub fn new(test: &str) -> Self {
+            refuse_hook_environment();
             let dir = std::env::temp_dir()
                 .join(format!("tycho-repositories-{test}-{}", std::process::id()));
             if dir.exists() {
@@ -670,7 +815,8 @@ pub(crate) mod tests {
     }
 
     fn git(dir: &Path, arguments: &[&str]) -> String {
-        let output = Command::new("git")
+        refuse_hook_environment();
+        let output = git_command()
             .args(["-C", &text(dir)])
             .args(arguments)
             .envs(GIT_ENVIRONMENT)
@@ -757,6 +903,91 @@ pub(crate) mod tests {
         assert!(Repositories::new(PathBuf::from("git"), "core".into(), "/w".into(), 0).is_err());
     }
 
+    const INHERITED_CHILD: &str =
+        "repositories::tests::the_git_runner_under_an_inherited_hook_environment";
+
+    /// Runs only in a child process that `the_git_runner_hides_the_hook_environment` starts
+    /// with the hook environment set. The runner spawns a shell in place of git that lists
+    /// variable names only: mbx adds about 50 KiB of values to a test's environment, past the
+    /// runner's 64 KiB output cap.
+    #[test]
+    #[ignore = "run by the_git_runner_hides_the_hook_environment in a child process"]
+    fn the_git_runner_under_an_inherited_hook_environment() {
+        assert!(
+            std::env::var_os("GIT_DIR").is_some(),
+            "the parent sets GIT_DIR"
+        );
+        let shell = PathBuf::from("/bin/sh");
+        let repositories = Repositories::new(shell, "/core".into(), "/agent/wt".into(), 0).unwrap();
+        let captured = repositories.git(&["-c", "env | sed 's/=.*/=/'"]).unwrap();
+        assert!(captured.stdout.contains("GIT_CONFIG_GLOBAL="));
+        assert_eq!(
+            git_environment_in(&captured.stdout),
+            Vec::<&str>::new(),
+            "{}",
+            captured.stdout
+        );
+    }
+
+    #[test]
+    fn the_git_runner_hides_the_hook_environment() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", INHERITED_CHILD])
+            .env("GIT_DIR", "/nonexistent/hook/.git")
+            .env("GIT_WORK_TREE", "/nonexistent/hook")
+            .env("GIT_INDEX_FILE", "/nonexistent/hook/.git/index")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stdout}{stderr}");
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "the child must run exactly one test: {stdout}"
+        );
+    }
+
+    const REFUSING_CHILD: &str = "repositories::tests::a_scratch_under_an_inherited_git_dir";
+
+    /// Runs only in a child process that `a_git_spawning_test_refuses_an_inherited_git_dir`
+    /// starts with `GIT_DIR` set; `Scratch::new` must panic before it creates anything.
+    #[test]
+    #[ignore = "run by a_git_spawning_test_refuses_an_inherited_git_dir in a child process"]
+    fn a_scratch_under_an_inherited_git_dir() {
+        assert!(
+            std::env::var_os("GIT_DIR").is_some(),
+            "the parent sets GIT_DIR"
+        );
+        let scratch = Scratch::new("refused");
+        panic!(
+            "Scratch::new returned {} under GIT_DIR",
+            scratch.0.display()
+        );
+    }
+
+    #[test]
+    fn a_git_spawning_test_refuses_an_inherited_git_dir() {
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", REFUSING_CHILD])
+            .env("GIT_DIR", "/nonexistent/hook/.git")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{stdout}{stderr}");
+        assert!(
+            stdout.contains("test result: FAILED. 0 passed; 1 failed"),
+            "the child must run exactly one test: {stdout}"
+        );
+        let report = format!("{stdout}{stderr}");
+        assert!(
+            report.contains("GIT_DIR=/nonexistent/hook/.git in this test process")
+                && report.contains("probably runs under a pre-push hook"),
+            "{report}"
+        );
+        assert!(!report.contains("Scratch::new returned"), "{report}");
+    }
+
     #[test]
     fn a_worktree_is_a_clone_of_the_canonical_repository_on_its_own_branch() {
         let scratch = Scratch::new("clone");
@@ -782,7 +1013,7 @@ pub(crate) mod tests {
             git(&path, &["config", "remote.origin.pushurl"]).trim(),
             PUSH_DISABLED
         );
-        let push = Command::new("git")
+        let push = git_command()
             .args([
                 "-C",
                 &text(&path),
@@ -1045,5 +1276,159 @@ pub(crate) mod tests {
         assert!(repositories
             .resolve(&project, &pin_ref(&unit(), 3))
             .is_err());
+    }
+
+    /// A worker commit on top of `trunk`, fetched into the canonical repository and pinned.
+    fn pinned_commit(
+        scratch: &Scratch,
+        repositories: &Repositories,
+        project: &ProjectName,
+    ) -> CommitSha {
+        let path = scratch.0.join("worktrees/cf7a/wu01/a1");
+        let branch = unit_branch(&unit(), Attempt::FIRST).unwrap();
+        let worktree = repositories
+            .clone_worktree(project, &path, &branch)
+            .unwrap();
+        fs::write(path.join("answer"), "42\n").unwrap();
+        git(&path, &["add", "answer"]);
+        git(&path, &["commit", "-q", "-m", "answer"]);
+        let head = CommitSha::parse(git(&path, &["rev-parse", "HEAD"]).trim()).unwrap();
+        repositories
+            .pin(project, &worktree, &head, &pin_ref(&unit(), 1))
+            .unwrap();
+        head
+    }
+
+    fn trunk() -> BranchName {
+        BranchName::parse("trunk").unwrap()
+    }
+
+    #[test]
+    fn a_fresh_checkout_holds_the_pinned_commit_and_is_removed_when_dropped() {
+        let scratch = Scratch::new("fresh-checkout");
+        let (repositories, project) = fixture(&scratch);
+        let head = pinned_commit(&scratch, &repositories, &project);
+        let checkout = repositories.fresh_checkout(&project, &head).unwrap();
+        let path = checkout.path();
+        assert!(path.starts_with(scratch.0.join("home").join(STAGING_DIR)));
+        assert_eq!(git(&path, &["rev-parse", "HEAD"]).trim(), head.as_str());
+        assert_eq!(fs::read_to_string(path.join("answer")).unwrap(), "42\n");
+        assert_eq!(git(&path, &["status", "--porcelain"]), "");
+        drop(checkout);
+        assert!(
+            fs::symlink_metadata(&path).is_err(),
+            "the checkout is removed"
+        );
+        let unknown = CommitSha::parse("1123456789abcdef0123456789abcdef01234567").unwrap();
+        assert!(matches!(
+            repositories.fresh_checkout(&project, &unknown),
+            Err(RepositoryError::Git(_))
+        ));
+        let staging = scratch.0.join("home").join(STAGING_DIR);
+        assert_eq!(
+            fs::read_dir(&staging).unwrap().count(),
+            0,
+            "a failed checkout is discarded"
+        );
+    }
+
+    #[test]
+    fn the_default_branch_fast_forwards_once_and_refuses_a_commit_that_does_not_contain_it() {
+        let scratch = Scratch::new("fast-forward");
+        let (repositories, project) = fixture(&scratch);
+        let base = repositories.resolve(&project, "refs/heads/trunk").unwrap();
+        let head = pinned_commit(&scratch, &repositories, &project);
+        repositories
+            .fast_forward(&project, &trunk(), &head)
+            .unwrap();
+        assert_eq!(
+            repositories.resolve(&project, "refs/heads/trunk").unwrap(),
+            head
+        );
+        assert_eq!(
+            repositories.fast_forward(&project, &trunk(), &head),
+            Ok(()),
+            "a replay finds the branch already there"
+        );
+        let refused = repositories.fast_forward(&project, &trunk(), &base);
+        assert!(matches!(refused, Err(RepositoryError::NotFastForward(_))));
+        assert!(!refused.unwrap_err().is_transient());
+        assert_eq!(
+            repositories.resolve(&project, "refs/heads/trunk").unwrap(),
+            head,
+            "a refused fast-forward leaves the branch"
+        );
+    }
+
+    #[test]
+    fn sync_pushes_the_one_branch_and_never_forces() {
+        let scratch = Scratch::new("sync");
+        let (repositories, project) = fixture(&scratch);
+        let remote = scratch.0.join("remote.git");
+        git(&scratch.0, &["init", "-q", "--bare", &text(&remote)]);
+        let head = pinned_commit(&scratch, &repositories, &project);
+        repositories
+            .fast_forward(&project, &trunk(), &head)
+            .unwrap();
+        repositories
+            .sync(&project, &text(&remote), &trunk())
+            .unwrap();
+        assert_eq!(
+            git(
+                &remote,
+                &["for-each-ref", "--format=%(refname) %(objectname)"]
+            ),
+            format!("refs/heads/trunk {head}\n"),
+            "only the branch reaches the remote, never a pin ref"
+        );
+        let elsewhere = git(
+            &remote,
+            &[
+                "commit-tree",
+                "-p",
+                "trunk",
+                "-m",
+                "elsewhere",
+                &format!("{head}^{{tree}}"),
+            ],
+        );
+        git(
+            &remote,
+            &["update-ref", "refs/heads/trunk", elsewhere.trim()],
+        );
+        assert!(matches!(
+            repositories.sync(&project, &text(&remote), &trunk()),
+            Err(RepositoryError::Git(_))
+        ));
+        assert_eq!(
+            git(&remote, &["rev-parse", "refs/heads/trunk"]).trim(),
+            elsewhere.trim(),
+            "a diverged remote is not overwritten"
+        );
+    }
+
+    #[test]
+    fn sync_refuses_a_remote_that_is_empty_an_option_or_over_the_bound() {
+        let scratch = Scratch::new("sync-remote");
+        let (repositories, project) = fixture(&scratch);
+        let oversize = format!("/{}", "r".repeat(REMOTE_MAX_BYTES));
+        for refused in ["--receive-pack=evil", "", oversize.as_str()] {
+            assert!(
+                matches!(
+                    repositories.sync(&project, refused, &trunk()),
+                    Err(RepositoryError::Input(_))
+                ),
+                "{} bytes",
+                refused.len()
+            );
+        }
+        let longest = format!("/{}", "r".repeat(REMOTE_MAX_BYTES - 1));
+        assert!(
+            matches!(
+                repositories.sync(&project, &longest, &trunk()),
+                Err(RepositoryError::Git(_))
+            ),
+            "a remote at the bound reaches git, which finds nothing there"
+        );
     }
 }

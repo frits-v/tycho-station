@@ -135,7 +135,7 @@ import (
 ]
 
 #MechanismId: "ruleset" | "ci" | "lefthook" | "post_edit_hook" | "core_directory_check" |
-	"setup" | "spine_services"
+	"setup" | "credential_handoff" | "spine_services"
 
 #Mandate: {
 	mechanisms!: {[#MechanismId]: #Mechanism}

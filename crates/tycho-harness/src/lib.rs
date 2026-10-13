@@ -12,5 +12,6 @@ pub mod chaos;
 pub mod content;
 pub mod metrics;
 pub mod repository;
+pub mod tool_prefix;
 pub mod verify;
 pub mod work_units;
