@@ -145,7 +145,7 @@ test runs the pty path against a developer session in a private directory, with 
 Before every sudo, the teardown's included, the attach suite checks that its process group
 is the terminal's foreground group, and refuses with a line naming both groups when it is
 not, since sudo could then show its prompt but never read the password. It writes the
-emulator resets to `/dev/tty` (the kitty keyboard protocol set to no flags and popped,
+emulator resets to `/dev/tty` (the kitty keyboard protocol popped, then set to no flags,
 bracketed paste, focus events and mouse reporting off), since a `zmx attach` in Ghostty can
 leave the keyboard protocol on, after which Enter arrives as `CSI 13 u` and a canonical read
 never ends, which termios cannot show. It puts the terminal in canonical mode with echo, DEL

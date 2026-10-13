@@ -307,17 +307,30 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Result<(), String> {
     }
     let pid = child.id();
     let state = process_state(pid);
-    match child.kill() {
-        Ok(()) => {
-            let reaped = wait_for_exit_after_kill(child);
-            Err(format!(
-                "did not finish within {timeout:?}; ps for pid {pid}: {state}; killed, {reaped}"
-            ))
-        }
-        Err(error) => Err(format!(
+    let killed = child.kill();
+    Err(after_kill(killed, pid, &state, timeout, || {
+        wait_for_exit_after_kill(child)
+    }))
+}
+
+/// The timeout's text from the kill's result: a refused kill, which sudo running as root gives
+/// the invoking user, is named and never waited for; a delivered one is waited for, bounded.
+fn after_kill(
+    killed: std::io::Result<()>,
+    pid: u32,
+    state: &str,
+    timeout: Duration,
+    reap: impl FnOnce() -> String,
+) -> String {
+    match killed {
+        Ok(()) => format!(
+            "did not finish within {timeout:?}; ps for pid {pid}: {state}; killed, {}",
+            reap()
+        ),
+        Err(error) => format!(
             "did not finish within {timeout:?}; ps for pid {pid}: {state}; kill refused \
              ({error}), not waited for"
-        )),
+        ),
     }
 }
 
@@ -442,7 +455,7 @@ fn foreground_refusal(terminal_group: i32, own_group: i32) -> Option<String> {
 }
 
 /// Puts the terminal in the modes a password prompt needs and checks this process group owns
-/// it; prints what it found and returns the state to restore when the test ends.
+/// it; returns the line naming what it found and what it set, for the caller to print.
 fn prepare_for_prompt() -> Result<String, String> {
     let tty = controlling_terminal()?;
     let terminal_group = tcgetpgrp(&tty)
@@ -490,10 +503,11 @@ fn describe_terminal(own_group: i32, terminal_group: i32, termios: &Termios) -> 
 }
 
 /// Turns off what a terminal application can leave on in the emulator and termios cannot show:
-/// the kitty keyboard protocol (set to no flags, then popped), under which Enter arrives as
+/// the kitty keyboard protocol (an entry popped, then the top set to no flags, which leaves no
+/// flags at any stack depth), under which Enter arrives as
 /// `CSI 13 u` and a canonical read never ends; bracketed paste; focus events; and mouse
 /// reporting with its SGR encoding. These are the emulator's defaults, so nothing is put back.
-const EMULATOR_RESETS: &[u8] = b"\x1b[=0;1u\x1b[<u\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1006l";
+const EMULATOR_RESETS: &[u8] = b"\x1b[<u\x1b[=0;1u\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1006l";
 
 fn reset_emulator(tty: &File) -> Result<(), String> {
     let mut writer = tty;
@@ -2003,8 +2017,8 @@ mod decoders {
     #[test]
     fn the_emulator_resets_are_exactly_the_six_sequences_and_reach_the_terminal() {
         let sequences: [&[u8]; 6] = [
-            b"\x1b[=0;1u",
             b"\x1b[<u",
+            b"\x1b[=0;1u",
             b"\x1b[?2004l",
             b"\x1b[?1004l",
             b"\x1b[?1000l",
@@ -2016,6 +2030,27 @@ mod decoders {
         let mut read = vec![0_u8; EMULATOR_RESETS.len()];
         File::from(master).read_exact(&mut read).unwrap();
         assert_eq!(read, EMULATOR_RESETS);
+    }
+
+    #[test]
+    fn a_refused_kill_is_named_and_never_waited_for() {
+        let refused = after_kill(
+            Err(std::io::Error::from_raw_os_error(1)),
+            4242,
+            "S 4242 4242",
+            Duration::from_secs(120),
+            || panic!("a refused kill is not waited for"),
+        );
+        assert!(
+            refused.contains("ps for pid 4242: S 4242 4242"),
+            "{refused}"
+        );
+        assert!(refused.contains("kill refused ("), "{refused}");
+        assert!(refused.ends_with("), not waited for"), "{refused}");
+        let delivered = after_kill(Ok(()), 4242, "S", Duration::from_secs(1), || {
+            "then exited".to_string()
+        });
+        assert!(delivered.ends_with("killed, then exited"), "{delivered}");
     }
 
     #[test]
