@@ -57,6 +57,24 @@ pub struct Federation {
     workspace: Option<String>,
 }
 
+/// What a run mints Anthropic tokens from. Each mint asks GitHub for a fresh OIDC token, so
+/// tokens minted side by side never present the same single-use assertion.
+#[derive(Debug)]
+pub struct Minter {
+    federation: Federation,
+    oidc: OidcRequest,
+}
+
+impl Minter {
+    pub const fn new(federation: Federation, oidc: OidcRequest) -> Self {
+        Self { federation, oidc }
+    }
+
+    pub fn mint(&self) -> Result<AccessToken, String> {
+        mint(&self.federation, &self.oidc)
+    }
+}
+
 /// Where the job asks GitHub for its OIDC token, and the bearer token that request carries.
 #[derive(Debug)]
 pub struct OidcRequest {
@@ -277,9 +295,10 @@ fn response(reply: Reply) -> Result<(u16, String), &'static str> {
     }
 }
 
-/// The claims a federation rule matches, read from the JWT's payload, for the job log: the
-/// token itself and its signature are never shown. A rule is written against these as the
-/// identity provider issues them; GitHub's `sub`, for one, can carry owner and repository ids.
+/// The claims a federation rule matches, read from the JWT's payload, for the job log, with
+/// the window from `nbf` to `exp`, which caps the access token: the token itself and its
+/// signature are never shown. A rule is written against these as the identity provider issues
+/// them; GitHub's `sub`, for one, can carry owner and repository ids.
 pub fn rule_claims(jwt: &str) -> Option<String> {
     let payload = jwt.split('.').nth(1)?;
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -300,8 +319,8 @@ pub fn rule_claims(jwt: &str) -> Option<String> {
         })
         .collect();
     let time = |name: &str| claims.get(name).and_then(serde_json::Value::as_u64);
-    if let (Some(issued), Some(expires)) = (time("iat"), time("exp")) {
-        shown.push(format!("lifetime={} s", expires.saturating_sub(issued)));
+    if let (Some(from), Some(expires)) = (time("nbf").or_else(|| time("iat")), time("exp")) {
+        shown.push(format!("valid={} s", expires.saturating_sub(from)));
     }
     Some(shown.join(", "))
 }
@@ -475,6 +494,7 @@ mod tests {
                 "sub": "repo:frits-v@4488681/tycho-station@1411277668:environment:review",
                 "environment": "review\u{1b}[31m",
                 "job_workflow_ref": "frits-v/tycho-station/.github/workflows/review.yml@refs/heads/main",
+                "nbf": 1_791_916_602_u64,
                 "iat": 1_791_916_902_u64,
                 "exp": 1_791_917_202_u64,
                 "aud": "https://api.anthropic.com",
@@ -487,7 +507,7 @@ mod tests {
             shown,
             "sub=repo:frits-v@4488681/tycho-station@1411277668:environment:review, \
              environment=review[31m, job_workflow_ref=frits-v/tycho-station/.github/workflows/\
-             review.yml@refs/heads/main, lifetime=300 s"
+             review.yml@refs/heads/main, valid=600 s"
         );
         assert!(!shown.contains("c2lnbmF0dXJl") && !shown.contains(&payload));
         assert_eq!(rule_claims("not-a-jwt"), None);

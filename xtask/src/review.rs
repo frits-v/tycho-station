@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::anthropic_token::AccessToken;
+use crate::anthropic_token;
 use crate::app_token::{self, InstallationToken};
 use langfuse::{Generation, Langfuse, Trace};
 use pull_request::{Posted, PullRequest};
@@ -82,12 +82,13 @@ struct GitHub {
     pull_request: PullRequest,
 }
 
-/// What the run was granted: its tokens, and the run time the Anthropic token leaves. Kept
-/// apart from [`Context`], which the run prints from, and handed only to the code that uses a
-/// token.
+/// What the run was granted: the means to mint Anthropic tokens, the App's token, and the run
+/// time. Kept apart from [`Context`], which the run prints from, and handed only to the code
+/// that uses a token.
 #[derive(Debug)]
 struct Grants {
-    anthropic: Option<AccessToken>,
+    /// Mints each pass its own Anthropic token; `None` uses the developer's own login.
+    anthropic: Option<anthropic_token::Minter>,
     app: Option<InstallationToken>,
     run_time: Duration,
 }

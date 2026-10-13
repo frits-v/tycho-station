@@ -648,8 +648,13 @@ check out, build and run it.
   `https://api.anthropic.com` and trades it at `https://api.anthropic.com/v1/oauth/token` with
   a JWT bearer grant naming `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID` and,
   when set, `ANTHROPIC_SERVICE_ACCOUNT_ID` and `ANTHROPIC_WORKSPACE_ID`. It requires a `Bearer`
-  token type and an `expires_in` of at most a day, and bounds the passes to that lifetime less
-  two minutes, at most 30 minutes. Anthropic documents no revocation; the token lapses.
+  token type and an `expires_in` of at most a day. Anthropic caps an exchanged token at the
+  validity window of the OIDC token it was traded for, `nbf` to `exp`, which GitHub sets to ten
+  minutes, whatever the rule's token lifetime; so each pass mints its own token from a fresh
+  OIDC token (an assertion is single-use, and passes run side by side) and runs at most until
+  that token's end less a minute, within the run's 30 minutes. A first exchange before any pass
+  checks the rule, and its token is dropped. A find pass that outlasts its token ends timed
+  out and the run posts no verdict. Anthropic documents no revocation; each token lapses.
 - This repository's OIDC tokens carry GitHub's immutable-id subject,
   `repo:frits-v@4488681/tycho-station@1411277668:environment:<name>`, not the
   `repo:<owner>/<name>:...` form GitHub's documentation shows. The federation rule therefore
@@ -665,12 +670,11 @@ check out, build and run it.
   ```
 
   Before each exchange the xtask prints the claims a rule matches on (`sub`, `environment`,
-  `job_workflow_ref`, `ref` and the token's lifetime), never the token. An exchange the rule
+  `job_workflow_ref`, `ref` and the window from `nbf` to `exp`), never the token. An exchange the rule
   refuses answers an opaque `401`; the Console's authentication history names the failed
   check, such as `match_condition_false`.
-- The rule's token lifetime is at least 1920 seconds: the passes run for at most 30 minutes
-  and the xtask leaves two minutes unused. A shorter lifetime fails the run before any pass,
-  naming the lifetime it got.
+- The rule's token lifetime is at least two minutes; anything above GitHub's ten-minute window
+  changes nothing. A shorter lifetime fails the run before any pass, naming the lifetime.
 - All exchanges are made in process over HTTPS (rustls on aws-lc-rs, the webpki roots
   compiled in, no proxy, no redirects); no token appears in arguments, output or errors.
 

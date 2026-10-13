@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use super::pull_request::CommitId;
 use super::{git_in, langfuse, pull_request, scrubbed, Context, GitHub, Grants, Mode};
-use crate::anthropic_token::{self, AccessToken};
+use crate::anthropic_token;
 use crate::app_token::{self, REVIEW};
 use crate::checkout;
 use crate::github_api::Client;
@@ -21,9 +21,8 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 const MISE_TIMEOUT: Duration = Duration::from_secs(60);
 const RUN_TIME_MAX: Duration = Duration::from_secs(30 * 60);
-/// Left unused at the end of the access token's life, so no run starts on a token about to lapse.
-const TOKEN_MARGIN: Duration = Duration::from_secs(120);
-const RUN_TIME_MIN: Duration = Duration::from_secs(10 * 60);
+/// The shortest token a pass can use: a minute of work and the minute a pass leaves unused.
+const TOKEN_LIFETIME_MIN: Duration = Duration::from_secs(2 * 60);
 const DRY_RUN_BASE: &str = "origin/main";
 /// The diff, the earlier findings and one instructions file per pass.
 const FILES_MAX: usize = 64;
@@ -37,24 +36,20 @@ const REVIEWS_PER_PULL_REQUEST_MAX: usize = 20;
 /// run prints from, so nothing that holds a token ever shares a value with what is printed.
 pub fn grants(mode: &Mode) -> Result<Grants, String> {
     match mode {
-        Mode::DryRun => {
-            let anthropic = anthropic_access(false)?;
-            Ok(Grants {
-                run_time: run_time(anthropic.as_ref())?,
-                anthropic,
-                app: None,
-            })
-        }
+        Mode::DryRun => Ok(Grants {
+            anthropic: anthropic_minter(false)?,
+            app: None,
+            run_time: RUN_TIME_MAX,
+        }),
         Mode::Post => {
             let credentials = review_credentials()?;
             let repository = app_token::read_repository(env::var("GITHUB_REPOSITORY").ok())?;
-            let anthropic = anthropic_access(true)?;
-            let run_time = run_time(anthropic.as_ref())?;
+            let anthropic = anthropic_minter(true)?;
             let app = app_token::mint(&credentials, &repository)?;
             Ok(Grants {
                 anthropic,
                 app: Some(app),
-                run_time,
+                run_time: RUN_TIME_MAX,
             })
         }
     }
@@ -106,21 +101,11 @@ fn current_user() -> Option<String> {
         .map(|user| user.name)
 }
 
-/// The run time the access token leaves, after the margin, capped at [`RUN_TIME_MAX`].
-pub fn run_time_for(expires_in_seconds: u64) -> Result<Duration, String> {
-    let usable = Duration::from_secs(expires_in_seconds).saturating_sub(TOKEN_MARGIN);
-    if usable < RUN_TIME_MIN {
-        return Err(format!(
-            "the access token lasts {expires_in_seconds} s; the review needs at least {} s",
-            RUN_TIME_MIN.saturating_add(TOKEN_MARGIN).as_secs()
-        ));
-    }
-    Ok(usable.min(RUN_TIME_MAX))
-}
-
-/// An Anthropic access token by workload identity federation when the federation rule is
-/// set, else none: the CLI then uses the developer's own login.
-fn anthropic_access(required_here: bool) -> Result<Option<AccessToken>, String> {
+/// Mints Anthropic tokens by workload identity federation when the federation rule is set,
+/// else none: the CLI then uses the developer's own login. A first exchange checks the rule
+/// before any pass and its token is dropped; each pass mints its own, since GitHub's OIDC
+/// token caps an exchanged token at its own validity window, ten minutes.
+fn anthropic_minter(required_here: bool) -> Result<Option<anthropic_token::Minter>, String> {
     let rule = env::var(anthropic_token::FEDERATION_RULE_VARIABLE).ok();
     if rule.as_deref().is_none_or(|rule| rule.trim().is_empty()) && !required_here {
         return Ok(None);
@@ -135,7 +120,24 @@ fn anthropic_access(required_here: bool) -> Result<Option<AccessToken>, String> 
         crate::secrets::read(anthropic_token::REQUEST_URL_VARIABLE),
         crate::secrets::read(anthropic_token::REQUEST_TOKEN_VARIABLE),
     )?;
-    anthropic_token::mint(&federation, &oidc).map(Some)
+    let minter = anthropic_token::Minter::new(federation, oidc);
+    let lifetime = minter.mint()?.expires_in_seconds;
+    check_token_lifetime(lifetime)?;
+    println!(
+        "xtask review: the federation rule issues tokens for {lifetime} s; each pass mints its own"
+    );
+    Ok(Some(minter))
+}
+
+/// A token too short for one pass fails the run before any pass, naming the lifetime.
+fn check_token_lifetime(seconds: u64) -> Result<(), String> {
+    if Duration::from_secs(seconds) < TOKEN_LIFETIME_MIN {
+        return Err(format!(
+            "the access token lasts {seconds} s; a pass needs at least {} s",
+            TOKEN_LIFETIME_MIN.as_secs()
+        ));
+    }
+    Ok(())
 }
 
 fn read_langfuse() -> Result<Option<langfuse::Langfuse>, String> {
@@ -144,12 +146,6 @@ fn read_langfuse() -> Result<Option<langfuse::Langfuse>, String> {
         env::var(langfuse::PUBLIC_KEY_VARIABLE).ok(),
         crate::secrets::read(langfuse::SECRET_KEY_VARIABLE),
     )
-}
-
-fn run_time(access_token: Option<&AccessToken>) -> Result<Duration, String> {
-    access_token.map_or(Ok(RUN_TIME_MAX), |token| {
-        run_time_for(token.expires_in_seconds)
-    })
 }
 
 fn head_commit(dir: &Path) -> Result<CommitId, String> {
@@ -580,13 +576,11 @@ pub mod tests {
     }
 
     #[test]
-    fn the_run_time_stays_inside_the_token_lifetime_and_the_cap() {
-        assert_eq!(run_time_for(3600), Ok(RUN_TIME_MAX));
-        assert_eq!(
-            run_time_for(900),
-            Ok(Duration::from_secs(900).saturating_sub(TOKEN_MARGIN))
-        );
-        assert!(run_time_for(600).unwrap_err().contains("at least 720 s"));
+    fn a_token_too_short_for_one_pass_is_refused_with_its_lifetime() {
+        assert_eq!(check_token_lifetime(598), Ok(()));
+        assert_eq!(check_token_lifetime(120), Ok(()));
+        let refused = check_token_lifetime(119).unwrap_err();
+        assert!(refused.contains("lasts 119 s"), "{refused}");
     }
 
     #[test]

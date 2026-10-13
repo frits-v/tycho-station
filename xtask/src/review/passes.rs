@@ -15,6 +15,7 @@ use super::langfuse::Generation;
 use super::pull_request::Posted;
 use super::verdict::blocks;
 use super::{git_in, Context, Grants, Tally, EXCLUDED_PATHSPECS, VERIFIED_MAX};
+use crate::anthropic_token;
 use crate::process::{run_bounded, Exit};
 
 const FIND_SCHEMA: &str = include_str!("../../../config/export/schema/review_findings.json");
@@ -33,6 +34,8 @@ const VERIFY_LIMITS: Limits = Limits {
 };
 const VERIFY_PARALLEL: usize = 4;
 const ONE_RUN_MIN: Duration = Duration::from_secs(60);
+/// Left unused at the end of a pass's token, so no request goes out on a token about to lapse.
+const TOKEN_MARGIN: Duration = Duration::from_secs(60);
 
 fn write_file(path: &Path, text: &str) -> Result<(), String> {
     fs::write(path, text).map_err(|error| format!("cannot write {}: {error}", path.display()))
@@ -106,7 +109,68 @@ pub fn minified(schema: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
-/// One pass: the instructions written to the run's directory, the CLI run under the
+/// When a pass must end: the run's deadline, or its own token's end less the margin, whichever
+/// comes first.
+fn pass_deadline(run: Instant, now: Instant, token_lifetime: Option<Duration>) -> Instant {
+    token_lifetime
+        .and_then(|lifetime| now.checked_add(lifetime.saturating_sub(TOKEN_MARGIN)))
+        .map_or(run, |token_end| token_end.min(run))
+}
+
+/// Mints the pass's own token, when the run mints any, and runs the CLI under the earlier of
+/// the run's deadline and the token's end.
+fn launch(
+    context: &Context,
+    grants: &Grants,
+    path: &Path,
+    schema: &str,
+    limits: Limits,
+    deadline: Instant,
+) -> RunOutcome {
+    let started = Instant::now();
+    if deadline
+        .checked_duration_since(started)
+        .is_none_or(|remaining| remaining < ONE_RUN_MIN)
+    {
+        return RunOutcome::Ended(Exit::TimedOut);
+    }
+    let token = match grants
+        .anthropic
+        .as_ref()
+        .map(anthropic_token::Minter::mint)
+        .transpose()
+    {
+        Ok(token) => token,
+        Err(reason) => return RunOutcome::Unrecognised(format!("the token exchange: {reason}")),
+    };
+    let lifetime = token
+        .as_ref()
+        .map(|token| Duration::from_secs(token.expires_in_seconds));
+    let Some(remaining) = pass_deadline(deadline, started, lifetime)
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| *remaining >= ONE_RUN_MIN)
+    else {
+        return RunOutcome::Ended(Exit::TimedOut);
+    };
+    let environment = claude_run::environment(
+        std::env::vars_os(),
+        context.user.as_deref(),
+        token.as_ref().map(|token| token.value.expose()),
+    );
+    let mut command = claude_run::command(
+        &context.claude,
+        path,
+        &context.files,
+        schema,
+        limits,
+        environment,
+    );
+    command.current_dir(&context.checkout);
+    let captured = run_bounded(&mut command, remaining);
+    claude_run::decode(captured.exit, &captured.stdout)
+}
+
+/// One pass: the instructions written to the run's directory, the CLI run under its
 /// deadline, and the generation the trace records.
 fn run_claude(
     context: &Context,
@@ -119,32 +183,9 @@ fn run_claude(
 ) -> (RunOutcome, Generation) {
     let started = SystemTime::now();
     let path = context.files.join(format!("{name}.md"));
-    let outcome = match (
-        write_file(&path, instructions),
-        deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| *remaining >= ONE_RUN_MIN),
-    ) {
-        (Err(reason), _) => RunOutcome::Unrecognised(reason),
-        (Ok(()), None) => RunOutcome::Ended(Exit::TimedOut),
-        (Ok(()), Some(remaining)) => {
-            let environment = claude_run::environment(
-                std::env::vars_os(),
-                context.user.as_deref(),
-                grants.anthropic.as_ref().map(|token| token.value.expose()),
-            );
-            let mut command = claude_run::command(
-                &context.claude,
-                &path,
-                &context.files,
-                schema,
-                limits,
-                environment,
-            );
-            command.current_dir(&context.checkout);
-            let captured = run_bounded(&mut command, remaining);
-            claude_run::decode(captured.exit, &captured.stdout)
-        }
+    let outcome = match write_file(&path, instructions) {
+        Err(reason) => RunOutcome::Unrecognised(reason),
+        Ok(()) => launch(context, grants, &path, schema, limits, deadline),
     };
     let generation = Generation {
         name: name.to_string(),
@@ -358,6 +399,22 @@ mod tests {
         );
         assert!(words.contains(&"--no-ext-diff".to_string()));
         assert!(words.contains(&"--no-textconv".to_string()));
+    }
+
+    #[test]
+    fn a_pass_ends_at_the_run_deadline_or_before_its_token_lapses() {
+        let now = Instant::now();
+        let run = now.checked_add(Duration::from_secs(1800)).unwrap();
+        assert_eq!(pass_deadline(run, now, None), run);
+        assert_eq!(
+            pass_deadline(run, now, Some(Duration::from_secs(598))),
+            now.checked_add(Duration::from_secs(538)).unwrap()
+        );
+        let soon = now.checked_add(Duration::from_secs(120)).unwrap();
+        assert_eq!(
+            pass_deadline(soon, now, Some(Duration::from_secs(598))),
+            soon
+        );
     }
 
     #[test]

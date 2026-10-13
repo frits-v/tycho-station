@@ -25,13 +25,14 @@ pub fn select(
     confirmed: &[Finding],
     tally: &mut Tally,
 ) -> Result<(Vec<Finding>, Vec<Finding>), String> {
-    let secrets: Vec<&str> = [
-        grants.anthropic.as_ref().map(|token| token.value.expose()),
-        grants.app.as_ref().map(InstallationToken::expose),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    // Each pass's Anthropic token lives in that pass alone; its `sk-ant-` prefix withholds a
+    // finding that names one.
+    let secrets: Vec<&str> = grants
+        .app
+        .as_ref()
+        .map(InstallationToken::expose)
+        .into_iter()
+        .collect();
     let posted: BTreeSet<&str> = context
         .posted
         .iter()
