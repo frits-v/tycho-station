@@ -514,8 +514,10 @@ mod tests {
     }
 
     #[test]
-    fn no_short_string_of_markdown_characters_posts_live_html_a_mention_or_a_stray_backtick() {
-        let alphabet = ['`', '\\', '<', '@', 'a', ' ', '\n', '*'];
+    fn no_short_string_of_markdown_characters_posts_one_of_them_live() {
+        let alphabet = [
+            '`', '\\', '<', '>', '@', '*', '_', '[', ']', '~', '|', 'a', ' ', '\n',
+        ];
         let mut examined = 0_usize;
         let mut indices = vec![0_usize; 0];
         for length in 0..=5_u32 {
@@ -535,13 +537,13 @@ mod tests {
                 assert!(!posted.contains(['\n', '\r']), "{text:?} -> {posted:?}");
                 let outside = outside_code(&posted);
                 assert!(
-                    !outside.contains(['<', '@', '`', '\\']),
+                    !outside.contains(['`', '\\', '<', '>', '@', '*', '_', '[', ']', '~', '|']),
                     "{text:?} -> {posted:?}"
                 );
                 examined = examined.saturating_add(1);
             }
         }
-        assert_eq!(examined, 37_449);
+        assert_eq!(examined, 579_195);
     }
 
     #[test]
