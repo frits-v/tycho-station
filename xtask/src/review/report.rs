@@ -6,7 +6,7 @@ use std::env;
 use std::fs;
 use std::io::Write as _;
 
-use super::checks::{self, Check};
+use super::checks::{self, Seen};
 use super::claude_run;
 use super::diff::DiffMap;
 use super::findings::{self, Finding};
@@ -87,7 +87,7 @@ pub fn body(
     context: &Context,
     verdict: (Event, &str),
     outside: &[Finding],
-    checks: &[Check],
+    checks: &Seen,
     tally: &Tally,
 ) -> String {
     let (event, reason) = verdict;
@@ -134,7 +134,7 @@ pub fn publish(
     context: &Context,
     map: &DiffMap,
     confirmed: &[Finding],
-    checks: &[Check],
+    checks: &Seen,
     verdict: (Event, &str),
     tally: &mut Tally,
 ) -> Result<(), String> {
@@ -242,10 +242,13 @@ mod tests {
 
     #[test]
     fn the_body_states_the_verdict_lists_the_checks_and_never_mentions_anyone() {
-        let checks = [Check {
-            name: "ci".to_string(),
-            outcome: checks::Outcome::Failed,
-        }];
+        let checks = Seen {
+            checks: vec![checks::Check {
+                name: "ci".to_string(),
+                outcome: checks::Outcome::Failed,
+            }],
+            unreadable: None,
+        };
         let text = body(
             &context(Vec::new(), "t"),
             (Event::Approve, "no confirmed high or medium findings"),

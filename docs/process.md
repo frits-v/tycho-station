@@ -485,8 +485,9 @@ check out, build and run it.
 
 ### When a review runs
 
-- The `review` workflow starts on `pull_request_target` when a pull request is marked ready
-  for review, and on `issue_comment` when a comment on a pull request mentions
+- The `review` workflow starts on `pull_request_target` when a pull request whose author is
+  an owner, member or collaborator is marked ready for review, and on `issue_comment` when a
+  comment on a pull request, any pull request a fork's included, mentions
   `@frits-code-review` or `@claude` as a whole word, from an account of type `User` whose
   association is `OWNER`, `MEMBER` or `COLLABORATOR`. Opening a pull request, pushing to it or
   editing a comment starts nothing; the workflow's condition and the xtask's event decoder
@@ -495,8 +496,8 @@ check out, build and run it.
   escaped. A review never asks for another one.
 - A pull request takes at most 20 reviews from the App; past that the run fails before
   calling the model.
-- Runs of one pull request share a concurrency group; a new request cancels the run in
-  progress.
+- Runs of one pull request share a concurrency group on the job, after its condition; a new
+  request cancels the run in progress, and a comment that starts no review cancels nothing.
 
 ### What runs where
 
@@ -506,7 +507,8 @@ check out, build and run it.
   xtask, and runs `xtask review --post pull-request`. Nothing from `pull-request/` is built
   or run: the xtask runs git in it with `--no-ext-diff --no-textconv`, runs the Claude binary
   `mise which claude` names from the base checkout (a mise shim run there would take the pull
-  request's pin), and hands the model only read tools.
+  request's pin), and hands the model only read tools. git and mise run without the App key,
+  the Langfuse secret key, the OIDC request variables or any job token in their environment.
 - The job runs in the `review` environment, whose secrets are the App key and the Langfuse
   key. `pull_request_target` and `issue_comment` runs carry the default branch's ref, so an
   environment that admits only the default branch serves them and refuses every branch's own
@@ -550,7 +552,9 @@ check out, build and run it.
 - While the passes run, nothing about the other checks reaches the model. Afterwards the
   xtask reads the check runs and commit statuses on the head commit every 30 seconds, leaving
   out the review's own jobs, until none is pending or 45 minutes after the start, and lists
-  each with its outcome in the review body. They never change the verdict: a failing required
+  each with its outcome in the review body; a read that fails is retried at the next poll, and
+  the last failure is named in the body instead of stopping the review. They never change the
+  verdict: a failing required
   check, code scanning alert or secret scanning result is the branch rules' to enforce, and
   the review judges the code.
 - A new finding on a line the diff shows becomes an inline comment; any other goes into the

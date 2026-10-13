@@ -80,6 +80,17 @@ pub fn decode_trigger(event_name: &str, text: &str) -> Result<Trigger, String> {
             let pull_request = event
                 .get("pull_request")
                 .ok_or("the event has no pull request")?;
+            let association = pull_request
+                .get("author_association")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !ASKERS.contains(&association) {
+                return Err(format!(
+                    "the pull request's author association is `{association}`; a pull request \
+                     from {} is reviewed when marked ready, any other when one of them asks",
+                    ASKERS.join(", ")
+                ));
+            }
             decode_pull_request(pull_request).map(Trigger::Ready)
         }
         ("issue_comment", Some("created")) => decode_ask(&event),
@@ -357,8 +368,9 @@ mod tests {
     }
 
     fn ready(head: &str) -> String {
-        serde_json::json!({"action": "ready_for_review", "pull_request": pull_request(head)})
-            .to_string()
+        let mut pull_request = pull_request(head);
+        pull_request["author_association"] = Value::from("MEMBER");
+        serde_json::json!({"action": "ready_for_review", "pull_request": pull_request}).to_string()
     }
 
     fn asked(body: &str, association: &str, kind: &str) -> String {
@@ -385,6 +397,15 @@ mod tests {
         assert!(decode_trigger("pull_request_target", &ready("main")).is_err());
         assert!(decode_trigger("pull_request_target", &ready(&HEAD.to_uppercase())).is_err());
         assert!(decode_trigger("pull_request_target", "nope").is_err());
+    }
+
+    #[test]
+    fn an_outsiders_pull_request_marked_ready_starts_nothing() {
+        for association in ["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE"] {
+            let outsider = ready(HEAD).replace("\"MEMBER\"", &format!("\"{association}\""));
+            let refused = decode_trigger("pull_request_target", &outsider).unwrap_err();
+            assert!(refused.contains(association), "{refused}");
+        }
     }
 
     #[test]

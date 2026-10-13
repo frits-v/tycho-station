@@ -21,6 +21,7 @@ mod setup;
 mod verdict;
 
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::anthropic_token::AccessToken;
@@ -40,6 +41,25 @@ const VERIFIED_MAX: usize = 12;
 /// an hour from the start.
 const CHECKS_WAIT: Duration = Duration::from_secs(45 * 60);
 const SHORT_COMMIT_CHARS: usize = 12;
+/// What a review run holds that no child it starts may see: the App key, the Langfuse secret
+/// key, the Actions OIDC request and runtime tokens and a job token. The Claude CLI gets an
+/// allowlist instead.
+const SECRET_VARIABLES: [&str; 6] = [
+    app_token::REVIEW.key_variable,
+    langfuse::SECRET_KEY_VARIABLE,
+    crate::anthropic_token::REQUEST_TOKEN_VARIABLE,
+    crate::anthropic_token::REQUEST_URL_VARIABLE,
+    "ACTIONS_RUNTIME_TOKEN",
+    "GITHUB_TOKEN",
+];
+
+/// `command` without the run's secrets in its environment.
+fn scrubbed(command: &mut Command) -> &mut Command {
+    for name in SECRET_VARIABLES {
+        command.env_remove(name);
+    }
+    command
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -142,16 +162,18 @@ fn review(context: &Context, tally: &mut Tally) -> Result<(Event, String), Strin
     tally.hunks = map.hunks;
     let candidates = passes::find(context, deadline, tally)?;
     let confirmed = passes::verify(context, &candidates, deadline, tally);
-    let checks = match &context.github {
-        Some(github) => checks::wait(
-            &crate::github_api::Client::github(),
-            github.token.expose(),
-            &github.repository,
-            &context.head,
-            started.checked_add(CHECKS_WAIT).unwrap_or(started),
-        )?,
-        None => Vec::new(),
-    };
+    let checks = context
+        .github
+        .as_ref()
+        .map_or_else(checks::Seen::default, |github| {
+            checks::wait(
+                &crate::github_api::Client::github(),
+                github.token.expose(),
+                &github.repository,
+                &context.head,
+                started.checked_add(CHECKS_WAIT).unwrap_or(started),
+            )
+        });
     let (event, reason) = verdict::decide(&verdict::Evidence {
         confirmed: &confirmed,
         unjudged_blocking: tally.unjudged_blocking,

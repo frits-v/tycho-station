@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tycho_types::git_environment::git_command;
 
-use super::{langfuse, pull_request, Context, GitHub, Mode};
+use super::{langfuse, pull_request, scrubbed, Context, GitHub, Mode};
 use crate::anthropic_token::{self, AccessToken};
 use crate::app_token::{self, REVIEW};
 use crate::checkout;
@@ -113,21 +113,49 @@ fn run_time(access_token: Option<&AccessToken>) -> Result<Duration, String> {
     })
 }
 
+/// git in `dir`, without the hook environment or the run's secrets.
+fn git_in(dir: &Path) -> Command {
+    let mut command = git_command();
+    scrubbed(command.arg("-C").arg(dir));
+    command
+}
+
+fn head_commit(dir: &Path) -> Result<String, String> {
+    let captured = run_bounded(git_in(dir).args(["rev-parse", "HEAD"]), GIT_TIMEOUT);
+    let commit = captured.stdout.trim();
+    match captured.exit {
+        Exit::Code(0) if pull_request::commit_sha(commit) => Ok(commit.to_string()),
+        other => Err(format!(
+            "git rev-parse HEAD in {} ended {other:?}",
+            dir.display()
+        )),
+    }
+}
+
+fn uncommitted(dir: &Path) -> Result<usize, String> {
+    let captured = run_bounded(git_in(dir).args(["status", "--porcelain"]), GIT_TIMEOUT);
+    match captured.exit {
+        Exit::Code(0) => Ok(captured
+            .stdout
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count()),
+        other => Err(format!("git status --porcelain ended {other:?}")),
+    }
+}
+
 /// The commits a dry run reviews: `origin/main` against a clean `HEAD`, the branch the run
 /// was started on.
 fn dry_run_commits(root: &Path) -> Result<(String, String, String), String> {
-    let changes = checkout::uncommitted(root)?;
+    let changes = uncommitted(root)?;
     if changes > 0 {
         return Err(format!(
             "{changes} uncommitted changes: the model reads the working tree, so commit first"
         ));
     }
-    let head = checkout::head_commit(root)?;
+    let head = head_commit(root)?;
     let merge_base = run_bounded(
-        git_command()
-            .arg("-C")
-            .arg(root)
-            .args(["merge-base", DRY_RUN_BASE, "HEAD"]),
+        git_in(root).args(["merge-base", DRY_RUN_BASE, "HEAD"]),
         GIT_TIMEOUT,
     );
     let base = merge_base.stdout.trim().to_string();
@@ -185,7 +213,7 @@ fn decode_which(exit: &Exit, stdout: &str) -> Result<PathBuf, String> {
 /// with its working directory in the pull request's checkout would take that checkout's pin.
 fn resolve_claude(root: &Path) -> Result<PathBuf, String> {
     let captured = run_bounded(
-        Command::new("mise")
+        scrubbed(&mut Command::new("mise"))
             .args(["which", "claude"])
             .current_dir(root),
         MISE_TIMEOUT,
@@ -235,7 +263,7 @@ fn read_pull_request(
             pull_request::fetch(&client, token, &full_name, *number)?
         }
     };
-    let checked_out = checkout::head_commit(checkout_dir)?;
+    let checked_out = head_commit(checkout_dir)?;
     if checked_out != pull_request.head {
         return Err(format!(
             "{} is at {checked_out}, not the pull request's head {}; it moved since the run \
@@ -279,7 +307,7 @@ fn post_context(checkout_dir: &Path) -> Result<Context, String> {
         claude: request.claude,
         access_token,
         session: format!("{full_name}#{}", pull_request.number),
-        fork: pull_request.head_repository != full_name,
+        fork: is_fork(&pull_request, &full_name),
         github: Some(GitHub {
             token,
             repository: full_name,
@@ -291,6 +319,11 @@ fn post_context(checkout_dir: &Path) -> Result<Context, String> {
         langfuse: request.langfuse,
         files,
     })
+}
+
+/// A pull request whose head lives in another repository; the App never approves one.
+fn is_fork(pull_request: &pull_request::PullRequest, repository: &str) -> bool {
+    pull_request.head_repository != repository
 }
 
 /// A new 0700 directory under the runner's temporary directory, or the system's outside
@@ -353,6 +386,43 @@ pub mod tests {
             langfuse: None,
             files: PathBuf::from("/t/tycho-review-1"),
         }
+    }
+
+    #[test]
+    fn no_git_or_mise_child_sees_a_secret_of_the_run() {
+        let git = git_in(Path::new("/r"));
+        let mut mise = Command::new("mise");
+        scrubbed(&mut mise);
+        for command in [&git, &mise] {
+            let removed: Vec<&std::ffi::OsStr> = command
+                .get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(name, _)| name)
+                .collect();
+            for name in crate::review::SECRET_VARIABLES {
+                assert!(removed.contains(&std::ffi::OsStr::new(name)), "{name}");
+            }
+        }
+        for name in [
+            "FRITS_CODE_REVIEW_APP_PRIVATE_KEY",
+            "LANGFUSE_SECRET_KEY",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        ] {
+            assert!(crate::review::SECRET_VARIABLES.contains(&name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_head_in_another_repository_is_a_fork() {
+        let mut pull_request = PullRequest {
+            number: 1,
+            base: "b".repeat(40),
+            head: "a".repeat(40),
+            head_repository: "o/r".to_string(),
+        };
+        assert!(!is_fork(&pull_request, "o/r"));
+        pull_request.head_repository = "someone/r".to_string();
+        assert!(is_fork(&pull_request, "o/r"));
     }
 
     #[test]

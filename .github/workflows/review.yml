@@ -9,25 +9,27 @@ on:
   issue_comment:
     types: [created]
 permissions: {}
-concurrency:
-  group: review-${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: true
 defaults:
   run:
     shell: bash
 jobs:
   review:
     name: review
-    # A comment on a pull request that mentions the reviewer, from a writer; xtask review
-    # checks the event again before anything else.
+    # A writer's pull request marked ready, or a writer's comment on a pull request that
+    # mentions the reviewer; xtask review checks the event again before anything else.
     if: >-
-      ${{ github.event_name == 'pull_request_target' ||
+      ${{ (github.event_name == 'pull_request_target' &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)) ||
       (github.event.issue.pull_request &&
       (contains(github.event.comment.body, '@frits-code-review') || contains(github.event.comment.body, '@claude')) &&
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) }}
     # The App key and the Langfuse key are secrets of this environment, which admits only the
     # default branch: both events run there, and no branch's workflow can read them.
     environment: review
+    # On the job, after its condition: a comment that starts no review cancels nothing.
+    concurrency:
+      group: review-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     env:

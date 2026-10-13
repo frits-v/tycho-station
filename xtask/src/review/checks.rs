@@ -179,51 +179,68 @@ pub fn read(
     ))
 }
 
-/// Reads the checks until none is pending or `until` passes, sleeping between reads.
-pub fn wait(
-    client: &Client,
-    token: &str,
-    repository: &str,
-    head: &str,
-    until: Instant,
-) -> Result<Vec<Check>, String> {
+/// What the polling saw: the last checks it read, and why the last read failed when it did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Seen {
+    pub checks: Vec<Check>,
+    pub unreadable: Option<String>,
+}
+
+/// Reads the checks until none is pending or `until` passes, sleeping between reads. A read
+/// that fails is kept as the reason and polled again; it never stops the verdict.
+pub fn wait(client: &Client, token: &str, repository: &str, head: &str, until: Instant) -> Seen {
     let polls = until
         .saturating_duration_since(Instant::now())
         .as_secs()
         .checked_div(POLL_INTERVAL.as_secs())
         .unwrap_or(0)
         .saturating_add(1);
-    let mut checks = read(client, token, repository, head)?;
+    let mut seen = Seen::default();
     for _ in 0..polls {
-        if !checks.iter().any(|check| check.outcome == Outcome::Pending)
-            || Instant::now()
-                .checked_add(POLL_INTERVAL)
-                .is_none_or(|next| next > until)
-        {
+        match read(client, token, repository, head) {
+            Ok(checks) => {
+                seen.checks = checks;
+                seen.unreadable = None;
+            }
+            Err(reason) => seen.unreadable = Some(reason),
+        }
+        let waiting = seen.unreadable.is_some()
+            || seen
+                .checks
+                .iter()
+                .any(|check| check.outcome == Outcome::Pending);
+        let no_time = Instant::now()
+            .checked_add(POLL_INTERVAL)
+            .is_none_or(|next| next > until);
+        if !waiting || no_time {
             break;
         }
         thread::sleep(POLL_INTERVAL);
-        checks = read(client, token, repository, head)?;
     }
-    Ok(checks)
+    seen
 }
 
-/// One line per check for the review body; `None` when there is no other check.
-pub fn summary(checks: &[Check]) -> Option<String> {
-    if checks.is_empty() {
-        return None;
-    }
-    let lines: Vec<String> = checks
+/// One line per check for the review body, and why the checks could not be read when the
+/// last read failed; `None` when there is nothing to say.
+pub fn summary(seen: &Seen) -> Option<String> {
+    let mut lines: Vec<String> = seen
+        .unreadable
         .iter()
-        .map(|check| {
+        .map(|reason| {
             format!(
-                "- `{}`: {}",
-                check.name.replace('`', "'"),
-                check.outcome.label()
+                "- the checks could not be read: {}",
+                reason.replace('`', "'")
             )
         })
         .collect();
-    Some(lines.join("\n"))
+    lines.extend(seen.checks.iter().map(|check| {
+        format!(
+            "- `{}`: {}",
+            check.name.replace('`', "'"),
+            check.outcome.label()
+        )
+    }));
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 #[cfg(test)]
@@ -301,15 +318,29 @@ mod tests {
             {"name": "ci", "status": "in_progress", "conclusion": null}]});
         let statuses = serde_json::json!({"statuses": []});
         let (base, _seen) = listener(vec![(200, runs.to_string()), (200, statuses.to_string())]);
-        let checks = wait(
+        let seen = wait(
             &Client::loopback(&base),
             "t",
             "o/r",
             &"a".repeat(40),
             Instant::now(),
-        )
-        .unwrap();
-        assert_eq!(checks.first().unwrap().outcome, Outcome::Pending);
+        );
+        assert_eq!(seen.checks.first().unwrap().outcome, Outcome::Pending);
+        assert_eq!(seen.unreadable, None);
+    }
+
+    #[test]
+    fn a_failed_read_is_kept_as_the_reason_and_never_an_error() {
+        let (base, _seen) = listener(vec![(502, "{}".to_string())]);
+        let seen = wait(
+            &Client::loopback(&base),
+            "t",
+            "o/r",
+            &"a".repeat(40),
+            Instant::now(),
+        );
+        assert!(seen.checks.is_empty());
+        assert!(seen.unreadable.unwrap().contains("HTTP 502"));
     }
 
     #[test]
@@ -326,12 +357,18 @@ mod tests {
     }
 
     #[test]
-    fn the_summary_lists_each_check_and_is_absent_without_any() {
-        assert_eq!(summary(&[]), None);
-        let checks = [Check {
-            name: "c`i".to_string(),
-            outcome: Outcome::Failed,
-        }];
-        assert_eq!(summary(&checks).unwrap(), "- `c'i`: failed");
+    fn the_summary_lists_each_check_and_why_a_read_failed() {
+        assert_eq!(summary(&Seen::default()), None);
+        let seen = Seen {
+            checks: vec![Check {
+                name: "c`i".to_string(),
+                outcome: Outcome::Failed,
+            }],
+            unreadable: Some("HTTP 502".to_string()),
+        };
+        assert_eq!(
+            summary(&seen).unwrap(),
+            "- the checks could not be read: HTTP 502\n- `c'i`: failed"
+        );
     }
 }
