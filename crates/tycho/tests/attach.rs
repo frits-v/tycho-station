@@ -23,19 +23,20 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{IsTerminal, Write};
+use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use nix::fcntl::OFlag;
 use nix::unistd::{access, AccessFlags, Group, User};
 use tycho::agent_files::current_uid;
 use tycho::command::{self, CommandError};
 use tycho::config::{
     ToolPrefix, AGENT_SOCKET_DIR_DEFAULT, AGENT_USER_DEFAULT, TOOL_PREFIX_DEFAULT,
 };
-use tycho::zmx::{self, Presence, Zmx, SESSION_ENV};
+use tycho::zmx::{self, ListEntry, Presence, Zmx, SESSION_ENV};
 
 const SUDO: &str = "/usr/bin/sudo";
 const SCRIPT: &str = "/usr/bin/script";
@@ -46,9 +47,17 @@ const GHOSTTY_APP: &str = "/Applications/Ghostty.app";
 const SHARED_GROUP: &str = "tycho-zmx";
 /// zmx 0.8.1 sets the log directory's mode from this and each log file's from the next; every
 /// client appends to `logs/zmx.log` and the session's log, so both users need them writable.
+/// The process umask masks both and the socket's mode, so every zmx run in the shared
+/// directory goes through `UMASK_EXEC`.
 const ZMX_DIR_MODE: &str = "0770";
 const ZMX_LOG_MODE: &str = "0660";
 const AGENT_PATH: &str = "PATH=/usr/bin:/bin";
+const SHELL: &str = "/bin/sh";
+/// Runs `$0` with its arguments under umask 007, the developer's clients included: under 022
+/// zmx makes a 0755 socket, a 0750 log directory and 0640 log files.
+const UMASK_EXEC: &str = "umask 007; exec \"$0\" \"$@\"";
+/// Exits 0 once `zmx list` shows a client attached to the session `$1` names as a pattern.
+const CLIENT_PROBE: &str = "umask 007; \"$0\" list | /usr/bin/grep -Eq \"$1\"";
 /// Covers the operator typing the password at the first prompt.
 const SUDO_TIMEOUT: Duration = Duration::from_secs(120);
 const OUTPUT_MAX_BYTES: usize = 65_536;
@@ -58,8 +67,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// reads as unanswered.
 const ANSWER_WAIT_MAX: Duration = Duration::from_secs(180);
 const MARKER_WAIT_MAX: Duration = Duration::from_secs(30);
-/// Lets `zmx attach` connect and set its terminal mode before the line is typed.
-const ATTACH_SETTLE: Duration = Duration::from_secs(2);
+/// How long a client gets to show as attached in `zmx list` before a line is typed.
+const ATTACH_WAIT_MAX: Duration = Duration::from_secs(10);
 const DETACH_WAIT_MAX: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MARKER_MAX_BYTES: u64 = 4096;
@@ -68,6 +77,7 @@ const EVIDENCE_MAX_CHARS: usize = 400;
 /// The agent-side shell's last line: who it ran as and what the script exited with.
 const RUN_MARKER: &str = "tycho-attach";
 const OPENED_PREFIX: &str = "opened terminal ";
+const NEVER_ATTACHED_PREFIX: &str = "never attached ";
 /// Ctrl-\, zmx's detach key.
 const DETACH_KEY: u8 = 0x1c;
 
@@ -82,33 +92,48 @@ const SPAWN_SESSIONS: &str = "umask 007; zmx=$1; export ZMX_DIR=\"$2\" ZMX_DIR_M
      while [ $# -ge 2 ]; do \"$zmx\" run \"$1\" -d exec /bin/sh -c \"$program\" sh \"$2\" \
      < /dev/null || status=$?; shift 2; done; exit $status";
 /// Ends each named session by name, never by pid, and removes its log.
-const KILL_SESSIONS: &str = "zmx=$1; dir=$2; export ZMX_DIR=\"$2\"; shift 2; status=0; \
+const KILL_SESSIONS: &str = "umask 007; zmx=$1; dir=$2; export ZMX_DIR=\"$2\"; shift 2; status=0; \
      for name in \"$@\"; do \"$zmx\" kill \"$name\" --force < /dev/null || status=$?; \
      /bin/rm -f \"$dir/logs/$name.log\"; done; exit $status";
 /// Runs inside the developer's zmx session: osascript's output and exit status land in files.
 const OSASCRIPT_IN_SESSION: &str =
-    "/usr/bin/osascript \"$1\" \"$2\" \"$3\" > \"$4\" 2> \"$5\"; echo $? > \"$6\"";
+    "/usr/bin/osascript \"$1\" \"$2\" \"$3\" \"$4\" > \"$5\" 2> \"$6\"; echo $? > \"$7\"";
 
-/// Opens a Ghostty tab running the attach command, types the line into it, and prints the
-/// tab's terminal id. A Ghostty that is not running is reported as -600, never launched.
+/// Opens a Ghostty tab running the attach command, waits until `zmx list` shows its client,
+/// types the line into it, and prints the tab's terminal id. A Ghostty that is not running is
+/// reported as -600, never launched.
 const OPEN_TAB_SCRIPT: &str = r#"on run argv
 	set attachCommand to item 1 of argv
 	set typedLine to item 2 of argv
+	set attachedProbe to item 3 of argv
 	if application id "com.mitchellh.ghostty" is not running then error "Ghostty is not running." number -600
 	tell application id "com.mitchellh.ghostty"
 		set surface to new surface configuration
 		set command of surface to attachCommand
+		set wait after command of surface to false
 		if (count of windows) is 0 then
 			set opened to selected tab of (new window with configuration surface)
 		else
 			set opened to new tab in front window with configuration surface
 		end if
 		set attached to focused terminal of opened
-		delay 2
+		set terminalId to id of attached
+	end tell
+	set clientSeen to false
+	repeat 40 times
+		try
+			do shell script attachedProbe
+			set clientSeen to true
+			exit repeat
+		end try
+		delay 0.25
+	end repeat
+	if not clientSeen then return "never attached " & terminalId
+	tell application id "com.mitchellh.ghostty"
 		input text typedLine to attached
 		send key "enter" to attached
-		return "opened terminal " & (id of attached)
 	end tell
+	return "opened terminal " & terminalId
 end run
 "#;
 
@@ -119,6 +144,19 @@ fn deadline_after(wait: Duration) -> Instant {
 
 fn cut(text: &str) -> String {
     text.chars().take(EVIDENCE_MAX_CHARS).collect()
+}
+
+/// One word for `/bin/sh`, single-quoted.
+fn shell_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
+fn shell_line(words: &[&str]) -> String {
+    words
+        .iter()
+        .map(|word| shell_quote(word))
+        .collect::<Vec<String>>()
+        .join(" ")
 }
 
 /// Why the suite refuses to start, if it does.
@@ -301,15 +339,26 @@ impl SharedZmx {
         ]
     }
 
-    fn listed(&self, name: &str) -> Listed {
-        match command::run_status_capped(
-            &self.binary,
-            &["list"],
+    fn zmx_text(&self) -> &str {
+        self.binary.to_str().unwrap_or("")
+    }
+
+    /// Runs zmx with `arguments` under umask 007 in the shared directory.
+    fn run(&self, arguments: &[&str]) -> Result<command::Captured, CommandError> {
+        let mut words = vec!["-c", UMASK_EXEC, self.zmx_text()];
+        words.extend_from_slice(arguments);
+        command::run_status_capped(
+            Path::new(SHELL),
+            &words,
             &self.environment(),
             &[OsString::from(SESSION_ENV)],
             COMMAND_TIMEOUT,
             OUTPUT_MAX_BYTES,
-        ) {
+        )
+    }
+
+    fn listed(&self, name: &str) -> Listed {
+        match self.run(&["list"]) {
             Ok(captured) => decode_listing(
                 captured.status.code(),
                 &captured.stdout,
@@ -320,16 +369,93 @@ impl SharedZmx {
         }
     }
 
-    /// The command a Ghostty tab runs: no inherited session, and no detach key on the outer
-    /// client, as design section 12 names it.
-    fn attach_command(&self, name: &str) -> String {
-        format!(
-            "/usr/bin/env -u {SESSION_ENV} ZMX_DIR={} ZMX_DIR_MODE={ZMX_DIR_MODE} \
-             ZMX_LOG_MODE={ZMX_LOG_MODE} ZMX_NO_DETACH_KEY=1 {} attach {name}",
-            self.dir,
-            self.binary.display()
-        )
+    fn entries(&self) -> Result<Vec<ListEntry>, String> {
+        let captured = self.run(&["list"]).map_err(|error| error.to_string())?;
+        if !captured.status.success() {
+            return Err(format!(
+                "{}: {}",
+                captured.status,
+                cut(captured.stderr.trim())
+            ));
+        }
+        zmx::decode_list(&captured.stdout).map_err(|error| format!("{error:?}"))
     }
+
+    /// The number of clients `zmx list` shows on the session, when it lists it once.
+    fn clients(&self, name: &str) -> Option<u32> {
+        let captured = self.run(&["list"]).ok()?;
+        captured
+            .status
+            .success()
+            .then(|| clients_of(&captured.stdout, name))
+            .flatten()
+    }
+
+    fn kill(&self, name: &str) -> String {
+        match self.run(&["kill", name, "--force"]) {
+            Ok(captured) => format!("{}: {}", captured.status, cut(captured.stdout.trim())),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    /// The command a Ghostty tab runs: umask 007, no inherited session, and no detach key on
+    /// the outer client, as design section 12 names it; every word quoted.
+    fn attach_command(&self, name: &str) -> String {
+        let directory = format!("ZMX_DIR={}", self.dir);
+        let dir_mode = format!("ZMX_DIR_MODE={ZMX_DIR_MODE}");
+        let log_mode = format!("ZMX_LOG_MODE={ZMX_LOG_MODE}");
+        shell_line(&[
+            SHELL,
+            "-c",
+            UMASK_EXEC,
+            "/usr/bin/env",
+            "-u",
+            SESSION_ENV,
+            &directory,
+            &dir_mode,
+            &log_mode,
+            "ZMX_NO_DETACH_KEY=1",
+            self.zmx_text(),
+            "attach",
+            name,
+        ])
+    }
+
+    /// A command that exits 0 once `zmx list` shows a client on the session; the tab script
+    /// runs it before it types.
+    fn attached_probe(&self, name: &str) -> String {
+        let directory = format!("ZMX_DIR={}", self.dir);
+        let dir_mode = format!("ZMX_DIR_MODE={ZMX_DIR_MODE}");
+        let log_mode = format!("ZMX_LOG_MODE={ZMX_LOG_MODE}");
+        let pattern = format!("name={name}[[:space:]]+pid=[0-9]+[[:space:]]+clients=[1-9]");
+        shell_line(&[
+            "/usr/bin/env",
+            &directory,
+            &dir_mode,
+            &log_mode,
+            SHELL,
+            "-c",
+            CLIENT_PROBE,
+            self.zmx_text(),
+            &pattern,
+        ])
+    }
+}
+
+/// The `clients` field of the one listed line named `name`.
+fn clients_of(stdout: &str, name: &str) -> Option<u32> {
+    let named = format!("name={name}");
+    let mut found = stdout.lines().filter_map(|line| {
+        let fields: Vec<&str> = line.trim_start_matches([' ', '*']).split('\t').collect();
+        fields.contains(&named.as_str()).then(|| {
+            fields
+                .iter()
+                .find_map(|field| field.strip_prefix("clients="))
+                .and_then(|count| count.parse().ok())
+        })
+    });
+    let first = found.next()?;
+    found.next().is_none().then_some(first).flatten()
 }
 
 /// What a marker file says about a typed line.
@@ -355,9 +481,21 @@ fn judge_marker(found: Option<(&str, u32)>, typed: &str, agent_uid: u32) -> Mark
     }
 }
 
+/// Reads the marker in a directory the agent can write: opened without following a link and
+/// without blocking on a FIFO, typed and owned by the descriptor, and read within its bound.
 fn read_marker(path: &Path, typed: &str, agent_uid: u32) -> Marker {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return Marker::Absent;
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits())
+        .open(path);
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Marker::Absent,
+        Err(error) => return Marker::Garbled(format!("not opened: {error}")),
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => return Marker::Garbled(format!("no fstat: {error}")),
     };
     if !metadata.is_file() || metadata.len() > MARKER_MAX_BYTES {
         return Marker::Garbled(format!(
@@ -366,8 +504,17 @@ fn read_marker(path: &Path, typed: &str, agent_uid: u32) -> Marker {
             metadata.len()
         ));
     }
-    let content = fs::read_to_string(path).unwrap_or_default();
-    judge_marker(Some((&content, metadata.uid())), typed, agent_uid)
+    let mut content = String::new();
+    match file
+        .take(MARKER_MAX_BYTES.saturating_add(1))
+        .read_to_string(&mut content)
+    {
+        Ok(_) if u64::try_from(content.len()).unwrap_or(u64::MAX) > MARKER_MAX_BYTES => {
+            Marker::Garbled(format!("over {MARKER_MAX_BYTES} bytes"))
+        }
+        Ok(_) => judge_marker(Some((&content, metadata.uid())), typed, agent_uid),
+        Err(error) => Marker::Garbled(format!("not read: {error}")),
+    }
 }
 
 /// Waits for the marker within the bound; an absent marker after it stays absent.
@@ -386,6 +533,10 @@ fn wait_for_marker(path: &Path, typed: &str, agent_uid: u32) -> Marker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Answer {
     Opened {
+        terminal: String,
+    },
+    /// The tab opened and `zmx list` never showed its client within the script's bound.
+    NeverAttached {
         terminal: String,
     },
     /// -1743 not authorised, -1744 consent would be required.
@@ -413,14 +564,22 @@ fn error_code(line: &str) -> Option<i32> {
 
 fn decode_osascript(exit: Option<i32>, stdout: &str, stderr: &str) -> Answer {
     match exit {
+        Some(0) if !stderr.trim().is_empty() => {
+            Answer::Unrecognised(format!("exit 0 with stderr {}", cut(stderr.trim())))
+        }
         Some(0) => {
-            let terminal = stdout.trim().strip_prefix(OPENED_PREFIX).unwrap_or("");
-            if terminal.is_empty() || !stderr.trim().is_empty() {
-                Answer::Unrecognised(format!("exit 0: {}", cut(stdout.trim())))
-            } else {
-                Answer::Opened {
+            let line = stdout.trim();
+            match (
+                line.strip_prefix(OPENED_PREFIX),
+                line.strip_prefix(NEVER_ATTACHED_PREFIX),
+            ) {
+                (Some(terminal), None) if !terminal.is_empty() => Answer::Opened {
                     terminal: terminal.to_string(),
-                }
+                },
+                (None, Some(terminal)) if !terminal.is_empty() => Answer::NeverAttached {
+                    terminal: terminal.to_string(),
+                },
+                _ => Answer::Unrecognised(format!("exit 0: {}", cut(line))),
             }
         }
         Some(exit) => {
@@ -504,6 +663,9 @@ fn tab_outcome(answer: Answer, requester: &str, marker: impl FnOnce() -> Marker)
             )),
             other => PathOutcome::Failed(format!("Ghostty terminal {terminal} opened; {other:?}")),
         },
+        Answer::NeverAttached { terminal } => PathOutcome::Failed(format!(
+            "Ghostty terminal {terminal} opened; zmx list never showed its client"
+        )),
         Answer::ConsentRequired { line, .. } => PathOutcome::ConsentRequired {
             requester: requester.to_string(),
             evidence: line,
@@ -594,7 +756,7 @@ fn xml_escape(text: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Job {
     Running,
-    /// Loaded and not yet run, or waiting to be spawned.
+    /// Loaded and not yet run, waiting to be spawned, or being spawned (`xpcproxy`).
     Waiting,
     Exited(i32),
     NotLoaded,
@@ -621,9 +783,8 @@ fn decode_job(exit: Option<i32>, stdout: &str, stderr: &str) -> Job {
     };
     match (field("state"), field("last exit code")) {
         (Some("running"), _) => Job::Running,
-        (Some("spawn scheduled"), _) | (Some("not running"), None | Some("(never exited)")) => {
-            Job::Waiting
-        }
+        (Some("spawn scheduled" | "xpcproxy"), _)
+        | (Some("not running"), None | Some("(never exited)")) => Job::Waiting,
         (Some("not running"), Some(code)) => code.parse().map_or_else(
             |_| Job::Unrecognised(format!("last exit code = {code}")),
             Job::Exited,
@@ -673,6 +834,8 @@ struct Entry {
     owner: Owner,
     mode: u32,
     socket: bool,
+    /// zmx 0.8.1 appends through a link at a log path, so one here is flagged.
+    symlink: bool,
     developer_writable: bool,
 }
 
@@ -686,6 +849,15 @@ fn writable_beyond_sockets(entries: &[Entry]) -> Vec<String> {
     entries
         .iter()
         .filter(|entry| entry.developer_writable && !entry.socket)
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+
+/// The entries that are symbolic links, each named.
+fn links(entries: &[Entry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|entry| entry.symlink)
         .map(|entry| entry.path.clone())
         .collect()
 }
@@ -716,6 +888,7 @@ fn shared_entries(dir: &Path, agent_uid: u32) -> Result<Vec<Entry>, String> {
                 owner: owner_of(metadata.uid(), agent_uid),
                 mode: metadata.permissions().mode() & 0o7777,
                 socket: metadata.file_type().is_socket(),
+                symlink: metadata.file_type().is_symlink(),
                 developer_writable: access(&path, AccessFlags::W_OK).is_ok(),
             });
             if entries.len() > SHARED_ENTRIES_MAX {
@@ -758,6 +931,7 @@ impl Drop for Scratch {
             arguments.extend(self.agent_sessions.iter().map(String::as_str));
             let killed = run_as_agent(&self.agent, KILL_SESSIONS, &arguments);
             println!("teardown: killed the agent's sessions by name: {killed:?}");
+            self.sweep_developer_sessions();
         }
         for dir in [&self.private, &self.drop] {
             if let Err(error) = fs::remove_dir_all(dir) {
@@ -767,27 +941,67 @@ impl Drop for Scratch {
     }
 }
 
-/// The throwaway launchd agent; booted out and its plist removed on teardown.
+impl Scratch {
+    /// Kills by name any session of this run's prefix that the developer owns in the shared
+    /// directory, which a `zmx attach` on a missing name creates, then prints what remains.
+    fn sweep_developer_sessions(&self) {
+        let prefix = format!("ta{}", std::process::id());
+        let entries = match self.shared.entries() {
+            Ok(entries) => entries,
+            Err(error) => {
+                println!("teardown: zmx list of the shared directory: {error}");
+                return;
+            }
+        };
+        for name in named_with_prefix(&entries, &prefix) {
+            let socket = Path::new(&self.shared.dir).join(&name);
+            let owner = fs::symlink_metadata(&socket).map(|metadata| metadata.uid());
+            if matches!(owner, Ok(uid) if uid == current_uid()) {
+                println!(
+                    "teardown: developer-owned {name} killed by name: {}",
+                    self.shared.kill(&name)
+                );
+            }
+        }
+        let remaining = self.shared.entries().map(|entries| {
+            entries
+                .iter()
+                .map(|entry| format!("{entry:?}"))
+                .collect::<Vec<String>>()
+        });
+        println!("teardown: the shared directory lists {remaining:?}");
+    }
+}
+
+/// The listed sessions whose name starts with `prefix`.
+fn named_with_prefix(entries: &[ListEntry], prefix: &str) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry {
+            ListEntry::Running { name, .. } | ListEntry::Ended { name, .. } => Some(name),
+            ListEntry::Unrecognised(_) => None,
+        })
+        .filter(|name| name.starts_with(prefix))
+        .cloned()
+        .collect()
+}
+
+/// The throwaway launchd agent, booted out on teardown; its plist lives in the private
+/// directory, so nothing loads it at a later login.
 struct LaunchdJob {
     target: String,
-    plist: PathBuf,
 }
 
 impl LaunchdJob {
     fn remove(&self) {
-        let answer = Command::new(LAUNCHCTL)
-            .args(["bootout", &self.target])
-            .output()
-            .map(|output| {
-                decode_bootout(
-                    output.status.code(),
-                    &String::from_utf8_lossy(&output.stderr),
-                )
-            });
+        let answer = command::run_status(
+            Path::new(LAUNCHCTL),
+            &["bootout", &self.target],
+            &[],
+            COMMAND_TIMEOUT,
+        )
+        .map(|captured| decode_bootout(captured.status.code(), &captured.stderr));
         println!("teardown: launchctl bootout {}: {answer:?}", self.target);
-        if let Err(error) = fs::remove_file(&self.plist) {
-            eprintln!("teardown: cannot remove {}: {error}", self.plist.display());
-        }
     }
 }
 
@@ -975,8 +1189,8 @@ fn attach_by_pty(shared: &SharedZmx, owner_uid: u32, target: &Target) -> PathOut
         Listed::AccessDenied(text) => return PathOutcome::CouldNotRun(format!("zmx list: {text}")),
         other => return PathOutcome::Unrecognised(format!("before attach: {other:?}")),
     }
-    let mut client = match Command::new(SCRIPT)
-        .args(["-q", "/dev/null"])
+    let mut client = match Command::new(SHELL)
+        .args(["-c", UMASK_EXEC, SCRIPT, "-q", "/dev/null"])
         .arg(&shared.binary)
         .args(["attach", &target.session])
         .env_remove(SESSION_ENV)
@@ -990,8 +1204,8 @@ fn attach_by_pty(shared: &SharedZmx, owner_uid: u32, target: &Target) -> PathOut
         Ok(child) => child,
         Err(error) => return PathOutcome::CouldNotRun(format!("{SCRIPT}: {error}")),
     };
-    std::thread::sleep(ATTACH_SETTLE);
-    let typed = type_into(&mut client, format!("{}\r", target.typed).as_bytes());
+    let typed = wait_for_client(shared, &target.session)
+        .and_then(|()| type_into(&mut client, format!("{}\r", target.typed).as_bytes()));
     let marker = wait_for_marker(&target.marker, &target.typed, owner_uid);
     let detached = type_into(&mut client, &[DETACH_KEY]).and_then(|()| wait_bounded(&mut client));
     let after = shared.listed(&target.session);
@@ -1006,6 +1220,20 @@ fn attach_by_pty(shared: &SharedZmx, owner_uid: u32, target: &Target) -> PathOut
             "typed {typed:?}, marker {marker:?}, detach {detached:?}, then {after:?}"
         )),
     }
+}
+
+/// Waits, bounded, until `zmx list` shows a client on the session.
+fn wait_for_client(shared: &SharedZmx, name: &str) -> Result<(), String> {
+    let deadline = deadline_after(ATTACH_WAIT_MAX);
+    while Instant::now() < deadline {
+        if shared.clients(name).is_some_and(|count| count > 0) {
+            return Ok(());
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    Err(format!(
+        "zmx list showed no client on {name} within {ATTACH_WAIT_MAX:?}"
+    ))
 }
 
 fn type_into(client: &mut Child, bytes: &[u8]) -> Result<(), String> {
@@ -1070,6 +1298,7 @@ fn tab_under_zmx(scratch: &mut Scratch, target: &Target) -> PathOutcome {
             .to_string(),
         scratch.shared.attach_command(&target.session),
         target.typed.clone(),
+        scratch.shared.attached_probe(&target.session),
     ]
     .into_iter()
     .chain(files.iter().map(|file| file.display().to_string()))
@@ -1094,29 +1323,28 @@ fn tab_under_zmx(scratch: &mut Scratch, target: &Target) -> PathOutcome {
     })
 }
 
-/// Writes the job's plist, new and never through a link, and bootstraps it in the GUI
-/// domain; the job is booted out and the plist removed on teardown.
+/// Writes the job's plist into the private directory, new and never through a link, and
+/// bootstraps it in the GUI domain; the job is booted out on teardown.
 fn install_job(
     scratch: &mut Scratch,
     target: &Target,
     outputs: &[PathBuf; 2],
 ) -> Result<String, PathOutcome> {
     let label = format!("tycho-attach-test-{}", std::process::id());
-    let home = PathBuf::from(env::var_os("HOME").unwrap());
-    let plist = home
-        .join("Library/LaunchAgents")
-        .join(format!("{label}.plist"));
+    let plist = scratch.private.join(format!("{label}.plist"));
     let script = scratch
         .private
         .join("open-tab.applescript")
         .display()
         .to_string();
     let attach = scratch.shared.attach_command(&target.session);
+    let probe = scratch.shared.attached_probe(&target.session);
     let arguments = [
         OSASCRIPT,
         script.as_str(),
         attach.as_str(),
         target.typed.as_str(),
+        probe.as_str(),
     ];
     let rendered = render_plist(&label, &arguments, &outputs[0], &outputs[1]);
     OpenOptions::new()
@@ -1131,7 +1359,6 @@ fn install_job(
     let job = format!("{domain}/{label}");
     scratch.launchd = Some(LaunchdJob {
         target: job.clone(),
-        plist: plist.clone(),
     });
     let plist_text = plist.display().to_string();
     match command::run_status(
@@ -1175,7 +1402,7 @@ fn wait_for_job(job: &str) -> Result<i32, PathOutcome> {
 fn answer_from_files(exit: i32, stdout: &Path, stderr: &Path) -> Answer {
     let read = |path: &Path| match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.len() > OUTPUT_FILE_MAX_BYTES => Err(format!(
-            "{} is over {OUTPUT_MAX_BYTES} bytes",
+            "{} is over {OUTPUT_FILE_MAX_BYTES} bytes",
             path.display()
         )),
         Ok(_) => fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display())),
@@ -1225,12 +1452,23 @@ fn record_shared_modes(scratch: &Scratch) {
     };
     for entry in &entries {
         println!(
-            "attach: shared entry {} owner {:?} mode {:o} socket {} developer-writable {}",
-            entry.path, entry.owner, entry.mode, entry.socket, entry.developer_writable
+            "attach: shared entry {} owner {:?} mode {:o} socket {} link {} developer-writable {}",
+            entry.path,
+            entry.owner,
+            entry.mode,
+            entry.socket,
+            entry.symlink,
+            entry.developer_writable
         );
         if entry.socket && !group_can_connect(entry.mode) {
             println!("attach:   the group cannot connect to {}", entry.path);
         }
+    }
+    for link in links(&entries) {
+        println!(
+            "attach: flagged: {link} is a symbolic link; zmx 0.8.1 appends to its log files \
+             through a link, so a developer's zmx run here writes where the link points"
+        );
     }
     println!(
         "attach: measured: beyond the sockets the developer can write {:?}; zmx 0.8.1 appends \
@@ -1385,9 +1623,25 @@ mod decoders {
                 terminal: "6F1C-22".to_string()
             }
         );
+        assert_eq!(
+            decode_osascript(Some(0), "never attached 6F1C-22\n", ""),
+            Answer::NeverAttached {
+                terminal: "6F1C-22".to_string()
+            }
+        );
+        let never = tab_outcome(
+            Answer::NeverAttached {
+                terminal: "T".to_string(),
+            },
+            "x",
+            || panic!("no marker is read for a tab that never attached"),
+        );
+        assert_eq!(disposition(&never), Disposition::Failed);
         for (stdout, stderr) in [
             ("", ""),
             ("something else\n", ""),
+            ("opened terminal \n", ""),
+            ("never attached \n", ""),
             ("opened terminal 1\n", "warning\n"),
         ] {
             assert!(
@@ -1425,7 +1679,7 @@ mod decoders {
                 Answer::GhosttyUnavailable { .. } => "unavailable",
                 Answer::Unanswered(_) => "no answer",
                 Answer::Unrecognised(_) => "unrecognised",
-                Answer::Opened { .. } => "opened",
+                Answer::Opened { .. } | Answer::NeverAttached { .. } => "opened",
             };
             assert_eq!(state, expected, "{stderr}");
             examined = examined.saturating_add(1);
@@ -1553,6 +1807,7 @@ mod decoders {
     }
 
     const EXITED: &str = include_str!("attach/launchctl-print-exited.txt");
+    const XPCPROXY: &str = include_str!("attach/launchctl-print-xpcproxy.txt");
     const RUNNING: &str = include_str!("../src/fixtures/launchctl-print-running.txt");
     const SCHEDULED: &str = include_str!("../src/fixtures/launchctl-print-scheduled.txt");
     const NOT_FOUND: &str = include_str!("../src/fixtures/launchctl-print-113.txt");
@@ -1560,6 +1815,11 @@ mod decoders {
     #[test]
     fn the_job_state_is_read_from_launchctl_print() {
         assert_eq!(decode_job(Some(0), EXITED, ""), Job::Exited(3));
+        assert_eq!(
+            decode_job(Some(0), XPCPROXY, ""),
+            Job::Waiting,
+            "launchctl print right after bootstrap"
+        );
         assert_eq!(decode_job(Some(0), RUNNING, ""), Job::Running);
         assert_eq!(decode_job(Some(0), SCHEDULED, ""), Job::Waiting);
         assert_eq!(decode_job(Some(113), "", NOT_FOUND), Job::NotLoaded);
@@ -1681,6 +1941,7 @@ mod decoders {
                 owner: Owner::Agent,
                 mode: 0o770,
                 socket: true,
+                symlink: false,
                 developer_writable: true,
             },
             Entry {
@@ -1688,6 +1949,7 @@ mod decoders {
                 owner: Owner::Agent,
                 mode: 0o660,
                 socket: false,
+                symlink: true,
                 developer_writable: true,
             },
             Entry {
@@ -1695,27 +1957,183 @@ mod decoders {
                 owner: Owner::Agent,
                 mode: 0o770,
                 socket: false,
+                symlink: false,
                 developer_writable: false,
             },
         ];
         assert_eq!(writable_beyond_sockets(&entries), ["logs/zmx.log"]);
+        assert_eq!(
+            links(&entries),
+            ["logs/zmx.log"],
+            "a planted link is flagged"
+        );
     }
 
     #[test]
-    fn the_tab_script_never_launches_ghostty_and_returns_the_terminal_id() {
+    fn the_tab_script_never_launches_ghostty_and_waits_for_the_client() {
         assert!(OPEN_TAB_SCRIPT.contains("is not running then error"));
         assert!(OPEN_TAB_SCRIPT.contains("number -600"));
+        assert!(OPEN_TAB_SCRIPT.contains("set wait after command of surface to false"));
         assert!(OPEN_TAB_SCRIPT.contains(&format!("return \"{OPENED_PREFIX}\"")));
+        assert!(OPEN_TAB_SCRIPT.contains(&format!("return \"{NEVER_ATTACHED_PREFIX}\"")));
+        let probe = OPEN_TAB_SCRIPT
+            .find("do shell script attachedProbe")
+            .unwrap();
+        let typing = OPEN_TAB_SCRIPT.find("input text typedLine").unwrap();
+        assert!(
+            probe < typing,
+            "the line is typed only after the client shows"
+        );
         let shared = SharedZmx {
             binary: PathBuf::from("/Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx"),
             dir: AGENT_SOCKET_DIR_DEFAULT.to_string(),
         };
         assert_eq!(
             shared.attach_command("ta1z"),
-            "/usr/bin/env -u ZMX_SESSION ZMX_DIR=/Users/Shared/tycho-agent-zmx ZMX_DIR_MODE=0770 \
-             ZMX_LOG_MODE=0660 ZMX_NO_DETACH_KEY=1 /Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx \
-             attach ta1z"
+            "'/bin/sh' '-c' 'umask 007; exec \"$0\" \"$@\"' '/usr/bin/env' '-u' 'ZMX_SESSION' \
+             'ZMX_DIR=/Users/Shared/tycho-agent-zmx' 'ZMX_DIR_MODE=0770' 'ZMX_LOG_MODE=0660' \
+             'ZMX_NO_DETACH_KEY=1' '/Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx' 'attach' \
+             'ta1z'"
         );
+    }
+
+    #[test]
+    fn a_quoted_line_reaches_the_program_word_for_word() {
+        let words = ["a b", "it's", "$HOME", "\"q\"", "*"];
+        let output = Command::new("/bin/sh")
+            .args(["-c", &format!("printf '%s|' {}", shell_line(&words))])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "a b|it's|$HOME|\"q\"|*|"
+        );
+        let umask = Command::new("/bin/sh")
+            .args(["-c", UMASK_EXEC, "/bin/sh", "-c", "umask"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8(umask.stdout).unwrap().trim(), "0007");
+    }
+
+    /// A stand-in zmx whose `list` prints `FAKE_LIST`.
+    fn fake_zmx(dir: &Path) -> SharedZmx {
+        let binary = dir.join("zmx");
+        fs::write(&binary, "#!/bin/sh\nprintf '%s' \"$FAKE_LIST\"\n").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+        SharedZmx {
+            binary,
+            dir: dir.display().to_string(),
+        }
+    }
+
+    #[test]
+    fn the_client_probe_passes_only_once_a_client_shows_on_its_session() {
+        let dir = env::temp_dir().join(format!("tycho-attach-probe-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let shared = fake_zmx(&dir);
+        let probe = shared.attached_probe("ta1z");
+        let cases = [
+            (
+                "  name=ta1z\tpid=7\tclients=1\tcreated=1\tcwd=file://h/\n",
+                true,
+            ),
+            (
+                "  name=ta1z\tpid=7\tclients=0\tcreated=1\tcwd=file://h/\n",
+                false,
+            ),
+            (
+                "  name=ta1zz\tpid=7\tclients=1\tcreated=1\tcwd=file://h/\n",
+                false,
+            ),
+            (
+                "  name=ta2z\tpid=7\tclients=1\tcreated=1\tcwd=file://h/\n",
+                false,
+            ),
+            ("", false),
+        ];
+        for (listing, attached) in cases {
+            let status = Command::new("/bin/sh")
+                .args(["-c", &probe])
+                .env("FAKE_LIST", listing)
+                .status()
+                .unwrap();
+            assert_eq!(status.success(), attached, "{listing:?}");
+            assert_eq!(
+                clients_of(listing, "ta1z").is_some_and(|count| count > 0),
+                attached,
+                "{listing:?}"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn clients_are_read_from_the_one_line_naming_the_session() {
+        let line = "  name=ta1p\tpid=7\tclients=1\tcreated=1\tcwd=file://h/\n";
+        assert_eq!(clients_of(line, "ta1p"), Some(1));
+        assert_eq!(clients_of(line, "ta1"), None);
+        assert_eq!(
+            clients_of(&format!("{line}{line}"), "ta1p"),
+            None,
+            "a duplicate name"
+        );
+        assert_eq!(clients_of("  name=ta1p\tpid=7\tclients=x\n", "ta1p"), None);
+    }
+
+    #[test]
+    fn the_sweep_names_only_this_runs_sessions() {
+        let entries = [
+            ListEntry::Running {
+                name: "ta123p".to_string(),
+                pid: 7,
+                created_unix_seconds: 1,
+            },
+            ListEntry::Ended {
+                name: "ta123z".to_string(),
+                pid: 8,
+                exit_code: 0,
+            },
+            ListEntry::Running {
+                name: "ta999p".to_string(),
+                pid: 9,
+                created_unix_seconds: 1,
+            },
+            ListEntry::Unrecognised("ta123l garbage".to_string()),
+        ];
+        assert_eq!(named_with_prefix(&entries, "ta123"), ["ta123p", "ta123z"]);
+    }
+
+    #[test]
+    fn a_planted_link_fifo_or_oversized_marker_is_garbled_and_never_followed() {
+        let dir = env::temp_dir().join(format!("tycho-attach-marker-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let target = dir.join("target");
+        fs::write(&target, "typed-1-p\n").unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let fifo = dir.join("fifo");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let big = dir.join("big");
+        fs::write(&big, "x".repeat(5000)).unwrap();
+        let uid = current_uid();
+        assert_eq!(
+            read_marker(&target, "typed-1-p", uid),
+            Marker::Arrived("typed-1-p".to_string())
+        );
+        for path in [&link, &fifo, &big] {
+            let marker = read_marker(path, "typed-1-p", uid);
+            assert!(
+                matches!(marker, Marker::Garbled(_)),
+                "{}: {marker:?}",
+                path.display()
+            );
+            assert!(!format!("{marker:?}").contains("typed-1-p"), "{marker:?}");
+        }
+        assert_eq!(
+            read_marker(&dir.join("absent"), "typed-1-p", uid),
+            Marker::Absent
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
