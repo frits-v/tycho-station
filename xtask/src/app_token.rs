@@ -72,6 +72,13 @@ pub struct Repository {
     name: String,
 }
 
+impl Repository {
+    /// `owner/name`, as API paths name it.
+    pub fn full_name(&self) -> String {
+        format!("{}/{}", self.owner, self.name)
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum InstallationOutcome {
     Found(u64),

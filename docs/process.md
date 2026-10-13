@@ -476,3 +476,68 @@ GitHub App installation token that the xtask mints for each run:
   workflow's own `GITHUB_TOKEN` and are unaffected. A key that does not belong to the App
   the id names, or an App not installed on this repository, fails the installation lookup with
   GitHub's message.
+
+## Code review
+
+The `review` workflow runs `xtask review` on every pull request from a branch of this
+repository that is not a draft and not the release pull request. Claude reviews the change
+and the xtask posts at most one review per push, with event `COMMENT`: it never approves or
+requests changes, and the `ci` check stays the only required one.
+
+- The xtask diffs the pull request's merge base against its head commit, which the job checks
+  out, leaving out `Cargo.lock`, `config/export` and `docs/figures`. A diff over 512 KiB, or one
+  with no head-side lines once those are left out, fails the job instead of being cut.
+- A find pass runs `claude -p` (model alias `opus`) with the diff, `CLAUDE.md`, the ledger
+  and this document to read, and returns at most 20 candidates in the JSON Schema exported
+  from `schemas/review.cue`. Each of the 12 most severe candidates then gets a verify pass in
+  a fresh session, four at a time, that tries to refute it and answers `confirmed` or
+  `refuted`; the job log shows each verdict's reasoning. Only confirmed findings are posted.
+- A finding on a line the diff shows becomes an inline comment; any other goes into the
+  review's body with its location, since GitHub refuses a whole review whose comment names a
+  line outside the diff. Every posted finding carries a fingerprint of its path, category and
+  summary in a hidden marker. The next run reads the pull request's review comments (at most
+  300; more fails the job), lists them for the find pass, and skips any finding whose
+  fingerprint is already there.
+- The model runs with the tools Read, Grep and Glob under permission mode `dontAsk`, which
+  refuses any read outside the checkout, and with `--setting-sources ""`, so the pull
+  request's `.claude/settings.json` adds no hook or permission. Its environment is `PATH`,
+  `HOME`, `LANG`, `TMPDIR`, the user name and the Anthropic access token: never the GitHub
+  token or the OIDC request variables. Model text is posted with `<`, `>`, `&` and `@`
+  escaped, so it can neither forge a marker nor mention anyone. A finding that holds the run's
+  own token fails the job and posts nothing; one that holds another credential prefix is
+  withheld and counted.
+- Each find pass is capped at 80 turns and $10, each verify pass at 30 turns and $2; the job
+  prints the count of every stage and the total cost, and writes them to the step summary.
+  A verify pass that ends without a verdict fails the job after the confirmed findings are
+  posted.
+- `mise run review` runs both passes locally against `origin/main` with the developer's
+  Claude login and prints the findings without posting. It refuses a tree with uncommitted
+  changes, since the model reads the working tree.
+
+Authentication is workload identity federation; no Anthropic key is stored:
+
+- The xtask asks the Actions OIDC endpoint for a token with audience
+  `https://api.anthropic.com`, then trades it at `https://api.anthropic.com/v1/oauth/token`
+  with a JWT bearer grant naming the federation rule, the organization and, when set, the
+  service account and workspace. It requires a `Bearer` token type and an `expires_in` of at
+  most a day, and bounds the whole run to that lifetime less two minutes, at most 30 minutes.
+  Both calls are made in process like the release exchange; the OIDC token never leaves the
+  xtask, and the access token reaches the Claude CLI only as `ANTHROPIC_AUTH_TOKEN`.
+  Anthropic documents no revocation for the access token; it lapses after `expires_in`.
+- The job holds `id-token: write`, so every step in it, the `cargo build` of the xtask
+  included, can request an OIDC token. Building before the GitHub token is mapped keeps that
+  token from build scripts; it does not keep them from the OIDC token. A writer who can push a
+  branch can already change the xtask, so this is the trust the `code-scanning` job extends
+  too. A fork's pull request gets no OIDC token, and the job skips it.
+- Setup, once: the federation rule matches this repository's GitHub OIDC tokens with
+  audience `https://api.anthropic.com`. Its identifiers are repository variables:
+
+  ```sh
+  gh variable set ANTHROPIC_FEDERATION_RULE_ID -R frits-v/tycho-station --body <fdrl_...>
+  gh variable set ANTHROPIC_ORGANIZATION_ID -R frits-v/tycho-station --body <organization uuid>
+  gh variable set ANTHROPIC_SERVICE_ACCOUNT_ID -R frits-v/tycho-station --body <svac_...>
+  gh variable set ANTHROPIC_WORKSPACE_ID -R frits-v/tycho-station --body <wrkspc_...>
+  ```
+
+  Without the rule and organization variables the job fails with a message naming them and
+  this section.

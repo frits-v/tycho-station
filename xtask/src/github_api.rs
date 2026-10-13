@@ -1,5 +1,6 @@
-//! Calls to the GitHub REST API made in process, so a credential travels only as an
-//! `Authorization: Bearer` header inside the TLS stream: never in a child process's arguments,
+//! Calls to the GitHub REST API, and to the few HTTPS endpoints outside it that a credential
+//! exchange needs, made in process, so a credential travels only as an `Authorization: Bearer`
+//! header or a request body inside the TLS stream: never in a child process's arguments,
 //! environment or output. TLS is rustls on aws-lc-rs with the webpki root store compiled in.
 
 use std::sync::Arc;
@@ -13,6 +14,11 @@ const API_VERSION: &str = "2022-11-28";
 const USER_AGENT: &str = "tycho-xtask";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const RESPONSE_MAX_BYTES: u64 = 256 * 1024;
+const GITHUB_HEADERS: [(&str, &str); 2] = [
+    ("Accept", "application/vnd.github+json"),
+    ("X-GitHub-Api-Version", API_VERSION),
+];
+const PLAIN_HEADERS: [(&str, &str); 1] = [("Accept", "application/json")];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
@@ -96,38 +102,78 @@ impl Client {
             &self.agent,
             &format!("{}{path}", self.base),
             method,
+            &GITHUB_HEADERS,
+            Some(credential),
+            json_body,
+        )
+    }
+}
+
+/// A client for absolute HTTPS URLs outside GitHub's REST API, such as the Actions OIDC
+/// endpoint and a token exchange; it sends JSON headers only, and a credential only when given.
+#[derive(Debug)]
+pub struct PlainClient {
+    agent: Agent,
+}
+
+impl PlainClient {
+    pub fn https() -> Self {
+        Self { agent: agent(true) }
+    }
+
+    #[cfg(test)]
+    pub fn loopback() -> Self {
+        Self {
+            agent: agent(false),
+        }
+    }
+
+    pub fn request(
+        &self,
+        method: Method,
+        url: &str,
+        credential: Option<&str>,
+        json_body: Option<&str>,
+    ) -> Reply {
+        send(
+            &self.agent,
+            url,
+            method,
+            &PLAIN_HEADERS,
             credential,
             json_body,
         )
     }
 }
 
+fn with_headers<Body>(
+    mut builder: ureq::RequestBuilder<Body>,
+    headers: &[(&str, &str)],
+    authorization: Option<&str>,
+) -> ureq::RequestBuilder<Body> {
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    if let Some(authorization) = authorization {
+        builder = builder.header("Authorization", authorization);
+    }
+    builder
+}
+
 fn send(
     agent: &Agent,
     url: &str,
     method: Method,
-    credential: &str,
+    headers: &[(&str, &str)],
+    credential: Option<&str>,
     json_body: Option<&str>,
 ) -> Reply {
-    let authorization = format!("Bearer {credential}");
+    let authorization = credential.map(|credential| format!("Bearer {credential}"));
+    let authorization = authorization.as_deref();
     let sent = match method {
-        Method::Get => agent
-            .get(url)
-            .header("Authorization", &authorization)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", API_VERSION)
-            .call(),
-        Method::Delete => agent
-            .delete(url)
-            .header("Authorization", &authorization)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", API_VERSION)
-            .call(),
-        Method::Post => agent
-            .post(url)
-            .header("Authorization", &authorization)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", API_VERSION)
+        Method::Get => with_headers(agent.get(url), headers, authorization).call(),
+        Method::Delete => with_headers(agent.delete(url), headers, authorization).call(),
+        Method::Post => with_headers(agent.post(url), headers, authorization)
             .content_type("application/json")
             .send(json_body.unwrap_or("{}")),
     };
@@ -269,6 +315,50 @@ pub mod tests {
         let raw = requests.first().unwrap();
         assert!(raw.starts_with("POST /p HTTP/1.1\r\n"), "{raw}");
         assert!(raw.ends_with("\r\n\r\n{\"a\":1}"), "{raw}");
+    }
+
+    #[test]
+    fn a_plain_request_carries_json_headers_and_a_credential_only_when_given() {
+        let (base, seen) = listener(vec![
+            (200, r#"{"value":"v"}"#.to_string()),
+            (200, "{}".to_string()),
+        ]);
+        let client = PlainClient::loopback();
+        let with_credential = client.request(
+            Method::Get,
+            &format!("{base}/token?api-version=2.0&audience=a"),
+            Some("request.token"),
+            None,
+        );
+        assert!(matches!(
+            with_credential,
+            Reply::Response { status: 200, .. }
+        ));
+        let without = client.request(Method::Post, &format!("{base}/x"), None, Some("{}"));
+        assert!(matches!(without, Reply::Response { status: 200, .. }));
+        let requests = seen.recv().unwrap();
+        let first = requests.first().unwrap().to_ascii_lowercase();
+        assert!(
+            first.starts_with("get /token?api-version=2.0&audience=a http/1.1\r\n"),
+            "{first}"
+        );
+        assert!(first.contains("\r\nauthorization: bearer request.token\r\n"));
+        assert!(first.contains("\r\naccept: application/json\r\n"));
+        assert!(!first.contains("x-github-api-version"));
+        let second = requests.get(1).unwrap().to_ascii_lowercase();
+        assert!(!second.contains("authorization"), "{second}");
+    }
+
+    #[test]
+    fn the_plain_client_is_https_only_without_proxy_or_redirects() {
+        let config = PlainClient::https().agent.config().clone();
+        assert!(config.https_only());
+        assert!(config.proxy().is_none());
+        assert_eq!(config.max_redirects(), 0);
+        assert_eq!(
+            PlainClient::https().request(Method::Get, "http://127.0.0.1:9/", None, None),
+            Reply::Failed("the URL is not HTTPS")
+        );
     }
 
     #[test]

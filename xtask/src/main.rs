@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
 
+mod anthropic_token;
 mod app_token;
 mod checkout;
 mod clippy;
@@ -27,6 +28,7 @@ mod prefix_manifest;
 mod process;
 mod provision;
 mod release;
+mod review;
 mod sarif;
 mod setup;
 mod test_step;
@@ -49,7 +51,7 @@ const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
 const DOC_DIRS: [&str; 1] = ["docs"];
 const RULES_DIR: &str = ".claude/rules";
 const RULE_MAX_LINES: usize = 24;
-const COMMANDS: [(&str, &str); 23] = [
+const COMMANDS: [(&str, &str); 24] = [
     (
         "ci",
         "format check, clippy, tests, workflow audits, opengrep, repository checks, PR title",
@@ -123,6 +125,10 @@ const COMMANDS: [(&str, &str); 23] = [
     (
         "release-binaries [tag]",
         "build this host's archives with dist, upload to the release",
+    ),
+    (
+        "review [--dry-run]",
+        "Claude reviews the pull request and posts one review; --dry-run prints it locally",
     ),
     (
         "hook post-tool-use",
@@ -906,6 +912,7 @@ fn main() {
         },
         Some("release") => release::release(),
         Some("release-binaries") => release::release_binaries(args.get(1).cloned()),
+        Some("review") => review::command(args.get(1).map(String::as_str)),
         Some("hook") if args.get(1).map(String::as_str) == Some("post-tool-use") => {
             hook_post_tool_use()
         }
