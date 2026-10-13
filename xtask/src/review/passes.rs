@@ -86,8 +86,8 @@ fn render(template: &str, context: &Context, finding: Option<&Finding>) -> Strin
         .unwrap_or_default();
     let in_files = |name: &str| context.files.join(name).display().to_string();
     template
-        .replace("{{head}}", &context.head)
-        .replace("{{base}}", &context.base)
+        .replace("{{head}}", context.head.as_str())
+        .replace("{{base}}", context.base.as_str())
         .replace("{{files}}", &context.files.display().to_string())
         .replace("{{diff}}", &in_files("diff.patch"))
         .replace("{{posted}}", &in_files("posted.json"))
