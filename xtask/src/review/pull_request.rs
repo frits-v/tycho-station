@@ -3,16 +3,20 @@
 
 use serde_json::Value;
 
+use super::verdict::Event;
 use crate::github_api::{github_message, Client, Method, Reply};
 
 const PER_PAGE: usize = 30;
 const PAGES_MAX: usize = 10;
 const BODY_EXCERPT_CHARS: usize = 300;
-/// The account the job's `GITHUB_TOKEN` posts as; markers in anyone else's text are ignored.
-const REVIEWER_LOGIN: &str = "github-actions[bot]";
+/// The mentions that ask for a review in a pull request comment.
+const MENTIONS: [&str; 2] = ["@frits-code-review", "@claude"];
+/// Who may ask: the repository's owner, its organisation's members and its collaborators.
+const ASKERS: [&str; 3] = ["OWNER", "MEMBER", "COLLABORATOR"];
+const COMMENT_MAX_CHARS: usize = 65_536;
 
-/// The fields of a `pull_request` event the review reads.
-#[derive(Debug, PartialEq, Eq)]
+/// The fields of a pull request the review reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequest {
     pub number: u64,
     pub base: String,
@@ -42,13 +46,83 @@ pub fn commit_sha(value: &str) -> bool {
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
-/// Decodes the event file Actions writes for a `pull_request` run.
-pub fn decode_event(text: &str) -> Result<PullRequest, String> {
+/// What started a posting run: a pull request marked ready, whose event carries it, or a
+/// comment asking for a review, which names only its number.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Trigger {
+    Ready(PullRequest),
+    Asked { number: u64 },
+}
+
+/// Whether `body` mentions the reviewer as a whole word.
+fn mentions(body: &str) -> bool {
+    MENTIONS.iter().any(|mention| {
+        body.match_indices(mention).any(|(start, _)| {
+            let before = body.get(..start).and_then(|text| text.chars().next_back());
+            let after = body
+                .get(start.saturating_add(mention.len())..)
+                .and_then(|text| text.chars().next());
+            before.is_none_or(char::is_whitespace)
+                && after.is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        })
+    })
+}
+
+/// Decodes the event of a posting run. Only `pull_request_target` marked ready and a new
+/// pull request comment from a writer that mentions the reviewer start a review; every other
+/// event is refused, so pushes and the review's own comments never start one.
+pub fn decode_trigger(event_name: &str, text: &str) -> Result<Trigger, String> {
     let event: Value =
         serde_json::from_str(text).map_err(|_| "the event file is not JSON".to_string())?;
-    let pull_request = event
-        .get("pull_request")
-        .ok_or("the event is not a pull_request event")?;
+    let action = event.get("action").and_then(Value::as_str);
+    match (event_name, action) {
+        ("pull_request_target", Some("ready_for_review")) => {
+            let pull_request = event
+                .get("pull_request")
+                .ok_or("the event has no pull request")?;
+            decode_pull_request(pull_request).map(Trigger::Ready)
+        }
+        ("issue_comment", Some("created")) => decode_ask(&event),
+        _ => Err(format!(
+            "a {event_name} event ({action:?}) does not start a review; mark the pull request \
+             ready or mention {} in a comment",
+            MENTIONS.join(" or ")
+        )),
+    }
+}
+
+fn decode_ask(event: &Value) -> Result<Trigger, String> {
+    let text_at = |pointer: &str| event.pointer(pointer).and_then(Value::as_str);
+    if event.pointer("/issue/pull_request").is_none() {
+        return Err("the comment is on an issue, not a pull request".to_string());
+    }
+    let body = text_at("/comment/body").unwrap_or_default();
+    if body.chars().count() > COMMENT_MAX_CHARS || !mentions(body) {
+        return Err(format!(
+            "the comment does not mention {}",
+            MENTIONS.join(" or ")
+        ));
+    }
+    if text_at("/comment/user/type") != Some("User") {
+        return Err("the comment is not from a user account".to_string());
+    }
+    let association = text_at("/comment/author_association").unwrap_or_default();
+    if !ASKERS.contains(&association) {
+        return Err(format!(
+            "the commenter's association is `{association}`; only {} ask for a review",
+            ASKERS.join(", ")
+        ));
+    }
+    event
+        .pointer("/issue/number")
+        .and_then(Value::as_u64)
+        .filter(|number| *number > 0)
+        .map(|number| Trigger::Asked { number })
+        .ok_or_else(|| "the comment's issue has no number".to_string())
+}
+
+/// The commits and head repository of a pull request object, from an event or the API.
+fn decode_pull_request(pull_request: &Value) -> Result<PullRequest, String> {
     let text_at = |pointer: &str| pull_request.pointer(pointer).and_then(Value::as_str);
     let number = pull_request
         .get("number")
@@ -72,19 +146,44 @@ pub fn decode_event(text: &str) -> Result<PullRequest, String> {
     })
 }
 
+/// The pull request as the API reports it now, for a run a comment started.
+pub fn fetch(
+    client: &Client,
+    token: &str,
+    repository: &str,
+    number: u64,
+) -> Result<PullRequest, String> {
+    let path = format!("/repos/{repository}/pulls/{number}");
+    match client.request(Method::Get, &path, token, None) {
+        Reply::Response { status: 200, body } => {
+            let value: Value = serde_json::from_str(&body)
+                .map_err(|_| "the pull request response is not JSON".to_string())?;
+            decode_pull_request(&value)
+        }
+        Reply::Response { status, body } => Err(format!(
+            "{path} ended HTTP {status}{}",
+            github_message(&body)
+                .map(|message| format!(", {message}"))
+                .unwrap_or_default()
+        )),
+        Reply::BodyTooLarge => Err(format!("{path} is over its cap")),
+        Reply::Failed(reason) => Err(format!("{path}: {reason}")),
+    }
+}
+
 fn excerpt(prefix: &str, text: &str) -> String {
     let text = text.trim();
     let skipped = text.chars().count().saturating_sub(BODY_EXCERPT_CHARS);
     format!("{prefix}{}", text.chars().skip(skipped).collect::<String>())
 }
 
-fn ours(item: &Value) -> bool {
-    item.pointer("/user/login").and_then(Value::as_str) == Some(REVIEWER_LOGIN)
+fn ours(item: &Value, login: &str) -> bool {
+    item.pointer("/user/login").and_then(Value::as_str) == Some(login)
 }
 
 /// Our findings in one inline comment, located by its path and line.
-fn from_comment(comment: &Value) -> Vec<Posted> {
-    if !ours(comment) {
+fn from_comment(comment: &Value, login: &str) -> Vec<Posted> {
+    if !ours(comment, login) {
         return Vec::new();
     }
     let body = comment
@@ -109,8 +208,8 @@ fn from_comment(comment: &Value) -> Vec<Posted> {
 }
 
 /// Our findings in one review's body, each located by its own entry.
-fn from_review(review: &Value) -> Vec<Posted> {
-    if !ours(review) {
+fn from_review(review: &Value, login: &str) -> Vec<Posted> {
+    if !ours(review, login) {
         return Vec::new();
     }
     let body = review
@@ -126,15 +225,10 @@ fn from_review(review: &Value) -> Vec<Posted> {
         .collect()
 }
 
-/// Every item of a paged listing, decoded; a listing that would go past [`PAGES_MAX`] is an
-/// error, not a truncation.
-fn listing(
-    client: &Client,
-    token: &str,
-    path: &str,
-    decode: fn(&Value) -> Vec<Posted>,
-) -> Result<Vec<Posted>, String> {
-    let mut posted = Vec::new();
+/// Every item of a paged listing; a listing that would go past [`PAGES_MAX`] is an error,
+/// not a truncation.
+fn listing(client: &Client, token: &str, path: &str) -> Result<Vec<Value>, String> {
+    let mut all = Vec::new();
     for page in 1..=PAGES_MAX {
         let paged = format!("{path}?per_page={PER_PAGE}&page={page}");
         let body = match client.request(Method::Get, &paged, token, None) {
@@ -153,9 +247,10 @@ fn listing(
         let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&body) else {
             return Err(format!("a page of {path} is not a JSON array"));
         };
-        posted.extend(items.iter().flat_map(decode));
-        if items.len() < PER_PAGE {
-            return Ok(posted);
+        let full = items.len() >= PER_PAGE;
+        all.extend(items);
+        if !full {
+            return Ok(all);
         }
     }
     Err(format!(
@@ -164,22 +259,34 @@ fn listing(
     ))
 }
 
-/// The findings earlier reviews posted on the pull request, inline and in review bodies.
-pub fn posted_findings(
+/// What the review App posted on the pull request before: its findings, inline and in
+/// review bodies, and how many reviews it posted.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Earlier {
+    pub posted: Vec<Posted>,
+    pub reviews: usize,
+}
+
+/// Reads what `login` posted on the pull request before; anyone else's text is ignored.
+pub fn earlier(
     client: &Client,
     token: &str,
     repository: &str,
     number: u64,
-) -> Result<Vec<Posted>, String> {
+    login: &str,
+) -> Result<Earlier, String> {
     let base = format!("/repos/{repository}/pulls/{number}");
-    let mut posted = listing(client, token, &format!("{base}/comments"), from_comment)?;
-    posted.extend(listing(
-        client,
-        token,
-        &format!("{base}/reviews"),
-        from_review,
-    )?);
-    Ok(posted)
+    let comments = listing(client, token, &format!("{base}/comments"))?;
+    let reviews = listing(client, token, &format!("{base}/reviews"))?;
+    let mut posted: Vec<Posted> = comments
+        .iter()
+        .flat_map(|comment| from_comment(comment, login))
+        .collect();
+    posted.extend(reviews.iter().flat_map(|review| from_review(review, login)));
+    Ok(Earlier {
+        posted,
+        reviews: reviews.iter().filter(|review| ours(review, login)).count(),
+    })
 }
 
 pub fn decode_post(status: u16, body: &str) -> PostOutcome {
@@ -201,15 +308,16 @@ pub fn decode_post(status: u16, body: &str) -> PostOutcome {
         )
 }
 
-/// Posts one review that comments and never approves or requests changes.
+/// Posts one review with the verdict's event on the head commit the review read.
 pub fn post_review(
     client: &Client,
     token: &str,
     repository: &str,
     pull_request: &PullRequest,
-    body: &str,
+    review: (Event, &str),
     comments: &[(String, u32, String)],
 ) -> PostOutcome {
+    let (event, body) = review;
     let comments: Vec<Value> = comments
         .iter()
         .map(|(path, line, text)| {
@@ -218,7 +326,7 @@ pub fn post_review(
         .collect();
     let request = serde_json::json!({
         "commit_id": pull_request.head,
-        "event": "COMMENT",
+        "event": event.api_name(),
         "body": body,
         "comments": comments,
     })
@@ -238,42 +346,121 @@ mod tests {
 
     const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
     const BASE: &str = "89abcdef0123456789abcdef0123456789abcdef";
+    const BOT: &str = "frits-code-review[bot]";
 
-    fn event(head: &str) -> String {
-        serde_json::json!({"pull_request": {
+    fn pull_request(head: &str) -> Value {
+        serde_json::json!({
             "number": 12,
             "base": {"sha": BASE},
             "head": {"sha": head, "repo": {"full_name": "o/r"}},
-        }})
+        })
+    }
+
+    fn ready(head: &str) -> String {
+        serde_json::json!({"action": "ready_for_review", "pull_request": pull_request(head)})
+            .to_string()
+    }
+
+    fn asked(body: &str, association: &str, kind: &str) -> String {
+        serde_json::json!({
+            "action": "created",
+            "issue": {"number": 12, "pull_request": {"url": "u"}},
+            "comment": {"body": body, "author_association": association,
+                        "user": {"login": "someone", "type": kind}},
+        })
         .to_string()
     }
 
     #[test]
-    fn the_event_decodes_and_a_malformed_one_is_refused() {
+    fn a_pull_request_marked_ready_starts_a_review_with_its_commits() {
         assert_eq!(
-            decode_event(&event(HEAD)),
-            Ok(PullRequest {
+            decode_trigger("pull_request_target", &ready(HEAD)),
+            Ok(Trigger::Ready(PullRequest {
                 number: 12,
                 base: BASE.to_string(),
                 head: HEAD.to_string(),
                 head_repository: "o/r".to_string(),
-            })
+            }))
         );
-        assert!(decode_event(&event("main")).is_err());
-        assert!(decode_event(&event(&HEAD.to_uppercase())).is_err());
-        assert!(decode_event(r#"{"push": {}}"#).is_err());
-        assert!(decode_event("nope").is_err());
-    }
-
-    fn comment(body: &str) -> Value {
-        serde_json::json!({"body": body, "path": "a.rs", "line": 3,
-            "user": {"login": REVIEWER_LOGIN}})
+        assert!(decode_trigger("pull_request_target", &ready("main")).is_err());
+        assert!(decode_trigger("pull_request_target", &ready(&HEAD.to_uppercase())).is_err());
+        assert!(decode_trigger("pull_request_target", "nope").is_err());
     }
 
     #[test]
-    fn our_marked_findings_are_collected_from_comments_and_review_bodies() {
+    fn opening_or_pushing_never_starts_a_review() {
+        for action in ["opened", "synchronize", "reopened", "edited"] {
+            let event = serde_json::json!({"action": action, "pull_request": pull_request(HEAD)});
+            let refused = decode_trigger("pull_request_target", &event.to_string()).unwrap_err();
+            assert!(refused.contains("does not start a review"), "{refused}");
+        }
+        assert!(decode_trigger("push", &ready(HEAD)).is_err());
+        assert!(decode_trigger("pull_request", &ready(HEAD)).is_err());
+    }
+
+    #[test]
+    fn a_writers_comment_mentioning_the_reviewer_asks_for_a_review() {
+        for body in [
+            "@frits-code-review please",
+            "can you look, @claude?",
+            "@claude",
+            "line one\n@frits-code-review",
+        ] {
+            assert_eq!(
+                decode_trigger("issue_comment", &asked(body, "MEMBER", "User")),
+                Ok(Trigger::Asked { number: 12 }),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_comment_without_the_mention_from_an_outsider_or_a_bot_or_on_an_issue_is_refused() {
+        for body in [
+            "no mention",
+            "@claudette",
+            "mail@claude",
+            "@frits-code-reviewer",
+        ] {
+            assert!(
+                decode_trigger("issue_comment", &asked(body, "OWNER", "User")).is_err(),
+                "{body}"
+            );
+        }
+        for association in ["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "NONE"] {
+            assert!(
+                decode_trigger("issue_comment", &asked("@claude", association, "User")).is_err()
+            );
+        }
+        assert!(decode_trigger("issue_comment", &asked("@claude", "OWNER", "Bot")).is_err());
+        let on_issue = serde_json::json!({"action": "created", "issue": {"number": 3},
+            "comment": {"body": "@claude", "author_association": "OWNER",
+                        "user": {"type": "User"}}});
+        assert!(decode_trigger("issue_comment", &on_issue.to_string()).is_err());
+        let edited = asked("@claude", "OWNER", "User").replace("\"created\"", "\"edited\"");
+        assert!(decode_trigger("issue_comment", &edited).is_err());
+    }
+
+    #[test]
+    fn a_pull_request_is_fetched_by_number() {
+        let (base, seen) = listener(vec![(200, pull_request(HEAD).to_string())]);
+        let fetched = fetch(&Client::loopback(&base), "t", "o/r", 12).unwrap();
+        assert_eq!(fetched.head, HEAD);
+        let requests = seen.recv().unwrap();
+        assert!(requests
+            .first()
+            .unwrap()
+            .starts_with("GET /repos/o/r/pulls/12 "));
+    }
+
+    fn comment(body: &str) -> Value {
+        serde_json::json!({"body": body, "path": "a.rs", "line": 3, "user": {"login": BOT}})
+    }
+
+    #[test]
+    fn only_the_apps_marked_findings_and_reviews_count() {
         let ours = "x\n<!-- tycho-review 0123456789abcdef -->";
-        let full: Vec<Value> = (0..PER_PAGE).map(|_| comment("someone else")).collect();
+        let full: Vec<Value> = (0..PER_PAGE).map(|_| comment("no marker")).collect();
         let planted = serde_json::json!({"body": "<!-- tycho-review 1111111111111111 -->",
             "path": "a.rs", "line": 3, "user": {"login": "someone"}});
         let last = vec![
@@ -281,31 +468,28 @@ mod tests {
             comment("<!-- tycho-review nothex -->"),
             planted,
         ];
+        let review = serde_json::json!({"user": {"login": BOT}, "body":
+            "- `b.rs:9` (Low, correctness): s\n  f\n  <!-- tycho-review fedcba9876543210 -->"});
         let planted_review = serde_json::json!({"user": {"login": "someone"},
             "body": "<!-- tycho-review 2222222222222222 -->"});
-        let review = serde_json::json!({"user": {"login": REVIEWER_LOGIN}, "body":
-            "- `b.rs:9` (Low, correctness): s\n  f\n  <!-- tycho-review fedcba9876543210 -->"});
+        let plain_review = serde_json::json!({"user": {"login": BOT}, "body": "Approve."});
         let (base, seen) = listener(vec![
             (200, Value::Array(full).to_string()),
             (200, Value::Array(last).to_string()),
             (
                 200,
-                Value::Array(vec![
-                    review,
-                    planted_review,
-                    serde_json::json!({"body": null}),
-                ])
-                .to_string(),
+                Value::Array(vec![review, planted_review, plain_review]).to_string(),
             ),
         ]);
-        let posted = posted_findings(&Client::loopback(&base), "t", "o/r", 12).unwrap();
-        let fingerprints: Vec<&str> = posted
+        let earlier = earlier(&Client::loopback(&base), "t", "o/r", 12, BOT).unwrap();
+        let fingerprints: Vec<&str> = earlier
+            .posted
             .iter()
             .map(|entry| entry.fingerprint.as_str())
             .collect();
         assert_eq!(fingerprints, ["0123456789abcdef", "fedcba9876543210"]);
-        assert_eq!(posted.first().unwrap().excerpt, "a.rs:3: x");
-        assert!(posted.get(1).unwrap().excerpt.contains("b.rs:9"));
+        assert_eq!(earlier.reviews, 2);
+        assert_eq!(earlier.posted.first().unwrap().excerpt, "a.rs:3: x");
         let requests = seen.recv().unwrap();
         assert!(requests
             .get(1)
@@ -321,13 +505,13 @@ mod tests {
     fn a_listing_past_its_bound_or_a_refusal_is_an_error() {
         let full = Value::Array((0..PER_PAGE).map(|_| comment("c")).collect());
         let (base, _seen) = listener(vec![(200, full.to_string()); PAGES_MAX]);
-        let error = posted_findings(&Client::loopback(&base), "t", "o/r", 1).unwrap_err();
+        let error = earlier(&Client::loopback(&base), "t", "o/r", 1, BOT).unwrap_err();
         assert!(error.contains("more than 300"), "{error}");
         let (base, _seen) = listener(vec![(
             403,
             r#"{"message":"Resource not accessible"}"#.into(),
         )]);
-        let error = posted_findings(&Client::loopback(&base), "t", "o/r", 1).unwrap_err();
+        let error = earlier(&Client::loopback(&base), "t", "o/r", 1, BOT).unwrap_err();
         assert!(
             error.contains("HTTP 403, Resource not accessible"),
             "{error}"
@@ -335,18 +519,21 @@ mod tests {
     }
 
     #[test]
-    fn the_review_comments_on_the_head_commit_and_never_approves() {
+    fn the_review_carries_the_verdicts_event_on_the_head_commit() {
         let (base, seen) = listener(vec![(
             200,
             r#"{"id":1,"html_url":"https://github.com/o/r/pull/12#pullrequestreview-1"}"#.into(),
         )]);
-        let pull_request = decode_event(&event(HEAD)).unwrap();
+        let Ok(Trigger::Ready(pull_request)) = decode_trigger("pull_request_target", &ready(HEAD))
+        else {
+            panic!("not ready");
+        };
         let outcome = post_review(
             &Client::loopback(&base),
             "t",
             "o/r",
             &pull_request,
-            "body",
+            (Event::RequestChanges, "body"),
             &[("a.rs".to_string(), 4, "text".to_string())],
         );
         assert!(matches!(outcome, PostOutcome::Posted { .. }), "{outcome:?}");
@@ -356,7 +543,7 @@ mod tests {
         let sent: Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(
             sent,
-            serde_json::json!({"commit_id": HEAD, "event": "COMMENT", "body": "body",
+            serde_json::json!({"commit_id": HEAD, "event": "REQUEST_CHANGES", "body": "body",
                 "comments": [{"path": "a.rs", "line": 4, "side": "RIGHT", "body": "text"}]})
         );
     }

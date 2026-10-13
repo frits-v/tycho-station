@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use crate::github_api::{Method, PlainClient, Reply};
+use crate::github_api::{Credential, Method, PlainClient, Reply};
 
 pub const FEDERATION_RULE_VARIABLE: &str = "ANTHROPIC_FEDERATION_RULE_ID";
 pub const ORGANIZATION_VARIABLE: &str = "ANTHROPIC_ORGANIZATION_ID";
@@ -287,7 +287,7 @@ fn mint_at(
     let oidc = client.request(
         Method::Get,
         &audience_url(&request.url),
-        Some(request.token.expose()),
+        Credential::Bearer(request.token.expose()),
         None,
     );
     let (status, body) =
@@ -302,7 +302,7 @@ fn mint_at(
     let exchanged = client.request(
         Method::Post,
         endpoint,
-        None,
+        Credential::None,
         Some(&exchange_body(federation, &assertion)),
     );
     let (status, body) =

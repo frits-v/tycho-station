@@ -479,65 +479,143 @@ GitHub App installation token that the xtask mints for each run:
 
 ## Code review
 
-The `review` workflow runs `xtask review` on every pull request from a branch of this
-repository that is not a draft and not the release pull request. Claude reviews the change
-and the xtask posts at most one review per push, with event `COMMENT`: it never approves or
-requests changes, and the `ci` check stays the only required one.
+Claude reviews a pull request and the review App `frits-code-review` posts a verdict on it:
+`APPROVE`, `REQUEST_CHANGES` or `COMMENT`. `xtask review` does all of it; the workflows only
+check out, build and run it.
 
-- The xtask diffs the pull request's merge base against its head commit, which the job checks
-  out, leaving out `Cargo.lock`, `config/export` and `docs/figures`. A diff over 512 KiB, or one
-  with no head-side lines once those are left out, fails the job instead of being cut.
-- A find pass runs `claude -p` (model alias `opus`) with the diff, `CLAUDE.md`, the ledger
-  and this document to read, and returns at most 20 candidates in the JSON Schema exported
-  from `schemas/review.cue`. Each of the 12 most severe candidates then gets a verify pass in
-  a fresh session, four at a time, that tries to refute it and answers `confirmed` or
-  `refuted`; the job log shows each verdict's reasoning. Only confirmed findings are posted.
-- A finding on a line the diff shows becomes an inline comment; any other goes into the
-  review's body with its location, since GitHub refuses a whole review whose comment names a
-  line outside the diff. Every posted finding carries a fingerprint of its path, category and
-  summary in a hidden marker. The next run reads the pull request's review comments (at most
-  300; more fails the job), lists them for the find pass, and skips any finding whose
-  fingerprint is already there.
+### When a review runs
+
+- The `review` workflow starts on `pull_request_target` when a pull request is marked ready
+  for review, and on `issue_comment` when a comment on a pull request mentions
+  `@frits-code-review` or `@claude` as a whole word, from an account of type `User` whose
+  association is `OWNER`, `MEMBER` or `COLLABORATOR`. Opening a pull request, pushing to it or
+  editing a comment starts nothing; the workflow's condition and the xtask's event decoder
+  both enforce this.
+- The review's own text holds no `@`: model text is posted with `<`, `>`, `&` and `@`
+  escaped. A review never asks for another one.
+- A pull request takes at most 20 reviews from the App; past that the run fails before
+  calling the model.
+- Runs of one pull request share a concurrency group; a new request cancels the run in
+  progress.
+
+### What runs where
+
+- The trusted `review` job runs the base branch's workflow and xtask. It checks the base
+  branch out at the workspace root and the pull request's head (`refs/pull/<n>/head`, the
+  head of a fork's pull request included) into `pull-request/`, builds the base branch's
+  xtask, and runs `xtask review --post pull-request`. Nothing from `pull-request/` is built
+  or run: the xtask runs git in it with `--no-ext-diff --no-textconv`, runs the Claude binary
+  `mise which claude` names from the base checkout (a mise shim run there would take the pull
+  request's pin), and hands the model only read tools.
+- The job runs in the `review` environment, whose secrets are the App key and the Langfuse
+  key. `pull_request_target` and `issue_comment` runs carry the default branch's ref, so an
+  environment that admits only the default branch serves them and refuses every branch's own
+  workflow.
+- The `review-dry-run` workflow runs by hand from any branch:
+  `gh workflow run review-dry-run.yml --ref <branch>`. It runs that branch's xtask with
+  `xtask review --dry-run` against `origin/main`, prints the verdict it would give and the
+  findings, writes them to the step summary, and posts nothing; it holds no App key. It is
+  how a change to the reviewer is tried before it reaches the base branch. `mise run review`
+  does the same locally with the developer's Claude login and refuses a tree with
+  uncommitted changes, since the model reads the working tree.
+
+### The review
+
+- The xtask diffs the merge base against the head, leaving out `Cargo.lock`, `config/export`
+  and `docs/figures`. A diff over 512 KiB, or one with no head-side lines once those are left
+  out, fails the run instead of being cut.
+- A find pass runs `claude -p` (model alias `opus`) with the diff, `CLAUDE.md`, the ledger and
+  this document to read, and returns at most 20 candidates in the JSON Schema exported from
+  `schemas/review.cue`, handed to the CLI without its `$schema` dialect. The App's earlier
+  findings on the pull request are listed for it; one that still holds is reported again.
+- Each of the 12 most severe candidates gets a verify pass in a fresh session, four at a
+  time, that tries to refute it and answers `confirmed` or `refuted`; the job log shows each
+  verdict's reasoning.
 - The model runs with the tools Read, Grep and Glob under permission mode `dontAsk`, which
-  refuses any read outside the checkout, and with `--setting-sources ""`, so the pull
-  request's `.claude/settings.json` adds no hook or permission. Its environment is `PATH`,
-  `HOME`, `LANG`, `TMPDIR`, the user name and the Anthropic access token: never the GitHub
-  token or the OIDC request variables. Model text is posted with `<`, `>`, `&` and `@`
-  escaped, so it can neither forge a marker nor mention anyone. A finding that holds the run's
-  own token fails the job and posts nothing; one that holds another credential prefix is
-  withheld and counted.
-- Each find pass is capped at 80 turns and $10, each verify pass at 30 turns and $2; the job
-  prints the count of every stage and the total cost, and writes them to the step summary.
-  A verify pass that ends without a verdict fails the job after the confirmed findings are
-  posted.
-- `mise run review` runs both passes locally against `origin/main` with the developer's
-  Claude login and prints the findings without posting. It refuses a tree with uncommitted
-  changes, since the model reads the working tree.
+  refuses any read outside the reviewed checkout and the run's own 0700 directory under
+  `RUNNER_TEMP`, passed with `--add-dir`; that directory holds the diff, the earlier findings
+  and the instructions, since the CLI refuses reads of gitignored paths. `--setting-sources ""`
+  keeps the pull request's `.claude/settings.json` from adding a hook or a permission. Its
+  environment is `PATH`, `HOME`, `LANG`, `TMPDIR`, the user name and the Anthropic access
+  token: never the App's token, the Langfuse keys or the OIDC request variables.
+- Each find pass is capped at 80 turns and $10, each verify pass at 30 turns and $2.
 
-Authentication is workload identity federation; no Anthropic key is stored:
+### The verdict
 
-- The xtask asks the Actions OIDC endpoint for a token with audience
-  `https://api.anthropic.com`, then trades it at `https://api.anthropic.com/v1/oauth/token`
-  with a JWT bearer grant naming the federation rule, the organization and, when set, the
-  service account and workspace. It requires a `Bearer` token type and an `expires_in` of at
-  most a day, and bounds the whole run to that lifetime less two minutes, at most 30 minutes.
-  Both calls are made in process like the release exchange; the OIDC token never leaves the
-  xtask, and the access token reaches the Claude CLI only as `ANTHROPIC_AUTH_TOKEN`.
-  Anthropic documents no revocation for the access token; it lapses after `expires_in`.
-- The job holds `id-token: write`, so every step in it, the `cargo build` of the xtask
-  included, can request an OIDC token. Building before the GitHub token is mapped keeps that
-  token from build scripts; it does not keep them from the OIDC token. A writer who can push a
-  branch can already change the xtask, so this is the trust the `code-scanning` job extends
-  too. A fork's pull request gets no OIDC token, and the job skips it.
-- Setup, once: the federation rule matches this repository's GitHub OIDC tokens with
-  audience `https://api.anthropic.com`. Its identifiers are repository variables:
+- A rule decides it from the confirmed findings, never the model: a confirmed high or medium
+  finding requests changes; without one, a high or medium candidate nobody judged (over the
+  cap of 12, or a verify pass that ended without a verdict) gets `COMMENT`, as does a fork's
+  pull request; otherwise the App approves. Low findings never block. A finding posted before
+  that still holds counts again.
+- While the passes run, nothing about the other checks reaches the model. Afterwards the
+  xtask reads the check runs and commit statuses on the head commit every 30 seconds, leaving
+  out the review's own jobs, until none is pending or 45 minutes after the start, and lists
+  each with its outcome in the review body. They never change the verdict: a failing required
+  check, code scanning alert or secret scanning result is the branch rules' to enforce, and
+  the review judges the code.
+- A new finding on a line the diff shows becomes an inline comment; any other goes into the
+  body, since GitHub refuses a whole review whose comment names a line outside the diff. Each
+  carries a fingerprint of its path, category and summary in a hidden marker; a finding whose
+  fingerprint the App posted before is not posted again. Only markers in the App's own
+  comments and reviews count, so nobody else's text can suppress a finding.
+- A finding that holds the run's own token fails the run and posts nothing; one that holds
+  another credential prefix is withheld and counted.
+- The run fails when it cannot post, when a verify pass gives no verdict, when the trace
+  cannot be sent, or when revoking the App's token fails; the verdict, when there is one, is
+  posted first.
+
+### Credentials
+
+- The App's installation token is minted like the release App's: an RS256 JWT from
+  `FRITS_CODE_REVIEW_CLIENT_ID` and `FRITS_CODE_REVIEW_APP_PRIVATE_KEY`, exchanged for a token
+  limited to this repository and to Checks read, Pull requests write and Commit statuses
+  read, whatever else the App is granted; a wider grant is refused and revoked. The App's
+  login, `<slug>[bot]`, comes from `GET /app`. The token is revoked when the run ends.
+- Anthropic: the xtask asks the Actions OIDC endpoint for a token with audience
+  `https://api.anthropic.com` and trades it at `https://api.anthropic.com/v1/oauth/token` with
+  a JWT bearer grant naming `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID` and,
+  when set, `ANTHROPIC_SERVICE_ACCOUNT_ID` and `ANTHROPIC_WORKSPACE_ID`. It requires a `Bearer`
+  token type and an `expires_in` of at most a day, and bounds the passes to that lifetime less
+  two minutes, at most 30 minutes. Anthropic documents no revocation; the token lapses.
+- In a job with an `environment:` the OIDC token's `sub` is
+  `repo:frits-v/tycho-station:environment:<name>`, so the federation rule matches the
+  `review` and `review-dry-run` environments.
+- All exchanges are made in process over HTTPS (rustls on aws-lc-rs, the webpki roots
+  compiled in, no proxy, no redirects); no token appears in arguments, output or errors.
+
+### Tracing
+
+When `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are all set, the
+xtask sends one trace per run to `<base>/api/public/otel/v1/traces` as OTLP/JSON, with Basic
+authentication and `x-langfuse-ingestion-version: 4`. The root span is the review (input the
+commit range, output the verdict and its reason, the counts as metadata) and each pass is a
+generation span with its instructions, its output, the model alias, its token counts and its
+cost. Runs of one pull request share the session `owner/name#<number>`; a dry run's session is
+`dry-run:<head>`. Each trace is tagged `post` or `dry-run`. None of the three set means no
+trace; some but not all is an error.
+
+### Setup, once
+
+- Install the App on this repository. Its repository permissions may be wider than the token
+  the xtask asks for.
+- Create the `review` environment admitting only the default branch, and put the App key and
+  the Langfuse secret key in it; create `review-dry-run` with only the Langfuse secret key:
 
   ```sh
-  gh variable set ANTHROPIC_FEDERATION_RULE_ID -R frits-v/tycho-station --body <fdrl_...>
-  gh variable set ANTHROPIC_ORGANIZATION_ID -R frits-v/tycho-station --body <organization uuid>
-  gh variable set ANTHROPIC_SERVICE_ACCOUNT_ID -R frits-v/tycho-station --body <svac_...>
-  gh variable set ANTHROPIC_WORKSPACE_ID -R frits-v/tycho-station --body <wrkspc_...>
+  gh api -X PUT repos/frits-v/tycho-station/environments/review \
+    -F 'deployment_branch_policy[protected_branches]=false' \
+    -F 'deployment_branch_policy[custom_branch_policies]=true'
+  gh api -X POST repos/frits-v/tycho-station/environments/review/deployment-branch-policies \
+    -f name=main -f type=branch
+  gh secret set FRITS_CODE_REVIEW_APP_PRIVATE_KEY -R frits-v/tycho-station --env review < key.pem
+  gh secret set LANGFUSE_SECRET_KEY -R frits-v/tycho-station --env review
+  gh api -X PUT repos/frits-v/tycho-station/environments/review-dry-run
+  gh secret set LANGFUSE_SECRET_KEY -R frits-v/tycho-station --env review-dry-run
   ```
 
-  Without the rule and organization variables the job fails with a message naming them and
-  this section.
+  Then delete the repository-level copies of both secrets, which every branch's workflow can
+  read. `FRITS_CODE_REVIEW_CLIENT_ID`, the four `ANTHROPIC_*` identifiers, `LANGFUSE_BASE_URL`
+  and `LANGFUSE_PUBLIC_KEY` are repository variables.
+- Whether the App's approval counts toward a required review is the repository ruleset's
+  setting. When it does, a review run that fails before posting leaves the pull request
+  without that approval: the review fails closed.

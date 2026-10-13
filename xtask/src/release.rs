@@ -7,9 +7,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::app_token::{
-    self, AppCredentials, Repository, APP_ID_VARIABLE, APP_KEY_VARIABLE, CLIENT_ID_VARIABLE,
-};
+use crate::app_token::{self, AppCredentials, Repository, RELEASE};
 use crate::process::{run_bounded, Captured, Exit};
 use std::time::Duration;
 use tycho_types::git_environment::git_command;
@@ -238,9 +236,10 @@ fn valid_tag(tag: &str) -> bool {
 
 fn release_pr_inputs() -> Result<(AppCredentials, Repository), String> {
     let credentials = app_token::read_credentials(
-        env::var(CLIENT_ID_VARIABLE).ok(),
-        env::var(APP_ID_VARIABLE).ok(),
-        env::var(APP_KEY_VARIABLE).ok(),
+        &RELEASE,
+        env::var(RELEASE.client_id_variable).ok(),
+        env::var(RELEASE.app_id_variable).ok(),
+        env::var(RELEASE.key_variable).ok(),
     )?;
     let repository = app_token::read_repository(env::var("GITHUB_REPOSITORY").ok())?;
     Ok((credentials, repository))
@@ -284,7 +283,7 @@ fn release_plz_command(
     command
         .args(args)
         .env_clear()
-        .envs(app_token::without_app_credentials(parent));
+        .envs(app_token::without_app_credentials(&RELEASE, parent));
     command
 }
 
@@ -735,9 +734,9 @@ mod tests {
     fn release_plz_never_receives_the_app_credentials() {
         let parent: Vec<(OsString, OsString)> = [
             ("PATH", "/usr/bin"),
-            (CLIENT_ID_VARIABLE, "Iv23liExample"),
-            (APP_ID_VARIABLE, "1"),
-            (APP_KEY_VARIABLE, "key-material"),
+            (RELEASE.client_id_variable, "Iv23liExample"),
+            (RELEASE.app_id_variable, "1"),
+            (RELEASE.key_variable, "key-material"),
         ]
         .into_iter()
         .map(|(name, value)| (name.into(), value.into()))
@@ -754,7 +753,7 @@ mod tests {
         let key_lines: Vec<usize> = lines
             .iter()
             .enumerate()
-            .filter(|(_, line)| line.contains(&format!("secrets.{APP_KEY_VARIABLE}")))
+            .filter(|(_, line)| line.contains(&format!("secrets.{}", RELEASE.key_variable)))
             .map(|(index, _)| index)
             .collect();
         assert_eq!(key_lines.len(), 1, "{key_lines:?}");

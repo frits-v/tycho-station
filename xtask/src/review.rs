@@ -1,94 +1,80 @@
-//! `xtask review`: a code review of a pull request by the Claude CLI, posted as one review.
+//! `xtask review`: a code review of a pull request by the Claude CLI, with a verdict.
 //!
 //! A find pass reports candidate findings against the diff; each candidate then gets a verify
-//! pass in a fresh session that tries to refute it. The xtask anchors what survives to lines
-//! the diff shows, drops what earlier runs posted, and posts one `COMMENT` review. The model
-//! reads only inside the checkout and never holds a GitHub credential.
+//! pass in a fresh session that tries to refute it. A rule over the confirmed findings decides
+//! the verdict; the other checks on the head commit are waited for and reported, never weighed.
+//! `--post` runs from the base branch's checkout, reviews a pull request checked out beside it
+//! as data, and posts the verdict as the review App; `--dry-run` reviews the checkout it runs
+//! in and posts nothing. The model reads only inside the reviewed checkout and the run's own
+//! directory, and never holds a GitHub credential. Each run is traced to Langfuse when it is
+//! configured.
 
+mod checks;
 mod claude_run;
 mod diff;
 mod findings;
+mod langfuse;
+mod passes;
 mod pull_request;
+mod report;
+mod setup;
+mod verdict;
 
-use std::collections::BTreeSet;
-use std::env;
-use std::fs;
-use std::io::Write as _;
-use std::os::unix::fs::DirBuilderExt as _;
-use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime};
 
-use serde_json::Value;
-use tycho_types::git_environment::git_command;
+use crate::anthropic_token::AccessToken;
+use crate::app_token::{self, InstallationToken};
+use langfuse::{Generation, Langfuse, Trace};
+use pull_request::{Posted, PullRequest};
+use verdict::Event;
 
-use crate::anthropic_token::{self, AccessToken};
-use crate::app_token;
-use crate::checkout;
-use crate::github_api::Client;
-use crate::process::{run_bounded, Exit};
-use claude_run::{Limits, RunOutcome};
-use diff::DiffMap;
-use findings::{Finding, Verdict};
-use pull_request::{PostOutcome, Posted, PullRequest};
-
-const FIND_SCHEMA: &str = include_str!("../../config/export/schema/review_findings.json");
-const VERDICT_SCHEMA: &str = include_str!("../../config/export/schema/review_verdict.json");
-const FIND_INSTRUCTIONS: &str = include_str!("../prompts/review-find.md");
-const VERIFY_INSTRUCTIONS: &str = include_str!("../prompts/review-verify.md");
 /// Generated or derived files: a review of them restates their sources.
 const EXCLUDED_PATHSPECS: [&str; 3] = [
     ":(exclude)Cargo.lock",
     ":(exclude)config/export",
     ":(exclude)docs/figures",
 ];
-const DIFF_MAX_BYTES: usize = 512 * 1024;
-const EVENT_MAX_BYTES: u64 = 1 << 20;
-const GIT_TIMEOUT: Duration = Duration::from_secs(120);
-const FIND_LIMITS: Limits = Limits {
-    max_turns: 80,
-    max_budget_usd: 10,
-};
-const VERIFY_LIMITS: Limits = Limits {
-    max_turns: 30,
-    max_budget_usd: 2,
-};
 const VERIFIED_MAX: usize = 12;
-const VERIFY_PARALLEL: usize = 4;
-const RUN_TIME_MAX: Duration = Duration::from_secs(30 * 60);
-/// Left unused at the end of the access token's life, so no run starts on a token about to lapse.
-const TOKEN_MARGIN: Duration = Duration::from_secs(120);
-const RUN_TIME_MIN: Duration = Duration::from_secs(10 * 60);
-const ONE_RUN_MIN: Duration = Duration::from_secs(60);
-const DRY_RUN_BASE: &str = "origin/main";
+/// How long after the review starts the other checks are waited for; the App's token lasts
+/// an hour from the start.
+const CHECKS_WAIT: Duration = Duration::from_secs(45 * 60);
 const SHORT_COMMIT_CHARS: usize = 12;
-/// The diff, the earlier findings and one instructions file per pass.
-const FILES_MAX: usize = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
-    Post,
     DryRun,
+    /// The pull request's head, checked out at this path, is reviewed and never run.
+    Post {
+        checkout: PathBuf,
+    },
 }
 
-/// Where a posting run sends its review.
+/// Where a posting run reads and writes on GitHub, as the review App.
 #[derive(Debug)]
-struct Destination {
-    token: String,
+struct GitHub {
+    token: InstallationToken,
     repository: String,
     pull_request: PullRequest,
 }
 
 #[derive(Debug)]
 struct Context {
-    root: PathBuf,
+    tag: &'static str,
+    /// The tree the model reads and the diff is taken in.
+    checkout: PathBuf,
     base: String,
     head: String,
+    claude: PathBuf,
     access_token: Option<AccessToken>,
-    destination: Option<Destination>,
+    github: Option<GitHub>,
+    /// `owner/name#number` in Actions; Langfuse groups a pull request's runs by it.
+    session: String,
+    fork: bool,
     posted: Vec<Posted>,
     run_time: Duration,
     user: Option<String>,
+    langfuse: Option<Langfuse>,
     /// A directory private to this run, outside the checkout: the CLI refuses reads of
     /// gitignored paths under `dontAsk`, so `target/` cannot hold what the model reads.
     files: PathBuf,
@@ -99,57 +85,51 @@ struct Tally {
     files: usize,
     hunks: usize,
     candidates: usize,
-    verified: usize,
     confirmed: usize,
     refuted: usize,
     unverified: usize,
-    already_posted: usize,
+    unjudged_blocking: usize,
+    still_holding: usize,
     withheld: usize,
     inline: usize,
     outside: usize,
     failed: Vec<String>,
     cost: u64,
+    generations: Vec<Generation>,
 }
 
-/// `xtask review [--dry-run]`.
-pub fn command(argument: Option<&str>) -> i32 {
-    match argument {
-        None => review(Mode::Post),
-        Some("--dry-run") => review(Mode::DryRun),
-        Some(other) => {
-            eprintln!("usage: xtask review [--dry-run]; got {other}");
-            2
+/// `xtask review --dry-run` or `xtask review --post <pull request checkout>`.
+pub fn command(arguments: &[String]) -> i32 {
+    let mode = match arguments {
+        [flag] if flag == "--dry-run" => Mode::DryRun,
+        [flag, checkout] if flag == "--post" => Mode::Post {
+            checkout: PathBuf::from(checkout),
+        },
+        _ => {
+            eprintln!("usage: xtask review --dry-run | --post <pull request checkout>");
+            return 2;
         }
-    }
-}
-
-fn review(mode: Mode) -> i32 {
-    match run(mode) {
-        Ok(code) => code,
+    };
+    let context = match setup::context(&mode) {
+        Ok(context) => context,
         Err(reason) => {
             eprintln!("xtask review: {reason}");
-            1
+            return 1;
         }
-    }
-}
-
-fn run(mode: Mode) -> Result<i32, String> {
-    let root = checkout::running_checkout()?;
-    let context = match mode {
-        Mode::Post => post_context(root)?,
-        Mode::DryRun => dry_run_context(root)?,
     };
-    let reviewed = review_in(&context);
-    remove_files(&context.files);
-    reviewed
+    let started = SystemTime::now();
+    let mut tally = Tally::default();
+    let reviewed = review(&context, &mut tally);
+    setup::remove_files(&context.files);
+    finish(&context, started, &tally, &reviewed)
 }
 
-fn review_in(context: &Context) -> Result<i32, String> {
+fn review(context: &Context, tally: &mut Tally) -> Result<(Event, String), String> {
     let started = Instant::now();
     let deadline = started
         .checked_add(context.run_time)
         .ok_or("the run deadline overflows")?;
-    let map = diff::parse_diff(&prepare(context)?)?;
+    let map = diff::parse_diff(&passes::prepare(context)?)?;
     if map.commentable.is_empty() {
         return Err(format!(
             "the diff {}...{} has no file with head-side lines to review once {} are excluded",
@@ -158,548 +138,91 @@ fn review_in(context: &Context) -> Result<i32, String> {
             EXCLUDED_PATHSPECS.join(", ")
         ));
     }
-    let mut tally = Tally {
-        files: map.files,
-        hunks: map.hunks,
-        ..Tally::default()
+    tally.files = map.files;
+    tally.hunks = map.hunks;
+    let candidates = passes::find(context, deadline, tally)?;
+    let confirmed = passes::verify(context, &candidates, deadline, tally);
+    let checks = match &context.github {
+        Some(github) => checks::wait(
+            &crate::github_api::Client::github(),
+            github.token.expose(),
+            &github.repository,
+            &context.head,
+            started.checked_add(CHECKS_WAIT).unwrap_or(started),
+        )?,
+        None => Vec::new(),
     };
-    let candidates = find(context, deadline, &mut tally)?;
-    let confirmed = verify(context, candidates, deadline, &mut tally);
-    publish(context, &map, confirmed, &mut tally)
-}
-
-fn required(name: &str) -> Result<String, String> {
-    env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| format!("{name} is unset; the review job sets it"))
-}
-
-fn read_event() -> Result<PullRequest, String> {
-    let path = required("GITHUB_EVENT_PATH")?;
-    let size = fs::metadata(&path)
-        .map_err(|error| format!("cannot read the event file: {error}"))?
-        .len();
-    if size > EVENT_MAX_BYTES {
-        return Err(format!("the event file is over {EVENT_MAX_BYTES} bytes"));
-    }
-    let text = fs::read_to_string(&path)
-        .map_err(|error| format!("cannot read the event file: {error}"))?;
-    pull_request::decode_event(&text)
-}
-
-fn current_user() -> Option<String> {
-    nix::unistd::User::from_uid(nix::unistd::Uid::current())
-        .ok()
-        .flatten()
-        .map(|user| user.name)
-}
-
-/// The run time the access token leaves, after the margin, capped at [`RUN_TIME_MAX`].
-fn run_time_for(expires_in_seconds: u64) -> Result<Duration, String> {
-    let usable = Duration::from_secs(expires_in_seconds).saturating_sub(TOKEN_MARGIN);
-    if usable < RUN_TIME_MIN {
-        return Err(format!(
-            "the access token lasts {expires_in_seconds} s; the review needs at least {} s",
-            RUN_TIME_MIN.saturating_add(TOKEN_MARGIN).as_secs()
-        ));
-    }
-    Ok(usable.min(RUN_TIME_MAX))
-}
-
-fn post_context(root: PathBuf) -> Result<Context, String> {
-    let repository = app_token::read_repository(env::var("GITHUB_REPOSITORY").ok())?.full_name();
-    let event = read_event()?;
-    if event.head_repository != repository {
-        return Err(format!(
-            "the pull request's head is in {}, not {repository}; a fork is not reviewed",
-            event.head_repository
-        ));
-    }
-    let checked_out = checkout::head_commit(&root)?;
-    if checked_out != event.head {
-        return Err(format!(
-            "the checkout is at {checked_out}, not the pull request's head {}",
-            event.head
-        ));
-    }
-    let federation = anthropic_token::read_federation(
-        env::var(anthropic_token::FEDERATION_RULE_VARIABLE).ok(),
-        env::var(anthropic_token::ORGANIZATION_VARIABLE).ok(),
-        env::var(anthropic_token::SERVICE_ACCOUNT_VARIABLE).ok(),
-        env::var(anthropic_token::WORKSPACE_VARIABLE).ok(),
-    )?;
-    let oidc = anthropic_token::read_oidc_request(
-        env::var(anthropic_token::REQUEST_URL_VARIABLE).ok(),
-        env::var(anthropic_token::REQUEST_TOKEN_VARIABLE).ok(),
-    )?;
-    let token = required("GITHUB_TOKEN")?;
-    let posted =
-        pull_request::posted_findings(&Client::github(), &token, &repository, event.number)?;
-    let access_token = anthropic_token::mint(&federation, &oidc)?;
-    Ok(Context {
-        root,
-        base: event.base.clone(),
-        head: event.head.clone(),
-        run_time: run_time_for(access_token.expires_in_seconds)?,
-        access_token: Some(access_token),
-        destination: Some(Destination {
-            token,
-            repository,
-            pull_request: event,
-        }),
-        posted,
-        user: current_user(),
-        files: create_files()?,
-    })
-}
-
-fn dry_run_context(root: PathBuf) -> Result<Context, String> {
-    let changes = checkout::uncommitted(&root)?;
-    if changes > 0 {
-        return Err(format!(
-            "{changes} uncommitted changes: the model reads the working tree, so commit first"
-        ));
-    }
-    let head = checkout::head_commit(&root)?;
-    let merge_base = run_bounded(
-        git_command()
-            .arg("-C")
-            .arg(&root)
-            .args(["merge-base", DRY_RUN_BASE, "HEAD"]),
-        GIT_TIMEOUT,
-    );
-    let base = merge_base.stdout.trim().to_string();
-    if merge_base.exit != Exit::Code(0) || !pull_request::commit_sha(&base) {
-        return Err(format!(
-            "git merge-base {DRY_RUN_BASE} HEAD ended {:?}",
-            merge_base.exit
-        ));
-    }
-    Ok(Context {
-        root,
-        base,
-        head,
-        access_token: None,
-        destination: None,
-        posted: Vec::new(),
-        run_time: RUN_TIME_MAX,
-        user: current_user(),
-        files: create_files()?,
-    })
+    let (event, reason) = verdict::decide(&verdict::Evidence {
+        confirmed: &confirmed,
+        unjudged_blocking: tally.unjudged_blocking,
+        fork: context.fork,
+    });
+    report::publish(context, &map, &confirmed, &checks, (event, &reason), tally)?;
+    Ok((event, reason))
 }
 
 fn short(commit: &str) -> &str {
     commit.get(..SHORT_COMMIT_CHARS).unwrap_or(commit)
 }
 
-/// A new 0700 directory under the runner's temporary directory, or the system's outside
-/// Actions; one left by an earlier run with the same pid is an error, not reused.
-fn create_files() -> Result<PathBuf, String> {
-    let base = env::var_os("RUNNER_TEMP")
-        .filter(|value| !value.is_empty())
-        .map_or_else(env::temp_dir, PathBuf::from);
-    let dir = base.join(format!("tycho-review-{}", std::process::id()));
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
-    Ok(dir)
-}
-
-/// Removes the files this run wrote and their directory; a failure is reported, not fatal.
-fn remove_files(dir: &Path) {
-    let removed = fs::read_dir(dir).and_then(|entries| {
-        for entry in entries.take(FILES_MAX) {
-            fs::remove_file(entry?.path())?;
-        }
-        fs::remove_dir(dir)
-    });
-    if let Err(error) = removed {
-        eprintln!("xtask review: cannot remove {}: {error}", dir.display());
-    }
-}
-
-fn write_file(path: &Path, text: &str) -> Result<(), String> {
-    fs::write(path, text).map_err(|error| format!("cannot write {}: {error}", path.display()))
-}
-
-/// The diff, written where the model can read it with the earlier findings beside it.
-fn prepare(context: &Context) -> Result<String, String> {
-    let range = format!("{}...{}", context.base, context.head);
-    let captured = run_bounded(
-        git_command()
-            .arg("-C")
-            .arg(&context.root)
-            .args(["-c", "core.quotePath=false", "diff", "--no-color"])
-            .args(["--no-ext-diff", "--no-textconv", "-M", "--unified=3"])
-            .args([range.as_str(), "--", "."])
-            .args(EXCLUDED_PATHSPECS),
-        GIT_TIMEOUT,
-    );
-    if captured.exit != Exit::Code(0) {
-        return Err(format!("git diff {range} ended {:?}", captured.exit));
-    }
-    if captured.stdout.len() > DIFF_MAX_BYTES {
-        return Err(format!(
-            "the diff is {} bytes; the review takes at most {DIFF_MAX_BYTES}",
-            captured.stdout.len()
-        ));
-    }
-    write_file(&context.files.join("diff.patch"), &captured.stdout)?;
-    write_file(
-        &context.files.join("posted.json"),
-        &posted_listing(&context.posted),
-    )?;
-    Ok(captured.stdout)
-}
-
-fn posted_listing(posted: &[Posted]) -> String {
-    let entries: Vec<Value> = posted
-        .iter()
-        .map(|entry| Value::from(entry.excerpt.as_str()))
-        .collect();
-    Value::Array(entries).to_string()
-}
-
-fn render(template: &str, context: &Context, finding: Option<&Finding>) -> String {
-    let finding = finding
-        .and_then(|finding| serde_json::to_string_pretty(finding).ok())
-        .unwrap_or_default();
-    template
-        .replace("{{head}}", &context.head)
-        .replace("{{base}}", &context.base)
-        .replace("{{files}}", &context.files.display().to_string())
-        .replace(
-            "{{diff}}",
-            &context.files.join("diff.patch").display().to_string(),
-        )
-        .replace(
-            "{{posted}}",
-            &context.files.join("posted.json").display().to_string(),
-        )
-        .replace("{{finding}}", &finding)
-}
-
-/// The exported schema on one line without its `$schema` dialect: the CLI's validator refuses
-/// the draft 2020-12 URI cue writes, and reads `$defs` and patterns without it.
-fn minified(schema: &str) -> Result<String, String> {
-    let mut value = serde_json::from_str::<Value>(schema)
-        .map_err(|_| "an exported review schema is not JSON; run `mise run config-export`")?;
-    value
-        .as_object_mut()
-        .ok_or("an exported review schema is not a JSON object")?
-        .remove("$schema");
-    Ok(value.to_string())
-}
-
-fn run_claude(
+fn trace(
     context: &Context,
-    instructions: &Path,
-    schema: &str,
-    limits: Limits,
-    deadline: Instant,
-) -> RunOutcome {
-    let Some(remaining) = deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| *remaining >= ONE_RUN_MIN)
-    else {
-        return RunOutcome::Ended(Exit::TimedOut);
-    };
-    let environment = claude_run::environment(
-        env::vars_os(),
-        context.user.as_deref(),
-        context
-            .access_token
-            .as_ref()
-            .map(|token| token.value.expose()),
-    );
-    let mut command =
-        claude_run::command(instructions, &context.files, schema, limits, environment);
-    command.current_dir(&context.root);
-    let captured = run_bounded(&mut command, remaining);
-    claude_run::decode(captured.exit, &captured.stdout)
-}
-
-fn find(context: &Context, deadline: Instant, tally: &mut Tally) -> Result<Vec<Finding>, String> {
-    let instructions = context.files.join("find.md");
-    write_file(&instructions, &render(FIND_INSTRUCTIONS, context, None))?;
-    let outcome = run_claude(
-        context,
-        &instructions,
-        &minified(FIND_SCHEMA)?,
-        FIND_LIMITS,
-        deadline,
-    );
-    tally.cost = tally.cost.saturating_add(outcome.cost());
-    match outcome {
-        RunOutcome::Answered { output, .. } => {
-            let candidates = findings::decode_findings(&output)?;
-            tally.candidates = candidates.len();
-            Ok(candidates)
-        }
-        other => Err(format!("the find pass ended {other:?}")),
-    }
-}
-
-/// One verify pass; `Ok` carries the verdict, `Err` why the pass gave none.
-fn verify_one(
-    context: &Context,
-    index: usize,
-    finding: &Finding,
-    schema: &str,
-    deadline: Instant,
-) -> (Result<Verdict, String>, u64) {
-    let instructions = context.files.join(format!("verify-{index}.md"));
-    if let Err(reason) = write_file(
-        &instructions,
-        &render(VERIFY_INSTRUCTIONS, context, Some(finding)),
-    ) {
-        return (Err(reason), 0);
-    }
-    let outcome = run_claude(context, &instructions, schema, VERIFY_LIMITS, deadline);
-    let cost = outcome.cost();
-    let verdict = match outcome {
-        RunOutcome::Answered { output, .. } => {
-            findings::decode_verdict(&output).map(|(verdict, reasoning)| {
-                println!(
-                    "xtask review: {}:{} {verdict:?}: {reasoning}",
-                    finding.path, finding.line
-                );
-                verdict
-            })
-        }
-        other => Err(format!("{other:?}")),
-    };
-    (verdict, cost)
-}
-
-/// Verifies the most severe candidates, a few sessions at a time, and keeps the confirmed.
-fn verify(
-    context: &Context,
-    candidates: Vec<Finding>,
-    deadline: Instant,
-    tally: &mut Tally,
-) -> Vec<Finding> {
-    let schema = match minified(VERDICT_SCHEMA) {
-        Ok(schema) => schema,
-        Err(reason) => {
-            tally.failed.push(reason);
-            return Vec::new();
-        }
-    };
-    tally.unverified = candidates.len().saturating_sub(VERIFIED_MAX);
-    let checked: Vec<Finding> = candidates.into_iter().take(VERIFIED_MAX).collect();
-    let mut confirmed = Vec::new();
-    for (batch, chunk) in checked.chunks(VERIFY_PARALLEL).enumerate() {
-        #[allow(
-            clippy::needless_collect,
-            reason = "every pass in the chunk starts before the first is joined"
-        )]
-        let results: Vec<(Result<Verdict, String>, u64)> = thread::scope(|scope| {
-            let handles: Vec<_> = chunk
-                .iter()
-                .enumerate()
-                .map(|(offset, finding)| {
-                    let index = batch.saturating_mul(VERIFY_PARALLEL).saturating_add(offset);
-                    let schema = schema.as_str();
-                    scope.spawn(move || verify_one(context, index, finding, schema, deadline))
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .unwrap_or_else(|_| (Err("the verify thread panicked".into()), 0))
-                })
-                .collect()
-        });
-        for (finding, (verdict, cost)) in chunk.iter().zip(results) {
-            tally.cost = tally.cost.saturating_add(cost);
-            match verdict {
-                Ok(Verdict::Confirmed) => confirmed.push(finding.clone()),
-                Ok(Verdict::Refuted) => tally.refuted = tally.refuted.saturating_add(1),
-                Err(reason) => tally
-                    .failed
-                    .push(format!("{}:{}: {reason}", finding.path, finding.line)),
-            }
-        }
-    }
-    tally.verified = checked.len().saturating_sub(tally.failed.len());
-    tally.confirmed = confirmed.len();
-    confirmed
-}
-
-/// The confirmed findings that are new and safe to post, split by whether the diff shows
-/// their line.
-fn select(
-    context: &Context,
-    map: &DiffMap,
-    confirmed: Vec<Finding>,
-    tally: &mut Tally,
-) -> Result<(Vec<Finding>, Vec<Finding>), String> {
-    let secrets: Vec<&str> = [
-        context
-            .access_token
-            .as_ref()
-            .map(|token| token.value.expose()),
-        context
-            .destination
-            .as_ref()
-            .map(|destination| destination.token.as_str()),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    let posted: BTreeSet<&str> = context
-        .posted
-        .iter()
-        .map(|entry| entry.fingerprint.as_str())
-        .collect();
-    let mut inline = Vec::new();
-    let mut outside = Vec::new();
-    for finding in confirmed {
-        if findings::names_secret(&finding, &secrets) {
-            return Err(
-                "a confirmed finding holds the run's own credential; nothing is posted".into(),
-            );
-        }
-        if findings::carries_credential_prefix(&finding) {
-            tally.withheld = tally.withheld.saturating_add(1);
-        } else if posted.contains(findings::fingerprint(&finding).as_str()) {
-            tally.already_posted = tally.already_posted.saturating_add(1);
-        } else if map.anchors(&finding.path, finding.line) {
-            inline.push(finding);
-        } else {
-            outside.push(finding);
-        }
-    }
-    tally.inline = inline.len();
-    tally.outside = outside.len();
-    Ok((inline, outside))
-}
-
-fn counts(tally: &Tally) -> String {
-    format!(
-        "examined {} files and {} hunks; {} candidates, {} verified, {} confirmed, {} refuted, \
-         {} not verified (over the cap of {VERIFIED_MAX}), {} already posted, {} withheld; \
-         {} inline, {} outside the diff; cost ${}.{:02}",
-        tally.files,
-        tally.hunks,
-        tally.candidates,
-        tally.verified,
-        tally.confirmed,
-        tally.refuted,
-        tally.unverified,
-        tally.already_posted,
-        tally.withheld,
-        tally.inline,
-        tally.outside,
-        tally.cost / 1_000_000,
-        (tally.cost % 1_000_000) / 10_000
-    )
-}
-
-fn review_body(context: &Context, outside: &[Finding], tally: &Tally) -> String {
-    let mut body = format!(
-        "Claude review (`{}`) of {}: {} new findings, {} inline below.\n",
-        claude_run::MODEL,
-        short(&context.head),
-        tally.inline.saturating_add(tally.outside),
-        tally.inline
-    );
-    if !outside.is_empty() {
-        body.push_str("\nOn lines the diff does not show:\n\n");
-        for finding in outside {
-            body.push_str(&findings::outside_entry(finding));
-            body.push('\n');
-        }
-    }
-    body.push_str("\nThe review ");
-    body.push_str(&counts(tally));
-    body.push_str(".\n");
-    body
-}
-
-fn write_step_summary(text: &str) {
-    let Ok(path) = env::var("GITHUB_STEP_SUMMARY") else {
-        return;
-    };
-    let written = fs::OpenOptions::new()
-        .append(true)
-        .open(&path)
-        .and_then(|mut file| writeln!(file, "{text}"));
-    if let Err(error) = written {
-        eprintln!("xtask review: cannot write the step summary: {error}");
-    }
-}
-
-fn post(
-    context: &Context,
-    inline: &[Finding],
-    outside: &[Finding],
+    started: SystemTime,
     tally: &Tally,
-) -> Result<(), String> {
-    let Some(destination) = &context.destination else {
-        for finding in inline.iter().chain(outside) {
-            println!(
-                "\n{}:{}\n{}",
-                finding.path,
-                finding.line,
-                findings::inline_body(finding)
-            );
-        }
-        return Ok(());
+    reviewed: &Result<(Event, String), String>,
+) -> Trace {
+    let output = match reviewed {
+        Ok((event, reason)) => format!("{}: {reason}", event.label()),
+        Err(reason) => format!("no verdict: {reason}"),
     };
-    if inline.is_empty() && outside.is_empty() {
-        println!("xtask review: no new findings; nothing posted");
-        return Ok(());
-    }
-    let comments: Vec<(String, u32, String)> = inline
-        .iter()
-        .map(|finding| {
-            (
-                finding.path.clone(),
-                finding.line,
-                findings::inline_body(finding),
-            )
-        })
-        .collect();
-    match pull_request::post_review(
-        &Client::github(),
-        &destination.token,
-        &destination.repository,
-        &destination.pull_request,
-        &review_body(context, outside, tally),
-        &comments,
-    ) {
-        PostOutcome::Posted { url } => {
-            println!("xtask review: posted {url}");
-            Ok(())
-        }
-        other => Err(format!("posting the review ended {other:?}")),
+    let verdict = reviewed.as_ref().map_or("none", |(event, _)| event.label());
+    Trace {
+        name: "code-review".to_string(),
+        session: context.session.clone(),
+        tags: vec![context.tag.to_string()],
+        started,
+        ended: SystemTime::now(),
+        input: format!("{}...{}", context.base, context.head),
+        output,
+        metadata: vec![
+            ("verdict".to_string(), verdict.to_string()),
+            ("head".to_string(), context.head.clone()),
+            ("counts".to_string(), report::counts(tally)),
+        ],
+        generations: tally.generations.clone(),
     }
 }
 
-fn publish(
+/// Exports the trace and revokes the App's token; any failure on the way is the exit code.
+fn finish(
     context: &Context,
-    map: &DiffMap,
-    confirmed: Vec<Finding>,
-    tally: &mut Tally,
-) -> Result<i32, String> {
-    let (inline, outside) = select(context, map, confirmed, tally)?;
-    post(context, &inline, &outside, tally)?;
-    let summary = format!("xtask review: {}", counts(tally));
-    println!("{summary}");
-    write_step_summary(&summary);
-    if tally.failed.is_empty() {
-        return Ok(0);
+    started: SystemTime,
+    tally: &Tally,
+    reviewed: &Result<(Event, String), String>,
+) -> i32 {
+    if let Err(reason) = reviewed {
+        eprintln!("xtask review: {reason}");
     }
     for failure in &tally.failed {
         eprintln!("xtask review: a verify pass gave no verdict: {failure}");
     }
-    Ok(1)
+    let traced = context.langfuse.as_ref().map_or_else(
+        || {
+            println!("xtask review: Langfuse is not configured; no trace sent");
+            true
+        },
+        |langfuse| {
+            langfuse::export(langfuse, &trace(context, started, tally, reviewed))
+                .map_err(|reason| eprintln!("xtask review: {reason}"))
+                .is_ok()
+        },
+    );
+    let revoked = context.github.as_ref().is_none_or(|github| {
+        app_token::revoke(&github.token)
+            .map_err(|reason| eprintln!("xtask review: {reason}"))
+            .is_ok()
+    });
+    i32::from(reviewed.is_err() || !tally.failed.is_empty() || !traced || !revoked)
 }
 
 #[cfg(test)]
@@ -707,139 +230,106 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_run_time_stays_inside_the_token_lifetime_and_the_cap() {
-        assert_eq!(run_time_for(3600), Ok(RUN_TIME_MAX));
-        assert_eq!(
-            run_time_for(900),
-            Ok(Duration::from_secs(900).saturating_sub(TOKEN_MARGIN))
-        );
-        assert!(run_time_for(600).unwrap_err().contains("at least 720 s"));
+    fn the_arguments_choose_the_mode_and_anything_else_is_a_usage_error() {
+        assert_eq!(command(&[]), 2);
+        assert_eq!(command(&["--post".to_string()]), 2);
+        assert_eq!(command(&["--dry-run".to_string(), "x".to_string()]), 2);
     }
 
-    #[test]
-    fn the_schemas_handed_to_the_cli_name_no_dialect_and_the_prompts_name_every_placeholder() {
-        for schema in [FIND_SCHEMA, VERDICT_SCHEMA] {
-            assert!(schema.contains("\"$schema\""));
-            let handed = minified(schema).unwrap();
-            assert!(!handed.contains("$schema"), "{handed}");
-            assert!(handed.contains("\"$defs\""));
-        }
-        for placeholder in [
-            "{{head}}",
-            "{{base}}",
-            "{{files}}",
-            "{{diff}}",
-            "{{posted}}",
-        ] {
-            assert!(FIND_INSTRUCTIONS.contains(placeholder), "{placeholder}");
-        }
-        for placeholder in [
-            "{{head}}",
-            "{{base}}",
-            "{{files}}",
-            "{{diff}}",
-            "{{finding}}",
-        ] {
-            assert!(VERIFY_INSTRUCTIONS.contains(placeholder), "{placeholder}");
-        }
-    }
-
-    fn finding(path: &str, line: u32, summary: &str) -> Finding {
-        Finding {
-            path: path.to_string(),
-            line,
-            severity: findings::Severity::Medium,
-            category: findings::Category::Correctness,
-            summary: summary.to_string(),
-            failure_scenario: "Given x, y happens.".to_string(),
-        }
-    }
-
-    fn context(posted: Vec<Posted>, github_token: &str) -> Context {
-        Context {
-            root: PathBuf::from("/r"),
-            base: "b".repeat(40),
-            head: "a".repeat(40),
-            access_token: None,
-            destination: Some(Destination {
-                token: github_token.to_string(),
-                repository: "o/r".to_string(),
-                pull_request: PullRequest {
-                    number: 1,
-                    base: "b".repeat(40),
-                    head: "a".repeat(40),
-                    head_repository: "o/r".to_string(),
-                },
-            }),
-            posted,
-            run_time: RUN_TIME_MAX,
-            user: None,
-            files: PathBuf::from("/t/tycho-review-1"),
-        }
-    }
-
-    #[test]
-    fn select_withholds_skips_and_splits_the_confirmed_findings() {
-        let map =
-            diff::parse_diff("diff --git a/a.rs b/a.rs\n+++ b/a.rs\n@@ -1,0 +1,2 @@\n+x\n+y\n")
-                .unwrap();
-        let seen = finding("a.rs", 2, "posted before");
-        let posted = vec![Posted {
-            fingerprint: findings::fingerprint(&seen),
-            excerpt: String::new(),
-        }];
-        let confirmed = vec![
-            finding("a.rs", 1, "anchors"),
-            finding("a.rs", 9, "outside the hunk"),
-            finding("a.rs", 2, "token sk-ant-oat01-x in a message"),
-            finding("a.rs", 1, "Posted   before"),
-        ];
-        let mut tally = Tally::default();
-        let (inline, outside) =
-            select(&context(posted, "ghs_job"), &map, confirmed, &mut tally).unwrap();
-        assert_eq!(inline, [finding("a.rs", 1, "anchors")]);
-        assert_eq!(outside, [finding("a.rs", 9, "outside the hunk")]);
-        assert_eq!((tally.withheld, tally.already_posted), (1, 1));
-        assert_eq!((tally.inline, tally.outside), (1, 1));
-    }
-
-    #[test]
-    fn a_finding_holding_the_job_token_stops_the_whole_post() {
-        let map = DiffMap::default();
-        let confirmed = vec![
-            finding("a.rs", 1, "fine"),
-            finding("a.rs", 1, "leaks job-token-value"),
-        ];
-        let error = select(
-            &context(Vec::new(), "job-token-value"),
-            &map,
-            confirmed,
-            &mut Tally::default(),
-        )
-        .unwrap_err();
-        assert!(error.contains("nothing is posted"), "{error}");
-    }
-
-    #[test]
-    fn the_step_holding_the_tokens_runs_a_built_binary_not_a_build() {
-        let workflow = include_str!("../../.github/workflows/review.yml");
+    fn step_running(workflow: &str, needle: &str) -> Option<String> {
         let lines: Vec<&str> = workflow.lines().collect();
-        let token_line = lines
+        let at = lines.iter().position(|line| line.contains(needle))?;
+        lines
+            .get(..at)?
             .iter()
-            .position(|line| line.contains("${{ github.token }}"))
-            .unwrap();
-        let step_run = lines
-            .get(..token_line)
-            .and_then(|before| before.iter().rev().find(|line| line.contains("run:")))
-            .map(|line| line.trim());
-        assert_eq!(step_run, Some("- run: target/debug/xtask review"));
-        assert_eq!(workflow.matches("${{ github.token }}").count(), 1);
+            .rev()
+            .find(|line| line.contains("run:"))
+            .map(|line| line.trim().to_string())
+    }
+
+    #[test]
+    fn the_trusted_review_starts_only_on_ready_or_a_comment_and_runs_the_base_xtask() {
+        let workflow = include_str!("../../.github/workflows/review.yml");
+        let triggers: Vec<&str> = workflow
+            .lines()
+            .skip_while(|line| !line.starts_with("on:"))
+            .skip(1)
+            .take_while(|line| line.starts_with(' ') || line.starts_with('#'))
+            .filter(|line| line.starts_with("  ") && !line.starts_with("    "))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            triggers,
+            [
+                "# The workflow and the xtask come from the base branch; the pull request's head is checked",
+                "# out as data the model reads and is never built or run.",
+                "pull_request_target: # zizmor: ignore[dangerous-triggers]",
+                "issue_comment:",
+            ]
+        );
+        assert!(workflow.contains("    types: [ready_for_review]\n"));
+        assert!(workflow.contains("    types: [created]\n"));
+        assert_eq!(
+            step_running(workflow, "secrets.FRITS_CODE_REVIEW_APP_PRIVATE_KEY").as_deref(),
+            Some("- run: target/debug/xtask review --post pull-request")
+        );
+        assert_eq!(
+            workflow
+                .matches("secrets.FRITS_CODE_REVIEW_APP_PRIVATE_KEY")
+                .count(),
+            1
+        );
         let build = workflow
             .find("- run: cargo build --locked -p xtask")
             .unwrap();
-        let review = workflow.find("- run: target/debug/xtask review").unwrap();
+        let review = workflow
+            .find("- run: target/debug/xtask review --post")
+            .unwrap();
         assert!(build < review);
-        assert!(workflow.contains("ref: ${{ github.event.pull_request.head.sha }}"));
-        assert!(!workflow.contains("pull_request_target"));
+        assert!(workflow.contains("          path: pull-request\n"));
+        assert_eq!(workflow.matches("persist-credentials: false").count(), 2);
+        assert!(!workflow.contains("working-directory"));
+        assert_eq!(workflow.matches("- run:").count(), 2);
+        assert!(workflow.contains("    environment: review\n"));
+    }
+
+    #[test]
+    fn the_dry_run_is_started_by_hand_and_never_holds_the_app_key() {
+        let workflow = include_str!("../../.github/workflows/review-dry-run.yml");
+        assert!(workflow.contains("on:\n  workflow_dispatch:\n"));
+        assert!(!workflow.contains("pull_request"));
+        assert!(!workflow.contains("FRITS_CODE_REVIEW"));
+        assert!(!workflow.contains("pull-requests: write"));
+        assert!(workflow.contains("- run: target/debug/xtask review --dry-run"));
+        assert!(workflow.contains("    environment: review-dry-run\n"));
+    }
+
+    #[test]
+    fn the_trace_names_the_verdict_or_why_there_is_none() {
+        let context = setup::tests::context(Vec::new(), "t");
+        let tally = Tally::default();
+        let started = SystemTime::now();
+        let approved = trace(
+            &context,
+            started,
+            &tally,
+            &Ok((
+                Event::Approve,
+                "no confirmed high or medium findings".to_string(),
+            )),
+        );
+        assert_eq!(approved.session, "o/r#1");
+        assert_eq!(approved.tags, ["post"]);
+        assert!(approved.output.starts_with("approve: "));
+        let failed = trace(
+            &context,
+            started,
+            &tally,
+            &Err("the find pass ended".into()),
+        );
+        assert!(failed.output.starts_with("no verdict: "));
+        assert!(failed
+            .metadata
+            .contains(&("verdict".to_string(), "none".to_string())));
     }
 }

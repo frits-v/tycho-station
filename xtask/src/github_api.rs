@@ -20,6 +20,25 @@ const GITHUB_HEADERS: [(&str, &str); 2] = [
 ];
 const PLAIN_HEADERS: [(&str, &str); 1] = [("Accept", "application/json")];
 
+/// How a plain request authenticates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credential<'a> {
+    None,
+    Bearer(&'a str),
+    /// The base64 of `user:password`.
+    Basic(&'a str),
+}
+
+impl Credential<'_> {
+    fn header(self) -> Option<String> {
+        match self {
+            Self::None => None,
+            Self::Bearer(token) => Some(format!("Bearer {token}")),
+            Self::Basic(encoded) => Some(format!("Basic {encoded}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Method {
     Get,
@@ -103,7 +122,7 @@ impl Client {
             &format!("{}{path}", self.base),
             method,
             &GITHUB_HEADERS,
-            Some(credential),
+            Credential::Bearer(credential),
             json_body,
         )
     }
@@ -132,17 +151,23 @@ impl PlainClient {
         &self,
         method: Method,
         url: &str,
-        credential: Option<&str>,
+        credential: Credential<'_>,
         json_body: Option<&str>,
     ) -> Reply {
-        send(
-            &self.agent,
-            url,
-            method,
-            &PLAIN_HEADERS,
-            credential,
-            json_body,
-        )
+        self.request_with(method, url, credential, &[], json_body)
+    }
+
+    /// A request with headers beyond the JSON ones, such as an API version.
+    pub fn request_with(
+        &self,
+        method: Method,
+        url: &str,
+        credential: Credential<'_>,
+        headers: &[(&str, &str)],
+        json_body: Option<&str>,
+    ) -> Reply {
+        let all: Vec<(&str, &str)> = PLAIN_HEADERS.iter().chain(headers).copied().collect();
+        send(&self.agent, url, method, &all, credential, json_body)
     }
 }
 
@@ -165,10 +190,10 @@ fn send(
     url: &str,
     method: Method,
     headers: &[(&str, &str)],
-    credential: Option<&str>,
+    credential: Credential<'_>,
     json_body: Option<&str>,
 ) -> Reply {
-    let authorization = credential.map(|credential| format!("Bearer {credential}"));
+    let authorization = credential.header();
     let authorization = authorization.as_deref();
     let sent = match method {
         Method::Get => with_headers(agent.get(url), headers, authorization).call(),
@@ -327,14 +352,20 @@ pub mod tests {
         let with_credential = client.request(
             Method::Get,
             &format!("{base}/token?api-version=2.0&audience=a"),
-            Some("request.token"),
+            Credential::Bearer("request.token"),
             None,
         );
         assert!(matches!(
             with_credential,
             Reply::Response { status: 200, .. }
         ));
-        let without = client.request(Method::Post, &format!("{base}/x"), None, Some("{}"));
+        let without = client.request_with(
+            Method::Post,
+            &format!("{base}/x"),
+            Credential::Basic("cGs6c2s="),
+            &[("x-langfuse-ingestion-version", "4")],
+            Some("{}"),
+        );
         assert!(matches!(without, Reply::Response { status: 200, .. }));
         let requests = seen.recv().unwrap();
         let first = requests.first().unwrap().to_ascii_lowercase();
@@ -346,7 +377,12 @@ pub mod tests {
         assert!(first.contains("\r\naccept: application/json\r\n"));
         assert!(!first.contains("x-github-api-version"));
         let second = requests.get(1).unwrap().to_ascii_lowercase();
-        assert!(!second.contains("authorization"), "{second}");
+        assert!(
+            second.contains("\r\nauthorization: basic cgs6c2s=\r\n"),
+            "{second}"
+        );
+        assert!(second.contains("\r\nx-langfuse-ingestion-version: 4\r\n"));
+        assert!(second.contains("\r\naccept: application/json\r\n"));
     }
 
     #[test]
@@ -356,7 +392,12 @@ pub mod tests {
         assert!(config.proxy().is_none());
         assert_eq!(config.max_redirects(), 0);
         assert_eq!(
-            PlainClient::https().request(Method::Get, "http://127.0.0.1:9/", None, None),
+            PlainClient::https().request(
+                Method::Get,
+                "http://127.0.0.1:9/",
+                Credential::None,
+                None
+            ),
             Reply::Failed("the URL is not HTTPS")
         );
     }

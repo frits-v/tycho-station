@@ -26,27 +26,52 @@ pub struct Limits {
     pub max_budget_usd: u32,
 }
 
-/// How one run ended. Every non-answer carries the cost the CLI reported.
+/// What a run spent: input counts cache reads and writes too; cost is in micro-dollars.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost: u64,
+}
+
+/// How one run ended. Every result the CLI wrote carries what it spent.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RunOutcome {
-    Answered { output: Value, cost: u64 },
-    Unanswered { cost: u64 },
-    MaxTurns { cost: u64 },
-    BudgetExhausted { cost: u64 },
-    ApiError { status: Option<u64>, cost: u64 },
+    Answered { output: Value, usage: Usage },
+    Unanswered { usage: Usage },
+    MaxTurns { usage: Usage },
+    BudgetExhausted { usage: Usage },
+    ApiError { status: Option<u64>, usage: Usage },
     Ended(Exit),
     Unrecognised(String),
 }
 
 impl RunOutcome {
-    pub const fn cost(&self) -> u64 {
+    pub const fn usage(&self) -> Usage {
         match self {
-            Self::Answered { cost, .. }
-            | Self::Unanswered { cost }
-            | Self::MaxTurns { cost }
-            | Self::BudgetExhausted { cost }
-            | Self::ApiError { cost, .. } => *cost,
-            Self::Ended(_) | Self::Unrecognised(_) => 0,
+            Self::Answered { usage, .. }
+            | Self::Unanswered { usage }
+            | Self::MaxTurns { usage }
+            | Self::BudgetExhausted { usage }
+            | Self::ApiError { usage, .. } => *usage,
+            Self::Ended(_) | Self::Unrecognised(_) => Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cost: 0,
+            },
+        }
+    }
+
+    /// A short name for the trace and the log, never the output itself.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Answered { .. } => "answered".to_string(),
+            Self::Unanswered { .. } => "unanswered".to_string(),
+            Self::MaxTurns { .. } => "max_turns".to_string(),
+            Self::BudgetExhausted { .. } => "budget_exhausted".to_string(),
+            Self::ApiError { status, .. } => format!("api_error {status:?}"),
+            Self::Ended(exit) => format!("ended {exit:?}"),
+            Self::Unrecognised(reason) => format!("unrecognised: {reason}"),
         }
     }
 }
@@ -55,13 +80,14 @@ impl RunOutcome {
 /// `.claude/settings.json`, which the pull request controls, adds no hook or permission.
 /// `--add-dir` takes several values, so another flag always follows it.
 pub fn command(
+    program: &Path,
     instructions: &Path,
     files: &Path,
     schema: &str,
     limits: Limits,
     environment: Vec<(OsString, OsString)>,
 ) -> Command {
-    let mut command = Command::new("claude");
+    let mut command = Command::new(program);
     command
         .args(["-p", "--output-format", "json", "--model", MODEL])
         .args(["--tools", TOOLS, "--permission-mode", "dontAsk"])
@@ -143,6 +169,19 @@ pub fn decode(exit: Exit, stdout: &str) -> RunOutcome {
     let Some(cost) = result.get("total_cost_usd").and_then(micro_dollars) else {
         return RunOutcome::Unrecognised("the result has no usable total_cost_usd".to_string());
     };
+    let count = |key: &str| {
+        result
+            .pointer(&format!("/usage/{key}"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    };
+    let usage = Usage {
+        input_tokens: count("input_tokens")
+            .saturating_add(count("cache_read_input_tokens"))
+            .saturating_add(count("cache_creation_input_tokens")),
+        output_tokens: count("output_tokens"),
+        cost,
+    };
     let subtype = result.get("subtype").and_then(Value::as_str).unwrap_or("");
     let is_error = result.get("is_error").and_then(Value::as_bool);
     let api_status = result.get("api_error_status").and_then(Value::as_u64);
@@ -150,22 +189,22 @@ pub fn decode(exit: Exit, stdout: &str) -> RunOutcome {
         (0, "success", Some(false)) => result
             .get("structured_output")
             .filter(|output| output.is_object())
-            .map_or(RunOutcome::Unanswered { cost }, |output| {
+            .map_or(RunOutcome::Unanswered { usage }, |output| {
                 RunOutcome::Answered {
                     output: output.clone(),
-                    cost,
+                    usage,
                 }
             }),
         (1, "success", Some(true)) if api_status.is_some() => RunOutcome::ApiError {
             status: api_status,
-            cost,
+            usage,
         },
         (1, "error_during_execution", Some(true)) => RunOutcome::ApiError {
             status: api_status,
-            cost,
+            usage,
         },
-        (1, "error_max_turns", Some(true)) => RunOutcome::MaxTurns { cost },
-        (1, "error_max_budget_usd", Some(true)) => RunOutcome::BudgetExhausted { cost },
+        (1, "error_max_turns", Some(true)) => RunOutcome::MaxTurns { usage },
+        (1, "error_max_budget_usd", Some(true)) => RunOutcome::BudgetExhausted { usage },
         (code, subtype, is_error) => RunOutcome::Unrecognised(format!(
             "exit {code}, subtype `{}`, is_error {is_error:?}",
             plain_word(subtype)
@@ -187,6 +226,7 @@ mod tests {
     #[test]
     fn the_command_line_has_exact_text() {
         let command = command(
+            Path::new("/opt/claude/2.1.280/claude"),
             Path::new("/t/tycho-review-7/find.md"),
             Path::new("/t/tycho-review-7"),
             "{}",
@@ -203,7 +243,7 @@ mod tests {
         assert_eq!(
             words,
             [
-                "claude",
+                "/opt/claude/2.1.280/claude",
                 "-p",
                 "--output-format",
                 "json",
@@ -245,6 +285,9 @@ mod tests {
             ("ACTIONS_RUNTIME_TOKEN", "t"),
             ("ANTHROPIC_FEDERATION_RULE_ID", "fdrl_x"),
             ("ANTHROPIC_API_KEY", "k"),
+            ("LANGFUSE_SECRET_KEY", "sk-lf-x"),
+            ("LANGFUSE_PUBLIC_KEY", "pk-lf-x"),
+            ("FRITS_CODE_REVIEW_APP_PRIVATE_KEY", "key"),
         ]
         .into_iter()
         .map(|(name, value)| (name.into(), value.into()))
@@ -274,25 +317,43 @@ mod tests {
     #[test]
     fn each_captured_result_decodes_to_its_state() {
         match decode(Exit::Code(0), SUCCESS) {
-            RunOutcome::Answered { output, cost } => {
+            RunOutcome::Answered { output, usage } => {
                 assert!(output.get("findings").is_some_and(Value::is_array));
-                assert_eq!(cost, 19_972);
+                assert_eq!(
+                    usage,
+                    Usage {
+                        input_tokens: 28 + 7368 + 13_532,
+                        output_tokens: 771,
+                        cost: 19_972
+                    }
+                );
             }
             other => panic!("{other:?}"),
         }
         assert_eq!(
             decode(Exit::Code(1), MAX_TURNS),
-            RunOutcome::MaxTurns { cost: 13_842 }
+            RunOutcome::MaxTurns {
+                usage: Usage {
+                    input_tokens: 6381,
+                    output_tokens: 218,
+                    cost: 13_842
+                }
+            }
         );
         assert_eq!(
             decode(Exit::Code(1), MAX_BUDGET),
-            RunOutcome::BudgetExhausted { cost: 5_114 }
+            RunOutcome::BudgetExhausted {
+                usage: Usage {
+                    cost: 5_114,
+                    ..Usage::default()
+                }
+            }
         );
         assert_eq!(
             decode(Exit::Code(1), UNAUTHORIZED),
             RunOutcome::ApiError {
                 status: Some(401),
-                cost: 0
+                usage: Usage::default()
             }
         );
     }

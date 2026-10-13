@@ -127,8 +127,8 @@ const COMMANDS: [(&str, &str); 24] = [
         "build this host's archives with dist, upload to the release",
     ),
     (
-        "review [--dry-run]",
-        "Claude reviews the pull request and posts one review; --dry-run prints it locally",
+        "review --dry-run | --post <dir>",
+        "Claude reviews a pull request; --post posts the App's verdict, --dry-run prints it",
     ),
     (
         "hook post-tool-use",
@@ -912,7 +912,7 @@ fn main() {
         },
         Some("release") => release::release(),
         Some("release-binaries") => release::release_binaries(args.get(1).cloned()),
-        Some("review") => review::command(args.get(1).map(String::as_str)),
+        Some("review") => review::command(args.get(1..).unwrap_or_default()),
         Some("hook") if args.get(1).map(String::as_str) == Some("post-tool-use") => {
             hook_post_tool_use()
         }

@@ -1,10 +1,16 @@
 name: review
+# A review runs only when a pull request is marked ready or a writer asks for one in a
+# comment; opening a pull request or pushing to it starts nothing.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+  # The workflow and the xtask come from the base branch; the pull request's head is checked
+  # out as data the model reads and is never built or run.
+  pull_request_target: # zizmor: ignore[dangerous-triggers]
+    types: [ready_for_review]
+  issue_comment:
+    types: [created]
 permissions: {}
 concurrency:
-  group: review-${{ github.event.pull_request.number }}
+  group: review-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
 defaults:
   run:
@@ -12,20 +18,31 @@ defaults:
 jobs:
   review:
     name: review
-    # A fork's pull request gets no OIDC token; drafts and the release pull request wait.
-    if: ${{ !github.event.pull_request.draft && github.event.pull_request.head.repo.full_name == github.repository && !startsWith(github.head_ref, 'release-plz-') }}
+    # A comment on a pull request that mentions the reviewer, from a writer; xtask review
+    # checks the event again before anything else.
+    if: >-
+      ${{ github.event_name == 'pull_request_target' ||
+      (github.event.issue.pull_request &&
+      (contains(github.event.comment.body, '@frits-code-review') || contains(github.event.comment.body, '@claude')) &&
+      contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) }}
+    # The App key and the Langfuse key are secrets of this environment, which admits only the
+    # default branch: both events run there, and no branch's workflow can read them.
+    environment: review
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       MISE_TASK_RUN_AUTO_INSTALL: "false"
     permissions:
-      contents: read # checkout
+      contents: read # the base branch's checkout
       id-token: write # the OIDC token xtask review trades for an Anthropic access token
-      pull-requests: write # post the review
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number || github.event.issue.number }}/head
+          path: pull-request
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -42,13 +59,16 @@ jobs:
           version: 2026.9.13
           cache: false
           install_args: rust mr-boxington claude
-      # Built before the GitHub token is mapped; the build scripts of xtask's locked
-      # dependencies run in this job, which can request OIDC tokens in every step.
+      # The base branch's xtask, built before the App key is mapped.
       - run: cargo build --locked -p xtask
-      - run: target/debug/xtask review
+      - run: target/debug/xtask review --post pull-request
         env:
-          GITHUB_TOKEN: ${{ github.token }}
+          FRITS_CODE_REVIEW_CLIENT_ID: ${{ vars.FRITS_CODE_REVIEW_CLIENT_ID }}
+          FRITS_CODE_REVIEW_APP_PRIVATE_KEY: ${{ secrets.FRITS_CODE_REVIEW_APP_PRIVATE_KEY }}
           ANTHROPIC_FEDERATION_RULE_ID: ${{ vars.ANTHROPIC_FEDERATION_RULE_ID }}
           ANTHROPIC_ORGANIZATION_ID: ${{ vars.ANTHROPIC_ORGANIZATION_ID }}
           ANTHROPIC_SERVICE_ACCOUNT_ID: ${{ vars.ANTHROPIC_SERVICE_ACCOUNT_ID }}
           ANTHROPIC_WORKSPACE_ID: ${{ vars.ANTHROPIC_WORKSPACE_ID }}
+          LANGFUSE_BASE_URL: ${{ vars.LANGFUSE_BASE_URL }}
+          LANGFUSE_PUBLIC_KEY: ${{ vars.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
