@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use super::passes::TOKEN_LIFETIME_MIN;
 use super::pull_request::CommitId;
 use super::{git_in, langfuse, pull_request, scrubbed, Context, GitHub, Grants, Mode};
 use crate::anthropic_token;
@@ -21,8 +22,6 @@ const GIT_TIMEOUT: Duration = Duration::from_secs(120);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 const MISE_TIMEOUT: Duration = Duration::from_secs(60);
 const RUN_TIME_MAX: Duration = Duration::from_secs(30 * 60);
-/// The shortest token a pass can use: a minute of work and the minute a pass leaves unused.
-const TOKEN_LIFETIME_MIN: Duration = Duration::from_secs(2 * 60);
 const DRY_RUN_BASE: &str = "origin/main";
 /// The diff, the earlier findings and one instructions file per pass.
 const FILES_MAX: usize = 64;
@@ -578,9 +577,10 @@ pub mod tests {
     #[test]
     fn a_token_too_short_for_one_pass_is_refused_with_its_lifetime() {
         assert_eq!(check_token_lifetime(598), Ok(()));
-        assert_eq!(check_token_lifetime(120), Ok(()));
-        let refused = check_token_lifetime(119).unwrap_err();
-        assert!(refused.contains("lasts 119 s"), "{refused}");
+        assert_eq!(check_token_lifetime(TOKEN_LIFETIME_MIN.as_secs()), Ok(()));
+        let refused = check_token_lifetime(TOKEN_LIFETIME_MIN.as_secs() - 1).unwrap_err();
+        assert!(refused.contains("lasts 239 s"), "{refused}");
+        assert!(refused.contains("at least 240 s"), "{refused}");
     }
 
     #[test]

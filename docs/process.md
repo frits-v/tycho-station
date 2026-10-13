@@ -673,8 +673,10 @@ check out, build and run it.
   `job_workflow_ref`, `ref` and the window from `nbf` to `exp`), never the token. An exchange the rule
   refuses answers an opaque `401`; the Console's authentication history names the failed
   check, such as `match_condition_false`.
-- The rule's token lifetime is at least two minutes; anything above GitHub's ten-minute window
-  changes nothing. A shorter lifetime fails the run before any pass, naming the lifetime.
+- The rule's token lifetime is at least four minutes: the exchange's two requests at up to a
+  minute each, the minute a pass leaves unused, and a minute of work. Anything above GitHub's
+  ten-minute window changes nothing. A shorter lifetime fails the run before any pass, naming
+  the lifetime.
 - All exchanges are made in process over HTTPS (rustls on aws-lc-rs, the webpki roots
   compiled in, no proxy, no redirects); no token appears in arguments, output or errors.
 
