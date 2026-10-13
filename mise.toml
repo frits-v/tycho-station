@@ -77,6 +77,10 @@ run = "cargo run -q -p xtask -- release"
 description = "Build this host's tycho archives with dist and upload them to the release"
 run = "cargo run -q -p xtask -- release-binaries"
 
+[tasks.review]
+description = "Claude reviews this branch against origin/main and prints the findings; posts nothing"
+run = "cargo run -q -p xtask -- review --dry-run"
+
 [tasks.spine-tests]
 description = "Drive the spine services through a real core with a test-double endpoint beside the production one (macOS)"
 run = "cargo test -p tycho --test spine -- --ignored --test-threads=1 --nocapture"

@@ -5,6 +5,6 @@
 - `slices.md`: the build plan, three slices with exit tests, tracked as GitHub issues and milestones.
 - `figures/`: the design's figures as SVG and PNG, light and dark, rendered from `../figures/` by `xtask render-figures`; never edited by hand.
 - `style.md`: code and documentation rules, each naming what enforces it.
-- `process.md`: what happens when something goes wrong, where mechanisms live, how a change is verified and reported, and how the agent user is provisioned.
+- `process.md`: what happens when something goes wrong, where mechanisms live, how a change is verified and reported, how the agent user is provisioned, releases, and the Claude code review of pull requests.
 - `vendor-surfaces.md`: go or no-go on Claude Code mods, OpenAI's Intelligent UI and the vendor extension points and surfaces around them, per design area, with the issues each go opens.
 - `prompts/`: prompts that start a session on a slice. `prompts/slice-zero.md` runs slice zero in fan-out.

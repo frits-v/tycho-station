@@ -23,6 +23,18 @@ const MARKERS: [&str; 10] = [
     "github_pat_",
     "release_plz_token",
 ];
+/// Credential prefixes a review comment must never carry onto a pull request: Anthropic keys
+/// and OAuth tokens, GitHub installation, user and refresh tokens. Kept here, the one file
+/// the scan skips.
+pub const POSTED_TEXT_PREFIXES: [&str; 7] = [
+    "sk-ant-",
+    "ghs_",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghr_",
+    "github_pat_",
+];
 const EXCLUDED_PATHS: [&str; 1] = ["xtask/src/credentials.rs"];
 const STYLE_PATH: &str = "docs/style.md";
 /// The style document's row for this rule names the markers it bans; only that row is exempt.
