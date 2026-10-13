@@ -151,15 +151,20 @@ fn one_line(text: &str) -> String {
         .join(" ")
 }
 
+/// Placed after `@`, and between `#`, `/` or `-` and a digit, so GitHub links no mention and
+/// no issue or pull request reference: its autolinking runs on the decoded text, so an entity
+/// still pings or links, which its markdown API shows.
+const WORD_JOINER: char = '\u{2060}';
+
 /// One character of model text outside a code span, written so it renders as itself: an
-/// entity for each character that could start HTML, a mention, a code span, an escape or
-/// emphasis, so the text around the review's own code spans holds none of them.
-fn push_inert(out: &mut String, character: char) {
+/// entity for each character that could start HTML, a code span, an escape or emphasis, so
+/// the text around the review's own code spans holds none of them, and a word joiner after
+/// each character that could start a mention or a reference.
+fn push_inert(out: &mut String, character: char, following: Option<&char>) {
     match character {
         '&' => out.push_str("&amp;"),
         '<' => out.push_str("&lt;"),
         '>' => out.push_str("&gt;"),
-        '@' => out.push_str("&#64;"),
         '\\' => out.push_str("&#92;"),
         '`' => out.push_str("&#96;"),
         '*' => out.push_str("&#42;"),
@@ -169,6 +174,11 @@ fn push_inert(out: &mut String, character: char) {
         '~' => out.push_str("&#126;"),
         '|' => out.push_str("&#124;"),
         _ => out.push(character),
+    }
+    let starts_reference =
+        matches!(character, '#' | '/' | '-') && following.is_some_and(char::is_ascii_digit);
+    if character == '@' || starts_reference {
+        out.push(WORD_JOINER);
     }
 }
 
@@ -238,8 +248,9 @@ fn push_code_span(out: &mut String, content: &[char]) {
 /// spans are found by the spec's rules (a backslash escapes the punctuation after it, a run
 /// of backticks closes at the next run of the same length) and each is written again inside
 /// a span the review builds; every other character that markdown or GitHub acts on becomes an
-/// entity. Only the review's own fences open a span, so a reading that differs from GitHub's
-/// changes how the text looks, never what it does: no HTML, no marker and no mention.
+/// entity, and a mention or a reference is broken by a word joiner. Only the review's own
+/// fences open a span, so a reading that differs from GitHub's changes how the text looks,
+/// never what it does: no HTML, no marker, no mention and no reference.
 fn inert(text: &str) -> String {
     let characters: Vec<char> = one_line(text).chars().collect();
     let mut out = String::with_capacity(characters.len());
@@ -250,12 +261,13 @@ fn inert(text: &str) -> String {
             .get(next)
             .filter(|literal| character == '\\' && literal.is_ascii_punctuation());
         if let Some(&literal) = escaped {
-            push_inert(&mut out, literal);
-            at = next.saturating_add(1);
+            let after = next.saturating_add(1);
+            push_inert(&mut out, literal, characters.get(after));
+            at = after;
             continue;
         }
         if character != '`' {
-            push_inert(&mut out, character);
+            push_inert(&mut out, character, characters.get(next));
             at = next;
             continue;
         }
@@ -268,7 +280,7 @@ fn inert(text: &str) -> String {
             );
             at = close.saturating_add(run);
         } else {
-            (0..run).for_each(|_| push_inert(&mut out, '`'));
+            (0..run).for_each(|_| push_inert(&mut out, '`', None));
             at = opened_end;
         }
     }
@@ -458,7 +470,7 @@ mod tests {
         for body in [inline_body(&cue), outside_entry(&cue)] {
             assert!(body.contains("`open_max!: int & >=1 & <=8`"), "{body}");
             assert!(body.contains("`a < b`"), "{body}");
-            assert!(body.contains("&#64;someone &lt;b&gt;"), "{body}");
+            assert!(body.contains("@\u{2060}someone &lt;b&gt;"), "{body}");
             assert!(body.contains("Say `a < b` holds. Then &lt;i&gt;x&lt;/i&gt; &amp; y."));
             assert!(!body.contains("@someone"), "{body}");
         }
@@ -479,7 +491,7 @@ mod tests {
     fn an_escaped_backslash_leaves_the_backtick_after_it_to_open_a_span() {
         assert_eq!(
             inert("\\\\` x `@octocat` <b>"),
-            "&#92;`x`&#64;octocat&#96; &lt;b&gt;"
+            "&#92;`x`@\u{2060}octocat&#96; &lt;b&gt;"
         );
         assert_eq!(inert("\\\\`<b>`"), "&#92;`<b>`");
     }
@@ -492,8 +504,9 @@ mod tests {
         assert_eq!(inert("```a``b```"), "```a``b```");
     }
 
-    /// The text outside the code spans of posted text. With no backslash outside a span, the
-    /// spec finds the same openers, and a closer never depends on a backslash.
+    /// The text outside the code spans of posted text, each span a `C`: GitHub links neither a
+    /// mention nor a reference across one. With no backslash outside a span, the spec finds
+    /// the same openers, and a closer never depends on a backslash.
     fn outside_code(posted: &str) -> String {
         let characters: Vec<char> = posted.chars().collect();
         let mut outside = String::new();
@@ -504,6 +517,7 @@ mod tests {
                 .then(|| closing_run(&characters, at.saturating_add(run), run))
                 .flatten();
             if let Some(close) = close {
+                outside.push('C');
                 at = close.saturating_add(run);
             } else {
                 outside.push(character);
@@ -537,13 +551,79 @@ mod tests {
                 assert!(!posted.contains(['\n', '\r']), "{text:?} -> {posted:?}");
                 let outside = outside_code(&posted);
                 assert!(
-                    !outside.contains(['`', '\\', '<', '>', '@', '*', '_', '[', ']', '~', '|']),
+                    !outside.contains(['`', '\\', '<', '>', '*', '_', '[', ']', '~', '|']),
                     "{text:?} -> {posted:?}"
                 );
                 examined = examined.saturating_add(1);
             }
         }
         assert_eq!(examined, 579_195);
+    }
+
+    #[test]
+    fn no_mention_or_reference_survives_outside_a_code_span() {
+        let joined = |text: &str| text.replace('^', "\u{2060}");
+        for (text, posted) in [
+            ("@octocat", "@^octocat"),
+            ("see #1 and gh-12", "see #^1 and gh-^12"),
+            ("frits-v/tycho-station#1", "frits-v/tycho-station#^1"),
+            ("org/repo/issues/7", "org/repo/issues/^7"),
+            (
+                "https://github.com/o/r/pull/3/files",
+                "https://github.com/o/r/pull/^3/files",
+            ),
+            ("o/r@3cfcaa7", "o/r@^3cfcaa7"),
+            ("\\#1", "#^1"),
+            ("`@octocat #1`", "`@octocat #1`"),
+            ("a-b c/d #x", "a-b c/d #x"),
+        ] {
+            assert_eq!(inert(text), joined(posted), "{text:?}");
+        }
+    }
+
+    /// Whether `@` or a reference start followed by a digit appears without a word joiner in
+    /// the text GitHub links on, which has the review's entities decoded to characters that
+    /// start neither.
+    fn live_link(outside: &str) -> bool {
+        let decoded = [
+            "&amp;", "&lt;", "&gt;", "&#92;", "&#96;", "&#42;", "&#95;", "&#91;", "&#93;",
+            "&#126;", "&#124;",
+        ]
+        .iter()
+        .fold(outside.to_string(), |text, entity| {
+            text.replace(entity, "E")
+        });
+        let characters: Vec<char> = decoded.chars().collect();
+        characters.windows(2).any(|pair| match pair {
+            ['@', next] => *next != WORD_JOINER,
+            ['#' | '/' | '-', next] => next.is_ascii_digit(),
+            _ => false,
+        }) || characters.last() == Some(&'@')
+    }
+
+    #[test]
+    fn no_short_string_of_reference_characters_posts_a_live_mention_or_reference() {
+        let alphabet = ['`', '\\', '@', '#', '/', '-', '1', 'a', ' '];
+        let mut examined = 0_usize;
+        let mut indices = Vec::new();
+        for length in 0..=5_u32 {
+            for number in 0..alphabet.len().pow(length) {
+                indices.clear();
+                let mut rest = number;
+                for _ in 0..length {
+                    indices.push(rest % alphabet.len());
+                    rest /= alphabet.len();
+                }
+                let text: String = indices
+                    .iter()
+                    .filter_map(|index| alphabet.get(*index))
+                    .collect();
+                let posted = inert(&text);
+                assert!(!live_link(&outside_code(&posted)), "{text:?} -> {posted:?}");
+                examined = examined.saturating_add(1);
+            }
+        }
+        assert_eq!(examined, 66_430);
     }
 
     #[test]

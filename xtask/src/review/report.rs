@@ -292,6 +292,7 @@ mod tests {
         );
         assert!(text.contains("- `ci`: failed"), "{text}");
         assert!(text.contains("does not weigh"));
-        assert!(!text.contains('@'), "{text}");
+        assert!(!text.contains("@claude"), "{text}");
+        assert!(text.contains("@\u{2060}claude"), "{text}");
     }
 }
