@@ -14,7 +14,7 @@ use super::findings::{self, Finding, Verdict};
 use super::langfuse::Generation;
 use super::pull_request::Posted;
 use super::verdict::blocks;
-use super::{git_in, Context, Tally, EXCLUDED_PATHSPECS, VERIFIED_MAX};
+use super::{git_in, Context, Grants, Tally, EXCLUDED_PATHSPECS, VERIFIED_MAX};
 use crate::process::{run_bounded, Exit};
 
 const FIND_SCHEMA: &str = include_str!("../../../config/export/schema/review_findings.json");
@@ -110,6 +110,7 @@ pub fn minified(schema: &str) -> Result<String, String> {
 /// deadline, and the generation the trace records.
 fn run_claude(
     context: &Context,
+    grants: &Grants,
     name: &str,
     instructions: &str,
     schema: &str,
@@ -130,10 +131,7 @@ fn run_claude(
             let environment = claude_run::environment(
                 std::env::vars_os(),
                 context.user.as_deref(),
-                context
-                    .access_token
-                    .as_ref()
-                    .map(|token| token.value.expose()),
+                grants.anthropic.as_ref().map(|token| token.value.expose()),
             );
             let mut command = claude_run::command(
                 &context.claude,
@@ -166,12 +164,14 @@ fn run_claude(
 
 pub fn find(
     context: &Context,
+    grants: &Grants,
     deadline: Instant,
     tally: &mut Tally,
 ) -> Result<Vec<Finding>, String> {
     let instructions = render(FIND_INSTRUCTIONS, context, None);
     let (outcome, generation) = run_claude(
         context,
+        grants,
         "find",
         &instructions,
         &minified(FIND_SCHEMA)?,
@@ -193,6 +193,7 @@ pub fn find(
 /// One verify pass; `Ok` carries the verdict, `Err` why the pass gave none.
 fn verify_one(
     context: &Context,
+    grants: &Grants,
     index: usize,
     finding: &Finding,
     schema: &str,
@@ -202,6 +203,7 @@ fn verify_one(
     let name = format!("verify-{index}");
     let (outcome, generation) = run_claude(
         context,
+        grants,
         &name,
         &instructions,
         schema,
@@ -225,6 +227,7 @@ fn verify_one(
 
 fn verify_chunk(
     context: &Context,
+    grants: &Grants,
     first_index: usize,
     chunk: &[Finding],
     schema: &str,
@@ -240,7 +243,7 @@ fn verify_chunk(
             .enumerate()
             .map(|(offset, finding)| {
                 let index = first_index.saturating_add(offset);
-                scope.spawn(move || verify_one(context, index, finding, schema, deadline))
+                scope.spawn(move || verify_one(context, grants, index, finding, schema, deadline))
             })
             .collect();
         handles
@@ -257,6 +260,7 @@ fn verify_chunk(
 /// A blocking candidate over the cap or without a verdict is counted as unjudged.
 pub fn verify(
     context: &Context,
+    grants: &Grants,
     candidates: &[Finding],
     deadline: Instant,
     tally: &mut Tally,
@@ -276,7 +280,7 @@ pub fn verify(
     let mut confirmed = Vec::new();
     for (batch, chunk) in checked.chunks(VERIFY_PARALLEL).enumerate() {
         let first = batch.saturating_mul(VERIFY_PARALLEL);
-        let results = verify_chunk(context, first, chunk, &schema, deadline);
+        let results = verify_chunk(context, grants, first, chunk, &schema, deadline);
         for (finding, (verdict, generation)) in chunk.iter().zip(results) {
             if let Some(generation) = generation {
                 tally.cost = tally.cost.saturating_add(generation.usage.cost);
@@ -334,7 +338,7 @@ mod tests {
 
     #[test]
     fn the_diff_runs_in_the_reviewed_checkout_without_the_runs_secrets() {
-        let context = crate::review::setup::tests::context(Vec::new(), "t");
+        let context = crate::review::setup::tests::context(Vec::new());
         let command = diff_command(&context);
         let removed: Vec<&std::ffi::OsStr> = command
             .get_envs()
@@ -358,7 +362,7 @@ mod tests {
 
     #[test]
     fn a_rendered_prompt_names_the_runs_own_files() {
-        let context = crate::review::setup::tests::context(Vec::new(), "t");
+        let context = crate::review::setup::tests::context(Vec::new());
         let rendered = render(FIND_INSTRUCTIONS, &context, None);
         assert!(rendered.contains("/t/tycho-review-1/diff.patch"));
         assert!(rendered.contains("/t/tycho-review-1/posted.json"));
@@ -367,15 +371,22 @@ mod tests {
 
     #[test]
     fn a_pass_past_its_deadline_never_starts_and_is_recorded() {
-        let context = crate::review::setup::tests::context(Vec::new(), "t");
+        let context = crate::review::setup::tests::context(Vec::new());
         let dir = std::env::temp_dir().join(format!("tycho-review-pass-{}", std::process::id()));
         fs::create_dir(&dir).unwrap();
         let context = Context {
             files: dir.clone(),
             ..context
         };
-        let (outcome, generation) =
-            run_claude(&context, "find", "text", "{}", FIND_LIMITS, Instant::now());
+        let (outcome, generation) = run_claude(
+            &context,
+            &crate::review::setup::tests::grants("t"),
+            "find",
+            "text",
+            "{}",
+            FIND_LIMITS,
+            Instant::now(),
+        );
         assert_eq!(outcome, RunOutcome::Ended(Exit::TimedOut));
         assert_eq!(generation.name, "find");
         assert_eq!(generation.input, "text");

@@ -12,23 +12,22 @@ use super::diff::DiffMap;
 use super::findings::{self, Finding};
 use super::pull_request::{self, PostOutcome};
 use super::verdict::Event;
-use super::{short, Context, Tally, VERIFIED_MAX};
+use super::{short, Context, Grants, Tally, VERIFIED_MAX};
+use crate::app_token::InstallationToken;
 use crate::github_api::Client;
 
 /// The confirmed findings that are new and safe to post, split by whether the diff shows
 /// their line. One that names the run's own credential stops the whole post.
 pub fn select(
     context: &Context,
+    grants: &Grants,
     map: &DiffMap,
     confirmed: &[Finding],
     tally: &mut Tally,
 ) -> Result<(Vec<Finding>, Vec<Finding>), String> {
     let secrets: Vec<&str> = [
-        context
-            .access_token
-            .as_ref()
-            .map(|token| token.value.expose()),
-        context.github.as_ref().map(|github| github.token.expose()),
+        grants.anthropic.as_ref().map(|token| token.value.expose()),
+        grants.app.as_ref().map(InstallationToken::expose),
     ]
     .into_iter()
     .flatten()
@@ -132,17 +131,18 @@ fn write_step_summary(text: &str) {
 /// either way.
 pub fn publish(
     context: &Context,
+    grants: &Grants,
     map: &DiffMap,
     confirmed: &[Finding],
     checks: &Seen,
     verdict: (Event, &str),
     tally: &mut Tally,
 ) -> Result<(), String> {
-    let (inline, outside) = select(context, map, confirmed, tally)?;
+    let (inline, outside) = select(context, grants, map, confirmed, tally)?;
     let text = body(context, verdict, &outside, checks, tally);
     println!("{text}");
     write_step_summary(&text);
-    let Some(github) = &context.github else {
+    let (Some(github), Some(token)) = (&context.github, &grants.app) else {
         for finding in &inline {
             println!(
                 "{}:{}\n{}\n",
@@ -166,7 +166,7 @@ pub fn publish(
         .collect();
     match pull_request::post_review(
         &Client::github(),
-        github.token.expose(),
+        token.expose(),
         &github.repository,
         &github.pull_request,
         (verdict.0, &text),
@@ -186,7 +186,7 @@ mod tests {
     use crate::review::diff;
     use crate::review::findings::{Category, Severity};
     use crate::review::pull_request::Posted;
-    use crate::review::setup::tests::context;
+    use crate::review::setup::tests::{context, grants};
 
     fn finding(path: &str, line: u32, summary: &str) -> Finding {
         Finding {
@@ -216,8 +216,14 @@ mod tests {
             finding("a.rs", 1, "Posted   before"),
         ];
         let mut tally = Tally::default();
-        let (inline, outside) =
-            select(&context(posted, "ghs_job"), &map, &confirmed, &mut tally).unwrap();
+        let (inline, outside) = select(
+            &context(posted),
+            &grants("ghs_job"),
+            &map,
+            &confirmed,
+            &mut tally,
+        )
+        .unwrap();
         assert_eq!(inline, [finding("a.rs", 1, "anchors")]);
         assert_eq!(outside, [finding("a.rs", 9, "outside the hunk")]);
         assert_eq!((tally.withheld, tally.still_holding), (1, 1));
@@ -231,7 +237,8 @@ mod tests {
             finding("a.rs", 1, "leaks job-token-value"),
         ];
         let error = select(
-            &context(Vec::new(), "job-token-value"),
+            &context(Vec::new()),
+            &grants("job-token-value"),
             &DiffMap::default(),
             &confirmed,
             &mut Tally::default(),
@@ -250,7 +257,7 @@ mod tests {
             unreadable: None,
         };
         let text = body(
-            &context(Vec::new(), "t"),
+            &context(Vec::new()),
             (Event::Approve, "no confirmed high or medium findings"),
             &[finding("b.rs", 4, "ping @claude here")],
             &checks,

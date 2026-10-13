@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use super::{git_in, langfuse, pull_request, scrubbed, Context, GitHub, Mode};
+use super::{git_in, langfuse, pull_request, scrubbed, Context, GitHub, Grants, Mode};
 use crate::anthropic_token::{self, AccessToken};
 use crate::app_token::{self, REVIEW};
 use crate::checkout;
@@ -31,7 +31,8 @@ const PATH_MAX_BYTES: usize = 4096;
 /// comments and reviews goes on without end.
 const REVIEWS_PER_PULL_REQUEST_MAX: usize = 20;
 
-pub fn context(mode: &Mode) -> Result<Context, String> {
+/// The run's context, which it prints from, and its grants, which it never prints.
+pub fn context(mode: &Mode) -> Result<(Context, Grants), String> {
     match mode {
         Mode::DryRun => dry_run_context(),
         Mode::Post => post_context(),
@@ -161,20 +162,23 @@ fn dry_run_commits(root: &Path) -> Result<(String, String, String), String> {
     Ok((base, head, session))
 }
 
-fn dry_run_context() -> Result<Context, String> {
+fn dry_run_context() -> Result<(Context, Grants), String> {
     let root = checkout::running_checkout()?;
     let (base, head, session) = dry_run_commits(&root)?;
     let langfuse = read_langfuse()?;
-    let access_token = anthropic_access(false)?;
-    Ok(Context {
+    let anthropic = anthropic_access(false)?;
+    let grants = Grants {
+        run_time: run_time(anthropic.as_ref())?,
+        anthropic,
+        app: None,
+    };
+    let context = Context {
         tag: "dry-run",
         checkout: root,
         worktree: None,
         base,
         head,
         claude: PathBuf::from("claude"),
-        run_time: run_time(access_token.as_ref())?,
-        access_token,
         github: None,
         session,
         fork: false,
@@ -182,7 +186,8 @@ fn dry_run_context() -> Result<Context, String> {
         user: current_user(),
         langfuse,
         files: create_files()?,
-    })
+    };
+    Ok((context, grants))
 }
 
 /// `mise which claude` printed one absolute path to a file.
@@ -355,10 +360,10 @@ fn prepare_trees(root: &Path, head: &str) -> Result<(Worktree, PathBuf), String>
     }
 }
 
-fn post_context() -> Result<Context, String> {
+fn post_context() -> Result<(Context, Grants), String> {
     let request = read_request()?;
-    let access_token = anthropic_access(true)?;
-    let run_time = run_time(access_token.as_ref())?;
+    let anthropic = anthropic_access(true)?;
+    let run_time = run_time(anthropic.as_ref())?;
     let bot = app_token::bot_login(&request.credentials)?;
     let token = app_token::mint(&request.credentials, &request.repository)?;
     let prepared =
@@ -376,27 +381,30 @@ fn post_context() -> Result<Context, String> {
         }
     };
     let full_name = request.repository.full_name();
-    Ok(Context {
+    let context = Context {
         tag: "post",
         checkout: worktree.dir.clone(),
         worktree: Some(worktree),
         base: pull_request.base.clone(),
         head: pull_request.head.clone(),
         claude: request.claude,
-        access_token,
         session: format!("{full_name}#{}", pull_request.number),
         fork: is_fork(&pull_request, &full_name),
         github: Some(GitHub {
-            token,
             repository: full_name,
             pull_request,
         }),
         posted: earlier.posted,
-        run_time,
         user: current_user(),
         langfuse: request.langfuse,
         files,
-    })
+    };
+    let grants = Grants {
+        anthropic,
+        app: Some(token),
+        run_time,
+    };
+    Ok((context, grants))
 }
 
 /// A pull request whose head lives in another repository; the App never approves one.
@@ -441,9 +449,8 @@ pub mod tests {
     use crate::review::pull_request::PullRequest;
     use tycho_types::git_environment::git_command;
 
-    /// A posting context for a pull request of `o/r`, with the given earlier findings and an
-    /// installation token value.
-    pub fn context(posted: Vec<pull_request::Posted>, token: &str) -> Context {
+    /// A posting context for a pull request of `o/r`, with the given earlier findings.
+    pub fn context(posted: Vec<pull_request::Posted>) -> Context {
         Context {
             tag: "post",
             checkout: PathBuf::from("/r/pull-request"),
@@ -451,9 +458,7 @@ pub mod tests {
             base: "b".repeat(40),
             head: "a".repeat(40),
             claude: PathBuf::from("/opt/claude"),
-            access_token: None,
             github: Some(GitHub {
-                token: app_token::InstallationToken::for_tests(token),
                 repository: "o/r".to_string(),
                 pull_request: PullRequest {
                     number: 1,
@@ -465,7 +470,6 @@ pub mod tests {
             session: "o/r#1".to_string(),
             fork: false,
             posted,
-            run_time: RUN_TIME_MAX,
             user: None,
             langfuse: None,
             files: PathBuf::from("/t/tycho-review-1"),
@@ -559,6 +563,15 @@ pub mod tests {
         assert!(!is_fork(&pull_request, "o/r"));
         pull_request.head_repository = "someone/r".to_string();
         assert!(is_fork(&pull_request, "o/r"));
+    }
+
+    /// Grants with an installation token of the given value and no Anthropic token.
+    pub fn grants(token: &str) -> Grants {
+        Grants {
+            anthropic: None,
+            app: Some(app_token::InstallationToken::for_tests(token)),
+            run_time: RUN_TIME_MAX,
+        }
     }
 
     #[test]

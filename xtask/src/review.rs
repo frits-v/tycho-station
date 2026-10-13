@@ -78,9 +78,18 @@ pub enum Mode {
 /// Where a posting run reads and writes on GitHub, as the review App.
 #[derive(Debug)]
 struct GitHub {
-    token: InstallationToken,
     repository: String,
     pull_request: PullRequest,
+}
+
+/// What the run was granted: its tokens, and the run time the Anthropic token leaves. Kept
+/// apart from [`Context`], which the run prints from, and handed only to the code that uses a
+/// token.
+#[derive(Debug)]
+struct Grants {
+    anthropic: Option<AccessToken>,
+    app: Option<InstallationToken>,
+    run_time: Duration,
 }
 
 #[derive(Debug)]
@@ -93,13 +102,11 @@ struct Context {
     base: String,
     head: String,
     claude: PathBuf,
-    access_token: Option<AccessToken>,
     github: Option<GitHub>,
     /// `owner/name#number` in Actions; Langfuse groups a pull request's runs by it.
     session: String,
     fork: bool,
     posted: Vec<Posted>,
-    run_time: Duration,
     user: Option<String>,
     langfuse: Option<Langfuse>,
     /// A directory private to this run, outside the checkout: the CLI refuses reads of
@@ -135,8 +142,8 @@ pub fn command(arguments: &[String]) -> i32 {
             return 2;
         }
     };
-    let context = match setup::context(&mode) {
-        Ok(context) => context,
+    let (context, grants) = match setup::context(&mode) {
+        Ok(prepared) => prepared,
         Err(reason) => {
             eprintln!("xtask review: {reason}");
             return 1;
@@ -144,18 +151,22 @@ pub fn command(arguments: &[String]) -> i32 {
     };
     let started = SystemTime::now();
     let mut tally = Tally::default();
-    let reviewed = review(&context, &mut tally);
+    let reviewed = review(&context, &grants, &mut tally);
     setup::remove_files(&context.files);
     if let Some(worktree) = &context.worktree {
         setup::remove_worktree(worktree);
     }
-    finish(&context, started, &tally, &reviewed)
+    finish(&context, &grants, started, &tally, &reviewed)
 }
 
-fn review(context: &Context, tally: &mut Tally) -> Result<(Event, String), String> {
+fn review(
+    context: &Context,
+    grants: &Grants,
+    tally: &mut Tally,
+) -> Result<(Event, String), String> {
     let started = Instant::now();
     let deadline = started
-        .checked_add(context.run_time)
+        .checked_add(grants.run_time)
         .ok_or("the run deadline overflows")?;
     let map = diff::parse_diff(&passes::prepare(context)?)?;
     if map.commentable.is_empty() {
@@ -168,26 +179,32 @@ fn review(context: &Context, tally: &mut Tally) -> Result<(Event, String), Strin
     }
     tally.files = map.files;
     tally.hunks = map.hunks;
-    let candidates = passes::find(context, deadline, tally)?;
-    let confirmed = passes::verify(context, &candidates, deadline, tally);
-    let checks = context
-        .github
-        .as_ref()
-        .map_or_else(checks::Seen::default, |github| {
-            checks::wait(
-                &crate::github_api::Client::github(),
-                github.token.expose(),
-                &github.repository,
-                &context.head,
-                started.checked_add(CHECKS_WAIT).unwrap_or(started),
-            )
-        });
+    let candidates = passes::find(context, grants, deadline, tally)?;
+    let confirmed = passes::verify(context, grants, &candidates, deadline, tally);
+    let checks = match (&context.github, &grants.app) {
+        (Some(github), Some(token)) => checks::wait(
+            &crate::github_api::Client::github(),
+            token.expose(),
+            &github.repository,
+            &context.head,
+            started.checked_add(CHECKS_WAIT).unwrap_or(started),
+        ),
+        _ => checks::Seen::default(),
+    };
     let (event, reason) = verdict::decide(&verdict::Evidence {
         confirmed: &confirmed,
         unjudged_blocking: tally.unjudged_blocking,
         fork: context.fork,
     });
-    report::publish(context, &map, &confirmed, &checks, (event, &reason), tally)?;
+    report::publish(
+        context,
+        grants,
+        &map,
+        &confirmed,
+        &checks,
+        (event, &reason),
+        tally,
+    )?;
     Ok((event, reason))
 }
 
@@ -226,6 +243,7 @@ fn trace(
 /// Exports the trace and revokes the App's token; any failure on the way is the exit code.
 fn finish(
     context: &Context,
+    grants: &Grants,
     started: SystemTime,
     tally: &Tally,
     reviewed: &Result<(Event, String), String>,
@@ -247,8 +265,8 @@ fn finish(
                 .is_ok()
         },
     );
-    let revoked = context.github.as_ref().is_none_or(|github| {
-        app_token::revoke(&github.token)
+    let revoked = grants.app.as_ref().is_none_or(|token| {
+        app_token::revoke(token)
             .map_err(|reason| eprintln!("xtask review: {reason}"))
             .is_ok()
     });
@@ -338,7 +356,7 @@ mod tests {
 
     #[test]
     fn the_trace_names_the_verdict_or_why_there_is_none() {
-        let context = setup::tests::context(Vec::new(), "t");
+        let context = setup::tests::context(Vec::new());
         let tally = Tally::default();
         let started = SystemTime::now();
         let approved = trace(
