@@ -76,7 +76,9 @@ Steps and the question each one answers:
 6. Attach tests: a Ghostty tab as the developer attaches to a zmx session owned by the
    agent user through the shared socket directory; the reader opens that tab through
    AppleScript while running under zmx and under launchd, and the Automation consent
-   prompt is recorded for each.
+   prompt is recorded for each. `crates/tycho/tests/attach.rs`, run with
+   `mise run attach-tests` from a Ghostty terminal, since sudo asks for the developer's
+   password to create the agent's sessions.
 7. A planted contradiction makes the worker reject its awaitable with a certified
    question; the packet lands in a directory; a verdict typed into a file resumes the
    unit.

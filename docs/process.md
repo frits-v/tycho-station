@@ -97,6 +97,7 @@ The suites that start real processes are ignored tests, run by their mise tasks 
 | `control-tests` | a Claude token in the core's store, which the suite copies into its test core and hands each control session; never beside `worker-tests` |
 | `graph-tests` | `mise run graph-plugin` |
 | `boundary-tests` | a terminal and the provisioned agent user: sudo asks for the developer's password on the terminal to run each probe as `tycho-agent` |
+| `attach-tests` | a Ghostty terminal and the agent user: sudo once, again at teardown past its five-minute cache; up to two Automation dialogs (the suite's terminal, `osascript`) |
 
 The boundary suite refuses to start when stdin is not a terminal, and when `sudo -n` runs as
 the agent with no password after `sudo -k`, since nothing in the station installs such a
@@ -112,6 +113,52 @@ is printed as a measurement. The run ends with the number of boundaries examined
 count of each disposition; zero examined fails. The agent's walk to the canonical
 repository names the first directory it cannot search, with `ls`'s line saying whether that
 directory refused it or was absent.
+
+The attach suite refuses to start without a terminal and makes the same `sudo -n` check. In
+one sudo call it creates three sessions as the agent in `/Users/Shared/tycho-agent-zmx` with
+the prefix's zmx; each session's program reads one typed line, writes it to a marker file in
+a directory of group `tycho-zmx`, then sleeps 600 seconds. Every zmx run in the shared
+directory, the agent's and the developer's clients alike, runs under `umask 007` with
+`ZMX_DIR_MODE=0770` and `ZMX_LOG_MODE=0660`, since the umask masks the socket, directory and
+log modes. Three paths attach as the developer: a pty from `script`, which waits until
+`zmx list` shows its client, types the line, detaches with Ctrl-\ and checks the session is
+still listed; and a Ghostty tab opened by `osascript`, run once inside a developer zmx
+session and once as a one-shot launchd user agent (`tycho-attach-test-<pid>`, its plist in
+the suite's private directory, booted out at teardown). The tab script waits, bounded, until
+`zmx list` shows the tab's client, then types the line through Ghostty's `input text`; a tab
+whose client never shows fails.
+
+A path passes only when the marker holds the typed line and the agent owns it; the marker is
+opened without following a link or blocking on a FIFO and read within its bound. osascript's
+answer decodes to opened, never attached, consent required (-1743, -1744), Ghostty
+unavailable (-600, -10814, or -1728 when the script cannot compile without Ghostty),
+unanswered (-1712, or no answer within 180 seconds) or unrecognised, which includes a -1728
+at run time. A consent prompt is a path that could not look, and its line names System
+Settings, Privacy & Security, Automation, the requesting application and Ghostty, to turn on
+before running the suite again. The run prints the owner, mode, link flag and developer
+write access of every entry in the shared directory, flags any symbolic link, ends with
+`examined N attach paths` and each path's state, and fails on zero examined or any path that
+did not attach. Teardown kills the agent's sessions by name as the agent, never by pid, then
+kills by name any session of the run's prefix the developer owns, which `zmx attach` on a
+missing name creates, and prints what the shared directory still lists. A second ignored
+test runs the pty path against a developer session in a private directory, with no sudo.
+
+Before every sudo, the teardown's included, the attach suite checks that its process group
+is the terminal's foreground group, and refuses with a line naming both groups when it is
+not, since sudo could then show its prompt but never read the password. It writes the
+emulator resets to `/dev/tty` (the kitty keyboard protocol popped, then set to no flags,
+bracketed paste, focus events and mouse reporting off), since a `zmx attach` in Ghostty can
+leave the keyboard protocol on, after which Enter arrives as `CSI 13 u` and a canonical read
+never ends, which termios cannot show. It puts the terminal in canonical mode with echo, DEL
+as erase, and carriage return read as newline with neither ignored nor swapped, and prints
+the process group, the foreground group, the input and local flags, VERASE, VMIN and VTIME
+before and after. After each pty client and when the test ends, a panic included, it writes
+the resets again and restores the saved settings. Each agent-side command runs with its
+output in files and is bounded by sudo's own exit; on a timeout the line carries `ps`'s
+state, process group and foreground group for sudo (`T` is stopped reading the terminal from
+a background group, `S` is waiting), and a refused kill is named and not waited for. The
+agent's scripts send zmx's output to a file of their own, so a session daemon that inherits
+a descriptor cannot hold the run open.
 
 ## Reporting
 
