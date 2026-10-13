@@ -6,6 +6,7 @@
 //! error text; the access token reaches the Claude CLI only as `ANTHROPIC_AUTH_TOKEN`.
 
 use std::fmt;
+use std::sync::{Mutex, PoisonError};
 
 use base64::Engine as _;
 
@@ -58,20 +59,57 @@ pub struct Federation {
 }
 
 /// What a run mints Anthropic tokens from. Each mint asks GitHub for a fresh OIDC token, so
-/// tokens minted side by side never present the same single-use assertion.
+/// tokens minted side by side never present the same single-use assertion. The minter keeps
+/// every token it issued, so the run can refuse to post one whatever its format.
 #[derive(Debug)]
 pub struct Minter {
     federation: Federation,
     oidc: OidcRequest,
+    minted: Mutex<Vec<Secret>>,
 }
 
 impl Minter {
     pub const fn new(federation: Federation, oidc: OidcRequest) -> Self {
-        Self { federation, oidc }
+        Self {
+            federation,
+            oidc,
+            minted: Mutex::new(Vec::new()),
+        }
     }
 
     pub fn mint(&self) -> Result<AccessToken, String> {
-        mint(&self.federation, &self.oidc)
+        let token = mint(&self.federation, &self.oidc)?;
+        self.minted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Secret(token.value.expose().to_string()));
+        Ok(token)
+    }
+
+    /// Every token this minter issued, for the check that a posted text names none.
+    pub fn minted(&self) -> Vec<String> {
+        self.minted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|token| token.expose().to_string())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub fn with_minted(tokens: &[&str]) -> Self {
+        let minter = Self::new(
+            read_federation(Some("r".into()), Some("o".into()), None, None)
+                .unwrap_or_else(|reason| panic!("{reason}")),
+            read_oidc_request(Some("https://x/".into()), Some("t".into()))
+                .unwrap_or_else(|reason| panic!("{reason}")),
+        );
+        minter
+            .minted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(tokens.iter().map(|token| Secret((*token).to_string())));
+        minter
     }
 }
 
