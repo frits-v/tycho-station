@@ -563,13 +563,13 @@ check out, build and run it.
 
 ### After the verdict
 
-- An approval stands for the low findings that come with it. The author fixes the ones worth
-  fixing in one last commit, replies on each thread with the commit that resolves it, resolves
-  every thread and merges; no second review is asked for. The branch rules dismiss the
-  approval on that push and require none, and they require every thread resolved and `ci`
-  passing on a branch up to date with `main`.
-- Changes requested, or a high or medium finding the author disputes, is the case for another
-  review.
+- An approval can come with findings still open. The author fixes them in later commits,
+  within the change the pull request set out to make, replies on each thread with the commit
+  that resolves it, resolves every thread and merges; those fixes need no new review.
+- When the author judges that the change has grown significantly past what was approved, the
+  author dismisses the approval, saying why, and asks for a new review.
+- The branch rules require every thread resolved and `ci` passing on a branch up to date with
+  `main`.
 
 ### What runs where
 
