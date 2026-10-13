@@ -11,7 +11,7 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use tycho_types::session::{SESSION_NAME_MAX_BYTES, SOCKET_PATH_MAX_BYTES};
 
-use crate::tool_prefix::{self, AgentTool};
+use crate::tool_prefix;
 
 pub const AGENT_USER_NAME: &str = "tycho-agent";
 pub const AGENT_GROUP_NAME: &str = "tycho-agent";
@@ -41,10 +41,14 @@ const PROBE_OUTPUT_MAX_BYTES: usize = 1 << 17;
 const SECURITY_ITEM_NOT_FOUND_EXIT: i32 = 44;
 /// `dsmemberutil checkmembership` exit code when the user or group does not exist.
 const DSMEMBERUTIL_NOT_FOUND_EXIT: i32 = 7;
-/// `claude auth status` exit code when no login is stored.
-const CLAUDE_LOGGED_OUT_EXIT: i32 = 1;
-/// `codex login status` exit code when no login is stored.
-const CODEX_LOGGED_OUT_EXIT: i32 = 1;
+/// The core home tycho resolves when `TYCHO_HOME` is unset, under the developer's home.
+const CORE_HOME_RELATIVE: &str = ".tycho";
+/// The variable that moves the core home, as `tycho::config::core_home` reads it.
+const CORE_HOME_ENV: &str = "TYCHO_HOME";
+/// The vendor credential store under the core home.
+const CREDENTIALS_DIR: &str = "credentials";
+const CREDENTIAL_STORE_MODE: u32 = 0o700;
+const CREDENTIAL_FILE_MODE: u32 = 0o600;
 /// `git config --get-all` exit code when the key is not set.
 const GIT_CONFIG_KEY_UNSET_EXIT: i32 = 1;
 
@@ -146,8 +150,9 @@ pub enum Check {
     KeychainAws,
     KeychainSsh,
     KeychainGhCli,
-    ClaudeLogin,
-    CodexLogin,
+    ClaudeCredential,
+    CodexCredential,
+    AgentCredentialStoreClosed,
     AgentPrefixWritable,
     AgentPrefixMise,
     AgentPrefixClaude,
@@ -167,7 +172,7 @@ const fn spec(check: Check, name: &'static str, side: Side) -> CheckSpec {
 }
 
 /// Every check, in print order; each one runs on exactly one side.
-const CATALOGUE: [CheckSpec; 51] = [
+const CATALOGUE: [CheckSpec; 52] = [
     spec(
         Check::AgentGroupExists,
         "agent group exists",
@@ -285,6 +290,16 @@ const CATALOGUE: [CheckSpec; 51] = [
         Side::Developer,
     ),
     spec(
+        Check::ClaudeCredential,
+        "vendor credential: claude token in the core's store, the developer's, mode 0600",
+        Side::Developer,
+    ),
+    spec(
+        Check::CodexCredential,
+        "vendor credential: codex auth.json in the core's store, the developer's, mode 0600",
+        Side::Developer,
+    ),
+    spec(
         Check::PrefixDirectory,
         "tool prefix: a real directory the developer owns, mode 0755",
         Side::Developer,
@@ -385,13 +400,8 @@ const CATALOGUE: [CheckSpec; 51] = [
         Side::Agent,
     ),
     spec(
-        Check::ClaudeLogin,
-        "claude logged in as the agent",
-        Side::Agent,
-    ),
-    spec(
-        Check::CodexLogin,
-        "codex logged in as the agent",
+        Check::AgentCredentialStoreClosed,
+        "as the agent: the core's credential store cannot be reached",
         Side::Agent,
     ),
     spec(
@@ -888,28 +898,11 @@ fn json_bool(text: &str, field: &str) -> Option<bool> {
     value.get(field)?.as_bool()
 }
 
-/// `claude auth status --json` prints `loggedIn` either way and exits 1 when logged out.
-fn decode_claude_auth_status(code: Option<i32>, stdout: &str, _stderr: &str) -> AuthStatus {
-    match (code, json_bool(stdout, "loggedIn")) {
-        (Some(0), Some(true)) => AuthStatus::LoggedIn,
-        (Some(CLAUDE_LOGGED_OUT_EXIT), Some(false)) => AuthStatus::LoggedOut,
-        _ => AuthStatus::Unrecognised,
-    }
-}
-
 /// `entire auth status --json` exits 0 logged in or out; a non-zero exit is a failure to look.
 fn decode_entire_auth_status(code: Option<i32>, stdout: &str, _stderr: &str) -> AuthStatus {
     match (code, json_bool(stdout, "logged_in")) {
         (Some(0), Some(true)) => AuthStatus::LoggedIn,
         (Some(0), Some(false)) => AuthStatus::LoggedOut,
-        _ => AuthStatus::Unrecognised,
-    }
-}
-
-/// `codex login status` exits 1 with `Not logged in` on stderr when logged out; the logged-in output is unsampled until the agent's first `codex login`, so it decodes as unrecognised.
-fn decode_codex_login_status(code: Option<i32>, _stdout: &str, stderr: &str) -> AuthStatus {
-    match (code, first_line(stderr)) {
-        (Some(CODEX_LOGGED_OUT_EXIT), "Not logged in") => AuthStatus::LoggedOut,
         _ => AuthStatus::Unrecognised,
     }
 }
@@ -929,22 +922,8 @@ const ENTIRE_LOGIN: LoginProbe = LoginProbe {
     decode: decode_entire_auth_status,
     login_hint: "log in once from a terminal: entire auth login",
 };
-const CLAUDE_LOGIN: LoginProbe = LoginProbe {
-    check: Check::ClaudeLogin,
-    tool: "claude",
-    args: &["auth", "status", "--json"],
-    decode: decode_claude_auth_status,
-    login_hint: "log in once from a terminal: claude auth login",
-};
-const CODEX_LOGIN: LoginProbe = LoginProbe {
-    check: Check::CodexLogin,
-    tool: "codex",
-    args: &["login", "status"],
-    decode: decode_codex_login_status,
-    login_hint: "log in once from a terminal: codex login",
-};
 
-/// Claude and entire answer on stdout and codex on stderr, so both first lines are shown.
+/// A tool may answer on stdout or stderr, so both first lines are shown.
 fn unrecognised_login(probe: &LoginProbe, code: Option<i32>, stdout: &str, stderr: &str) -> String {
     format!(
         "unrecognised {} {} result (exit {code:?}): stdout {:?}, stderr {:?}",
@@ -965,33 +944,6 @@ fn login_finding(probe: &LoginProbe, ls: &MiseLs) -> Finding {
         Capture::ExecutableNotFound => Finding::unreachable(probe.check, "mise is not on PATH"),
         capture => decoded_login(probe, capture),
     }
-}
-
-/// The agent's login probe runs the pinned install by absolute path, never `mise exec` in the
-/// checkout, which the agent cannot read, and only once that install checks out.
-fn prefix_login_finding(
-    probe: &LoginProbe,
-    tool: AgentTool,
-    gate: &Status,
-    identity: &Identity,
-) -> Finding {
-    if !gate.is_pass() {
-        return Finding::unreachable(
-            probe.check,
-            format!(
-                "{} does not run from the tool prefix at its pin, so its login cannot be checked: {gate}",
-                probe.tool
-            ),
-        );
-    }
-    let command = match tool_prefix::agent_tool_command(identity, tool, probe.args) {
-        Ok(command) => command,
-        Err(why) => return Finding::unreachable(probe.check, why),
-    };
-    decoded_login(
-        probe,
-        run_bounded_within(command, tool_prefix::TOOL_PROBE_TIMEOUT),
-    )
 }
 
 fn decoded_login(probe: &LoginProbe, capture: Capture) -> Finding {
@@ -2144,9 +2096,206 @@ pub fn developer_findings(identity: &Identity) -> Vec<Finding> {
     let ls = mise_ls();
     findings.extend(vendor_findings(&ls));
     findings.push(login_finding(&ENTIRE_LOGIN, &ls));
+    findings.extend(stored_credential_findings(identity));
     findings
         .extend(tool_prefix::Probe::read(&tool_prefix::Prefix::production(), identity).findings());
     findings
+}
+
+/// A vendor's stored credential as setup reports it: the check, the file name in the store,
+/// and how the operator stores it.
+struct StoredCredential {
+    check: Check,
+    vendor: &'static str,
+    hint: &'static str,
+}
+
+const STORED_CREDENTIALS: [StoredCredential; 2] = [
+    StoredCredential {
+        check: Check::ClaudeCredential,
+        vendor: "claude",
+        hint: "as the subscription's owner run claude setup-token, then /Users/Shared/tycho/bin/tycho credentials set claude and paste the token (docs/process.md, Vendor credentials)",
+    },
+    StoredCredential {
+        check: Check::CodexCredential,
+        vendor: "codex",
+        hint: "as the plan's owner run codex login, then /Users/Shared/tycho/bin/tycho credentials set codex < ~/.codex/auth.json (docs/process.md, Vendor credentials)",
+    },
+];
+
+/// The core home the way `tycho` resolves it: `TYCHO_HOME` when it names a directory strictly
+/// inside the user's home with no link on the way, else `.tycho` under the user's home.
+fn core_home(user_home: &Path, moved: Option<&std::ffi::OsStr>) -> Result<PathBuf, String> {
+    let Some(moved) = moved else {
+        return Ok(user_home.join(CORE_HOME_RELATIVE));
+    };
+    let home = PathBuf::from(moved);
+    let inside = home.is_absolute()
+        && home != user_home
+        && home.starts_with(user_home)
+        && home.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        });
+    if !inside {
+        return Err(format!(
+            "{CORE_HOME_ENV}={} is not a directory inside {}",
+            home.display(),
+            user_home.display()
+        ));
+    }
+    let mut walked = user_home.to_path_buf();
+    for component in home.strip_prefix(user_home).unwrap_or(&home).components() {
+        walked.push(component);
+        if fs::symlink_metadata(&walked).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(format!("{} is a symbolic link", walked.display()));
+        }
+    }
+    Ok(home)
+}
+
+fn stored_credential_findings(identity: &Identity) -> Vec<Finding> {
+    let moved = std::env::var_os(CORE_HOME_ENV);
+    let store = resolve_home(&identity.username)
+        .and_then(|home| core_home(Path::new(&home), moved.as_deref()))
+        .map(|home| home.join(CREDENTIALS_DIR));
+    STORED_CREDENTIALS
+        .iter()
+        .map(|stored| {
+            let status = store.as_ref().map_or_else(
+                |why| Status::Unreachable { why: why.clone() },
+                |store| stored_credential_status(store, stored.vendor, identity.uid),
+            );
+            if status.is_pass() {
+                Finding::new(stored.check, status)
+            } else {
+                Finding::with_hint(stored.check, status, stored.hint)
+            }
+        })
+        .collect()
+}
+
+/// An entry of the store as lstat sees it: never through a link, contents never read.
+fn store_entry_status(path: &Path, directory: bool, uid: u32, mode: u32) -> Status {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Status::Missing,
+        Err(error) => {
+            return Status::Unreachable {
+                why: format!("{}: {error}", path.display()),
+            }
+        }
+    };
+    let kind_ok = if directory {
+        metadata.file_type().is_dir()
+    } else {
+        metadata.file_type().is_file()
+    };
+    if !kind_ok {
+        return Status::Wrong {
+            found: format!("{} at {}", file_kind(&metadata), path.display()),
+            wanted: if directory {
+                "directory"
+            } else {
+                "regular file"
+            }
+            .to_string(),
+        };
+    }
+    if metadata.uid() != uid {
+        return Status::Wrong {
+            found: format!("{} owned by uid {}", path.display(), metadata.uid()),
+            wanted: format!("uid {uid}"),
+        };
+    }
+    match mode_status(metadata.permissions().mode() & 0o7777, mode) {
+        Status::Wrong { found, wanted } => Status::Wrong {
+            found: format!("{} at mode {found}", path.display()),
+            wanted,
+        },
+        other => other,
+    }
+}
+
+/// The store is a 0700 directory of the developer and the vendor's file a 0600 regular file
+/// of the developer: nothing in the group or other bits, no link.
+fn stored_credential_status(store: &Path, vendor: &str, developer_uid: u32) -> Status {
+    match store_entry_status(store, true, developer_uid, CREDENTIAL_STORE_MODE) {
+        Status::Present => store_entry_status(
+            &store.join(vendor),
+            false,
+            developer_uid,
+            CREDENTIAL_FILE_MODE,
+        ),
+        other => other,
+    }
+}
+
+/// Where the agent looks for the core's store: the default core home of the user who owns the
+/// tool prefix, the developer, read from the password database rather than any environment.
+/// The agent cannot see a core home the developer moved with `TYCHO_HOME`, so a moved home is
+/// checked on the developer's side only.
+fn developer_store() -> Result<PathBuf, String> {
+    let metadata = fs::symlink_metadata(tool_prefix::PREFIX_ROOT)
+        .map_err(|error| format!("{}: {error}", tool_prefix::PREFIX_ROOT))?;
+    let user = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(metadata.uid()))
+        .map_err(|error| format!("uid {}: {error}", metadata.uid()))?
+        .ok_or_else(|| {
+            format!(
+                "no user has uid {}, the tool prefix's owner",
+                metadata.uid()
+            )
+        })?;
+    Ok(user.dir.join(CORE_HOME_RELATIVE).join(CREDENTIALS_DIR))
+}
+
+/// Run as the agent: a denial at any step of the walk passes; reaching the store, listing it
+/// or opening a vendor file is the boundary answering.
+fn agent_store_status(store: &Path) -> Status {
+    let denied = |error: &io::Error| error.kind() == io::ErrorKind::PermissionDenied;
+    match fs::metadata(store) {
+        Err(error) if denied(&error) => return Status::Present,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Status::Unreachable {
+                why: format!(
+                    "{} does not exist and every directory above it let the agent search, so the store's own mode is untested",
+                    store.display()
+                ),
+            }
+        }
+        Err(error) => {
+            return Status::Unreachable {
+                why: format!("{}: {error}", store.display()),
+            }
+        }
+        Ok(_) => {}
+    }
+    if fs::read_dir(store).is_ok() {
+        return Status::Wrong {
+            found: format!("the agent lists {}", store.display()),
+            wanted: "permission denied".to_string(),
+        };
+    }
+    for stored in &STORED_CREDENTIALS {
+        let path = store.join(stored.vendor);
+        match fs::File::open(&path) {
+            Ok(_) => {
+                return Status::Wrong {
+                    found: format!("the agent opens {}", path.display()),
+                    wanted: "permission denied".to_string(),
+                }
+            }
+            Err(error) if denied(&error) => {}
+            Err(error) => {
+                return Status::Unreachable {
+                    why: format!("{}: {error}", path.display()),
+                }
+            }
+        }
+    }
+    Status::Present
 }
 
 /// The developer-side checks of directory records and socket directories, which read no
@@ -2214,28 +2363,12 @@ fn agent_findings(identity: &Identity) -> Vec<Finding> {
     findings.extend(credential_findings(&home));
     findings.extend(keychain_findings());
     let prefix = tool_prefix::agent_findings(identity);
-    let gate = |check: Check| {
-        prefix
-            .iter()
-            .find(|finding| finding.check == check)
-            .map_or_else(
-                || Status::Unreachable {
-                    why: "no probe produced this finding".to_string(),
-                },
-                |finding| finding.status.clone(),
-            )
-    };
-    findings.push(prefix_login_finding(
-        &CLAUDE_LOGIN,
-        AgentTool::Claude,
-        &gate(Check::AgentPrefixClaude),
-        identity,
-    ));
-    findings.push(prefix_login_finding(
-        &CODEX_LOGIN,
-        AgentTool::Codex,
-        &gate(Check::AgentPrefixCodex),
-        identity,
+    findings.push(Finding::new(
+        Check::AgentCredentialStoreClosed,
+        developer_store().map_or_else(
+            |why| Status::Unreachable { why },
+            |store| agent_store_status(&store),
+        ),
     ));
     findings.extend(prefix);
     findings
@@ -2358,7 +2491,7 @@ pub fn run() -> i32 {
 mod tests {
     use super::*;
 
-    const EXPECTED_SIDES: [(&str, Side); 51] = [
+    const EXPECTED_SIDES: [(&str, Side); 52] = [
         ("agent group exists", Side::Developer),
         ("agent user exists", Side::Developer),
         ("agent home directory", Side::Developer),
@@ -2411,6 +2544,14 @@ mod tests {
         ),
         ("entire logged in as the developer", Side::Developer),
         (
+            "vendor credential: claude token in the core's store, the developer's, mode 0600",
+            Side::Developer,
+        ),
+        (
+            "vendor credential: codex auth.json in the core's store, the developer's, mode 0600",
+            Side::Developer,
+        ),
+        (
             "tool prefix: a real directory the developer owns, mode 0755",
             Side::Developer,
         ),
@@ -2451,8 +2592,7 @@ mod tests {
         ("agent keychain: no item for aws", Side::Agent),
         ("agent keychain: no item for ssh", Side::Agent),
         ("agent keychain: no item for gh:github.com", Side::Agent),
-        ("claude logged in as the agent", Side::Agent),
-        ("codex logged in as the agent", Side::Agent),
+        ("as the agent: the core's credential store cannot be reached", Side::Agent),
         (
             "as the agent: nothing in the tool prefix is writable",
             Side::Agent,
@@ -2523,8 +2663,8 @@ mod tests {
             developer_checks.len().saturating_add(agent_checks.len()),
             CATALOGUE.len()
         );
-        assert_eq!(developer_checks.len(), 32);
-        assert_eq!(agent_checks.len(), 19);
+        assert_eq!(developer_checks.len(), 34);
+        assert_eq!(agent_checks.len(), 18);
     }
 
     /// `ls -lde` on this machine's home and on a directory carrying the deny entry and an
@@ -2655,7 +2795,10 @@ mod tests {
             })
         );
 
-        let stray = [Finding::new(Check::ClaudeLogin, Status::Present)];
+        let stray = [Finding::new(
+            Check::AgentCredentialStoreClosed,
+            Status::Present,
+        )];
         let findings = assemble(Side::Developer, &stray);
         assert_eq!(findings.len(), CATALOGUE.len().saturating_add(1));
         assert!(findings
@@ -2678,16 +2821,16 @@ mod tests {
         assert_eq!(summarize(Some(Side::Developer), &[]), 1);
         let own_side_green = [
             Finding::new(Check::AgentUserExists, Status::Present),
-            Finding::new(Check::ClaudeLogin, Status::Deferred { to: Side::Agent }),
+            Finding::new(Check::KeychainSsh, Status::Deferred { to: Side::Agent }),
         ];
         assert_eq!(summarize(Some(Side::Developer), &own_side_green), 0);
         let own_side_red = [
             Finding::new(Check::AgentUserExists, Status::Missing),
-            Finding::new(Check::ClaudeLogin, Status::Deferred { to: Side::Agent }),
+            Finding::new(Check::KeychainSsh, Status::Deferred { to: Side::Agent }),
         ];
         assert_eq!(summarize(Some(Side::Developer), &own_side_red), 1);
         let only_deferred = [Finding::new(
-            Check::ClaudeLogin,
+            Check::KeychainSsh,
             Status::Deferred { to: Side::Agent },
         )];
         assert_eq!(summarize(Some(Side::Developer), &only_deferred), 1);
@@ -2744,30 +2887,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_auth_status_with_exit_code_per_tool() {
-        let claude_logged_in = r#"{"loggedIn": true, "authMethod": "claude.ai"}"#;
-        let claude_logged_out = "{\n  \"loggedIn\": false,\n  \"authMethod\": \"none\",\n  \"apiProvider\": \"firstParty\"\n}\n";
-        assert_eq!(
-            decode_claude_auth_status(Some(0), claude_logged_in, ""),
-            AuthStatus::LoggedIn
-        );
-        assert_eq!(
-            decode_claude_auth_status(Some(1), claude_logged_out, ""),
-            AuthStatus::LoggedOut
-        );
-        assert_eq!(
-            decode_claude_auth_status(Some(0), claude_logged_out, ""),
-            AuthStatus::Unrecognised
-        );
-        assert_eq!(
-            decode_claude_auth_status(Some(1), claude_logged_in, ""),
-            AuthStatus::Unrecognised
-        );
-        assert_eq!(
-            decode_claude_auth_status(Some(1), "not json", ""),
-            AuthStatus::Unrecognised
-        );
-
+    fn decodes_entire_auth_status_with_its_exit_code() {
         let entire_logged_in = r#"{"logged_in": true, "token_source": "macOS Keychain"}"#;
         let entire_logged_out = "{\n  \"logged_in\": false,\n  \"available_contexts\": 0\n}\n";
         assert_eq!(
@@ -2786,48 +2906,158 @@ mod tests {
             decode_entire_auth_status(Some(0), "not json", ""),
             AuthStatus::Unrecognised
         );
-
-        assert_eq!(
-            decode_codex_login_status(Some(1), "", "Not logged in\n"),
-            AuthStatus::LoggedOut
-        );
-        assert_eq!(
-            decode_codex_login_status(Some(1), "Not logged in\n", ""),
-            AuthStatus::Unrecognised
-        );
-        assert_eq!(
-            decode_codex_login_status(Some(0), "", "Not logged in\n"),
-            AuthStatus::Unrecognised
-        );
-        assert_eq!(
-            decode_codex_login_status(Some(0), "Logged in", ""),
-            AuthStatus::Unrecognised
-        );
-        assert_eq!(
-            decode_codex_login_status(Some(1), "", "error: something else\n"),
-            AuthStatus::Unrecognised
-        );
     }
 
     #[test]
     fn an_unrecognised_login_names_both_first_lines() {
         let message = unrecognised_login(
-            &CLAUDE_LOGIN,
+            &ENTIRE_LOGIN,
             Some(2),
             "{\"error\": true}\nmore\n",
             "warning\n",
         );
         assert_eq!(
             message,
-            "unrecognised claude auth status --json result (exit Some(2)): stdout \"{\\\"error\\\": true}\", stderr \"warning\""
+            "unrecognised entire auth status --json result (exit Some(2)): stdout \"{\\\"error\\\": true}\", stderr \"warning\""
         );
     }
 
     #[test]
     fn login_hints_name_each_tools_own_login_command() {
-        assert!(CODEX_LOGIN.login_hint.ends_with("codex login"));
-        assert!(CLAUDE_LOGIN.login_hint.ends_with("claude auth login"));
         assert!(ENTIRE_LOGIN.login_hint.ends_with("entire auth login"));
+        let [claude, codex] = &STORED_CREDENTIALS;
+        assert!(
+            claude.hint.contains("claude setup-token")
+                && claude.hint.contains("credentials set claude")
+        );
+        assert!(
+            codex.hint.contains("codex login")
+                && codex
+                    .hint
+                    .contains("credentials set codex < ~/.codex/auth.json")
+        );
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the scratch directory is this test's own, under the temporary directory"
+    )]
+    fn remove_scratch(dir: &Path) {
+        drop(fs::remove_dir_all(dir));
+    }
+
+    fn credential_scratch(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xtask-store-{test}-{}", std::process::id()));
+        remove_scratch(&dir);
+        fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    fn uid_of(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().uid()
+    }
+
+    #[test]
+    fn a_credential_store_must_be_a_private_directory_of_the_developer() {
+        let root = credential_scratch("store");
+        let store = root.join("credentials");
+        let me = uid_of(&root);
+        assert_eq!(
+            stored_credential_status(&store, "claude", me),
+            Status::Missing
+        );
+        fs::create_dir(&store).unwrap();
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(matches!(
+            stored_credential_status(&store, "claude", me),
+            Status::Wrong { wanted, .. } if wanted == "0700"
+        ));
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            stored_credential_status(&store, "claude", me),
+            Status::Missing
+        );
+        assert!(matches!(
+            stored_credential_status(&store, "claude", me.wrapping_add(1)),
+            Status::Wrong { wanted, .. } if wanted.starts_with("uid ")
+        ));
+        remove_scratch(&root);
+    }
+
+    #[test]
+    fn a_stored_credential_must_be_a_private_file_of_the_developer() {
+        let root = credential_scratch("file");
+        let store = root.join("credentials");
+        let me = uid_of(&root);
+        fs::create_dir(&store).unwrap();
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+        let file = store.join("claude");
+        fs::write(&file, "sk-ant-oat01-x").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+        let wrong = stored_credential_status(&store, "claude", me);
+        assert!(
+            matches!(&wrong, Status::Wrong { found, wanted } if found.ends_with("mode 0640") && wanted == "0600"),
+            "{wrong}"
+        );
+        assert!(!wrong.to_string().contains("sk-ant-oat01-x"));
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            stored_credential_status(&store, "claude", me),
+            Status::Present
+        );
+        fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), &file).unwrap();
+        assert!(matches!(
+            stored_credential_status(&store, "claude", me),
+            Status::Wrong { wanted, .. } if wanted == "regular file"
+        ));
+        remove_scratch(&root);
+    }
+
+    #[test]
+    fn the_store_follows_the_core_home_tycho_resolves() {
+        let root = credential_scratch("home");
+        assert_eq!(core_home(&root, None).unwrap(), root.join(".tycho"));
+        let moved = root.join("test-core");
+        assert_eq!(core_home(&root, Some(moved.as_os_str())).unwrap(), moved);
+        for refused in [
+            PathBuf::from("relative"),
+            root.clone(),
+            PathBuf::from("/elsewhere/core"),
+            root.join("a/../b"),
+        ] {
+            assert!(
+                core_home(&root, Some(refused.as_os_str())).is_err(),
+                "{}",
+                refused.display()
+            );
+        }
+        std::os::unix::fs::symlink("/tmp", root.join("linked")).unwrap();
+        assert!(core_home(&root, Some(root.join("linked/core").as_os_str())).is_err());
+        remove_scratch(&root);
+    }
+
+    #[test]
+    fn the_agents_store_probe_passes_only_on_a_denial() {
+        let root = credential_scratch("agent");
+        let store = root.join("credentials");
+        assert!(matches!(
+            agent_store_status(&store),
+            Status::Unreachable { .. }
+        ));
+        fs::create_dir(&store).unwrap();
+        fs::write(store.join("claude"), "x").unwrap();
+        assert!(matches!(
+            agent_store_status(&store),
+            Status::Wrong { found, .. } if found.starts_with("the agent lists")
+        ));
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(agent_store_status(&store), Status::Present);
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(agent_store_status(&store), Status::Present);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        remove_scratch(&root);
     }
 
     #[test]
@@ -2943,14 +3173,14 @@ mod tests {
             .to_string(),
         );
         assert!(matches!(
-            installed_gate(Check::ClaudeLogin, "claude", &ls),
+            installed_gate(Check::EntireLogin, "claude", &ls),
             Some(Finding {
                 status: Status::Unreachable { .. },
                 ..
             })
         ));
         assert!(matches!(
-            installed_gate(Check::CodexLogin, "codex", &ls),
+            installed_gate(Check::EntireLogin, "codex", &ls),
             Some(Finding {
                 status: Status::Unreachable { .. },
                 ..

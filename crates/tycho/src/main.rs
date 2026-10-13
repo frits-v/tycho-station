@@ -7,16 +7,19 @@
 
 use std::env;
 use std::fmt::Display;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
 use std::thread;
+use std::time::SystemTime;
 
 use tycho::config::{
     self, CoreConfig, CorePorts, PROBE_TIMEOUT, VERDICT_INTERVAL, VERDICT_ITERATIONS_MAX,
     WATCHDOG_INTERVAL,
 };
 use tycho::config_store::{self, FactoryConfig, CONFIG_DIR_ENV};
+use tycho::credentials::{self, CredentialVendor};
 use tycho::epic_command::{self, OperatorAnswer};
 use tycho::http::Http;
 use tycho::launchd::Agent;
@@ -44,6 +47,8 @@ const USAGE: &str = "usage: tycho <command>
   epic start <id> <goal>      start an epic through the operator service
   epic add-unit <id> <unit>   add a work unit to an epic through the operator service
   epic dispatch <id> <unit> <plan.json>   start a listed unit's run with a dispatch plan
+  credentials set claude|codex   store a vendor credential read from stdin, mode 0600
+  credentials status          presence, owner, mode and age of each stored credential
   launch --spec <spec file> [--tier <tier>]   run a vendor session: lease, heartbeat, spool, resolve
   launch --replay <spool file>    deliver a spooled result that was never acknowledged
   worker --vendor <vendor> ...    run one headless worker inside a launcher session
@@ -90,6 +95,8 @@ fn main() {
                 .and_then(|agent| agent.uninstall())
                 .map_err(|error| error.to_string()),
         ),
+        ["credentials", "set", vendor] => credentials_set(vendor),
+        ["credentials", "status"] => credentials_status(),
         ["launch", "--replay", spool] => replay(spool),
         ["launch", "--spec", spec] => launch(spec, None),
         ["launch", "--spec", spec, "--tier", tier] => launch(spec, Some(tier)),
@@ -104,6 +111,51 @@ fn main() {
         }
     };
     process::exit(code);
+}
+
+/// Reads the credential from stdin, never an argument, so it reaches no shell history or `ps`.
+fn credentials_set(vendor: &str) -> i32 {
+    let Some(vendor) = CredentialVendor::parse(vendor) else {
+        eprintln!("tycho: credentials: unknown vendor {vendor:?}; expected claude or codex");
+        return 2;
+    };
+    let home = match config::core_home() {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("tycho: credentials: {error}");
+            return 2;
+        }
+    };
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        eprintln!("paste the {vendor} credential, then press Ctrl-D on a line of its own");
+    }
+    let stored = credentials::read_input(stdin.lock(), vendor)
+        .and_then(|credential| credentials::store(&home, &credential));
+    match stored {
+        Ok(path) => {
+            println!("{vendor} credential stored in {}", path.display());
+            0
+        }
+        Err(error) => {
+            eprintln!("tycho: credentials: {error}");
+            1
+        }
+    }
+}
+
+/// Exits non-zero while any vendor's credential is absent or not private to the core.
+fn credentials_status() -> i32 {
+    let home = match config::core_home() {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("tycho: credentials: {error}");
+            return 2;
+        }
+    };
+    let status = credentials::status(&home, agent_files::current_uid(), SystemTime::now());
+    println!("{status}");
+    i32::from(!status.ready())
 }
 
 const LAUNCH_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);

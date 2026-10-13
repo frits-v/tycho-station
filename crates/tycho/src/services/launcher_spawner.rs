@@ -10,6 +10,7 @@ use std::io::Write;
 
 use crate::agent_files::open_append;
 use crate::config::{AgentDirs, ConfigError, CorePorts, ToolPrefix, LOG_DIR};
+use crate::credentials::{self, Credential, CredentialVendor};
 use crate::kill::{kill_by_name, kill_session, KillReport, KillRequest};
 use crate::launch_spec::{HeartbeatTarget, VendorTerminal};
 use crate::private_dir;
@@ -32,7 +33,7 @@ pub struct LauncherSpawner {
     tycho: PathBuf,
     /// `HOME` in the launcher's environment.
     pub home: PathBuf,
-    /// Where scrollback is saved.
+    /// Where scrollback is saved and the vendor credentials are kept.
     pub core_home: PathBuf,
     pub agent_uid: u32,
     pub heartbeat: HeartbeatTarget,
@@ -98,6 +99,17 @@ impl LauncherSpawner {
         })
     }
 
+    /// The core's stored credential for the session's vendor; a vendor that needs one and has
+    /// none refuses the spawn with the command that stores it.
+    fn credential_for(&self, session: &SessionName) -> Result<Option<Credential>, SpawnerError> {
+        CredentialVendor::for_session(session.vendor())
+            .map(|vendor| {
+                credentials::load(&self.core_home, vendor)
+                    .map_err(|error| SpawnerError::Refused(error.to_string()))
+            })
+            .transpose()
+    }
+
     fn log_kill(&self, line: &str) -> Result<(), SpawnerError> {
         let dir = self.core_home.join(LOG_DIR);
         let path = dir.join(KILL_LOG);
@@ -129,6 +141,7 @@ impl Spawner for LauncherSpawner {
             .working_dir
             .as_ref()
             .map(|dir| PathBuf::from(dir.as_str()));
+        let credential = self.credential_for(&spec.environment.session_name)?;
         spawn_session(&SpawnRequest {
             zmx: &self.zmx,
             dirs: &self.dirs,
@@ -143,6 +156,7 @@ impl Spawner for LauncherSpawner {
             vendor_dir: vendor_dir.as_deref(),
             ports: self.ports,
             tool_prefix: &self.tool_prefix,
+            credential: credential.as_ref(),
         })
         .and_then(spawned_pid)
     }
@@ -258,6 +272,38 @@ mod tests {
             log.contains("launcher Refused(CoreUid)") && log.contains("vendor Some(Signalled)"),
             "{log}"
         );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_vendor_session_needs_the_cores_credential_and_names_how_to_store_it() {
+        use crate::credentials::tests::CLAUDE_TOKEN;
+        let home = std::env::temp_dir().join(format!("tycho-spawner-cred-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&home));
+        std::fs::create_dir_all(&home).unwrap();
+        let spawner = LauncherSpawner {
+            zmx: Zmx::agent(Path::new("/usr/bin/true"), &home),
+            dirs: AgentDirs::new(home.join("agent")).unwrap(),
+            tycho: PathBuf::from("/opt/tycho"),
+            home: home.clone(),
+            core_home: home.join("core"),
+            agent_uid: 1,
+            heartbeat: HeartbeatTarget::Session,
+            ports: CorePorts::PRODUCTION,
+            tool_prefix: ToolPrefix::new(home.join("prefix")).unwrap(),
+        };
+        let claude = SessionName::parse("cf7a.wu01.wrk.claude.a1f3").unwrap();
+        let refusal = spawner.credential_for(&claude).unwrap_err();
+        assert!(
+            matches!(&refusal, SpawnerError::Refused(why) if why.contains("tycho credentials set claude")),
+            "{refusal:?}"
+        );
+        let stored = Credential::parse(CredentialVendor::Claude, CLAUDE_TOKEN.as_bytes()).unwrap();
+        credentials::store(&spawner.core_home, &stored).unwrap();
+        let loaded = spawner.credential_for(&claude).unwrap().unwrap();
+        assert_eq!(loaded.vendor(), CredentialVendor::Claude);
+        let amp = SessionName::parse("cf7a.wu01.wrk.amp.a1f3").unwrap();
+        assert!(spawner.credential_for(&amp).unwrap().is_none());
         std::fs::remove_dir_all(&home).unwrap();
     }
 

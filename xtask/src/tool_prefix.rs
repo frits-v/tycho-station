@@ -1204,19 +1204,6 @@ pub fn agent_findings(identity: &Identity) -> Vec<Finding> {
     findings
 }
 
-/// The agent runs a tool's command by the pinned install's absolute path in the prefix
-/// environment, so a login probe reads the install a session runs.
-pub fn agent_tool_command(
-    identity: &Identity,
-    tool: AgentTool,
-    args: &[&str],
-) -> Result<Command, String> {
-    let prefix = Prefix::production();
-    let home = ToolEnvironment::current_home(identity)?;
-    let binary = prefix.tool_binary(tool, &pinned_version(tool)?);
-    tool_command(&prefix, &ToolEnvironment::for_agent(&home), &binary, args)
-}
-
 #[cfg(test)]
 #[expect(
     clippy::disallowed_methods,

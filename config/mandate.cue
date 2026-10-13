@@ -35,10 +35,16 @@ mandate: #Mandate & {
 			pending: false
 		}
 		setup: {
-			what:    "xtask provision-agent creates the agent user and group, the shared group, the socket directories, a deny entry for the agent in the developer's home ACL, and the tool prefix /Users/Shared/tycho with mise, the agent's tools and the station binaries. xtask setup checks the home is closed to the agent; the prefix's owner, mode, ancestors and every entry beneath it; each tool's path, pin and digest; the station binaries; and, as the agent, its group, credentials, keychain, tools and write access."
+			what:    "xtask provision-agent creates the agent user and group, the shared group, the socket directories, a deny entry for the agent in the developer's home ACL, and the tool prefix /Users/Shared/tycho with mise, the agent's tools and station binaries. Setup checks the home is closed to the agent; the prefix, its entries, tools and binaries; each vendor credential, a 0600 file of the developer in a 0700 store; and, as the agent, its group, credentials, keychain, tools, write access, and the store's refusal of it."
 			runs:    "on demand, once per side; provisioning once per machine as the developer"
 			record:  "not_recorded"
 			pending: false
+		}
+		credential_handoff: {
+			what:    "tycho credentials set stores each vendor credential from stdin at 0600 in a 0700 directory under the core home. The spawn step refuses a Claude or Codex session without one, else serves it once over a Unix socket in the core-only spec directory to a peer of the agent's uid naming the session and its secret. The launcher starts no vendor without it; Claude gets its token only in its environment, Codex its auth.json only in a per-session CODEX_HOME removed when the vendor stops."
+			runs:    "every session spawn through the launcher spawner; each credentials set"
+			record:  "not_recorded"
+			pending: true
 		}
 		spine_services: {
 			what:    "Epic reserve and settle are exclusive and private to service calls; reserve answers budget_exhausted past a ledger's limit, seat and metered ledgers are separate, and settlement charges the larger of reservation and usage. Session heartbeat and handoff check the session secret in constant time; handoff validates and caps the note; spawn, nudge, kill and expire are private; kill goes by the recorded pid and saves scrollback when asked."
@@ -211,8 +217,8 @@ mandate: #Mandate & {
 		}
 		"7.1": {
 			requires: "Agents hold no credentials; only the core touches remotes, the canonical repository, the admin surfaces and the store."
-			mechanisms: ["core_directory_check", "setup"]
-			coverage: "core directory check; setup"
+			mechanisms: ["core_directory_check", "setup", "credential_handoff"]
+			coverage: "core directory check; setup; credential hand-off (pending): the core holds the vendor credentials and hands each session its own, none at rest outside a running session's spool"
 			partial:  true
 			slices: ["zero"]
 		}
@@ -232,9 +238,9 @@ mandate: #Mandate & {
 		}
 		"7.4": {
 			requires: "The most secure option that does the work, with the trade-off named; no token issued to a person; credentials shortest-lived, narrowest, issued to the station's own identity."
-			mechanisms: []
-			coverage: ""
-			partial:  false
+			mechanisms: ["credential_handoff"]
+			coverage: "credential hand-off: the vendor credentials are the core's and reach a session only through the hand-off, with the trade-off of their lifetime named in section 7"
+			partial:  true
 			slices: ["zero"]
 		}
 		"8.1": {

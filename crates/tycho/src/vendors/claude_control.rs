@@ -384,7 +384,7 @@ pub fn post_on(channel: &mut impl Channel, label: String, line: &str) -> Deliver
 
 /// The effective uid of the process that bound the connected socket.
 #[cfg(target_os = "macos")]
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     nix::unistd::getpeereid(stream)
         .map(|(uid, _)| uid.as_raw())
         .map_err(io::Error::from)
@@ -392,7 +392,7 @@ fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
 
 /// The effective uid of the process that bound the connected socket.
 #[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+pub(crate) fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
         .map(|credentials| credentials.uid())
         .map_err(io::Error::from)

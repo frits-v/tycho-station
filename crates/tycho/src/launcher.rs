@@ -25,9 +25,15 @@ use tycho_types::lease::Lease;
 use tycho_types::session::SessionName;
 
 use crate::agent_files::{
-    create_new, current_uid, ensure_private_dir, open_append, read_checked, write_durable,
+    create_new, current_uid, ensure_private_dir, open_append, read_checked, shred, write_durable,
+    write_new,
 };
+use crate::agent_tree::{self, Bounds, Owners};
 use crate::config::AgentDirs;
+use crate::credential_handoff::fetch;
+use crate::credentials::{
+    Credential, CredentialVendor, CLAUDE_TOKEN_ENV, CODEX_AUTH_FILE, CODEX_HOME_ENV,
+};
 use crate::exit_decode::{
     decode_exit, read_progress, read_result_file, status_payload, ChildEnd, Decoded, ResultFile,
     ResultReport, Stop,
@@ -59,6 +65,16 @@ const TERM_GRACE_POLLS_MAX: u32 = 20;
 pub const EXIT_ACKNOWLEDGED: i32 = 0;
 pub const EXIT_UNDELIVERED: i32 = 1;
 pub const EXIT_REFUSED_TO_START: i32 = 2;
+/// The exit state of a session whose launcher got no credential and so started no vendor;
+/// it decodes as unrecognised, which goes to the inbox rather than back to the queue.
+pub const CREDENTIAL_UNAVAILABLE: &str = "vendor_credential_unavailable";
+/// The per-session Codex home under the session's private spool directory.
+pub const CODEX_HOME_DIR: &str = "codex-home";
+/// What removing a Codex home may walk: Codex keeps logs and session files beside `auth.json`.
+const CODEX_HOME_BOUNDS: Bounds = Bounds {
+    depth: 8,
+    entries: 4096,
+};
 
 /// The files of one session under its spool directory.
 #[derive(Debug, Clone)]
@@ -276,6 +292,35 @@ struct Run<'a, I: Ingress> {
     log: LaunchLog,
     /// Set once a record is on disk, so the exit trap delivers it rather than writing again.
     spooled: bool,
+    /// What the core's hand-off gave this launcher; taken when the vendor starts.
+    credential: Option<Result<Credential, String>>,
+    /// The Codex home made for this session, removed when the vendor stops.
+    codex_home: Option<PathBuf>,
+}
+
+/// Asks the core for the session's credential when the spec names a hand-off socket.
+fn fetch_credential(settings: &LauncherSettings) -> Option<Result<Credential, String>> {
+    let path = settings.credential_socket.as_ref()?;
+    let session = &settings.env.session_name;
+    let fetched = match (
+        settings.core_uid,
+        CredentialVendor::for_session(session.vendor()),
+    ) {
+        (Some(core_uid), Some(vendor)) => fetch(
+            path,
+            core_uid,
+            session,
+            &settings.env.session_secret,
+            vendor,
+        )
+        .map_err(|error| error.to_string()),
+        (None, _) => Err("no core uid to check the credential socket against".to_string()),
+        (_, None) => Err(format!(
+            "a {} session takes no credential",
+            session.vendor().as_str()
+        )),
+    };
+    Some(fetched)
 }
 
 /// Writes the lease before anything else runs, so a replayed spawn step sees it.
@@ -315,6 +360,8 @@ pub fn launch_with_stop(
     stop: Option<Arc<AtomicBool>>,
 ) -> Result<LaunchEnd, String> {
     let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
+    // The core keeps the hand-off open until the lease appears, so the request comes first.
+    let credential = fetch_credential(settings);
     let lease = write_first_lease(settings, &files)?;
     let spool_ready = ensure_private_dir(&files.spool_dir);
     let mut run = Run {
@@ -324,6 +371,8 @@ pub fn launch_with_stop(
         lease,
         ingress,
         spooled: false,
+        credential,
+        codex_home: None,
     };
     let decoded = match spool_ready
         .map_err(|error| error.to_string())
@@ -349,13 +398,26 @@ pub fn launch_with_stop(
 impl<I: Ingress> Run<'_, I> {
     fn supervise_vendor(&mut self, vendor: &[String], stop_flag: &AtomicBool) -> Decoded {
         let session = self.settings.env.session_name.clone();
-        let (end, stop) = match self.start_vendor(vendor) {
+        let credential = match self.credential_environment() {
+            Ok(pairs) => pairs,
+            Err(reason) => {
+                self.remove_codex_home();
+                self.log
+                    .line(&format!("no credential, vendor not started: {reason}"));
+                return Decoded {
+                    state: ExitState::from_wire(CREDENTIAL_UNAVAILABLE),
+                    envelope: None,
+                };
+            }
+        };
+        let (end, stop) = match self.start_vendor(vendor, credential) {
             Ok(mut child) => self.supervise(&mut child, stop_flag),
             Err(error) => {
                 self.log.line(&format!("vendor did not start: {error}"));
                 (ChildEnd::NotStarted, Stop::None)
             }
         };
+        self.remove_codex_home();
         self.log
             .line(&format!("vendor ended: {end:?}, stop: {stop:?}"));
         if stop == Stop::None && end != ChildEnd::NotStarted {
@@ -374,13 +436,79 @@ impl<I: Ingress> Run<'_, I> {
         decode_exit(stop, end, result, &session)
     }
 
-    fn start_vendor(&mut self, vendor: &[String]) -> io::Result<Child> {
+    /// The vendor's credential pair: Claude's token itself, or the Codex home holding the
+    /// core's `auth.json`; empty when the spec named no hand-off.
+    fn credential_environment(&mut self) -> Result<Vec<(String, String)>, String> {
+        let credential = match self.credential.take() {
+            None => return Ok(Vec::new()),
+            Some(Err(reason)) => return Err(reason),
+            Some(Ok(credential)) => credential,
+        };
+        match credential.vendor() {
+            CredentialVendor::Claude => Ok(vec![(
+                CLAUDE_TOKEN_ENV.to_string(),
+                credential.expose().to_string(),
+            )]),
+            CredentialVendor::Codex => {
+                let home = self.files.spool_dir.join(CODEX_HOME_DIR);
+                ensure_private_dir(&home)
+                    .map_err(|error| format!("{}: {error}", home.display()))?;
+                self.codex_home = Some(home.clone());
+                let auth = home.join(CODEX_AUTH_FILE);
+                write_new(&auth, credential.expose().as_bytes())
+                    .map_err(|error| format!("{}: {error}", auth.display()))?;
+                Ok(vec![(
+                    CODEX_HOME_ENV.to_string(),
+                    home.display().to_string(),
+                )])
+            }
+        }
+    }
+
+    /// Zeroes and removes the session's `auth.json`, then the Codex home, never through a link.
+    fn remove_codex_home(&mut self) {
+        let Some(home) = self.codex_home.take() else {
+            return;
+        };
+        let auth = home.join(CODEX_AUTH_FILE);
+        if let Err(error) = shred(&auth) {
+            if error.kind() != io::ErrorKind::NotFound {
+                self.log.line(&format!("{}: {error}", auth.display()));
+            }
+        }
+        let owners = Owners {
+            core: current_uid(),
+            agent: current_uid(),
+        };
+        let removed = File::open(&self.files.spool_dir)
+            .map_err(|error| error.to_string())
+            .and_then(|spool| {
+                agent_tree::remove_dir(
+                    std::os::fd::AsFd::as_fd(&spool),
+                    &self.files.spool_dir,
+                    std::ffi::OsStr::new(CODEX_HOME_DIR),
+                    owners,
+                    CODEX_HOME_BOUNDS,
+                )
+                .map_err(|error| error.to_string())
+            });
+        if let Err(error) = removed {
+            self.log.line(&format!("codex home not removed: {error}"));
+        }
+    }
+
+    fn start_vendor(
+        &mut self,
+        vendor: &[String],
+        credential: Vec<(String, String)>,
+    ) -> io::Result<Child> {
         let (program, arguments) = vendor
             .split_first()
             .ok_or_else(|| io::Error::other("empty vendor command"))?;
-        let environment = self
+        let mut environment = self
             .settings
             .vendor_environment(&self.files.progress, &self.files.result);
+        environment.extend(credential);
         // An interactive vendor keeps the pty as its controlling terminal, which a new
         // session would drop, so it runs in its own process group instead.
         let leader = match self.settings.terminal {
@@ -487,8 +615,10 @@ impl<I: Ingress> Run<'_, I> {
                 }
             }
             if stop_flag.load(Ordering::SeqCst) {
-                // zmx sends SIGKILL half a second after SIGHUP: spool before stopping the vendor.
+                // zmx sends SIGKILL half a second after SIGHUP: spool and remove the Codex
+                // home before stopping the vendor, which may take longer than that.
                 self.spool_early(ExitState::Cancelled);
+                self.remove_codex_home();
                 return (self.terminate(child), Stop::Cancelled);
             }
             if self.output_too_large() {
@@ -677,10 +807,13 @@ impl<I: Ingress> Run<'_, I> {
 )]
 mod tests {
     use super::*;
+    use crate::credential_handoff::{HandoffOutcome, HandoffServer};
+    use crate::credentials::tests::{CLAUDE_TOKEN, CODEX_AUTH};
     use crate::launch_spec::tests::{environment, NAME, SECRET};
     use crate::spool::{Resolution, ACKNOWLEDGED_SUFFIX};
     use std::cell::RefCell;
     use tycho_types::launcher::AwaitableId;
+    use tycho_types::launcher::ENV_SESSION_NAME;
 
     fn scratch(test: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tycho-launch-{test}-{}", std::process::id()));
@@ -1012,6 +1145,190 @@ mod tests {
             recorder.events.borrow().last().map(String::as_str),
             Some("deliver sign_1abc failed spooled=true")
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A hand-off server in a short directory of its own, since `sun_path` holds 104 bytes.
+    fn serve(tag: &str, settings: &mut LauncherSettings, credential: Credential) -> HandoffServer {
+        let root = PathBuf::from(format!("/tmp/thl-{tag}-{}", std::process::id()));
+        if root.exists() {
+            fs::remove_dir_all(&root).unwrap();
+        }
+        let dirs = AgentDirs::new(root).unwrap();
+        fs::create_dir_all(dirs.spec_dir()).unwrap();
+        let server = HandoffServer::start(
+            &dirs,
+            current_uid(),
+            &settings.env.session_name,
+            &settings.env.session_secret,
+            credential,
+        )
+        .unwrap();
+        settings.credential_socket = Some(server.path().to_path_buf());
+        settings.core_uid = Some(current_uid());
+        server
+    }
+
+    /// Every file the launcher leaves, and its own report, must be free of the credential.
+    fn assert_nowhere(dir: &Path, end: &LaunchEnd, needle: &str) {
+        assert!(!format!("{end:?} {end}").contains(needle));
+        let mut stack = vec![dir.to_path_buf()];
+        let mut examined = 0_u32;
+        while let Some(next) = stack.pop() {
+            for entry in fs::read_dir(&next).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.file_name().is_some_and(|name| name != "env") {
+                    examined = examined.saturating_add(1);
+                    let bytes = fs::read(&path).unwrap();
+                    assert!(
+                        !String::from_utf8_lossy(&bytes).contains(needle),
+                        "{} holds the credential",
+                        path.display()
+                    );
+                }
+            }
+        }
+        assert!(examined >= 4, "only {examined} files examined");
+    }
+
+    #[test]
+    fn a_handed_claude_token_reaches_the_vendor_environment_and_no_file() {
+        let dir = scratch("claude-token");
+        let mut settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
+        let credential =
+            Credential::parse(CredentialVendor::Claude, CLAUDE_TOKEN.as_bytes()).unwrap();
+        let server = serve("claude", &mut settings, credential);
+        let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
+        let result = r#"{"state":"failed","envelope":null}"#;
+        let vendor = vendor_script(&files.lease, result, &dir);
+        let end = launch(&settings, &vendor, &recorder(&files)).unwrap();
+        assert_eq!(end.state, "failed");
+        assert_eq!(server.finish(), HandoffOutcome::Answered);
+        let env = fs::read_to_string(dir.join("env")).unwrap();
+        assert!(
+            env.lines()
+                .any(|line| line == format!("{CLAUDE_TOKEN_ENV}={CLAUDE_TOKEN}")),
+            "{env}"
+        );
+        assert!(!env.contains("TYCHO_CREDENTIAL_SOCKET"), "{env}");
+        assert_nowhere(&dir, &end, CLAUDE_TOKEN);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_codex_session_gets_a_private_home_that_is_gone_when_it_ends() {
+        let dir = scratch("codex-home");
+        let mut map = environment(&dir);
+        map.insert(
+            ENV_SESSION_NAME.to_string(),
+            "cf7a.wu03.wrk.codex.a1f3".to_string(),
+        );
+        let mut settings = LauncherSettings::from_map(&map).unwrap();
+        let credential = Credential::parse(CredentialVendor::Codex, CODEX_AUTH.as_bytes()).unwrap();
+        let server = serve("codex", &mut settings, credential);
+        let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
+        let script = format!(
+            r#"find "$CODEX_HOME" -prune -perm 0700 > "{0}/home-mode"; find "$CODEX_HOME/auth.json" -perm 0600 > "{0}/auth-mode"; cmp -s "$CODEX_HOME/auth.json" "{0}/expected" && echo same > "{0}/auth-same"; mkdir -p "$CODEX_HOME/sessions/x"; echo rollout > "$CODEX_HOME/sessions/x/r.jsonl"; /usr/bin/env > "{0}/env"; printf '{{"state":"failed","envelope":null}}' > "$TYCHO_RESULT_FILE""#,
+            dir.display()
+        );
+        fs::write(dir.join("expected"), CODEX_AUTH).unwrap();
+        let end = launch(&settings, &sh(&script), &recorder(&files)).unwrap();
+        fs::remove_file(dir.join("expected")).unwrap();
+        assert_eq!(end.state, "failed");
+        assert_eq!(server.finish(), HandoffOutcome::Answered);
+        let home = files.spool_dir.join(CODEX_HOME_DIR);
+        // `find -perm` with an octal mode matches that exact mode, on BSD and GNU alike.
+        assert_eq!(
+            fs::read_to_string(dir.join("home-mode")).unwrap().trim(),
+            home.display().to_string(),
+            "the Codex home is not 0700"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("auth-mode")).unwrap().trim(),
+            home.join(CODEX_AUTH_FILE).display().to_string(),
+            "auth.json is not 0600"
+        );
+        assert!(
+            dir.join("auth-same").exists(),
+            "auth.json is not the core's copy"
+        );
+        let env = fs::read_to_string(dir.join("env")).unwrap();
+        assert!(
+            env.contains(&format!("{CODEX_HOME_ENV}={}", home.display())),
+            "{env}"
+        );
+        assert!(!home.exists(), "the Codex home outlived the session");
+        assert_nowhere(&dir, &end, "test-refresh-credential");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_cancelled_codex_session_loses_its_home_before_the_vendor_is_stopped() {
+        let dir = scratch("codex-cancel");
+        let mut map = environment(&dir);
+        map.insert(
+            ENV_SESSION_NAME.to_string(),
+            "cf7a.wu03.wrk.codex.a1f4".to_string(),
+        );
+        let mut settings = LauncherSettings::from_map(&map).unwrap();
+        let credential = Credential::parse(CredentialVendor::Codex, CODEX_AUTH.as_bytes()).unwrap();
+        let server = serve("cancel", &mut settings, credential);
+        let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
+        let script = format!(
+            r#"trap 'test -e "$CODEX_HOME" || echo gone > "{}"; exit 0' TERM; sleep 30 & wait"#,
+            dir.join("gone-at-term").display()
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&stop);
+        let timer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(700));
+            setter.store(true, Ordering::SeqCst);
+        });
+        let end = launch_with_stop(&settings, &sh(&script), &recorder(&files), Some(stop)).unwrap();
+        timer.join().unwrap();
+        drop(server.finish());
+        assert_eq!(end.state, "cancelled");
+        assert!(
+            dir.join("gone-at-term").exists(),
+            "the Codex home was there at SIGTERM"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_credential_from_the_core_means_no_vendor_and_an_inbox_state() {
+        let dir = scratch("no-credential");
+        let mut settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
+        settings.credential_socket = Some(dir.join("absent.cred"));
+        settings.core_uid = Some(current_uid());
+        let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
+        let vendor = vec![
+            "/usr/bin/touch".to_string(),
+            dir.join("ran").display().to_string(),
+        ];
+        let recorder = recorder(&files);
+        let end = launch(&settings, &vendor, &recorder).unwrap();
+        assert_eq!(
+            end.state,
+            String::from(ExitState::from_wire(CREDENTIAL_UNAVAILABLE))
+        );
+        assert!(end.state.ends_with(CREDENTIAL_UNAVAILABLE), "{}", end.state);
+        assert!(
+            !dir.join("ran").exists(),
+            "the vendor ran without its credential"
+        );
+        assert!(
+            files.lease.exists(),
+            "the lease is written whatever the hand-off did"
+        );
+        assert_eq!(
+            ExitState::from_wire(CREDENTIAL_UNAVAILABLE).disposition(),
+            tycho_types::exit::Disposition::Inbox
+        );
+        let log = fs::read_to_string(&files.log).unwrap();
+        assert!(log.contains("no credential, vendor not started"), "{log}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

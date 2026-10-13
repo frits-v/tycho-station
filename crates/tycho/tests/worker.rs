@@ -35,9 +35,10 @@ use tycho::config::{
     RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
+use tycho::credentials::{self, CredentialVendor};
 use tycho::endpoint;
 use tycho::entire_graph::EntireGraph;
-use tycho::launch_spec::HeartbeatTarget;
+use tycho::launch_spec::{HeartbeatTarget, VendorTerminal, TIER_MAX_BYTES};
 use tycho::launcher::SessionFiles;
 use tycho::repositories::{ProjectName, Repositories};
 use tycho::services::doubles::FixedGate;
@@ -46,11 +47,13 @@ use tycho::services::merge_gate::GateVerdict;
 use tycho::services::operator::read_secret_file;
 use tycho::services::workers::WorkerPorts;
 use tycho::services::{Ports, Timing};
+use tycho::spawn::{typed_words, SpawnRequest};
 use tycho::spool::ACKNOWLEDGED_SUFFIX;
 use tycho::zmx::Zmx;
 use tycho_harness::tool_prefix::link_scratch_prefix;
 use tycho_types::envelope::CommitSha;
 use tycho_types::git_environment::git_command;
+use tycho_types::launcher::{LauncherEnv, ENV_AWAITABLE_ID, ENV_SESSION_NAME, ENV_SESSION_SECRET};
 use tycho_types::service::handler;
 use tycho_types::session::SessionName;
 use tycho_types::task_packet::RoutingName;
@@ -90,10 +93,59 @@ fn claim_ports(home: &Path) -> PortClaim {
     claim
 }
 
+/// Fails before any vendor seat is spent when the launcher's typed line would not fit: the
+/// scratch prefix appears in it nine times, and the spawn step refuses a line over 1000 bytes.
+fn assert_typed_line_fits(prefix: &ToolPrefix, agent: &Path) {
+    let dirs = AgentDirs::new(agent.to_path_buf()).unwrap();
+    let zmx = Zmx::agent(prefix.tool("zmx").unwrap(), agent);
+    let env = LauncherEnv::from_map(&std::collections::BTreeMap::from([
+        (ENV_AWAITABLE_ID.to_string(), "sign_1abc".to_string()),
+        (ENV_SESSION_SECRET.to_string(), "0".repeat(64)),
+        (
+            ENV_SESSION_NAME.to_string(),
+            "cf7a.wu01.wrk.claude.e7c7f6d06ca1".to_string(),
+        ),
+    ]))
+    .unwrap();
+    let tycho = prefix.tycho();
+    let home = PathBuf::from(env::var_os("HOME").unwrap());
+    let vendor = [tycho.display().to_string()];
+    let tier = "t".repeat(TIER_MAX_BYTES);
+    let request = SpawnRequest {
+        zmx: &zmx,
+        dirs: &dirs,
+        tycho: &tycho,
+        home: &home,
+        env: &env,
+        heartbeat: HeartbeatTarget::Session,
+        vendor: &vendor,
+        agent_uid: current_uid(),
+        tier: Some(&tier),
+        terminal: VendorTerminal::Files,
+        vendor_dir: None,
+        ports: CorePorts::PRODUCTION,
+        tool_prefix: prefix,
+        credential: None,
+    };
+    if let Err(refused) = typed_words(&request, &dirs.spec_path(&env.session_name)) {
+        panic!(
+            "the scratch prefix {} is too long: {refused:?}",
+            prefix.root().display()
+        );
+    }
+}
+
 impl Core {
     fn new(claim: PortClaim) -> Self {
         let home = claim.home.clone();
-        let prefix_root = home.with_extension("prefix");
+        // Short: the prefix appears nine times in the typed line, which holds 1000 bytes.
+        let tag = home
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_prefix(".tycho-worker-"))
+            .unwrap()
+            .to_string();
+        let prefix_root = home.with_file_name(format!(".twp-{tag}"));
         for dir in [&home, &prefix_root] {
             if dir.exists() {
                 fs::remove_dir_all(dir).unwrap();
@@ -101,6 +153,7 @@ impl Core {
         }
         let zmx = mise_which("zmx");
         let prefix = scratch_prefix(&prefix_root, &zmx);
+        assert_typed_line_fits(&prefix, &home.join("agent"));
         let restate_server = mise_which("restate-server");
         let config = CoreConfig::new(
             home.clone(),
@@ -203,6 +256,9 @@ impl Drop for Core {
         let left = clear_sessions(&core_zmx, "core", Path::new(TYCHO))
             .saturating_add(clear_sessions(&agent_zmx, "agent", &self.prefix.tycho()));
         drop(fs::remove_dir_all(self.prefix.root()));
+        // The copied token goes whatever else the teardown finds.
+        let shredded = credentials::shred_store(&self.config.home);
+        println!("teardown: shredded the test core's credential store: {shredded:?}");
         let mut outcome = (left == 0)
             .then_some(())
             .ok_or_else(|| format!("{left} sessions remain"));
@@ -364,6 +420,16 @@ fn worker_ports(core: &Core) -> (Arc<WorkerPorts>, CommitSha) {
     (Arc::new(ports), head)
 }
 
+/// The worker reaches the vendor only through the hand-off, so the test core holds the
+/// developer's stored token, which `tycho credentials set claude` put in the core home.
+fn copy_claude_credential(test_home: &Path) {
+    let production = config::core_home().unwrap();
+    let credential = credentials::load(&production, CredentialVendor::Claude)
+        .unwrap_or_else(|error| panic!("the worker suite needs a stored Claude token: {error}"));
+    credentials::store(test_home, &credential).unwrap();
+    println!("evidence: the test core holds the stored Claude token");
+}
+
 fn start(claim: PortClaim) -> (Core, TestEndpoint, Arc<WorkerPorts>) {
     let core = Core::new(claim);
     assert!(
@@ -372,6 +438,7 @@ fn start(claim: PortClaim) -> (Core, TestEndpoint, Arc<WorkerPorts>) {
     );
     let (workers, head) = worker_ports(&core);
     let factory = FactoryConfig::embedded().unwrap();
+    copy_claude_credential(&core.config.home);
     let spawner = LauncherSpawner::for_prefix(
         core.prefix.clone(),
         AgentDirs::new(core.agent.clone()).unwrap(),

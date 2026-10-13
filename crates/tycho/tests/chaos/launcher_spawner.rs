@@ -191,6 +191,8 @@ impl LauncherSpawner {
             vendor_dir: None,
             ports: self.inner.core_ports,
             tool_prefix: &self.inner.prefix,
+            // The chaos vendor is a script; the hand-off is the launcher suite's.
+            credential: None,
         })
     }
 
