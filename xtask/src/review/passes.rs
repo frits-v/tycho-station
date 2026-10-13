@@ -15,6 +15,7 @@ use super::langfuse::Generation;
 use super::pull_request::Posted;
 use super::verdict::blocks;
 use super::{git_in, Context, Grants, Tally, EXCLUDED_PATHSPECS, VERIFIED_MAX};
+use crate::anthropic_token;
 use crate::process::{run_bounded, Exit};
 
 const FIND_SCHEMA: &str = include_str!("../../../config/export/schema/review_findings.json");
@@ -33,6 +34,14 @@ const VERIFY_LIMITS: Limits = Limits {
 };
 const VERIFY_PARALLEL: usize = 4;
 const ONE_RUN_MIN: Duration = Duration::from_secs(60);
+/// Left unused at the end of a pass's token, so no request goes out on a token about to lapse.
+const TOKEN_MARGIN: Duration = Duration::from_secs(60);
+/// The longest a pass's exchange can take: the OIDC token and the exchange, each one request.
+const MINT_TIME_MAX: Duration =
+    Duration::from_secs(2 * crate::github_api::REQUEST_TIMEOUT.as_secs());
+/// The shortest token a pass can use: its exchange, the margin and a minute of work.
+pub const TOKEN_LIFETIME_MIN: Duration =
+    Duration::from_secs(MINT_TIME_MAX.as_secs() + TOKEN_MARGIN.as_secs() + ONE_RUN_MIN.as_secs());
 
 fn write_file(path: &Path, text: &str) -> Result<(), String> {
     fs::write(path, text).map_err(|error| format!("cannot write {}: {error}", path.display()))
@@ -106,7 +115,73 @@ pub fn minified(schema: &str) -> Result<String, String> {
     Ok(value.to_string())
 }
 
-/// One pass: the instructions written to the run's directory, the CLI run under the
+/// The time a pass has once its token is minted: until the run's deadline or the token's end
+/// less the margin, whichever comes first, dated from before the exchange, which the token
+/// was issued after. Less than a minute is none.
+fn pass_time(
+    run: Instant,
+    started: Instant,
+    minted: Instant,
+    token_lifetime: Option<Duration>,
+) -> Option<Duration> {
+    token_lifetime
+        .and_then(|lifetime| started.checked_add(lifetime.saturating_sub(TOKEN_MARGIN)))
+        .map_or(run, |token_end| token_end.min(run))
+        .checked_duration_since(minted)
+        .filter(|remaining| *remaining >= ONE_RUN_MIN)
+}
+
+/// Mints the pass's own token, when the run mints any, and runs the CLI under the earlier of
+/// the run's deadline and the token's end.
+fn launch(
+    context: &Context,
+    grants: &Grants,
+    path: &Path,
+    schema: &str,
+    limits: Limits,
+    deadline: Instant,
+) -> RunOutcome {
+    let started = Instant::now();
+    if deadline
+        .checked_duration_since(started)
+        .is_none_or(|remaining| remaining < ONE_RUN_MIN)
+    {
+        return RunOutcome::Ended(Exit::TimedOut);
+    }
+    let token = match grants
+        .anthropic
+        .as_ref()
+        .map(anthropic_token::Minter::mint)
+        .transpose()
+    {
+        Ok(token) => token,
+        Err(reason) => return RunOutcome::Unrecognised(format!("the token exchange: {reason}")),
+    };
+    let lifetime = token
+        .as_ref()
+        .map(|token| Duration::from_secs(token.expires_in_seconds));
+    let Some(remaining) = pass_time(deadline, started, Instant::now(), lifetime) else {
+        return RunOutcome::Ended(Exit::TimedOut);
+    };
+    let environment = claude_run::environment(
+        std::env::vars_os(),
+        context.user.as_deref(),
+        token.as_ref().map(|token| token.value.expose()),
+    );
+    let mut command = claude_run::command(
+        &context.claude,
+        path,
+        &context.files,
+        schema,
+        limits,
+        environment,
+    );
+    command.current_dir(&context.checkout);
+    let captured = run_bounded(&mut command, remaining);
+    claude_run::decode(captured.exit, &captured.stdout)
+}
+
+/// One pass: the instructions written to the run's directory, the CLI run under its
 /// deadline, and the generation the trace records.
 fn run_claude(
     context: &Context,
@@ -119,32 +194,9 @@ fn run_claude(
 ) -> (RunOutcome, Generation) {
     let started = SystemTime::now();
     let path = context.files.join(format!("{name}.md"));
-    let outcome = match (
-        write_file(&path, instructions),
-        deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| *remaining >= ONE_RUN_MIN),
-    ) {
-        (Err(reason), _) => RunOutcome::Unrecognised(reason),
-        (Ok(()), None) => RunOutcome::Ended(Exit::TimedOut),
-        (Ok(()), Some(remaining)) => {
-            let environment = claude_run::environment(
-                std::env::vars_os(),
-                context.user.as_deref(),
-                grants.anthropic.as_ref().map(|token| token.value.expose()),
-            );
-            let mut command = claude_run::command(
-                &context.claude,
-                &path,
-                &context.files,
-                schema,
-                limits,
-                environment,
-            );
-            command.current_dir(&context.checkout);
-            let captured = run_bounded(&mut command, remaining);
-            claude_run::decode(captured.exit, &captured.stdout)
-        }
+    let outcome = match write_file(&path, instructions) {
+        Err(reason) => RunOutcome::Unrecognised(reason),
+        Ok(()) => launch(context, grants, &path, schema, limits, deadline),
     };
     let generation = Generation {
         name: name.to_string(),
@@ -358,6 +410,41 @@ mod tests {
         );
         assert!(words.contains(&"--no-ext-diff".to_string()));
         assert!(words.contains(&"--no-textconv".to_string()));
+    }
+
+    #[test]
+    fn a_pass_ends_at_the_run_deadline_or_before_its_token_lapses() {
+        let now = Instant::now();
+        let run = now.checked_add(Duration::from_secs(1800)).unwrap();
+        assert_eq!(
+            pass_time(run, now, now, None),
+            Some(Duration::from_secs(1800))
+        );
+        assert_eq!(
+            pass_time(run, now, now, Some(Duration::from_secs(598))),
+            Some(Duration::from_secs(538))
+        );
+        let soon = now.checked_add(Duration::from_secs(120)).unwrap();
+        assert_eq!(
+            pass_time(soon, now, now, Some(Duration::from_secs(598))),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(pass_time(soon, now, soon, None), None);
+    }
+
+    #[test]
+    fn the_shortest_accepted_token_leaves_a_minute_after_the_slowest_exchange() {
+        let started = Instant::now();
+        let run = started.checked_add(Duration::from_secs(1800)).unwrap();
+        let minted = started.checked_add(MINT_TIME_MAX).unwrap();
+        assert_eq!(
+            pass_time(run, started, minted, Some(TOKEN_LIFETIME_MIN)),
+            Some(ONE_RUN_MIN)
+        );
+        let shorter = TOKEN_LIFETIME_MIN
+            .checked_sub(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(pass_time(run, started, minted, Some(shorter)), None);
     }
 
     #[test]

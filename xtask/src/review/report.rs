@@ -13,6 +13,7 @@ use super::findings::{self, Finding};
 use super::pull_request::{self, PostOutcome};
 use super::verdict::Event;
 use super::{short, Context, Grants, Tally, VERIFIED_MAX};
+use crate::anthropic_token;
 use crate::app_token::InstallationToken;
 use crate::github_api::Client;
 
@@ -25,13 +26,18 @@ pub fn select(
     confirmed: &[Finding],
     tally: &mut Tally,
 ) -> Result<(Vec<Finding>, Vec<Finding>), String> {
-    let secrets: Vec<&str> = [
-        grants.anthropic.as_ref().map(|token| token.value.expose()),
-        grants.app.as_ref().map(InstallationToken::expose),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let minted = grants
+        .anthropic
+        .as_ref()
+        .map(anthropic_token::Minter::minted)
+        .unwrap_or_default();
+    let secrets: Vec<&str> = grants
+        .app
+        .as_ref()
+        .map(InstallationToken::expose)
+        .into_iter()
+        .chain(minted.iter().map(anthropic_token::Secret::expose))
+        .collect();
     let posted: BTreeSet<&str> = context
         .posted
         .iter()
@@ -228,6 +234,23 @@ mod tests {
         assert_eq!(outside, [finding("a.rs", 9, "outside the hunk")]);
         assert_eq!((tally.withheld, tally.still_holding), (1, 1));
         assert_eq!((tally.inline, tally.outside), (1, 1));
+    }
+
+    #[test]
+    fn a_finding_holding_a_minted_anthropic_token_stops_the_whole_post_whatever_its_form() {
+        let grants = Grants {
+            anthropic: Some(anthropic_token::Minter::with_minted(&["opaque-token-4f2a"])),
+            ..grants("t")
+        };
+        let error = select(
+            &context(Vec::new()),
+            &grants,
+            &DiffMap::default(),
+            &[finding("a.rs", 1, "the pass saw opaque-token-4f2a")],
+            &mut Tally::default(),
+        )
+        .unwrap_err();
+        assert!(error.contains("nothing is posted"), "{error}");
     }
 
     #[test]

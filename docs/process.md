@@ -584,7 +584,9 @@ check out, build and run it.
   `gh workflow run review-dry-run.yml --ref <branch>`. It runs that branch's xtask with
   `xtask review --dry-run` against `origin/main`, prints the verdict it would give and the
   findings, writes them to the step summary, and posts nothing; it holds no App key. It is
-  how a change to the reviewer is tried before it reaches the base branch. `mise run review`
+  how a change to the reviewer is tried before it reaches the base branch. On `main` itself
+  the merge base is the head, so the diff is empty and the run fails with nothing to review;
+  dispatch it on a branch that differs from `main`. `mise run review`
   does the same locally with the developer's Claude login and refuses a tree with
   uncommitted changes, since the model reads the working tree.
 
@@ -646,11 +648,35 @@ check out, build and run it.
   `https://api.anthropic.com` and trades it at `https://api.anthropic.com/v1/oauth/token` with
   a JWT bearer grant naming `ANTHROPIC_FEDERATION_RULE_ID`, `ANTHROPIC_ORGANIZATION_ID` and,
   when set, `ANTHROPIC_SERVICE_ACCOUNT_ID` and `ANTHROPIC_WORKSPACE_ID`. It requires a `Bearer`
-  token type and an `expires_in` of at most a day, and bounds the passes to that lifetime less
-  two minutes, at most 30 minutes. Anthropic documents no revocation; the token lapses.
-- In a job with an `environment:` the OIDC token's `sub` is
-  `repo:frits-v/tycho-station:environment:<name>`, so the federation rule matches the
-  `review` and `review-dry-run` environments.
+  token type and an `expires_in` of at most a day. Anthropic caps an exchanged token at the
+  validity window of the OIDC token it was traded for, `nbf` to `exp`, which GitHub sets to ten
+  minutes, whatever the rule's token lifetime; so each pass mints its own token from a fresh
+  OIDC token (an assertion is single-use, and passes run side by side) and runs at most until
+  that token's end less a minute, within the run's 30 minutes. A first exchange before any pass
+  checks the rule, and its token is dropped. A find pass that outlasts its token ends timed
+  out and the run posts no verdict. Anthropic documents no revocation; each token lapses.
+- This repository's OIDC tokens carry GitHub's immutable-id subject,
+  `repo:frits-v@4488681/tycho-station@1411277668:environment:<name>`, not the
+  `repo:<owner>/<name>:...` form GitHub's documentation shows. The federation rule therefore
+  matches stable claims in a CEL condition instead of `sub`:
+
+  ```text
+  claims.repository_id == "1411277668" && (
+    (claims.environment == "review" &&
+     claims.job_workflow_ref == "frits-v/tycho-station/.github/workflows/review.yml@refs/heads/main") ||
+    (claims.environment == "review-dry-run" &&
+     claims.job_workflow_ref.startsWith("frits-v/tycho-station/.github/workflows/review-dry-run.yml@"))
+  )
+  ```
+
+  Before each exchange the xtask prints the claims a rule matches on (`sub`, `environment`,
+  `job_workflow_ref`, `ref` and the window from `nbf` to `exp`), never the token. An exchange the rule
+  refuses answers an opaque `401`; the Console's authentication history names the failed
+  check, such as `match_condition_false`.
+- The rule's token lifetime is at least four minutes: the exchange's two requests at up to a
+  minute each, the minute a pass leaves unused, and a minute of work. Anything above GitHub's
+  ten-minute window changes nothing. A shorter lifetime fails the run before any pass, naming
+  the lifetime.
 - All exchanges are made in process over HTTPS (rustls on aws-lc-rs, the webpki roots
   compiled in, no proxy, no redirects); no token appears in arguments, output or errors.
 

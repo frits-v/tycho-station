@@ -6,6 +6,9 @@
 //! error text; the access token reaches the Claude CLI only as `ANTHROPIC_AUTH_TOKEN`.
 
 use std::fmt;
+use std::sync::{Mutex, PoisonError};
+
+use base64::Engine as _;
 
 use crate::github_api::{Credential, Method, PlainClient, Reply};
 
@@ -23,11 +26,14 @@ const IDENTIFIER_MAX_CHARS: usize = 128;
 const REQUEST_URL_MAX_CHARS: usize = 2048;
 const TOKEN_MAX_CHARS: usize = 8192;
 const ERROR_CODE_MAX_CHARS: usize = 64;
+/// The claims a federation rule matches on, shown before each exchange.
+const RULE_CLAIMS: [&str; 4] = ["sub", "environment", "job_workflow_ref", "ref"];
+const CLAIM_SHOWN_MAX_CHARS: usize = 200;
 /// A day; a longer lifetime is not one this exchange issues.
 const EXPIRES_IN_MAX_SECONDS: u64 = 86_400;
 
 /// A token value; it leaves this module only through [`Secret::expose`].
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Secret(String);
 
 impl Secret {
@@ -50,6 +56,59 @@ pub struct Federation {
     organization: String,
     service_account: Option<String>,
     workspace: Option<String>,
+}
+
+/// What a run mints Anthropic tokens from. Each mint asks GitHub for a fresh OIDC token, so
+/// tokens minted side by side never present the same single-use assertion. The minter keeps
+/// every token it issued, so the run can refuse to post one whatever its format.
+#[derive(Debug)]
+pub struct Minter {
+    federation: Federation,
+    oidc: OidcRequest,
+    minted: Mutex<Vec<Secret>>,
+}
+
+impl Minter {
+    pub const fn new(federation: Federation, oidc: OidcRequest) -> Self {
+        Self {
+            federation,
+            oidc,
+            minted: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn mint(&self) -> Result<AccessToken, String> {
+        let token = mint(&self.federation, &self.oidc)?;
+        self.minted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(token.value.clone());
+        Ok(token)
+    }
+
+    /// Every token this minter issued, for the check that a posted text names none.
+    pub fn minted(&self) -> Vec<Secret> {
+        self.minted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    #[cfg(test)]
+    pub fn with_minted(tokens: &[&str]) -> Self {
+        let minter = Self::new(
+            read_federation(Some("r".into()), Some("o".into()), None, None)
+                .unwrap_or_else(|reason| panic!("{reason}")),
+            read_oidc_request(Some("https://x/".into()), Some("t".into()))
+                .unwrap_or_else(|reason| panic!("{reason}")),
+        );
+        minter
+            .minted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(tokens.iter().map(|token| Secret((*token).to_string())));
+        minter
+    }
 }
 
 /// Where the job asks GitHub for its OIDC token, and the bearer token that request carries.
@@ -272,6 +331,36 @@ fn response(reply: Reply) -> Result<(u16, String), &'static str> {
     }
 }
 
+/// The claims a federation rule matches, read from the JWT's payload, for the job log, with
+/// the window from `nbf` to `exp`, which caps the access token: the token itself and its
+/// signature are never shown. A rule is written against these as the identity provider issues
+/// them; GitHub's `sub`, for one, can carry owner and repository ids.
+pub fn rule_claims(jwt: &str) -> Option<String> {
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let mut shown: Vec<String> = RULE_CLAIMS
+        .iter()
+        .filter_map(|name| {
+            let value: String = claims
+                .get(*name)?
+                .as_str()?
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(CLAIM_SHOWN_MAX_CHARS)
+                .collect();
+            Some(format!("{name}={value}"))
+        })
+        .collect();
+    let time = |name: &str| claims.get(name).and_then(serde_json::Value::as_u64);
+    if let (Some(from), Some(expires)) = (time("nbf").or_else(|| time("iat")), time("exp")) {
+        shown.push(format!("valid={} s", expires.saturating_sub(from)));
+    }
+    Some(shown.join(", "))
+}
+
 /// Trades the job's OIDC token for an Anthropic access token. Anthropic documents no
 /// revocation for it; it lapses after its `expires_in`.
 pub fn mint(federation: &Federation, request: &OidcRequest) -> Result<AccessToken, String> {
@@ -299,6 +388,9 @@ fn mint_at(
         }
         OidcOutcome::Unrecognised(reason) => return Err(reason.to_string()),
     };
+    if let Some(claims) = rule_claims(assertion.expose()) {
+        println!("xtask: exchanging an OIDC token with {claims}");
+    }
     let exchanged = client.request(
         Method::Post,
         endpoint,
@@ -310,8 +402,9 @@ fn mint_at(
     match decode_exchange(status, &body) {
         ExchangeOutcome::Issued(token) => Ok(token),
         ExchangeOutcome::Failed(status, code) => Err(format!(
-            "the token exchange ended HTTP {status}{}; the federation rule must match this \
-             repository's OIDC claims and the audience https://api.anthropic.com",
+            "the token exchange ended HTTP {status}{}; the federation rule must match the \
+             claims printed above and the audience https://api.anthropic.com, and the \
+             Console's authentication history names the check that failed",
             code.map(|code| format!(", {code}")).unwrap_or_default()
         )),
         ExchangeOutcome::Unrecognised(reason) => Err(reason.to_string()),
@@ -428,6 +521,33 @@ mod tests {
             );
             assert!(!format!("{outcome:?}").contains(ACCESS));
         }
+    }
+
+    #[test]
+    fn the_rule_claims_are_shown_without_the_token_or_control_characters() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "sub": "repo:frits-v@4488681/tycho-station@1411277668:environment:review",
+                "environment": "review\u{1b}[31m",
+                "job_workflow_ref": "frits-v/tycho-station/.github/workflows/review.yml@refs/heads/main",
+                "nbf": 1_791_916_602_u64,
+                "iat": 1_791_916_902_u64,
+                "exp": 1_791_917_202_u64,
+                "aud": "https://api.anthropic.com",
+            })
+            .to_string(),
+        );
+        let jwt = format!("eyJhbGciOiJSUzI1NiJ9.{payload}.c2lnbmF0dXJlLXZhbHVl");
+        let shown = rule_claims(&jwt).unwrap();
+        assert_eq!(
+            shown,
+            "sub=repo:frits-v@4488681/tycho-station@1411277668:environment:review, \
+             environment=review[31m, job_workflow_ref=frits-v/tycho-station/.github/workflows/\
+             review.yml@refs/heads/main, valid=600 s"
+        );
+        assert!(!shown.contains("c2lnbmF0dXJl") && !shown.contains(&payload));
+        assert_eq!(rule_claims("not-a-jwt"), None);
+        assert_eq!(rule_claims("a.!!!.c"), None);
     }
 
     #[test]
