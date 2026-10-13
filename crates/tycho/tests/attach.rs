@@ -91,8 +91,10 @@ const SPAWN_SESSIONS: &str = "umask 007; zmx=$1; export ZMX_DIR=\"$2\" ZMX_DIR_M
      ZMX_LOG_MODE=\"$4\"; program=$5; shift 5; status=0; \
      while [ $# -ge 2 ]; do \"$zmx\" run \"$1\" -d exec /bin/sh -c \"$program\" sh \"$2\" \
      < /dev/null || status=$?; shift 2; done; exit $status";
-/// Ends each named session by name, never by pid, and removes its log.
-const KILL_SESSIONS: &str = "umask 007; zmx=$1; dir=$2; export ZMX_DIR=\"$2\"; shift 2; status=0; \
+/// Ends each named session by name, never by pid, and removes its log; with the spawn's modes,
+/// so a missing `logs/` or `zmx.log` is never made 0750 or 0640 by the kill.
+const KILL_SESSIONS: &str = "umask 007; zmx=$1; dir=$2; export ZMX_DIR=\"$2\" \
+     ZMX_DIR_MODE=\"$3\" ZMX_LOG_MODE=\"$4\"; shift 4; status=0; \
      for name in \"$@\"; do \"$zmx\" kill \"$name\" --force < /dev/null || status=$?; \
      /bin/rm -f \"$dir/logs/$name.log\"; done; exit $status";
 /// Runs inside the developer's zmx session: osascript's output and exit status land in files.
@@ -927,6 +929,8 @@ impl Drop for Scratch {
             let mut arguments = vec![
                 self.shared.binary.to_str().unwrap_or(""),
                 self.shared.dir.as_str(),
+                ZMX_DIR_MODE,
+                ZMX_LOG_MODE,
             ];
             arguments.extend(self.agent_sessions.iter().map(String::as_str));
             let killed = run_as_agent(&self.agent, KILL_SESSIONS, &arguments);
@@ -1548,28 +1552,20 @@ fn a_client_through_a_pty_reaches_a_developer_session_and_detaches() {
         target.session.as_str(),
         target.marker.to_str().unwrap(),
     ];
-    let spawned = Command::new("/bin/sh")
-        .args(["-c", SPAWN_SESSIONS, RUN_MARKER])
-        .args(spawn_arguments)
-        .env_remove(SESSION_ENV)
-        .current_dir("/")
-        .status()
-        .unwrap();
+    let spawned = run_as_self(SPAWN_SESSIONS, &spawn_arguments);
     let outcome = attach_by_pty(&shared, current_uid(), &target);
     let socket = fs::symlink_metadata(socket_dir.join(&target.session))
         .map(|metadata| format!("{:o}", metadata.permissions().mode() & 0o777));
-    let killed = Command::new("/bin/sh")
-        .args([
-            "-c",
-            KILL_SESSIONS,
-            RUN_MARKER,
+    let killed = run_as_self(
+        KILL_SESSIONS,
+        &[
             binary.to_str().unwrap(),
             &shared.dir,
+            ZMX_DIR_MODE,
+            ZMX_LOG_MODE,
             &target.session,
-        ])
-        .env_remove(SESSION_ENV)
-        .status()
-        .unwrap();
+        ],
+    );
     let left = shared.listed(&target.session);
     fs::remove_dir_all(&root).unwrap();
     println!("attach: self-check: spawn {spawned}, socket mode {socket:?}, {outcome:?}, kill {killed}, then {left:?}");
@@ -1582,6 +1578,17 @@ fn a_client_through_a_pty_reaches_a_developer_session_and_detaches() {
     assert!(matches!(outcome, PathOutcome::Attached(_)), "{outcome:?}");
     assert!(killed.success());
     assert_eq!(left, Listed::Absent, "the kill by name ended the session");
+}
+
+/// Runs one of the agent-side scripts as the test's own user, from `/`.
+fn run_as_self(script: &str, arguments: &[&str]) -> std::process::ExitStatus {
+    Command::new(SHELL)
+        .args(["-c", script, RUN_MARKER])
+        .args(arguments)
+        .env_remove(SESSION_ENV)
+        .current_dir("/")
+        .status()
+        .unwrap()
 }
 
 /// The developer's pinned zmx, which is the version the prefix holds.
