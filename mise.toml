@@ -105,6 +105,10 @@ run = "cargo test -p tycho --test chaos -- --ignored --test-threads=1 --nocaptur
 description = "Probe the developer's home and credentials, the agent's settings file, a test core's admin port and its canonical repository as the agent user, then run the merge gate's verify, fast-forward and sync to a throwaway remote; run from a terminal, since sudo asks for the developer's password to become the agent (macOS)"
 run = "cargo test -p tycho --test boundary -- --ignored --test-threads=1 --nocapture"
 
+[tasks.attach-tests]
+description = "Create zmx sessions as the agent user in the shared socket directory, attach to one as the developer through a pty, then have Ghostty open a tab running the attach through osascript from inside zmx and from a launchd agent; run from a Ghostty terminal, since sudo asks for the developer's password once and each path may raise an Automation consent dialog (macOS)"
+run = "cargo test -p tycho --test attach -- --ignored --test-threads=1 --nocapture"
+
 [tasks.setup]
 description = "Check the operator preconditions for running the factory on this machine"
 run = "cargo run -q -p xtask -- setup"

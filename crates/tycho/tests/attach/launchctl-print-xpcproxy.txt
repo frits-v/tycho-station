@@ -1,0 +1,69 @@
+gui/501/tycho-attach-test-4400 = {
+	active count = 1
+	path = /Users/someone/tmp/tycho-attach-test-4400.plist
+	type = LaunchAgent
+	state = xpcproxy
+
+	program = /bin/sleep
+	arguments = {
+		/bin/sleep
+		1
+	}
+
+	inherited environment = {
+		SSH_AUTH_SOCK => /var/run/com.apple.launchd.example/Listeners
+	}
+
+	default environment = {
+		PATH => /usr/bin:/bin:/usr/sbin:/sbin
+	}
+
+	environment = {
+		OSLogRateLimit => 64
+		XPC_SERVICE_NAME => tycho-attach-test-4400
+	}
+
+	domain = gui/501 [100015]
+	asid = 100015
+	minimum runtime = 10
+	exit timeout = 5
+	runs = 1
+	pid = 37719
+	immediate reason = speculative
+	forks = 0
+	execs = 0
+	initialized = 0
+	trampolined = 0
+	started suspended = 0
+	proxy started suspended = 0
+	checked allocations = 0 (queried = 0)
+	checked allocations reason = no host
+	checked allocations flags = 0x0
+	last exit code = (never exited)
+
+	resource coalition = {
+		ID = 471437
+		type = resource
+		state = active
+		active count = 1
+		name = tycho-attach-test-4400
+	}
+
+	jetsam coalition = {
+		ID = 471438
+		type = jetsam
+		state = active
+		active count = 1
+		name = tycho-attach-test-4400
+	}
+
+	spawn type = daemon (3)
+	jetsam priority = 40
+	jetsam memory limit (active) = (unlimited)
+	jetsam memory limit (inactive) = (unlimited)
+	jetsamproperties category = daemon
+	jetsam thread limit = 32
+	cpumon = default
+
+	properties = runatload | inferred program
+}
