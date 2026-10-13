@@ -142,14 +142,22 @@ kills by name any session of the run's prefix the developer owns, which `zmx att
 missing name creates, and prints what the shared directory still lists. A second ignored
 test runs the pty path against a developer session in a private directory, with no sudo.
 
-Before the first sudo the attach suite checks that its process group is the terminal's
-foreground group, and refuses with a line naming both groups when it is not, since sudo
-could then show its prompt but never read the password. It puts the terminal in canonical
-mode with echo when it finds it otherwise, prints which it found, and restores the
-terminal's settings after each pty client and when the test ends, a panic included. Each
-agent-side command runs with its output in files and is bounded by sudo's own exit, and the
-agent's scripts send zmx's output to a file of their own, so a session daemon that inherits a
-descriptor cannot hold the run open.
+Before every sudo, the teardown's included, the attach suite checks that its process group
+is the terminal's foreground group, and refuses with a line naming both groups when it is
+not, since sudo could then show its prompt but never read the password. It writes the
+emulator resets to `/dev/tty` (the kitty keyboard protocol set to no flags and popped,
+bracketed paste, focus events and mouse reporting off), since a `zmx attach` in Ghostty can
+leave the keyboard protocol on, after which Enter arrives as `CSI 13 u` and a canonical read
+never ends, which termios cannot show. It puts the terminal in canonical mode with echo, DEL
+as erase, and carriage return read as newline with neither ignored nor swapped, and prints
+the process group, the foreground group, the input and local flags, VERASE, VMIN and VTIME
+before and after. After each pty client and when the test ends, a panic included, it writes
+the resets again and restores the saved settings. Each agent-side command runs with its
+output in files and is bounded by sudo's own exit; on a timeout the line carries `ps`'s
+state, process group and foreground group for sudo (`T` is stopped reading the terminal from
+a background group, `S` is waiting), and a refused kill is named and not waited for. The
+agent's scripts send zmx's output to a file of their own, so a session daemon that inherits
+a descriptor cannot hold the run open.
 
 ## Reporting
 

@@ -31,7 +31,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use nix::fcntl::OFlag;
-use nix::sys::termios::{tcgetattr, tcsetattr, InputFlags, LocalFlags, SetArg, Termios};
+use nix::sys::termios::{
+    tcgetattr, tcsetattr, InputFlags, LocalFlags, SetArg, SpecialCharacterIndices, Termios,
+};
 use nix::unistd::{access, getpgrp, tcgetpgrp, AccessFlags, Group, User};
 use tycho::agent_files::current_uid;
 use tycho::command::{self, CommandError};
@@ -72,6 +74,9 @@ const MARKER_WAIT_MAX: Duration = Duration::from_secs(30);
 /// How long a client gets to show as attached in `zmx list` before a line is typed.
 const ATTACH_WAIT_MAX: Duration = Duration::from_secs(10);
 const DETACH_WAIT_MAX: Duration = Duration::from_secs(10);
+const KILL_WAIT_MAX: Duration = Duration::from_secs(5);
+/// DEL, the erase character `stty sane` sets on macOS.
+const ERASE_DELETE: u8 = 0x7f;
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const MARKER_MAX_BYTES: u64 = 4096;
 const SHARED_ENTRIES_MAX: usize = 64;
@@ -300,25 +305,73 @@ fn wait_for_exit(child: &mut Child, timeout: Duration) -> Result<(), String> {
             Err(error) => return Err(error.to_string()),
         }
     }
-    drop(child.kill());
-    drop(child.wait());
-    Err(format!("did not finish within {timeout:?}; killed"))
+    let pid = child.id();
+    let state = process_state(pid);
+    match child.kill() {
+        Ok(()) => {
+            let reaped = wait_for_exit_after_kill(child);
+            Err(format!(
+                "did not finish within {timeout:?}; ps for pid {pid}: {state}; killed, {reaped}"
+            ))
+        }
+        Err(error) => Err(format!(
+            "did not finish within {timeout:?}; ps for pid {pid}: {state}; kill refused \
+             ({error}), not waited for"
+        )),
+    }
+}
+
+/// Waits a bounded time for a child that was just killed.
+fn wait_for_exit_after_kill(child: &mut Child) -> String {
+    let deadline = deadline_after(KILL_WAIT_MAX);
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) => return format!("then exited with {status}"),
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
+            Err(error) => return format!("then could not be waited for: {error}"),
+        }
+    }
+    format!("still running {KILL_WAIT_MAX:?} after the kill")
+}
+
+/// `ps`'s stat, process group and terminal foreground group for a pid: `T` is stopped, which a
+/// background group reading the terminal gets; `S` is waiting, as for input.
+fn process_state(pid: u32) -> String {
+    let pid = pid.to_string();
+    match command::run_status(
+        Path::new("/bin/ps"),
+        &["-o", "stat=,pgid=,tpgid=", "-p", &pid],
+        &[],
+        COMMAND_TIMEOUT,
+    ) {
+        Ok(captured) => format!("{} (exit {})", cut(captured.stdout.trim()), captured.status),
+        Err(error) => error.to_string(),
+    }
 }
 
 /// A file's text; over `OUTPUT_FILE_MAX_BYTES` is an error, never a cut.
 fn read_bounded(path: &Path) -> Result<String, String> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.len() > OUTPUT_FILE_MAX_BYTES => Err(format!(
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(String::new()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    let mut text = String::new();
+    file.take(OUTPUT_FILE_MAX_BYTES.saturating_add(1))
+        .read_to_string(&mut text)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if u64::try_from(text.len()).unwrap_or(u64::MAX) > OUTPUT_FILE_MAX_BYTES {
+        return Err(format!(
             "{} is over {OUTPUT_FILE_MAX_BYTES} bytes",
             path.display()
-        )),
-        Ok(_) => fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display())),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(String::new()),
-        Err(error) => Err(format!("{}: {error}", path.display())),
+        ));
     }
+    Ok(text)
 }
 
-/// The controlling terminal's settings, put back when dropped, a panic's unwinding included.
+/// The controlling terminal's settings, put back when dropped, a panic's unwinding included,
+/// after the emulator resets. Saved once the prompt repair has run, so the suite's guard puts
+/// back the repaired settings, not whatever the terminal had before the suite.
 struct TerminalState {
     tty: File,
     saved: Termios,
@@ -331,13 +384,18 @@ impl TerminalState {
     }
 
     fn restore(&self) -> Result<(), String> {
-        tcsetattr(&self.tty, SetArg::TCSADRAIN, &self.saved)
+        // Not TCSADRAIN: draining waits for the emulator to read the resets just written, which
+        // a terminal nobody reads never does.
+        tcsetattr(&self.tty, SetArg::TCSANOW, &self.saved)
             .map_err(|error| format!("tcsetattr: {error}"))
     }
 }
 
 impl Drop for TerminalState {
     fn drop(&mut self) {
+        if let Err(error) = reset_emulator(&self.tty) {
+            eprintln!("attach: could not reset the terminal emulator: {error}");
+        }
         if let Err(error) = self.restore() {
             eprintln!("attach: could not restore the terminal: {error}");
         }
@@ -353,14 +411,23 @@ fn controlling_terminal() -> Result<File, String> {
 }
 
 /// The settings a password prompt on `/dev/tty` needs, the relevant part of `stty sane`:
-/// canonical line input with echo, erase, signals and carriage return read as newline. `None`
-/// when the terminal already has them.
+/// canonical line input with echo, erase on DEL, signals, and carriage return read as newline
+/// with neither ignored nor swapped. `None` when the terminal already has them.
 fn prompt_repair(current: &Termios) -> Option<Termios> {
     let mut wanted = current.clone();
     wanted
         .local_flags
         .insert(LocalFlags::ICANON | LocalFlags::ECHO | LocalFlags::ECHOE | LocalFlags::ISIG);
     wanted.input_flags.insert(InputFlags::ICRNL);
+    wanted
+        .input_flags
+        .remove(InputFlags::IGNCR | InputFlags::INLCR);
+    if let Some(erase) = wanted
+        .control_chars
+        .get_mut(SpecialCharacterIndices::VERASE as usize)
+    {
+        *erase = ERASE_DELETE;
+    }
     (wanted != *current).then_some(wanted)
 }
 
@@ -376,33 +443,74 @@ fn foreground_refusal(terminal_group: i32, own_group: i32) -> Option<String> {
 
 /// Puts the terminal in the modes a password prompt needs and checks this process group owns
 /// it; prints what it found and returns the state to restore when the test ends.
-fn prepare_for_prompt() -> TerminalState {
-    let tty = controlling_terminal().unwrap_or_else(|error| panic!("attach: {error}"));
+fn prepare_for_prompt() -> Result<String, String> {
+    let tty = controlling_terminal()?;
     let terminal_group = tcgetpgrp(&tty)
-        .unwrap_or_else(|error| panic!("attach: tcgetpgrp: {error}"))
+        .map_err(|error| format!("tcgetpgrp: {error}"))?
         .as_raw();
-    if let Some(refusal) = foreground_refusal(terminal_group, getpgrp().as_raw()) {
-        panic!("{refusal}");
+    let own_group = getpgrp().as_raw();
+    let current = tcgetattr(&tty).map_err(|error| format!("tcgetattr: {error}"))?;
+    let found = describe_terminal(own_group, terminal_group, &current);
+    if let Some(refusal) = foreground_refusal(terminal_group, own_group) {
+        return Err(format!("{refusal}; {found}"));
     }
-    let current = tcgetattr(&tty).unwrap_or_else(|error| panic!("attach: tcgetattr: {error}"));
+    reset_emulator(&tty)?;
     match prompt_repair(&current) {
         Some(wanted) => {
-            tcsetattr(&tty, SetArg::TCSADRAIN, &wanted)
-                .unwrap_or_else(|error| panic!("attach: tcsetattr: {error}"));
-            println!(
-                "attach: terminal before sudo: was {:?}, set canonical input with echo",
-                current.local_flags
-            );
+            tcsetattr(&tty, SetArg::TCSANOW, &wanted)
+                .map_err(|error| format!("tcsetattr: {error}"))?;
+            Ok(format!(
+                "attach: terminal before sudo: {found}; repaired to {}",
+                describe_terminal(own_group, terminal_group, &wanted)
+            ))
         }
-        None => println!("attach: terminal before sudo: canonical input with echo, foreground"),
+        None => Ok(format!(
+            "attach: terminal before sudo: {found}; left as it was"
+        )),
     }
-    TerminalState::save(tty).unwrap_or_else(|error| panic!("attach: {error}"))
+}
+
+/// The groups and the settings a password prompt depends on, as numbers and flag names.
+fn describe_terminal(own_group: i32, terminal_group: i32, termios: &Termios) -> String {
+    let control = |index: SpecialCharacterIndices| {
+        termios
+            .control_chars
+            .get(index as usize)
+            .map_or_else(|| "absent".to_string(), |value| format!("{value:#04x}"))
+    };
+    format!(
+        "pgrp {own_group}, tpgid {terminal_group}, input {:?}, local {:?}, VERASE {}, VMIN {}, \
+         VTIME {}",
+        termios.input_flags,
+        termios.local_flags,
+        control(SpecialCharacterIndices::VERASE),
+        control(SpecialCharacterIndices::VMIN),
+        control(SpecialCharacterIndices::VTIME)
+    )
+}
+
+/// Turns off what a terminal application can leave on in the emulator and termios cannot show:
+/// the kitty keyboard protocol (set to no flags, then popped), under which Enter arrives as
+/// `CSI 13 u` and a canonical read never ends; bracketed paste; focus events; and mouse
+/// reporting with its SGR encoding. These are the emulator's defaults, so nothing is put back.
+const EMULATOR_RESETS: &[u8] = b"\x1b[=0;1u\x1b[<u\x1b[?2004l\x1b[?1004l\x1b[?1000l\x1b[?1006l";
+
+fn reset_emulator(tty: &File) -> Result<(), String> {
+    let mut writer = tty;
+    writer
+        .write_all(EMULATOR_RESETS)
+        .and_then(|()| writer.flush())
+        .map_err(|error| format!("writing the emulator resets: {error}"))
 }
 
 /// Runs `script` with `arguments` as `$1`.. in a shell of the agent user, with an empty
 /// environment, from `/`. The one place the identity switch is made: today through sudo,
 /// which prompts on the terminal.
 fn run_as_agent(agent: &Agent, script: &str, arguments: &[&str]) -> AgentRun {
+    match prepare_for_prompt() {
+        Ok(line) => println!("{line}"),
+        Err(error) => return AgentRun::CouldNotRun(error),
+    }
     let home = format!("HOME={}", agent.home.display());
     let wrapped = wrap(script);
     let mut words = vec![
@@ -1179,13 +1287,19 @@ impl LaunchdJob {
     }
 }
 
+/// Prepares the terminal for the first prompt and saves the repaired settings for the end.
+fn terminal_for_the_run() -> Result<TerminalState, String> {
+    println!("{}", prepare_for_prompt()?);
+    controlling_terminal().and_then(TerminalState::save)
+}
+
 /// Refuses to start without a terminal, the agent user, the prefix's zmx, or the shared
 /// directory, or with a sudo answer the station does not expect; prints what it saw.
 fn preflight() -> (Agent, SharedZmx, TerminalState) {
     if let Some(refusal) = terminal_refusal(std::io::stdin().is_terminal()) {
         panic!("{refusal}");
     }
-    let terminal = prepare_for_prompt();
+    let terminal = terminal_for_the_run().unwrap_or_else(|error| panic!("attach: {error}"));
     let agent = User::from_name(AGENT_USER_DEFAULT)
         .unwrap_or_else(|error| panic!("attach: cannot look up {AGENT_USER_DEFAULT}: {error}"))
         .unwrap_or_else(|| {
@@ -1361,7 +1475,13 @@ fn spawn_agent_sessions(scratch: &mut Scratch, targets: &[Target]) -> Result<(),
 /// checks the session still runs.
 fn attach_by_pty(shared: &SharedZmx, owner_uid: u32, target: &Target) -> PathOutcome {
     // Put back whatever the client does to the controlling terminal before the next prompt.
-    let _terminal = controlling_terminal().and_then(TerminalState::save);
+    let _terminal = match controlling_terminal().and_then(TerminalState::save) {
+        Ok(terminal) => Some(terminal),
+        Err(error) => {
+            println!("attach: the pty client runs with no terminal to put back: {error}");
+            None
+        }
+    };
     match shared.listed(&target.session) {
         Listed::Running { .. } => {}
         Listed::AccessDenied(text) => return PathOutcome::CouldNotRun(format!("zmx list: {text}")),
@@ -1843,8 +1963,70 @@ mod decoders {
             .local_flags
             .contains(LocalFlags::ICANON | LocalFlags::ECHO));
         assert!(wanted.input_flags.contains(InputFlags::ICRNL));
+        assert!(!wanted
+            .input_flags
+            .intersects(InputFlags::IGNCR | InputFlags::INLCR));
+        assert_eq!(
+            wanted.control_chars[SpecialCharacterIndices::VERASE as usize],
+            ERASE_DELETE
+        );
         tcsetattr(&tty, SetArg::TCSANOW, &wanted).unwrap();
         assert_eq!(prompt_repair(&tcgetattr(&tty).unwrap()), None);
+    }
+
+    #[test]
+    fn a_raw_terminal_with_cr_swapped_is_repaired_and_described_in_numbers() {
+        let (_master, tty) = pty_slave();
+        let mut odd = tcgetattr(&tty).unwrap();
+        odd.input_flags
+            .insert(InputFlags::IGNCR | InputFlags::INLCR);
+        odd.control_chars[SpecialCharacterIndices::VERASE as usize] = 0x08;
+        tcsetattr(&tty, SetArg::TCSANOW, &odd).unwrap();
+        let wanted = prompt_repair(&tcgetattr(&tty).unwrap()).unwrap();
+        assert!(!wanted
+            .input_flags
+            .intersects(InputFlags::IGNCR | InputFlags::INLCR));
+        let line = describe_terminal(42, 42, &wanted);
+        for part in [
+            "pgrp 42",
+            "tpgid 42",
+            "input ",
+            "local ",
+            "VERASE 0x7f",
+            "VMIN ",
+            "VTIME ",
+        ] {
+            assert!(line.contains(part), "{part}: {line}");
+        }
+    }
+
+    #[test]
+    fn the_emulator_resets_are_exactly_the_six_sequences_and_reach_the_terminal() {
+        let sequences: [&[u8]; 6] = [
+            b"\x1b[=0;1u",
+            b"\x1b[<u",
+            b"\x1b[?2004l",
+            b"\x1b[?1004l",
+            b"\x1b[?1000l",
+            b"\x1b[?1006l",
+        ];
+        assert_eq!(EMULATOR_RESETS, sequences.concat().as_slice());
+        let (master, tty) = pty_slave();
+        reset_emulator(&tty).unwrap();
+        let mut read = vec![0_u8; EMULATOR_RESETS.len()];
+        File::from(master).read_exact(&mut read).unwrap();
+        assert_eq!(read, EMULATOR_RESETS);
+    }
+
+    #[test]
+    fn a_child_that_outlives_its_bound_is_named_with_its_process_state() {
+        let mut child = Command::new("/bin/sleep").arg("5").spawn().unwrap();
+        let error = wait_for_exit(&mut child, Duration::from_millis(300)).unwrap_err();
+        assert!(
+            error.contains(&format!("ps for pid {}", child.id())),
+            "{error}"
+        );
+        assert!(error.contains("killed, then exited"), "{error}");
     }
 
     #[test]
@@ -1852,6 +2034,8 @@ mod decoders {
         assert_eq!(foreground_refusal(42, 42), None);
         let refusal = foreground_refusal(41, 42).unwrap();
         assert!(refusal.contains("never read the password"), "{refusal}");
+        assert!(refusal.contains("process group 42"), "{refusal}");
+        assert!(refusal.contains("foreground group is 41"), "{refusal}");
     }
 
     #[test]
