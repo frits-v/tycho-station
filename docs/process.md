@@ -551,12 +551,25 @@ check out, build and run it.
   association is `OWNER`, `MEMBER` or `COLLABORATOR`. Opening a pull request, pushing to it or
   editing a comment starts nothing; the workflow's condition and the xtask's event decoder
   both enforce this.
-- The review's own text holds no `@`: model text is posted with `<`, `>`, `&` and `@`
-  escaped. A review never asks for another one.
+- The review's own text mentions nobody and references nothing: model text is posted on one
+  line, its code spans rewritten inside fences the review builds, the markdown characters
+  outside them as entities, and a word joiner after `@` and between `#`, `/` or `-` and a
+  digit, since GitHub links mentions and references after it decodes entities. A review never
+  asks for another one.
 - A pull request takes at most 20 reviews from the App; past that the run fails before
   calling the model.
 - Runs of one pull request share a concurrency group on the job, after its condition; a new
   request cancels the run in progress, and a comment that starts no review cancels nothing.
+
+### After the verdict
+
+- An approval stands for the low findings that come with it. The author fixes the ones worth
+  fixing in one last commit, replies on each thread with the commit that resolves it, resolves
+  every thread and merges; no second review is asked for. The branch rules dismiss the
+  approval on that push and require none, and they require every thread resolved and `ci`
+  passing on a branch up to date with `main`.
+- Changes requested, or a high or medium finding the author disputes, is the case for another
+  review.
 
 ### What runs where
 
