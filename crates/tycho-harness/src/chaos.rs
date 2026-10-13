@@ -7,10 +7,12 @@
 pub const CHAOS_SUITE: &str = "crates/tycho/tests/chaos";
 /// The boundary tests run from this file with `mise run boundary-tests`, from a terminal.
 pub const BOUNDARY_SUITE: &str = "crates/tycho/tests/boundary.rs";
+/// The attach tests run from this file with `mise run attach-tests`, from a Ghostty terminal.
+pub const ATTACH_SUITE: &str = "crates/tycho/tests/attach.rs";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Readiness {
-    /// Runs as this test in the chaos or the boundary suite.
+    /// Runs as this test in the chaos, boundary or attach suite.
     Runnable {
         test: &'static str,
     },
@@ -70,7 +72,7 @@ pub const CHAOS_CATALOGUE: [ChaosTest; 4] = [
 ];
 
 /// Slice zero's exit tests (`docs/slices.md`).
-pub const SLICE_ZERO_EXIT_TESTS: [SliceZeroExitTest; 5] = [
+pub const SLICE_ZERO_EXIT_TESTS: [SliceZeroExitTest; 6] = [
     SliceZeroExitTest {
         name: "kill tests (step 4)",
         pass_condition: "killing the terminal app, the Restate server between worker exit and resolve, the endpoint, and the launcher before its exit trap each leaves nothing lost and spawns no duplicate session",
@@ -83,6 +85,13 @@ pub const SLICE_ZERO_EXIT_TESTS: [SliceZeroExitTest; 5] = [
         pass_condition: "the agent user's reads of the developer's keychain and config directories, its write to its own settings file, and its reach to the Restate admin port, the canonical repository, its hooks and the default branch are all refused; then the core verifies a worker's commit on a fresh checkout, fast-forwards the default branch and syncs it to a throwaway remote",
         readiness: Readiness::Runnable {
             test: "the_agent_user_is_refused_at_every_boundary, the_core_verifies_a_worker_commit_fast_forwards_and_syncs_it",
+        },
+    },
+    SliceZeroExitTest {
+        name: "attach tests (step 6)",
+        pass_condition: "a developer pty and a Ghostty tab opened through osascript, from inside a zmx session and from a launchd agent, each attach to a zmx session the agent user owns in the shared socket directory and type a line its program writes; an Automation consent prompt is recorded and does not pass",
+        readiness: Readiness::Runnable {
+            test: "a_developer_tab_attaches_to_an_agent_owned_session, a_client_through_a_pty_reaches_a_developer_session_and_detaches",
         },
     },
     SliceZeroExitTest {
@@ -126,7 +135,7 @@ mod tests {
         );
     }
 
-    /// The test function names of the chaos and boundary suites, read from their sources.
+    /// The test function names of the chaos, boundary and attach suites, read from their sources.
     fn suite_tests() -> String {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
@@ -135,7 +144,9 @@ mod tests {
         for entry in std::fs::read_dir(root.join(CHAOS_SUITE)).unwrap() {
             sources.push_str(&std::fs::read_to_string(entry.unwrap().path()).unwrap());
         }
-        sources.push_str(&std::fs::read_to_string(root.join(BOUNDARY_SUITE)).unwrap());
+        for suite in [BOUNDARY_SUITE, ATTACH_SUITE] {
+            sources.push_str(&std::fs::read_to_string(root.join(suite)).unwrap());
+        }
         sources
     }
 
@@ -181,8 +192,8 @@ mod tests {
     }
 
     #[test]
-    fn slice_zero_steps_four_and_five_and_the_baselines_name_tests_that_exist() {
-        assert_eq!(SLICE_ZERO_EXIT_TESTS.len(), 5);
+    fn slice_zero_steps_four_five_and_six_and_the_baselines_name_tests_that_exist() {
+        assert_eq!(SLICE_ZERO_EXIT_TESTS.len(), 6);
         let sources = suite_tests();
         let runnable: Vec<&str> = SLICE_ZERO_EXIT_TESTS
             .iter()
@@ -194,6 +205,7 @@ mod tests {
             [
                 "kill tests (step 4)",
                 "boundary tests (step 5)",
+                "attach tests (step 6)",
                 "first baselines"
             ]
         );
@@ -201,7 +213,7 @@ mod tests {
             .iter()
             .flat_map(|test| runnable_names(test.readiness))
             .collect();
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 9);
         for name in names {
             assert!(sources.contains(&format!("fn {name}()")), "{name}");
         }
@@ -215,6 +227,18 @@ mod tests {
             .unwrap();
         assert!(step_five.pass_condition.contains("keychain"));
         assert!(step_five.pass_condition.contains("config"));
+    }
+
+    #[test]
+    fn step_six_names_both_tab_paths_and_the_consent_prompt() {
+        let step_six = SLICE_ZERO_EXIT_TESTS
+            .iter()
+            .find(|test| test.name == "attach tests (step 6)")
+            .unwrap();
+        assert!(step_six
+            .pass_condition
+            .contains("zmx session and from a launchd agent"));
+        assert!(step_six.pass_condition.contains("consent"));
     }
 
     #[test]
