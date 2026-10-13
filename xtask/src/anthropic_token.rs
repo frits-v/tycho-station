@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use base64::Engine as _;
+
 use crate::github_api::{Credential, Method, PlainClient, Reply};
 
 pub const FEDERATION_RULE_VARIABLE: &str = "ANTHROPIC_FEDERATION_RULE_ID";
@@ -23,6 +25,9 @@ const IDENTIFIER_MAX_CHARS: usize = 128;
 const REQUEST_URL_MAX_CHARS: usize = 2048;
 const TOKEN_MAX_CHARS: usize = 8192;
 const ERROR_CODE_MAX_CHARS: usize = 64;
+/// The claims a federation rule matches on, shown before each exchange.
+const RULE_CLAIMS: [&str; 4] = ["sub", "environment", "job_workflow_ref", "ref"];
+const CLAIM_SHOWN_MAX_CHARS: usize = 200;
 /// A day; a longer lifetime is not one this exchange issues.
 const EXPIRES_IN_MAX_SECONDS: u64 = 86_400;
 
@@ -272,6 +277,35 @@ fn response(reply: Reply) -> Result<(u16, String), &'static str> {
     }
 }
 
+/// The claims a federation rule matches, read from the JWT's payload, for the job log: the
+/// token itself and its signature are never shown. A rule is written against these as the
+/// identity provider issues them; GitHub's `sub`, for one, can carry owner and repository ids.
+pub fn rule_claims(jwt: &str) -> Option<String> {
+    let payload = jwt.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let mut shown: Vec<String> = RULE_CLAIMS
+        .iter()
+        .filter_map(|name| {
+            let value: String = claims
+                .get(*name)?
+                .as_str()?
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(CLAIM_SHOWN_MAX_CHARS)
+                .collect();
+            Some(format!("{name}={value}"))
+        })
+        .collect();
+    let time = |name: &str| claims.get(name).and_then(serde_json::Value::as_u64);
+    if let (Some(issued), Some(expires)) = (time("iat"), time("exp")) {
+        shown.push(format!("lifetime={} s", expires.saturating_sub(issued)));
+    }
+    Some(shown.join(", "))
+}
+
 /// Trades the job's OIDC token for an Anthropic access token. Anthropic documents no
 /// revocation for it; it lapses after its `expires_in`.
 pub fn mint(federation: &Federation, request: &OidcRequest) -> Result<AccessToken, String> {
@@ -299,6 +333,9 @@ fn mint_at(
         }
         OidcOutcome::Unrecognised(reason) => return Err(reason.to_string()),
     };
+    if let Some(claims) = rule_claims(assertion.expose()) {
+        println!("xtask: exchanging an OIDC token with {claims}");
+    }
     let exchanged = client.request(
         Method::Post,
         endpoint,
@@ -310,8 +347,9 @@ fn mint_at(
     match decode_exchange(status, &body) {
         ExchangeOutcome::Issued(token) => Ok(token),
         ExchangeOutcome::Failed(status, code) => Err(format!(
-            "the token exchange ended HTTP {status}{}; the federation rule must match this \
-             repository's OIDC claims and the audience https://api.anthropic.com",
+            "the token exchange ended HTTP {status}{}; the federation rule must match the \
+             claims printed above and the audience https://api.anthropic.com, and the \
+             Console's authentication history names the check that failed",
             code.map(|code| format!(", {code}")).unwrap_or_default()
         )),
         ExchangeOutcome::Unrecognised(reason) => Err(reason.to_string()),
@@ -428,6 +466,32 @@ mod tests {
             );
             assert!(!format!("{outcome:?}").contains(ACCESS));
         }
+    }
+
+    #[test]
+    fn the_rule_claims_are_shown_without_the_token_or_control_characters() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::json!({
+                "sub": "repo:frits-v@4488681/tycho-station@1411277668:environment:review",
+                "environment": "review\u{1b}[31m",
+                "job_workflow_ref": "frits-v/tycho-station/.github/workflows/review.yml@refs/heads/main",
+                "iat": 1_791_916_902_u64,
+                "exp": 1_791_917_202_u64,
+                "aud": "https://api.anthropic.com",
+            })
+            .to_string(),
+        );
+        let jwt = format!("eyJhbGciOiJSUzI1NiJ9.{payload}.c2lnbmF0dXJlLXZhbHVl");
+        let shown = rule_claims(&jwt).unwrap();
+        assert_eq!(
+            shown,
+            "sub=repo:frits-v@4488681/tycho-station@1411277668:environment:review, \
+             environment=review[31m, job_workflow_ref=frits-v/tycho-station/.github/workflows/\
+             review.yml@refs/heads/main, lifetime=300 s"
+        );
+        assert!(!shown.contains("c2lnbmF0dXJl") && !shown.contains(&payload));
+        assert_eq!(rule_claims("not-a-jwt"), None);
+        assert_eq!(rule_claims("a.!!!.c"), None);
     }
 
     #[test]

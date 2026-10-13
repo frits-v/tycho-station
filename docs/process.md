@@ -650,9 +650,27 @@ check out, build and run it.
   when set, `ANTHROPIC_SERVICE_ACCOUNT_ID` and `ANTHROPIC_WORKSPACE_ID`. It requires a `Bearer`
   token type and an `expires_in` of at most a day, and bounds the passes to that lifetime less
   two minutes, at most 30 minutes. Anthropic documents no revocation; the token lapses.
-- In a job with an `environment:` the OIDC token's `sub` is
-  `repo:frits-v/tycho-station:environment:<name>`, so the federation rule matches the
-  `review` and `review-dry-run` environments.
+- This repository's OIDC tokens carry GitHub's immutable-id subject,
+  `repo:frits-v@4488681/tycho-station@1411277668:environment:<name>`, not the
+  `repo:<owner>/<name>:...` form GitHub's documentation shows. The federation rule therefore
+  matches stable claims in a CEL condition instead of `sub`:
+
+  ```text
+  claims.repository_id == "1411277668" && (
+    (claims.environment == "review" &&
+     claims.job_workflow_ref == "frits-v/tycho-station/.github/workflows/review.yml@refs/heads/main") ||
+    (claims.environment == "review-dry-run" &&
+     claims.job_workflow_ref.startsWith("frits-v/tycho-station/.github/workflows/review-dry-run.yml@"))
+  )
+  ```
+
+  Before each exchange the xtask prints the claims a rule matches on (`sub`, `environment`,
+  `job_workflow_ref`, `ref` and the token's lifetime), never the token. An exchange the rule
+  refuses answers an opaque `401`; the Console's authentication history names the failed
+  check, such as `match_condition_false`.
+- The rule's token lifetime is at least 1920 seconds: the passes run for at most 30 minutes
+  and the xtask leaves two minutes unused. A shorter lifetime fails the run before any pass,
+  naming the lifetime it got.
 - All exchanges are made in process over HTTPS (rustls on aws-lc-rs, the webpki roots
   compiled in, no proxy, no redirects); no token appears in arguments, output or errors.
 
