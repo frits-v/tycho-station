@@ -442,4 +442,83 @@ mod tests {
             b"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n"
         );
     }
+
+    /// Bounded keys of `#Petitions` (design section 11), each with its committed default and
+    /// the bound `config/schema.cue` carries for it.
+    const PETITIONS_BOUNDS: [(&str, i64, i64, i64); 7] = [
+        ("repeated_ruling_count", 3, 2, 50),
+        ("convention_citations_min", 5, 1, 1_000),
+        ("convention_hold_days", 90, 7, 730),
+        ("review_period_days", 90, 7, 730),
+        ("open_max", 3, 1, 8),
+        ("evaluation_interval_seconds", 3_600, 60, 86_400),
+        ("cases_listed_max", 8, 1, 16),
+    ];
+
+    /// A `#Petitions` value with every key at its committed default except `field`, set to
+    /// `value`.
+    fn petitions_fixture(field: &str, value: i64) -> String {
+        use std::fmt::Write as _;
+
+        let mut body = String::from("package config\n\npetitions: #Petitions & {\n");
+        for (name, default, _min, _max) in PETITIONS_BOUNDS {
+            let used = if name == field { value } else { default };
+            writeln!(body, "\t{name}: {used}").expect("writing to a String never fails");
+        }
+        body.push_str("}\n");
+        body
+    }
+
+    /// `cue vet`s a fixture body against the schema from a file private to this process and
+    /// this case, removed again before returning.
+    fn vet_petitions_fixture(schema: &Path, body: &str, case: &str) -> CueOutcome {
+        let path = std::env::temp_dir().join(format!(
+            "xtask-petitions-bounds-{}-{case}.cue",
+            std::process::id()
+        ));
+        fs::write(&path, body).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let outcome = cue(&[
+            "vet",
+            "-c",
+            &schema.to_string_lossy(),
+            &path.to_string_lossy(),
+        ]);
+        drop(fs::remove_file(&path));
+        outcome
+    }
+
+    /// Design section 11's test plan: a fixture one past each key's maximum, and one below
+    /// its minimum, fails `cue vet`; the committed `config/petitions.cue` passes. Dropping a
+    /// bound from `#Petitions` (for example `<=8` on `open_max`) turns one of the refused
+    /// cases clean and fails this test.
+    #[test]
+    fn every_petition_bound_is_refused_one_past_its_limit_and_the_committed_file_is_accepted() {
+        let workspace = crate::setup::workspace_root();
+        let schema = workspace.join(CONFIG_SCHEMA);
+        let mut examined = 0_usize;
+        for (field, _default, min, max) in PETITIONS_BOUNDS {
+            for (case, value) in [("below_min", min - 1), ("above_max", max + 1)] {
+                examined += 1;
+                let outcome = vet_petitions_fixture(
+                    &schema,
+                    &petitions_fixture(field, value),
+                    &format!("{field}-{case}"),
+                );
+                assert!(
+                    matches!(outcome, CueOutcome::Rejected),
+                    "{field} = {value} ({case}): {outcome:?}"
+                );
+            }
+        }
+        assert_eq!(examined, 14, "zero or a short run is a failure");
+
+        let committed = workspace.join("config/petitions.cue");
+        let accepted = cue(&[
+            "vet",
+            "-c",
+            &schema.to_string_lossy(),
+            &committed.to_string_lossy(),
+        ]);
+        assert!(matches!(accepted, CueOutcome::Clean(_)), "{accepted:?}");
+    }
 }
