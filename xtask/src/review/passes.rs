@@ -3,18 +3,18 @@
 
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::Value;
-use tycho_types::git_environment::git_command;
 
 use super::claude_run::{self, Limits, RunOutcome};
 use super::findings::{self, Finding, Verdict};
 use super::langfuse::Generation;
 use super::pull_request::Posted;
 use super::verdict::blocks;
-use super::{Context, Tally, EXCLUDED_PATHSPECS, VERIFIED_MAX};
+use super::{git_in, Context, Tally, EXCLUDED_PATHSPECS, VERIFIED_MAX};
 use crate::process::{run_bounded, Exit};
 
 const FIND_SCHEMA: &str = include_str!("../../../config/export/schema/review_findings.json");
@@ -38,19 +38,23 @@ fn write_file(path: &Path, text: &str) -> Result<(), String> {
     fs::write(path, text).map_err(|error| format!("cannot write {}: {error}", path.display()))
 }
 
+/// The diff of the reviewed checkout, through git without the run's secrets: it runs inside
+/// the pull request's checkout.
+fn diff_command(context: &Context) -> Command {
+    let mut command = git_in(&context.checkout);
+    command
+        .args(["-c", "core.quotePath=false", "diff", "--no-color"])
+        .args(["--no-ext-diff", "--no-textconv", "-M", "--unified=3"])
+        .arg(format!("{}...{}", context.base, context.head))
+        .args(["--", "."])
+        .args(EXCLUDED_PATHSPECS);
+    command
+}
+
 /// The diff, written where the model can read it with the earlier findings beside it.
 pub fn prepare(context: &Context) -> Result<String, String> {
     let range = format!("{}...{}", context.base, context.head);
-    let captured = run_bounded(
-        git_command()
-            .arg("-C")
-            .arg(&context.checkout)
-            .args(["-c", "core.quotePath=false", "diff", "--no-color"])
-            .args(["--no-ext-diff", "--no-textconv", "-M", "--unified=3"])
-            .args([range.as_str(), "--", "."])
-            .args(EXCLUDED_PATHSPECS),
-        GIT_TIMEOUT,
-    );
+    let captured = run_bounded(&mut diff_command(context), GIT_TIMEOUT);
     if captured.exit != Exit::Code(0) {
         return Err(format!("git diff {range} ended {:?}", captured.exit));
     }
@@ -326,6 +330,30 @@ mod tests {
         ] {
             assert!(VERIFY_INSTRUCTIONS.contains(placeholder), "{placeholder}");
         }
+    }
+
+    #[test]
+    fn the_diff_runs_in_the_reviewed_checkout_without_the_runs_secrets() {
+        let context = crate::review::setup::tests::context(Vec::new(), "t");
+        let command = diff_command(&context);
+        let removed: Vec<&std::ffi::OsStr> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name)
+            .collect();
+        for name in crate::review::SECRET_VARIABLES {
+            assert!(removed.contains(&std::ffi::OsStr::new(name)), "{name}");
+        }
+        let words: Vec<String> = command
+            .get_args()
+            .map(|word| word.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            words.get(..2),
+            Some(["-C".to_string(), "/r/pull-request".to_string()].as_slice())
+        );
+        assert!(words.contains(&"--no-ext-diff".to_string()));
+        assert!(words.contains(&"--no-textconv".to_string()));
     }
 
     #[test]

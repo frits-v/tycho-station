@@ -8,9 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use tycho_types::git_environment::git_command;
-
-use super::{langfuse, pull_request, scrubbed, Context, GitHub, Mode};
+use super::{git_in, langfuse, pull_request, scrubbed, Context, GitHub, Mode};
 use crate::anthropic_token::{self, AccessToken};
 use crate::app_token::{self, REVIEW};
 use crate::checkout;
@@ -111,13 +109,6 @@ fn run_time(access_token: Option<&AccessToken>) -> Result<Duration, String> {
     access_token.map_or(Ok(RUN_TIME_MAX), |token| {
         run_time_for(token.expires_in_seconds)
     })
-}
-
-/// git in `dir`, without the hook environment or the run's secrets.
-fn git_in(dir: &Path) -> Command {
-    let mut command = git_command();
-    scrubbed(command.arg("-C").arg(dir));
-    command
 }
 
 fn head_commit(dir: &Path) -> Result<String, String> {

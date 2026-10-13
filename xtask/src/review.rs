@@ -20,7 +20,7 @@ mod report;
 mod setup;
 mod verdict;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -58,6 +58,13 @@ fn scrubbed(command: &mut Command) -> &mut Command {
     for name in SECRET_VARIABLES {
         command.env_remove(name);
     }
+    command
+}
+
+/// git in `dir`, without the hook environment or the run's secrets.
+fn git_in(dir: &Path) -> Command {
+    let mut command = tycho_types::git_environment::git_command();
+    scrubbed(command.arg("-C").arg(dir));
     command
 }
 
