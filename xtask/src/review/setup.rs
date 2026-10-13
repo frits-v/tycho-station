@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use super::pull_request::CommitId;
 use super::{git_in, langfuse, pull_request, scrubbed, Context, GitHub, Grants, Mode};
 use crate::anthropic_token::{self, AccessToken};
 use crate::app_token::{self, REVIEW};
@@ -73,7 +74,7 @@ fn review_credentials() -> Result<app_token::AppCredentials, String> {
         &REVIEW,
         env::var(REVIEW.client_id_variable).ok(),
         env::var(REVIEW.app_id_variable).ok(),
-        env::var(REVIEW.key_variable).ok(),
+        crate::secrets::read(REVIEW.key_variable),
     )
 }
 
@@ -131,8 +132,8 @@ fn anthropic_access(required_here: bool) -> Result<Option<AccessToken>, String> 
         env::var(anthropic_token::WORKSPACE_VARIABLE).ok(),
     )?;
     let oidc = anthropic_token::read_oidc_request(
-        env::var(anthropic_token::REQUEST_URL_VARIABLE).ok(),
-        env::var(anthropic_token::REQUEST_TOKEN_VARIABLE).ok(),
+        crate::secrets::read(anthropic_token::REQUEST_URL_VARIABLE),
+        crate::secrets::read(anthropic_token::REQUEST_TOKEN_VARIABLE),
     )?;
     anthropic_token::mint(&federation, &oidc).map(Some)
 }
@@ -141,7 +142,7 @@ fn read_langfuse() -> Result<Option<langfuse::Langfuse>, String> {
     langfuse::read(
         env::var(langfuse::BASE_URL_VARIABLE).ok(),
         env::var(langfuse::PUBLIC_KEY_VARIABLE).ok(),
-        env::var(langfuse::SECRET_KEY_VARIABLE).ok(),
+        crate::secrets::read(langfuse::SECRET_KEY_VARIABLE),
     )
 }
 
@@ -151,11 +152,10 @@ fn run_time(access_token: Option<&AccessToken>) -> Result<Duration, String> {
     })
 }
 
-fn head_commit(dir: &Path) -> Result<String, String> {
+fn head_commit(dir: &Path) -> Result<CommitId, String> {
     let captured = run_bounded(git_in(dir).args(["rev-parse", "HEAD"]), GIT_TIMEOUT);
-    let commit = captured.stdout.trim();
     match captured.exit {
-        Exit::Code(0) if pull_request::commit_sha(commit) => Ok(commit.to_string()),
+        Exit::Code(0) => CommitId::parse(captured.stdout.trim()),
         other => Err(format!(
             "git rev-parse HEAD in {} ended {other:?}",
             dir.display()
@@ -177,7 +177,7 @@ fn uncommitted(dir: &Path) -> Result<usize, String> {
 
 /// The commits a dry run reviews: `origin/main` against a clean `HEAD`, the branch the run
 /// was started on.
-fn dry_run_commits(root: &Path) -> Result<(String, String, String), String> {
+fn dry_run_commits(root: &Path) -> Result<(CommitId, CommitId, String), String> {
     let changes = uncommitted(root)?;
     if changes > 0 {
         return Err(format!(
@@ -189,14 +189,14 @@ fn dry_run_commits(root: &Path) -> Result<(String, String, String), String> {
         git_in(root).args(["merge-base", DRY_RUN_BASE, "HEAD"]),
         GIT_TIMEOUT,
     );
-    let base = merge_base.stdout.trim().to_string();
-    if merge_base.exit != Exit::Code(0) || !pull_request::commit_sha(&base) {
+    if merge_base.exit != Exit::Code(0) {
         return Err(format!(
             "git merge-base {DRY_RUN_BASE} HEAD ended {:?}",
             merge_base.exit
         ));
     }
-    let session = format!("dry-run:{}", super::short(&head));
+    let base = CommitId::parse(merge_base.stdout.trim())?;
+    let session = format!("dry-run:{}", super::short(head.as_str()));
     Ok((base, head, session))
 }
 
@@ -319,14 +319,11 @@ fn git_without_hooks(dir: &Path) -> Command {
 /// Fetches exactly `head` from the base checkout's `origin` and checks it out as a detached
 /// worktree. The review reads that commit and posts on it, whatever the branch points to by
 /// then, so nothing pushed after the run resolved the commit can change what it reviews.
-fn check_out_head(root: &Path, head: &str, dir: PathBuf) -> Result<Worktree, String> {
-    if !pull_request::commit_sha(head) {
-        return Err(format!("`{head}` is not a commit id"));
-    }
+fn check_out_head(root: &Path, head: &CommitId, dir: PathBuf) -> Result<Worktree, String> {
     let fetched = run_bounded(
         git_without_hooks(root)
             .args(["fetch", "--quiet", "--no-tags", "--no-recurse-submodules"])
-            .args(["origin", head]),
+            .args(["origin", head.as_str()]),
         FETCH_TIMEOUT,
     );
     if fetched.exit != Exit::Code(0) {
@@ -336,7 +333,7 @@ fn check_out_head(root: &Path, head: &str, dir: PathBuf) -> Result<Worktree, Str
         git_without_hooks(root)
             .args(["worktree", "add", "--quiet", "--detach"])
             .arg(&dir)
-            .arg(head),
+            .arg(head.as_str()),
         GIT_TIMEOUT,
     );
     if added.exit != Exit::Code(0) {
@@ -347,7 +344,7 @@ fn check_out_head(root: &Path, head: &str, dir: PathBuf) -> Result<Worktree, Str
         dir,
     };
     match head_commit(&worktree.dir) {
-        Ok(checked_out) if checked_out == head => Ok(worktree),
+        Ok(checked_out) if &checked_out == head => Ok(worktree),
         checked_out => {
             remove_worktree(&worktree);
             Err(format!("the worktree for {head} is at {checked_out:?}"))
@@ -374,7 +371,7 @@ pub fn remove_worktree(worktree: &Worktree) {
 
 /// The pull request's head and the run's own directory, each removed again if the other
 /// cannot be made.
-fn prepare_trees(root: &Path, head: &str) -> Result<(Worktree, PathBuf), String> {
+fn prepare_trees(root: &Path, head: &CommitId) -> Result<(Worktree, PathBuf), String> {
     let dir = temporary_base().join(format!("tycho-review-head-{}", std::process::id()));
     let worktree = check_out_head(root, head, dir)?;
     match create_files() {
@@ -464,15 +461,15 @@ pub mod tests {
             tag: "post",
             checkout: PathBuf::from("/r/pull-request"),
             worktree: None,
-            base: "b".repeat(40),
-            head: "a".repeat(40),
+            base: CommitId::parse(&"b".repeat(40)).unwrap(),
+            head: CommitId::parse(&"a".repeat(40)).unwrap(),
             claude: PathBuf::from("/opt/claude"),
             github: Some(GitHub {
                 repository: "o/r".to_string(),
                 pull_request: PullRequest {
                     number: 1,
-                    base: "b".repeat(40),
-                    head: "a".repeat(40),
+                    base: CommitId::parse(&"b".repeat(40)).unwrap(),
+                    head: CommitId::parse(&"a".repeat(40)).unwrap(),
                     head_repository: "o/r".to_string(),
                 },
             }),
@@ -557,7 +554,6 @@ pub mod tests {
         );
         remove_worktree(&worktree);
         assert!(!worktree.dir.exists());
-        assert!(check_out_head(&root, "main", scratch.join("other")).is_err());
         fs::remove_dir_all(&scratch).unwrap();
     }
 
@@ -565,8 +561,8 @@ pub mod tests {
     fn a_head_in_another_repository_is_a_fork() {
         let mut pull_request = PullRequest {
             number: 1,
-            base: "b".repeat(40),
-            head: "a".repeat(40),
+            base: CommitId::parse(&"b".repeat(40)).unwrap(),
+            head: CommitId::parse(&"a".repeat(40)).unwrap(),
             head_repository: "o/r".to_string(),
         };
         assert!(!is_fork(&pull_request, "o/r"));

@@ -99,8 +99,8 @@ struct Context {
     checkout: PathBuf,
     /// The pull request's head as a worktree the posting run made, removed when it ends.
     worktree: Option<setup::Worktree>,
-    base: String,
-    head: String,
+    base: pull_request::CommitId,
+    head: pull_request::CommitId,
     claude: PathBuf,
     github: Option<GitHub>,
     /// `owner/name#number` in Actions; Langfuse groups a pull request's runs by it.
@@ -180,8 +180,8 @@ fn review(
     if map.commentable.is_empty() {
         return Err(format!(
             "the diff {}...{} has no file with head-side lines to review once {} are excluded",
-            short(&context.base),
-            short(&context.head),
+            short(context.base.as_str()),
+            short(context.head.as_str()),
             EXCLUDED_PATHSPECS.join(", ")
         ));
     }
@@ -194,7 +194,7 @@ fn review(
             &crate::github_api::Client::github(),
             token.expose(),
             &github.repository,
-            &context.head,
+            context.head.as_str(),
             started.checked_add(CHECKS_WAIT).unwrap_or(started),
         ),
         _ => checks::Seen::default(),
@@ -241,7 +241,7 @@ fn trace(
         output,
         metadata: vec![
             ("verdict".to_string(), verdict.to_string()),
-            ("head".to_string(), context.head.clone()),
+            ("head".to_string(), context.head.to_string()),
             ("counts".to_string(), report::counts(tally)),
         ],
         generations: tally.generations.clone(),

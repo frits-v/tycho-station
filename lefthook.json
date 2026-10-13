@@ -13,7 +13,9 @@
     "commands": {
       "clippy": { "run": "cargo run -q -p xtask -- clippy" },
       "test": { "run": "cargo run -q -p xtask -- test" },
-      "workflows": { "glob": ".github/**", "run": "cargo run -q -p xtask -- workflows --offline" }
+      "workflows": { "glob": ".github/**", "run": "cargo run -q -p xtask -- workflows --offline" },
+      "codeql": { "glob": ".github/**", "run": "cargo run -q -p xtask -- codeql" },
+      "opengrep": { "glob": ["**/*.rs", "opengrep/**"], "run": "cargo run -q -p xtask -- opengrep" }
     }
   }
 }

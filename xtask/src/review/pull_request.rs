@@ -19,8 +19,8 @@ const COMMENT_MAX_CHARS: usize = 65_536;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequest {
     pub number: u64,
-    pub base: String,
-    pub head: String,
+    pub base: CommitId,
+    pub head: CommitId,
     pub head_repository: String,
 }
 
@@ -39,11 +39,36 @@ pub enum PostOutcome {
     Unrecognised(&'static str),
 }
 
-pub fn commit_sha(value: &str) -> bool {
-    matches!(value.len(), 40 | 64)
-        && value
-            .chars()
-            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+/// A full commit id, 40 or 64 lowercase hex digits, checked once where it enters: what the
+/// review fetches, reads and posts on is always an exact commit, never a ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitId(String);
+
+impl CommitId {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let full = matches!(value.len(), 40 | 64)
+            && value
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c));
+        if full {
+            Ok(Self(value.to_string()))
+        } else {
+            Err(format!(
+                "`{}` is not a full commit id",
+                value.chars().take(80).collect::<String>()
+            ))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CommitId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
 }
 
 /// What started a posting run: a pull request marked ready, whose event carries it, or a
@@ -143,16 +168,14 @@ fn decode_pull_request(pull_request: &Value) -> Result<PullRequest, String> {
     let (Some(base), Some(head)) = (text_at("/base/sha"), text_at("/head/sha")) else {
         return Err("the event has no base or head commit".to_string());
     };
-    if !commit_sha(base) || !commit_sha(head) {
-        return Err("the event's base or head is not a commit id".to_string());
-    }
+    let (base, head) = (CommitId::parse(base)?, CommitId::parse(head)?);
     let head_repository = text_at("/head/repo/full_name")
         .ok_or("the event has no head repository")?
         .to_string();
     Ok(PullRequest {
         number,
-        base: base.to_string(),
-        head: head.to_string(),
+        base,
+        head,
         head_repository,
     })
 }
@@ -336,7 +359,7 @@ pub fn post_review(
         })
         .collect();
     let request = serde_json::json!({
-        "commit_id": pull_request.head,
+        "commit_id": pull_request.head.as_str(),
         "event": event.api_name(),
         "body": body,
         "comments": comments,
@@ -389,8 +412,8 @@ mod tests {
             decode_trigger("pull_request_target", &ready(HEAD)),
             Ok(Trigger::Ready(PullRequest {
                 number: 12,
-                base: BASE.to_string(),
-                head: HEAD.to_string(),
+                base: CommitId::parse(BASE).unwrap(),
+                head: CommitId::parse(HEAD).unwrap(),
                 head_repository: "o/r".to_string(),
             }))
         );
@@ -463,10 +486,25 @@ mod tests {
     }
 
     #[test]
+    fn only_a_full_lowercase_object_name_is_a_commit_id() {
+        assert_eq!(CommitId::parse(HEAD).unwrap().as_str(), HEAD);
+        assert!(CommitId::parse(&"c".repeat(64)).is_ok());
+        for refused in [
+            "main",
+            "refs/heads/main",
+            "0123abc",
+            "",
+            &HEAD.to_uppercase(),
+        ] {
+            assert!(CommitId::parse(refused).is_err(), "{refused}");
+        }
+    }
+
+    #[test]
     fn a_pull_request_is_fetched_by_number() {
         let (base, seen) = listener(vec![(200, pull_request(HEAD).to_string())]);
         let fetched = fetch(&Client::loopback(&base), "t", "o/r", 12).unwrap();
-        assert_eq!(fetched.head, HEAD);
+        assert_eq!(fetched.head.as_str(), HEAD);
         let requests = seen.recv().unwrap();
         assert!(requests
             .first()

@@ -93,7 +93,7 @@ pub fn body(
     let mut body = format!(
         "Claude review (`{}`) of {}: {}, {reason}.\n",
         claude_run::MODEL,
-        short(&context.head),
+        short(context.head.as_str()),
         event.label()
     );
     if !outside.is_empty() {
