@@ -18,6 +18,7 @@ mod app_token;
 mod checkout;
 mod clippy;
 mod code_scanning;
+mod codeql;
 mod config;
 mod credentials;
 mod figures;
@@ -52,7 +53,7 @@ const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
 const DOC_DIRS: [&str; 1] = ["docs"];
 const RULES_DIR: &str = ".claude/rules";
 const RULE_MAX_LINES: usize = 24;
-const COMMANDS: [(&str, &str); 24] = [
+const COMMANDS: [(&str, &str); 25] = [
     (
         "ci",
         "format check, clippy, tests, workflow audits, opengrep, repository checks, PR title",
@@ -73,6 +74,10 @@ const COMMANDS: [(&str, &str); 24] = [
     (
         "workflows [--offline]",
         "zizmor and jactionlint over the workflows at pedantic; online unless --offline",
+    ),
+    (
+        "codeql",
+        "CodeQL's Actions security queries over the workflows (pre-push on .github changes)",
     ),
     (
         "sarif-upload",
@@ -893,15 +898,9 @@ fn main() {
         Some("clippy") => exit_code(step_passed("clippy", clippy::clippy())),
         Some("test") => exit_code(tested().0),
         Some("opengrep") => opengrep::opengrep(),
-        Some("workflows") => match args.get(1).map(String::as_str) {
-            None => workflows::workflows(workflows::Network::Online),
-            Some("--offline") => workflows::workflows(workflows::Network::Offline),
-            Some(other) => {
-                eprintln!("usage: xtask workflows [--offline]; got {other}");
-                2
-            }
-        },
+        Some("workflows") => workflows::command(args.get(1).map(String::as_str)),
         Some("sarif-upload") => code_scanning::sarif_upload(),
+        Some("codeql") => codeql::codeql(),
         Some("check-names") => check_names(),
         Some("check-comments") => check_comments(),
         Some("check-rules") => check_rules(),

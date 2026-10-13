@@ -21,10 +21,11 @@ is a defect.
 | Layer | Location | Runs |
 |---|---|---|
 | Lints | `Cargo.toml` `[workspace.lints]`, `clippy.toml` | every build, ci, post-edit hook |
-| Repository checks | `xtask` (`check-names`, `check-comments`, `check-rules`, `check-credentials`, `check-figures`, `check-config`, `check-commit-msg`, `check-pr-title`, `opengrep`, `workflows`) | ci, post-edit hook, lefthook |
-| Source rules | `opengrep/rust.yml`, each rule with fixture lines in `opengrep/rust.rs` | `xtask opengrep` in ci |
+| Repository checks | `xtask` (`check-names`, `check-comments`, `check-rules`, `check-credentials`, `check-figures`, `check-config`, `check-commit-msg`, `check-pr-title`, `opengrep`, `workflows`, `codeql`) | ci, post-edit hook, lefthook |
+| Source rules | `opengrep/rust.yml`, each rule with fixture lines in `opengrep/rust.rs` | `xtask opengrep` in ci and in lefthook pre-push when Rust or a rule changes |
+| Workflow rules | `.github/workflow-policy.cue`; zizmor, jactionlint; CodeQL's Actions queries | `xtask workflows` in ci and pre-push; `xtask codeql` in pre-push when `.github` changes; code scanning on every pull request |
 | Git hooks | `lefthook.json`, each command `cargo run -q -p xtask -- <command>` | commit-msg, pre-commit, pre-push |
-| Host rules | repository ruleset on the default branch | every push and merge |
+| Host rules | repository ruleset on the default branch: the `ci` check, and code scanning with no new CodeQL alert of high security severity or error level | every push and merge |
 | Agent hooks | `.claude/settings.json` | after Edit and Write |
 | Tests | `xtask test` (`mbx test --workspace --no-fail-fast`) | ci, pre-push |
 
@@ -185,6 +186,17 @@ as its category, so one tool's upload never replaces another's alerts.
 - For code scanning to accept the files, the operator enables GitHub Code Security for the
   repository (Settings, Advanced Security) where the account's plan offers it, or moves the
   repository to an organisation that has it.
+- CodeQL runs in code scanning's default setup on every pull request, with the extended
+  query suite, for Rust and GitHub Actions; the ruleset refuses a merge that adds a CodeQL
+  alert of high security severity or above, or one at error level. A false positive is
+  dismissed with its data-flow path as the reason.
+- Before a push that changes `.github`, `xtask codeql` runs CodeQL's Actions security queries
+  locally (about five seconds): the CLI version is pinned in `mise.toml`, the query pack in
+  `xtask/src/codeql.rs`. It counts the workflow files the extractor took in and fails on
+  none, and fails on any result. Its SARIF goes to `target/codeql`, not `target/sarif`: code
+  scanning refuses CodeQL results uploaded beside its default setup. CodeQL's Rust queries
+  take about two minutes on this repository and run only in code scanning. The CodeQL CLI
+  licence permits this use on an open-source codebase; the repository is AGPL-3.0-only.
 
 ## Provisioning the agent user
 

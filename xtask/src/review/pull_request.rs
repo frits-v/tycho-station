@@ -491,7 +491,7 @@ mod tests {
         assert!(CommitId::parse(&"c".repeat(64)).is_ok());
         for refused in [
             "main",
-            "refs/pull/7/head",
+            "refs/heads/main",
             "0123abc",
             "",
             &HEAD.to_uppercase(),

@@ -260,6 +260,18 @@ fn audits(network: Network) -> Result<String, String> {
     ))
 }
 
+/// `xtask workflows [--offline]`.
+pub fn command(argument: Option<&str>) -> i32 {
+    match argument {
+        None => workflows(Network::Online),
+        Some("--offline") => workflows(Network::Offline),
+        Some(other) => {
+            eprintln!("usage: xtask workflows [--offline]; got {other}");
+            2
+        }
+    }
+}
+
 pub fn workflows(network: Network) -> i32 {
     match audits(network) {
         Ok(summary) => {
