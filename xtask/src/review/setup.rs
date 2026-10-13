@@ -17,6 +17,7 @@ use crate::process::{run_bounded, Exit};
 
 const EVENT_MAX_BYTES: u64 = 1 << 20;
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 const MISE_TIMEOUT: Duration = Duration::from_secs(60);
 const RUN_TIME_MAX: Duration = Duration::from_secs(30 * 60);
 /// Left unused at the end of the access token's life, so no run starts on a token about to lapse.
@@ -33,7 +34,7 @@ const REVIEWS_PER_PULL_REQUEST_MAX: usize = 20;
 pub fn context(mode: &Mode) -> Result<Context, String> {
     match mode {
         Mode::DryRun => dry_run_context(),
-        Mode::Post { checkout } => post_context(checkout),
+        Mode::Post => post_context(),
     }
 }
 
@@ -168,6 +169,7 @@ fn dry_run_context() -> Result<Context, String> {
     Ok(Context {
         tag: "dry-run",
         checkout: root,
+        worktree: None,
         base,
         head,
         claude: PathBuf::from("claude"),
@@ -215,6 +217,7 @@ fn resolve_claude(root: &Path) -> Result<PathBuf, String> {
 /// What a posting run reads before it mints the App's token: none of it needs one.
 #[derive(Debug)]
 struct Request {
+    root: PathBuf,
     repository: app_token::Repository,
     trigger: pull_request::Trigger,
     credentials: app_token::AppCredentials,
@@ -235,17 +238,17 @@ fn read_request() -> Result<Request, String> {
         )?,
         langfuse: read_langfuse()?,
         claude: resolve_claude(&root)?,
+        root,
     })
 }
 
-/// With the App's token: the pull request, checked against the checkout, and what the App
-/// posted on it before, within the cap.
+/// With the App's token: the pull request at its current head, and what the App posted on it
+/// before, within the cap.
 fn read_pull_request(
     request: &Request,
     token: &str,
     bot: &str,
-    checkout_dir: &Path,
-) -> Result<(pull_request::PullRequest, pull_request::Earlier, PathBuf), String> {
+) -> Result<(pull_request::PullRequest, pull_request::Earlier), String> {
     let client = Client::github();
     let full_name = request.repository.full_name();
     let pull_request = match &request.trigger {
@@ -254,15 +257,6 @@ fn read_pull_request(
             pull_request::fetch(&client, token, &full_name, *number)?
         }
     };
-    let checked_out = head_commit(checkout_dir)?;
-    if checked_out != pull_request.head {
-        return Err(format!(
-            "{} is at {checked_out}, not the pull request's head {}; it moved since the run \
-             started, so ask again",
-            checkout_dir.display(),
-            pull_request.head
-        ));
-    }
     let earlier = pull_request::earlier(&client, token, &full_name, pull_request.number, bot)?;
     if earlier.reviews >= REVIEWS_PER_PULL_REQUEST_MAX {
         return Err(format!(
@@ -270,29 +264,122 @@ fn read_pull_request(
             earlier.reviews
         ));
     }
-    Ok((pull_request, earlier, create_files()?))
+    Ok((pull_request, earlier))
 }
 
-fn post_context(checkout_dir: &Path) -> Result<Context, String> {
+/// The pull request's head at one commit, as a detached worktree of the base checkout's
+/// repository outside the workspace.
+#[derive(Debug)]
+pub struct Worktree {
+    root: PathBuf,
+    dir: PathBuf,
+}
+
+/// git in `dir` with hooks off and Git LFS not smudging: checking out a pull request's head
+/// runs nothing it carries.
+fn git_without_hooks(dir: &Path) -> Command {
+    let mut command = git_in(dir);
+    command
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .env("GIT_LFS_SKIP_SMUDGE", "1");
+    command
+}
+
+/// Fetches exactly `head` from the base checkout's `origin` and checks it out as a detached
+/// worktree. The review reads that commit and posts on it, whatever the branch points to by
+/// then, so nothing pushed after the run resolved the commit can change what it reviews.
+fn check_out_head(root: &Path, head: &str, dir: PathBuf) -> Result<Worktree, String> {
+    if !pull_request::commit_sha(head) {
+        return Err(format!("`{head}` is not a commit id"));
+    }
+    let fetched = run_bounded(
+        git_without_hooks(root)
+            .args(["fetch", "--quiet", "--no-tags", "--no-recurse-submodules"])
+            .args(["origin", head]),
+        FETCH_TIMEOUT,
+    );
+    if fetched.exit != Exit::Code(0) {
+        return Err(format!("git fetch origin {head} ended {:?}", fetched.exit));
+    }
+    let added = run_bounded(
+        git_without_hooks(root)
+            .args(["worktree", "add", "--quiet", "--detach"])
+            .arg(&dir)
+            .arg(head),
+        GIT_TIMEOUT,
+    );
+    if added.exit != Exit::Code(0) {
+        return Err(format!("git worktree add {head} ended {:?}", added.exit));
+    }
+    let worktree = Worktree {
+        root: root.to_path_buf(),
+        dir,
+    };
+    match head_commit(&worktree.dir) {
+        Ok(checked_out) if checked_out == head => Ok(worktree),
+        checked_out => {
+            remove_worktree(&worktree);
+            Err(format!("the worktree for {head} is at {checked_out:?}"))
+        }
+    }
+}
+
+/// Removes the head's worktree; a failure is reported, not fatal.
+pub fn remove_worktree(worktree: &Worktree) {
+    let removed = run_bounded(
+        git_without_hooks(&worktree.root)
+            .args(["worktree", "remove", "--force"])
+            .arg(&worktree.dir),
+        GIT_TIMEOUT,
+    );
+    if removed.exit != Exit::Code(0) {
+        eprintln!(
+            "xtask review: git worktree remove {} ended {:?}",
+            worktree.dir.display(),
+            removed.exit
+        );
+    }
+}
+
+/// The pull request's head and the run's own directory, each removed again if the other
+/// cannot be made.
+fn prepare_trees(root: &Path, head: &str) -> Result<(Worktree, PathBuf), String> {
+    let dir = temporary_base().join(format!("tycho-review-head-{}", std::process::id()));
+    let worktree = check_out_head(root, head, dir)?;
+    match create_files() {
+        Ok(files) => Ok((worktree, files)),
+        Err(reason) => {
+            remove_worktree(&worktree);
+            Err(reason)
+        }
+    }
+}
+
+fn post_context() -> Result<Context, String> {
     let request = read_request()?;
     let access_token = anthropic_access(true)?;
     let run_time = run_time(access_token.as_ref())?;
     let bot = app_token::bot_login(&request.credentials)?;
     let token = app_token::mint(&request.credentials, &request.repository)?;
-    let (pull_request, earlier, files) =
-        match read_pull_request(&request, token.expose(), &bot, checkout_dir) {
-            Ok(read) => read,
-            Err(reason) => {
-                return Err(match app_token::revoke(&token) {
-                    Ok(()) => reason,
-                    Err(revocation) => format!("{reason}; {revocation}"),
-                })
-            }
-        };
+    let prepared =
+        read_pull_request(&request, token.expose(), &bot).and_then(|(pull_request, earlier)| {
+            let (worktree, files) = prepare_trees(&request.root, &pull_request.head)?;
+            Ok((pull_request, earlier, worktree, files))
+        });
+    let (pull_request, earlier, worktree, files) = match prepared {
+        Ok(prepared) => prepared,
+        Err(reason) => {
+            return Err(match app_token::revoke(&token) {
+                Ok(()) => reason,
+                Err(revocation) => format!("{reason}; {revocation}"),
+            })
+        }
+    };
     let full_name = request.repository.full_name();
     Ok(Context {
         tag: "post",
-        checkout: checkout_dir.to_path_buf(),
+        checkout: worktree.dir.clone(),
+        worktree: Some(worktree),
         base: pull_request.base.clone(),
         head: pull_request.head.clone(),
         claude: request.claude,
@@ -317,13 +404,17 @@ fn is_fork(pull_request: &pull_request::PullRequest, repository: &str) -> bool {
     pull_request.head_repository != repository
 }
 
+/// The runner's temporary directory in Actions, outside the workspace; the system's elsewhere.
+fn temporary_base() -> PathBuf {
+    env::var_os("RUNNER_TEMP")
+        .filter(|value| !value.is_empty())
+        .map_or_else(env::temp_dir, PathBuf::from)
+}
+
 /// A new 0700 directory under the runner's temporary directory, or the system's outside
 /// Actions; one left by an earlier run with the same pid is an error, not reused.
 fn create_files() -> Result<PathBuf, String> {
-    let base = env::var_os("RUNNER_TEMP")
-        .filter(|value| !value.is_empty())
-        .map_or_else(env::temp_dir, PathBuf::from);
-    let dir = base.join(format!("tycho-review-{}", std::process::id()));
+    let dir = temporary_base().join(format!("tycho-review-{}", std::process::id()));
     fs::DirBuilder::new()
         .mode(0o700)
         .create(&dir)
@@ -348,6 +439,7 @@ pub fn remove_files(dir: &Path) {
 pub mod tests {
     use super::*;
     use crate::review::pull_request::PullRequest;
+    use tycho_types::git_environment::git_command;
 
     /// A posting context for a pull request of `o/r`, with the given earlier findings and an
     /// installation token value.
@@ -355,6 +447,7 @@ pub mod tests {
         Context {
             tag: "post",
             checkout: PathBuf::from("/r/pull-request"),
+            worktree: None,
             base: "b".repeat(40),
             head: "a".repeat(40),
             claude: PathBuf::from("/opt/claude"),
@@ -401,6 +494,58 @@ pub mod tests {
         ] {
             assert!(crate::review::SECRET_VARIABLES.contains(&name), "{name}");
         }
+    }
+
+    fn git(dir: &Path, arguments: &[&str]) {
+        crate::refuse_hook_environment();
+        let status = git_command()
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.name=xtask", "-c", "user.email=xtask@localhost"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(arguments)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?}");
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the scratch repositories live in this test's own temporary directory"
+    )]
+    fn the_head_is_fetched_by_its_commit_and_a_later_push_changes_nothing() {
+        let scratch = env::temp_dir().join(format!("xtask-review-head-{}", std::process::id()));
+        if scratch.exists() {
+            fs::remove_dir_all(&scratch).unwrap();
+        }
+        let (origin, root) = (scratch.join("origin"), scratch.join("root"));
+        fs::create_dir_all(&origin).unwrap();
+        git(&origin, &["init", "-q"]);
+        fs::write(origin.join("a.txt"), "base\n").unwrap();
+        git(&origin, &["add", "a.txt"]);
+        git(&origin, &["commit", "-q", "-m", "base"]);
+        git(&scratch, &["clone", "-q", origin.to_str().unwrap(), "root"]);
+        fs::write(origin.join("a.txt"), "reviewed\n").unwrap();
+        git(&origin, &["commit", "-q", "-am", "reviewed"]);
+        let reviewed = head_commit(&origin).unwrap();
+        let worktree = check_out_head(&root, &reviewed, scratch.join("head")).unwrap();
+        fs::write(origin.join("a.txt"), "pushed later\n").unwrap();
+        git(&origin, &["commit", "-q", "-am", "pushed later"]);
+        assert_eq!(head_commit(&worktree.dir).unwrap(), reviewed);
+        assert_eq!(
+            fs::read_to_string(worktree.dir.join("a.txt")).unwrap(),
+            "reviewed\n"
+        );
+        remove_worktree(&worktree);
+        assert!(!worktree.dir.exists());
+        assert!(check_out_head(&root, "main", scratch.join("other")).is_err());
+        fs::remove_dir_all(&scratch).unwrap();
     }
 
     #[test]

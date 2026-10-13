@@ -71,10 +71,8 @@ fn git_in(dir: &Path) -> Command {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     DryRun,
-    /// The pull request's head, checked out at this path, is reviewed and never run.
-    Post {
-        checkout: PathBuf,
-    },
+    /// The pull request's head is fetched by its commit, reviewed and never run.
+    Post,
 }
 
 /// Where a posting run reads and writes on GitHub, as the review App.
@@ -90,6 +88,8 @@ struct Context {
     tag: &'static str,
     /// The tree the model reads and the diff is taken in.
     checkout: PathBuf,
+    /// The pull request's head as a worktree the posting run made, removed when it ends.
+    worktree: Option<setup::Worktree>,
     base: String,
     head: String,
     claude: PathBuf,
@@ -125,15 +125,13 @@ struct Tally {
     generations: Vec<Generation>,
 }
 
-/// `xtask review --dry-run` or `xtask review --post <pull request checkout>`.
+/// `xtask review --dry-run` or `xtask review --post`.
 pub fn command(arguments: &[String]) -> i32 {
     let mode = match arguments {
         [flag] if flag == "--dry-run" => Mode::DryRun,
-        [flag, checkout] if flag == "--post" => Mode::Post {
-            checkout: PathBuf::from(checkout),
-        },
+        [flag] if flag == "--post" => Mode::Post,
         _ => {
-            eprintln!("usage: xtask review --dry-run | --post <pull request checkout>");
+            eprintln!("usage: xtask review --dry-run | --post");
             return 2;
         }
     };
@@ -148,6 +146,9 @@ pub fn command(arguments: &[String]) -> i32 {
     let mut tally = Tally::default();
     let reviewed = review(&context, &mut tally);
     setup::remove_files(&context.files);
+    if let Some(worktree) = &context.worktree {
+        setup::remove_worktree(worktree);
+    }
     finish(&context, started, &tally, &reviewed)
 }
 
@@ -261,7 +262,7 @@ mod tests {
     #[test]
     fn the_arguments_choose_the_mode_and_anything_else_is_a_usage_error() {
         assert_eq!(command(&[]), 2);
-        assert_eq!(command(&["--post".to_string()]), 2);
+        assert_eq!(command(&["--post".to_string(), "x".to_string()]), 2);
         assert_eq!(command(&["--dry-run".to_string(), "x".to_string()]), 2);
     }
 
@@ -290,8 +291,8 @@ mod tests {
         assert_eq!(
             triggers,
             [
-                "# The workflow and the xtask come from the base branch; the pull request's head is checked",
-                "# out as data the model reads and is never built or run.",
+                "# The workflow and the xtask come from the base branch; xtask review fetches the pull",
+                "# request's head by its commit as data the model reads, and never builds or runs it.",
                 "pull_request_target: # zizmor: ignore[dangerous-triggers]",
                 "issue_comment:",
             ]
@@ -300,7 +301,7 @@ mod tests {
         assert!(workflow.contains("    types: [created]\n"));
         assert_eq!(
             step_running(workflow, "secrets.FRITS_CODE_REVIEW_APP_PRIVATE_KEY").as_deref(),
-            Some("- run: target/debug/xtask review --post pull-request")
+            Some("- run: target/debug/xtask review --post")
         );
         assert_eq!(
             workflow
@@ -315,8 +316,10 @@ mod tests {
             .find("- run: target/debug/xtask review --post")
             .unwrap();
         assert!(build < review);
-        assert!(workflow.contains("          path: pull-request\n"));
-        assert_eq!(workflow.matches("persist-credentials: false").count(), 2);
+        assert_eq!(workflow.matches("uses: actions/checkout@").count(), 1);
+        assert_eq!(workflow.matches("persist-credentials: false").count(), 1);
+        assert!(!workflow.contains("refs/pull/"));
+        assert!(!workflow.contains("ref:"));
         assert!(!workflow.contains("working-directory"));
         assert_eq!(workflow.matches("- run:").count(), 2);
         assert!(workflow.contains("    environment: review\n"));

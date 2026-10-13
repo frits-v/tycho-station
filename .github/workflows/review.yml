@@ -2,8 +2,8 @@ name: review
 # A review runs only when a pull request is marked ready or a writer asks for one in a
 # comment; opening a pull request or pushing to it starts nothing.
 on:
-  # The workflow and the xtask come from the base branch; the pull request's head is checked
-  # out as data the model reads and is never built or run.
+  # The workflow and the xtask come from the base branch; xtask review fetches the pull
+  # request's head by its commit as data the model reads, and never builds or runs it.
   pull_request_target: # zizmor: ignore[dangerous-triggers]
     types: [ready_for_review]
   issue_comment:
@@ -38,13 +38,10 @@ jobs:
       contents: read # the base branch's checkout
       id-token: write # the OIDC token xtask review trades for an Anthropic access token
     steps:
+      # The base branch with its history; the pull request's head is fetched into it later by
+      # its commit, which the xtask resolves.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          persist-credentials: false
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: refs/pull/${{ github.event.pull_request.number || github.event.issue.number }}/head
-          path: pull-request
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -63,7 +60,7 @@ jobs:
           install_args: rust mr-boxington claude
       # The base branch's xtask, built before the App key is mapped.
       - run: cargo build --locked -p xtask
-      - run: target/debug/xtask review --post pull-request
+      - run: target/debug/xtask review --post
         env:
           FRITS_CODE_REVIEW_CLIENT_ID: ${{ vars.FRITS_CODE_REVIEW_CLIENT_ID }}
           FRITS_CODE_REVIEW_APP_PRIVATE_KEY: ${{ secrets.FRITS_CODE_REVIEW_APP_PRIVATE_KEY }}

@@ -502,13 +502,21 @@ check out, build and run it.
 ### What runs where
 
 - The trusted `review` job runs the base branch's workflow and xtask. It checks the base
-  branch out at the workspace root and the pull request's head (`refs/pull/<n>/head`, the
-  head of a fork's pull request included) into `pull-request/`, builds the base branch's
-  xtask, and runs `xtask review --post pull-request`. Nothing from `pull-request/` is built
-  or run: the xtask runs git in it with `--no-ext-diff --no-textconv`, runs the Claude binary
-  `mise which claude` names from the base checkout (a mise shim run there would take the pull
-  request's pin), and hands the model only read tools. git and mise run without the App key,
-  the Langfuse secret key, the OIDC request variables or any job token in their environment.
+  branch out with its history, builds the base branch's xtask, and runs
+  `xtask review --post`. The workflow checks out nothing of the pull request.
+- The xtask resolves the head commit (from the `ready_for_review` event, or from the pull
+  requests API for a comment), fetches exactly that commit from `origin` (a fork's head
+  included: GitHub serves it from the base repository) and checks it out as a detached
+  worktree under `RUNNER_TEMP`, with hooks off and Git LFS not smudging; it checks the
+  worktree is at that commit and posts the review on it. A push after the commit was resolved
+  changes nothing about what is reviewed; a push between a comment and the run is reviewed on
+  its own merits, since the commenter asks for a review and vouches for no code, and the
+  verdict is attached to the commit it judged.
+- Nothing from the worktree is built or run: the xtask runs git in it with `--no-ext-diff
+  --no-textconv`, runs the Claude binary `mise which claude` names from the base checkout (a
+  mise shim run in the worktree would take the pull request's pin), and hands the model only
+  read tools. git and mise run without the App key, the Langfuse secret key, the OIDC request
+  variables or any job token in their environment. The worktree is removed when the run ends.
 - The job runs in the `review` environment, whose secrets are the App key and the Langfuse
   key. `pull_request_target` and `issue_comment` runs carry the default branch's ref, so an
   environment that admits only the default branch serves them and refuses every branch's own
