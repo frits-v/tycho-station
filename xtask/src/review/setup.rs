@@ -31,12 +31,50 @@ const PATH_MAX_BYTES: usize = 4096;
 /// comments and reviews goes on without end.
 const REVIEWS_PER_PULL_REQUEST_MAX: usize = 20;
 
-/// The run's context, which it prints from, and its grants, which it never prints.
-pub fn context(mode: &Mode) -> Result<(Context, Grants), String> {
+/// The run's grants: the Anthropic token, the App's token in a posting run, and the run time
+/// the former leaves. Made by their own call and never returned with the context, which the
+/// run prints from, so nothing that holds a token ever shares a value with what is printed.
+pub fn grants(mode: &Mode) -> Result<Grants, String> {
+    match mode {
+        Mode::DryRun => {
+            let anthropic = anthropic_access(false)?;
+            Ok(Grants {
+                run_time: run_time(anthropic.as_ref())?,
+                anthropic,
+                app: None,
+            })
+        }
+        Mode::Post => {
+            let credentials = review_credentials()?;
+            let repository = app_token::read_repository(env::var("GITHUB_REPOSITORY").ok())?;
+            let anthropic = anthropic_access(true)?;
+            let run_time = run_time(anthropic.as_ref())?;
+            let app = app_token::mint(&credentials, &repository)?;
+            Ok(Grants {
+                anthropic,
+                app: Some(app),
+                run_time,
+            })
+        }
+    }
+}
+
+/// The run's context; a posting run reads the pull request with the App's token it borrows
+/// from `grants`.
+pub fn context(mode: &Mode, grants: &Grants) -> Result<Context, String> {
     match mode {
         Mode::DryRun => dry_run_context(),
-        Mode::Post => post_context(),
+        Mode::Post => post_context(grants),
     }
+}
+
+fn review_credentials() -> Result<app_token::AppCredentials, String> {
+    app_token::read_credentials(
+        &REVIEW,
+        env::var(REVIEW.client_id_variable).ok(),
+        env::var(REVIEW.app_id_variable).ok(),
+        env::var(REVIEW.key_variable).ok(),
+    )
 }
 
 fn required(name: &str) -> Result<String, String> {
@@ -162,17 +200,11 @@ fn dry_run_commits(root: &Path) -> Result<(String, String, String), String> {
     Ok((base, head, session))
 }
 
-fn dry_run_context() -> Result<(Context, Grants), String> {
+fn dry_run_context() -> Result<Context, String> {
     let root = checkout::running_checkout()?;
     let (base, head, session) = dry_run_commits(&root)?;
     let langfuse = read_langfuse()?;
-    let anthropic = anthropic_access(false)?;
-    let grants = Grants {
-        run_time: run_time(anthropic.as_ref())?,
-        anthropic,
-        app: None,
-    };
-    let context = Context {
+    Ok(Context {
         tag: "dry-run",
         checkout: root,
         worktree: None,
@@ -186,8 +218,7 @@ fn dry_run_context() -> Result<(Context, Grants), String> {
         user: current_user(),
         langfuse,
         files: create_files()?,
-    };
-    Ok((context, grants))
+    })
 }
 
 /// `mise which claude` printed one absolute path to a file.
@@ -235,12 +266,7 @@ fn read_request() -> Result<Request, String> {
     Ok(Request {
         repository: app_token::read_repository(env::var("GITHUB_REPOSITORY").ok())?,
         trigger: read_trigger()?,
-        credentials: app_token::read_credentials(
-            &REVIEW,
-            env::var(REVIEW.client_id_variable).ok(),
-            env::var(REVIEW.app_id_variable).ok(),
-            env::var(REVIEW.key_variable).ok(),
-        )?,
+        credentials: review_credentials()?,
         langfuse: read_langfuse()?,
         claude: resolve_claude(&root)?,
         root,
@@ -360,28 +386,17 @@ fn prepare_trees(root: &Path, head: &str) -> Result<(Worktree, PathBuf), String>
     }
 }
 
-fn post_context() -> Result<(Context, Grants), String> {
+fn post_context(grants: &Grants) -> Result<Context, String> {
+    let token = grants
+        .app
+        .as_ref()
+        .ok_or("a posting run holds the App's token")?;
     let request = read_request()?;
-    let anthropic = anthropic_access(true)?;
-    let run_time = run_time(anthropic.as_ref())?;
     let bot = app_token::bot_login(&request.credentials)?;
-    let token = app_token::mint(&request.credentials, &request.repository)?;
-    let prepared =
-        read_pull_request(&request, token.expose(), &bot).and_then(|(pull_request, earlier)| {
-            let (worktree, files) = prepare_trees(&request.root, &pull_request.head)?;
-            Ok((pull_request, earlier, worktree, files))
-        });
-    let (pull_request, earlier, worktree, files) = match prepared {
-        Ok(prepared) => prepared,
-        Err(reason) => {
-            return Err(match app_token::revoke(&token) {
-                Ok(()) => reason,
-                Err(revocation) => format!("{reason}; {revocation}"),
-            })
-        }
-    };
+    let (pull_request, earlier) = read_pull_request(&request, token.expose(), &bot)?;
+    let (worktree, files) = prepare_trees(&request.root, &pull_request.head)?;
     let full_name = request.repository.full_name();
-    let context = Context {
+    Ok(Context {
         tag: "post",
         checkout: worktree.dir.clone(),
         worktree: Some(worktree),
@@ -398,13 +413,7 @@ fn post_context() -> Result<(Context, Grants), String> {
         user: current_user(),
         langfuse: request.langfuse,
         files,
-    };
-    let grants = Grants {
-        anthropic,
-        app: Some(token),
-        run_time,
-    };
-    Ok((context, grants))
+    })
 }
 
 /// A pull request whose head lives in another repository; the App never approves one.

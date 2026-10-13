@@ -142,10 +142,18 @@ pub fn command(arguments: &[String]) -> i32 {
             return 2;
         }
     };
-    let (context, grants) = match setup::context(&mode) {
-        Ok(prepared) => prepared,
+    let grants = match setup::grants(&mode) {
+        Ok(grants) => grants,
         Err(reason) => {
             eprintln!("xtask review: {reason}");
+            return 1;
+        }
+    };
+    let context = match setup::context(&mode, &grants) {
+        Ok(context) => context,
+        Err(reason) => {
+            eprintln!("xtask review: {reason}");
+            revoke(&grants);
             return 1;
         }
     };
@@ -240,6 +248,15 @@ fn trace(
     }
 }
 
+/// Revokes the App's token when the run holds one; a failure is printed and returns false.
+fn revoke(grants: &Grants) -> bool {
+    grants.app.as_ref().is_none_or(|token| {
+        app_token::revoke(token)
+            .map_err(|reason| eprintln!("xtask review: {reason}"))
+            .is_ok()
+    })
+}
+
 /// Exports the trace and revokes the App's token; any failure on the way is the exit code.
 fn finish(
     context: &Context,
@@ -265,11 +282,7 @@ fn finish(
                 .is_ok()
         },
     );
-    let revoked = grants.app.as_ref().is_none_or(|token| {
-        app_token::revoke(token)
-            .map_err(|reason| eprintln!("xtask review: {reason}"))
-            .is_ok()
-    });
+    let revoked = revoke(grants);
     i32::from(reviewed.is_err() || !tally.failed.is_empty() || !traced || !revoked)
 }
 
