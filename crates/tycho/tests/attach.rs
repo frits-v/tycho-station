@@ -648,11 +648,29 @@ fn decode_bootout(exit: Option<i32>, stderr: &str) -> BootOut {
     }
 }
 
+/// Who owns an entry of the shared directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    Agent,
+    Developer,
+    Other,
+}
+
+fn owner_of(uid: u32, agent_uid: u32) -> Owner {
+    if uid == agent_uid {
+        Owner::Agent
+    } else if uid == current_uid() {
+        Owner::Developer
+    } else {
+        Owner::Other
+    }
+}
+
 /// One entry of the shared directory as the developer sees it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Entry {
     path: String,
-    owner: u32,
+    owner: Owner,
     mode: u32,
     socket: bool,
     developer_writable: bool,
@@ -674,7 +692,7 @@ fn writable_beyond_sockets(entries: &[Entry]) -> Vec<String> {
 
 /// Every entry of the directory and of its subdirectories, one level down; more than
 /// `SHARED_ENTRIES_MAX` entries is an error.
-fn shared_entries(dir: &Path) -> Result<Vec<Entry>, String> {
+fn shared_entries(dir: &Path, agent_uid: u32) -> Result<Vec<Entry>, String> {
     let mut entries = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(next) = pending.pop() {
@@ -695,7 +713,7 @@ fn shared_entries(dir: &Path) -> Result<Vec<Entry>, String> {
                     .unwrap_or(&path)
                     .display()
                     .to_string(),
-                owner: metadata.uid(),
+                owner: owner_of(metadata.uid(), agent_uid),
                 mode: metadata.permissions().mode() & 0o7777,
                 socket: metadata.file_type().is_socket(),
                 developer_writable: access(&path, AccessFlags::W_OK).is_ok(),
@@ -801,17 +819,20 @@ fn preflight() -> (Agent, SharedZmx) {
             dir.display()
         )
     });
+    let shared_gid = Group::from_name(SHARED_GROUP)
+        .ok()
+        .flatten()
+        .map(|group| group.gid.as_raw());
     println!(
-        "attach: agent {AGENT_USER_DEFAULT} uid {}; zmx {}; {} owner {} gid {} mode {:o}; {GHOSTTY_APP} {}",
-        agent.uid,
+        "attach: zmx {}; {} owned by the developer {}, in group {SHARED_GROUP} {}, mode {:o}; {GHOSTTY_APP} {}",
         binary.display(),
         dir.display(),
-        metadata.uid(),
-        metadata.gid(),
+        metadata.uid() == current_uid(),
+        Some(metadata.gid()) == shared_gid,
         metadata.permissions().mode() & 0o7777,
         if Path::new(GHOSTTY_APP).exists() { "present" } else { "absent" }
     );
-    match shared_entries(dir) {
+    match shared_entries(dir, agent.uid) {
         Ok(entries) => {
             for entry in entries {
                 println!("attach: before the run, the shared directory holds {entry:?}");
@@ -1195,7 +1216,7 @@ fn job_state(target: &str) -> Job {
 
 /// Prints every entry of the shared directory with the agent's sessions in it.
 fn record_shared_modes(scratch: &Scratch) {
-    let entries = match shared_entries(Path::new(&scratch.shared.dir)) {
+    let entries = match shared_entries(Path::new(&scratch.shared.dir), scratch.agent.uid) {
         Ok(entries) => entries,
         Err(error) => {
             println!("attach: the shared directory with the sessions in it: {error}");
@@ -1204,7 +1225,7 @@ fn record_shared_modes(scratch: &Scratch) {
     };
     for entry in &entries {
         println!(
-            "attach: shared entry {} owner {} mode {:o} socket {} developer-writable {}",
+            "attach: shared entry {} owner {:?} mode {:o} socket {} developer-writable {}",
             entry.path, entry.owner, entry.mode, entry.socket, entry.developer_writable
         );
         if entry.socket && !group_can_connect(entry.mode) {
@@ -1657,21 +1678,21 @@ mod decoders {
         let entries = [
             Entry {
                 path: "ta1p".to_string(),
-                owner: AGENT,
+                owner: Owner::Agent,
                 mode: 0o770,
                 socket: true,
                 developer_writable: true,
             },
             Entry {
                 path: "logs/zmx.log".to_string(),
-                owner: AGENT,
+                owner: Owner::Agent,
                 mode: 0o660,
                 socket: false,
                 developer_writable: true,
             },
             Entry {
                 path: "logs".to_string(),
-                owner: AGENT,
+                owner: Owner::Agent,
                 mode: 0o770,
                 socket: false,
                 developer_writable: false,
