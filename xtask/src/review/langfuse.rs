@@ -319,6 +319,11 @@ mod tests {
     }
 
     #[test]
+    fn the_secret_key_is_taken_out_of_the_environment_at_startup() {
+        assert!(crate::secrets::SECRET_VARIABLES.contains(&SECRET_KEY_VARIABLE));
+    }
+
+    #[test]
     fn all_three_settings_trace_none_turns_tracing_off_and_some_is_an_error() {
         assert!(read(None, None, None).unwrap().is_none());
         let langfuse = read(

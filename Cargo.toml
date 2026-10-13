@@ -4,7 +4,7 @@ members = ["crates/tycho", "crates/tycho-types", "crates/tycho-harness", "xtask"
 
 [workspace.package]
 edition = "2021"
-license = "MIT"
+license = "AGPL-3.0-only"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

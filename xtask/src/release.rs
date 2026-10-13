@@ -239,7 +239,7 @@ fn release_pr_inputs() -> Result<(AppCredentials, Repository), String> {
         &RELEASE,
         env::var(RELEASE.client_id_variable).ok(),
         env::var(RELEASE.app_id_variable).ok(),
-        env::var(RELEASE.key_variable).ok(),
+        crate::secrets::read(RELEASE.key_variable),
     )?;
     let repository = app_token::read_repository(env::var("GITHUB_REPOSITORY").ok())?;
     Ok((credentials, repository))

@@ -30,6 +30,7 @@ mod provision;
 mod release;
 mod review;
 mod sarif;
+mod secrets;
 mod setup;
 mod test_step;
 mod tool_prefix;
@@ -868,8 +869,15 @@ fn help() -> i32 {
     0
 }
 
-fn main() {
+/// What the process environment holds before any command runs: no git hook variable, and no
+/// secret, which the secret store keeps instead.
+fn prepare_environment() {
     scrub_git_hook_environment();
+    secrets::take_from_environment();
+}
+
+fn main() {
+    prepare_environment();
     let args: Vec<String> = env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
         Some("check-commit-msg") => args.get(1).map_or_else(

@@ -93,8 +93,8 @@ fn anthropic_access(required_here: bool) -> Result<Option<AccessToken>, String> 
         env::var(anthropic_token::WORKSPACE_VARIABLE).ok(),
     )?;
     let oidc = anthropic_token::read_oidc_request(
-        env::var(anthropic_token::REQUEST_URL_VARIABLE).ok(),
-        env::var(anthropic_token::REQUEST_TOKEN_VARIABLE).ok(),
+        crate::secrets::read(anthropic_token::REQUEST_URL_VARIABLE),
+        crate::secrets::read(anthropic_token::REQUEST_TOKEN_VARIABLE),
     )?;
     anthropic_token::mint(&federation, &oidc).map(Some)
 }
@@ -103,7 +103,7 @@ fn read_langfuse() -> Result<Option<langfuse::Langfuse>, String> {
     langfuse::read(
         env::var(langfuse::BASE_URL_VARIABLE).ok(),
         env::var(langfuse::PUBLIC_KEY_VARIABLE).ok(),
-        env::var(langfuse::SECRET_KEY_VARIABLE).ok(),
+        crate::secrets::read(langfuse::SECRET_KEY_VARIABLE),
     )
 }
 
@@ -239,7 +239,7 @@ fn read_request() -> Result<Request, String> {
             &REVIEW,
             env::var(REVIEW.client_id_variable).ok(),
             env::var(REVIEW.app_id_variable).ok(),
-            env::var(REVIEW.key_variable).ok(),
+            crate::secrets::read(REVIEW.key_variable),
         )?,
         langfuse: read_langfuse()?,
         claude: resolve_claude(&root)?,
