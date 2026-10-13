@@ -129,7 +129,9 @@ pub fn decode(exit: Exit, stdout: &str) -> RunOutcome {
         other => return RunOutcome::Ended(other),
     };
     let Ok(result) = serde_json::from_str::<Value>(stdout.trim()) else {
-        return RunOutcome::Unrecognised("the output is not one JSON value".to_string());
+        return RunOutcome::Unrecognised(format!(
+            "exit {code} with output that is not one JSON value; the CLI's message is above"
+        ));
     };
     if result.get("type").and_then(Value::as_str) != Some("result") {
         return RunOutcome::Unrecognised("the output is not a result".to_string());

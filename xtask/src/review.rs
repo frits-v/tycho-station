@@ -341,10 +341,16 @@ fn render(template: &str, context: &Context, finding: Option<&Finding>) -> Strin
         .replace("{{finding}}", &finding)
 }
 
+/// The exported schema on one line without its `$schema` dialect: the CLI's validator refuses
+/// the draft 2020-12 URI cue writes, and reads `$defs` and patterns without it.
 fn minified(schema: &str) -> Result<String, String> {
-    serde_json::from_str::<Value>(schema)
-        .map(|value| value.to_string())
-        .map_err(|_| "an exported review schema is not JSON; run `mise run config-export`".into())
+    let mut value = serde_json::from_str::<Value>(schema)
+        .map_err(|_| "an exported review schema is not JSON; run `mise run config-export`")?;
+    value
+        .as_object_mut()
+        .ok_or("an exported review schema is not a JSON object")?
+        .remove("$schema");
+    Ok(value.to_string())
 }
 
 fn run_claude(
@@ -670,9 +676,13 @@ mod tests {
     }
 
     #[test]
-    fn the_exported_schemas_are_json_and_the_prompts_name_every_placeholder() {
-        assert!(minified(FIND_SCHEMA).is_ok());
-        assert!(minified(VERDICT_SCHEMA).is_ok());
+    fn the_schemas_handed_to_the_cli_name_no_dialect_and_the_prompts_name_every_placeholder() {
+        for schema in [FIND_SCHEMA, VERDICT_SCHEMA] {
+            assert!(schema.contains("\"$schema\""));
+            let handed = minified(schema).unwrap();
+            assert!(!handed.contains("$schema"), "{handed}");
+            assert!(handed.contains("\"$defs\""));
+        }
         for placeholder in ["{{head}}", "{{base}}", "{{diff}}", "{{posted}}"] {
             assert!(FIND_INSTRUCTIONS.contains(placeholder), "{placeholder}");
         }
