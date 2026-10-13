@@ -93,3 +93,69 @@ rules:
               metavariable: $RUNNER
               regex: '^(?:\w+(?:::|\s+))*run_(?:captured|status|detached)\w*$'
           - pattern-not: $RUNNER($ANY, $WORDS, $PAIRS, &git_environment_removed(), ...)
+
+  - id: rust-secret-variable-read-outside-the-store
+    message: >-
+      A secret variable is read from the environment outside `xtask/src/secrets.rs`, which
+      takes every secret out of the process environment before any child starts. Read it
+      with `secrets::read` and list it in `SECRET_VARIABLES`. The job tokens `GITHUB_TOKEN`
+      and `GH_TOKEN` are exempt: gh and release-plz read them from their own environment.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      exclude:
+        - "xtask/src/secrets.rs"
+        - "crates/**"
+    patterns:
+      - pattern-either:
+          - pattern: env::var($NAME)
+          - pattern: std::env::var($NAME)
+          - pattern: env::var_os($NAME)
+          - pattern: std::env::var_os($NAME)
+      # The name's last path segment, or the literal, names a key, secret or token; a public
+      # key and the job tokens are not secrets the store holds.
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: '(?i)^(?:[\w.]*(?:::|\.))?(?!\w*public)(?!"?(?:GITHUB_TOKEN|GH_TOKEN)"?$)[\w"]*(?:secret|token|key)[\w"]*$'
+
+  - id: rust-secret-printed
+    message: >-
+      A secret's exposed value is written to output. Print what the secret is for, never its
+      value; output reaches job logs, step summaries and terminals.
+    languages: [rust]
+    severity: ERROR
+    patterns:
+      - pattern-either:
+          - pattern-inside: println!(...)
+          - pattern-inside: eprintln!(...)
+          - pattern-inside: print!(...)
+          - pattern-inside: eprint!(...)
+          - pattern-inside: writeln!(...)
+          - pattern-inside: write!(...)
+      - pattern-regex: '\.expose\(\)'
+
+  - id: rust-secret-copied-out-of-its-type
+    message: >-
+      A secret's exposed value is copied into a plain `String`, which prints, logs and
+      serializes like any other. Keep it in its own type and borrow it with `expose()` where
+      it is sent.
+    languages: [rust]
+    severity: ERROR
+    paths:
+      exclude:
+        - "crates/**"
+    pattern-either:
+      - pattern: $SECRET.expose().to_string()
+      - pattern: $SECRET.expose().to_owned()
+      - pattern: String::from($SECRET.expose())
+      - patterns:
+          - pattern-inside: format!(...)
+          - pattern-regex: '\.expose\(\)'
+
+  - id: rust-pull-request-ref
+    message: >-
+      A pull request is named by a `refs/pull/` reference, which its author can move after a
+      check. Fetch the pull request by the commit the run resolved, and post on that commit.
+    languages: [rust]
+    severity: ERROR
+    pattern-regex: '"refs/pull/[^"]'
