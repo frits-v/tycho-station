@@ -1564,7 +1564,7 @@ mod tests {
         let task = TaskId::parse("t1").unwrap();
         let reason = |outcome| match worker_blocker(&task, outcome) {
             Blocker::Uncertified { reason } => reason,
-            Blocker::Certified(payload) => panic!("{payload:?}"),
+            Blocker::Certified(_) => panic!("an uncertified outcome gave a certified blocker"),
         };
         assert!(reason(WorkerRunOutcome::Escalated {
             attempt: 1,

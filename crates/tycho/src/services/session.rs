@@ -1207,9 +1207,13 @@ mod tests {
             ..note(0, 1)
         });
         let view = serde_json::to_string(&SessionView::from(&state)).unwrap();
-        for hidden in ["sign_1abc", "sign_1worker", "resume-7f3a", &the_secret()] {
+        for hidden in ["sign_1abc", "sign_1worker", "resume-7f3a"] {
             assert!(!view.contains(hidden), "{hidden} in {view}");
         }
+        assert!(
+            !view.contains(&the_secret()),
+            "the session secret is in the view"
+        );
         assert!(view.contains("\"handoff_present\":true"));
     }
 

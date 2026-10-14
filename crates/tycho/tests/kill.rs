@@ -310,11 +310,11 @@ fn watchdog_killed_is_restarted_by_launchd_without_duplicates() {
     assert_eq!(
         agent.state().unwrap(),
         AgentState::NotLoaded,
-        "{} is already loaded; not replacing an agent this test did not load",
-        agent.target()
+        "{label} is already loaded; not replacing an agent this test did not load"
     );
     core.launchd = Some(agent.clone());
-    println!("evidence: {}", agent.install(&core.config).unwrap());
+    agent.install(&core.config).unwrap();
+    println!("evidence: bootstrapped {label}");
     wait_until("launchd watchdog brought the core up", || {
         core_healthy(ports)
     });
