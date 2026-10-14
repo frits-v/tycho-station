@@ -26,7 +26,7 @@ is a defect.
 | Workflow rules | `.github/workflow-policy.cue`; zizmor, jactionlint; CodeQL's Actions queries | `xtask workflows` in ci and pre-push; `xtask codeql` in pre-push when `.github` changes; code scanning on every pull request |
 | Git hooks | `lefthook.json`, each command `cargo run -q -p xtask -- <command>` | commit-msg, pre-commit, pre-push |
 | Host rules | repository ruleset on the default branch: the `ci` check, and code scanning with no new CodeQL alert of high security severity or error level | every push and merge |
-| Agent hooks | `.claude/settings.json` | after Edit and Write |
+| Agent hooks | `.claude/settings.json`, each command `cargo run -q -p xtask -- hook <event>` | after Edit and Write; before `gh pr create` and `gh pr edit` |
 | Tests | `xtask test` (`mbx test --workspace --no-fail-fast`) | ci, pre-push |
 
 ## Git hooks and the tests
@@ -544,6 +544,12 @@ check out, build and run it.
 
 ### When a review runs
 
+- A pull request opens as a draft (`gh pr create --draft`) and is marked ready with
+  `gh pr ready <number>` once its ci passes; GitHub sends `ready_for_review` only when a
+  draft is marked ready, so a pull request opened ready starts no review. The agent hook
+  `xtask hook pre-tool-use` refuses a `gh pr create` without `--draft`, and a
+  `gh pr create` or `gh pr edit` whose title is not literal text or fails the commit
+  subject check.
 - The `review` workflow starts on `pull_request_target` when a pull request whose author is
   an owner, member or collaborator is marked ready for review, and on `issue_comment` when a
   comment on a pull request, any pull request a fork's included, mentions

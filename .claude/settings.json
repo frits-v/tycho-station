@@ -1,10 +1,30 @@
 {
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(gh pr create *)",
+            "command": "cargo run -q -p xtask -- hook pre-tool-use"
+          },
+          {
+            "type": "command",
+            "if": "Bash(gh pr edit *)",
+            "command": "cargo run -q -p xtask -- hook pre-tool-use"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Edit|Write",
         "hooks": [
-          { "type": "command", "command": "cargo run -q -p xtask -- hook post-tool-use" }
+          {
+            "type": "command",
+            "command": "cargo run -q -p xtask -- hook post-tool-use"
+          }
         ]
       }
     ]
