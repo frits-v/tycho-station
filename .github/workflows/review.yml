@@ -25,7 +25,9 @@ jobs:
       contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)) }}
     # The App key and the Langfuse key are secrets of this environment, which admits only the
     # default branch: both events run there, and no branch's workflow can read them.
-    environment: review
+    environment:
+      name: review
+      deployment: false
     # On the job, after its condition: a comment that starts no review cancels nothing.
     concurrency:
       group: review-${{ github.event.pull_request.number || github.event.issue.number }}

@@ -354,7 +354,9 @@ mod tests {
         assert!(!workflow.contains("ref:"));
         assert!(!workflow.contains("working-directory"));
         assert_eq!(workflow.matches("- run:").count(), 2);
-        assert!(workflow.contains("    environment: review\n"));
+        assert!(
+            workflow.contains("    environment:\n      name: review\n      deployment: false\n")
+        );
     }
 
     #[test]
@@ -365,7 +367,8 @@ mod tests {
         assert!(!workflow.contains("FRITS_CODE_REVIEW"));
         assert!(!workflow.contains("pull-requests: write"));
         assert!(workflow.contains("- run: target/debug/xtask review --dry-run"));
-        assert!(workflow.contains("    environment: review-dry-run\n"));
+        assert!(workflow
+            .contains("    environment:\n      name: review-dry-run\n      deployment: false\n"));
     }
 
     #[test]
