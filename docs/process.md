@@ -568,8 +568,8 @@ check out, build and run it.
   that resolves it, resolves every thread and merges; those fixes need no new review.
 - When the author judges that the change has grown significantly past what was approved, the
   author dismisses the approval, saying why, and asks for a new review.
-- The branch rules require every thread resolved and `ci` passing on a branch up to date with
-  `main`.
+- The branch rules require one approving review, which a later push leaves standing, every
+  thread resolved, and `ci` passing on a branch up to date with `main`.
 
 ### What runs where
 
