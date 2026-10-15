@@ -125,8 +125,10 @@ relay and the rollover-fidelity cases also wait on the station mod.
   core-owned settings and checked in `ci`, including a check that the mod calls none of
   `$.process.run`, `$.process.spawn` and `$.http.fetch`. The launcher kills a session
   when a completed turn has no `session.measure` record by the next heartbeat after the
-  one that first saw it, which covers a mod unloaded mid-session. Probe as the agent
-  user: whether `prependPlugins` in user settings takes effect for that login.
+  one that first saw it, which covers a mod unloaded mid-session. Probes as the agent
+  user: whether `prependPlugins` in user settings takes effect for that login, and
+  whether `CLAUDE_CODE_PLUGIN_DIRS` in user settings replaces or adds to the directory in
+  the launcher's `--settings` object.
 - *Post relay lines through the station mod instead of the inbox socket*: after probing
   which fields `$.fs.stat` returns, how a line queues behind a running turn, and which
   `origin.kind` a submitted line carries at `session.receive`. The launcher's socket post
@@ -232,7 +234,7 @@ OpenAI documents: [Intelligent UI announcement](https://community.openai.com/t/g
 [Evals output items](https://developers.openai.com/api/reference/resources/evals/subresources/runs/subresources/output_items/methods/list),
 [data retention](https://developers.openai.com/api/docs/guides/your-data).
 
-Unverified claims: 14, each stated above as unverified or as a probe.
+Unverified claims: 15, each stated above as unverified or as a probe.
 
 | Claim | Settled by |
 |---|---|
