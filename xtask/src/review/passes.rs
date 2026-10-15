@@ -599,6 +599,35 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_registration_leaves_the_pass_unlinked_and_is_kept_for_the_exit_code() {
+        let mut tally = Tally::default();
+        let untraced = crate::review::setup::tests::context(Vec::new());
+        register_prompts(&untraced, &mut tally);
+        assert_eq!(tally.prompts.find, None);
+        assert!(tally.trace_failures.is_empty());
+        let unreachable = Context {
+            langfuse: Some(crate::review::langfuse::tests::langfuse(
+                "https://127.0.0.1:1",
+            )),
+            ..crate::review::setup::tests::context(Vec::new())
+        };
+        register_prompts(&unreachable, &mut tally);
+        assert_eq!(tally.prompts.find, None);
+        assert_eq!(tally.prompts.verify, None);
+        let [find, verify] = tally.trace_failures.as_slice() else {
+            panic!("{:?}", tally.trace_failures);
+        };
+        assert!(
+            find.starts_with("looking up prompt review-find: "),
+            "{find}"
+        );
+        assert!(
+            verify.starts_with("looking up prompt review-verify: "),
+            "{verify}"
+        );
+    }
+
+    #[test]
     fn the_registered_templates_are_the_prompt_files_with_their_run_settings() {
         let [find, verify] = templates().unwrap();
         assert_eq!(find.name, "review-find");

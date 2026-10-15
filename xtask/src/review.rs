@@ -304,8 +304,14 @@ fn finish(
         },
     );
     let revoked = revoke(grants);
-    let traced = traced && tally.trace_failures.is_empty();
-    i32::from(reviewed.is_err() || !tally.failed.is_empty() || !traced || !revoked)
+    exit_code(reviewed.is_ok(), tally, traced, revoked)
+}
+
+/// 0 only when the review gave a verdict, every verify pass did, the trace was exported with
+/// every part of it recorded, and the App's token was revoked.
+fn exit_code(reviewed: bool, tally: &Tally, exported: bool, revoked: bool) -> i32 {
+    let traced = exported && tally.trace_failures.is_empty();
+    i32::from(!reviewed || !tally.failed.is_empty() || !traced || !revoked)
 }
 
 #[cfg(test)]
@@ -390,6 +396,20 @@ mod tests {
         assert!(workflow.contains("- run: target/debug/xtask review --dry-run"));
         assert!(workflow
             .contains("    environment:\n      name: review-dry-run\n      deployment: false\n"));
+    }
+
+    #[test]
+    fn a_part_of_the_trace_that_could_not_be_recorded_fails_the_run() {
+        let clean = Tally::default();
+        assert_eq!(exit_code(true, &clean, true, true), 0);
+        let unregistered = Tally {
+            trace_failures: vec!["looking up prompt review-find: refused".to_string()],
+            ..Tally::default()
+        };
+        assert_eq!(exit_code(true, &unregistered, true, true), 1);
+        assert_eq!(exit_code(true, &clean, false, true), 1);
+        assert_eq!(exit_code(false, &clean, true, true), 1);
+        assert_eq!(exit_code(true, &clean, true, false), 1);
     }
 
     #[test]
