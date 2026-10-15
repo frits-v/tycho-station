@@ -301,10 +301,14 @@ what the developer side of `mise run setup` checks, in this order:
     (`umask_override`; otherwise sudo applies the union with its 0022 and the socket comes
     out 0750). The task writes the candidate new at 0600 in `~/.tycho/provision`, a 0700
     directory of the developer's, checks it with `/usr/sbin/visudo -c -f` as the developer,
-    which must answer `<file>: parsed OK`, and only then runs
-    `sudo /usr/bin/install -S -o root -g wheel -m 0440 <candidate> /etc/sudoers.d/tycho-agent`.
-    macOS's `install` writes a temporary file beside the target and renames it into place;
-    `-S` flushes it first. The step runs while the listing below shows no rule, the rule for
+    which must answer `<file>: parsed OK`, and only then runs, as root,
+    `/usr/bin/install -S -o root -g wheel -m 0440 <candidate> /etc/tycho-agent.sudoers.tmp`,
+    `/usr/sbin/visudo -c -f /etc/tycho-agent.sudoers.tmp` (again `parsed OK`) and
+    `/bin/mv -f /etc/tycho-agent.sudoers.tmp /etc/sudoers.d/tycho-agent`. sudo reads every
+    name in `sudoers.d` without a dot or a trailing `~`, a file there that does not parse makes
+    sudo refuse every command for every user, and `install` writes its own temporary file
+    (`INS@XXXXXX`) in its target's directory; so nothing but the final rename, on the same
+    volume, touches `sudoers.d`, and a failed step leaves at most the staging file in `/etc`. The step runs while the listing below shows no rule, the rule for
     another zmx install (a pin bump), or the rule's entry with another `Defaults!` line. Any
     other no-password entry is reported for the operator to remove, and does not stop the
     install.

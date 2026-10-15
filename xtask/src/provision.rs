@@ -42,6 +42,13 @@ const RMDIR: &str = "/bin/rmdir";
 const CHMOD: &str = "/bin/chmod";
 const INSTALL: &str = "/usr/bin/install";
 const VISUDO: &str = "/usr/sbin/visudo";
+const MV: &str = "/bin/mv";
+/// Where root installs the checked rule before it is renamed into `sudoers.d`: a root-owned
+/// directory sudo does not read, on the same volume. `install` writes its own temporary file
+/// (`INS@XXXXXX`, no dot) in the target's directory, and sudo reads every name in `sudoers.d`
+/// without a dot or a trailing `~`, so a partial file there makes sudo refuse every command
+/// for every user. Only the rename touches `sudoers.d`.
+const SUDOERS_STAGED: &str = "/etc/tycho-agent.sudoers.tmp";
 /// Where the candidate rule is written before root installs it, under the core home; the
 /// directory is the developer's at 0700, so only the developer and root read it.
 const CANDIDATE_DIR_RELATIVE: [&str; 2] = [".tycho", "provision"];
@@ -539,12 +546,12 @@ enum Action {
 
 #[cfg(test)]
 impl Action {
-    /// What the action runs through sudo, if anything.
-    fn root_words(&self) -> Option<Vec<String>> {
+    /// What the action runs through sudo, in order.
+    fn root_commands(&self) -> Vec<Vec<String>> {
         match self {
-            Self::Root(words) => Some(words.clone()),
-            Self::Sudoers(work) => Some(install_words(&work.candidate)),
-            Self::Directory(_) | Self::OnOwnDirectory { .. } | Self::Prefix(_) => None,
+            Self::Root(words) => vec![words.clone()],
+            Self::Sudoers(work) => sudoers_root_commands(&work.candidate).to_vec(),
+            Self::Directory(_) | Self::OnOwnDirectory { .. } | Self::Prefix(_) => Vec::new(),
         }
     }
 }
@@ -558,18 +565,25 @@ pub struct SudoersWork {
     rule: Result<String, String>,
 }
 
-fn install_words(candidate: &Path) -> Vec<String> {
-    vec![
-        INSTALL.to_string(),
-        "-S".to_string(),
-        "-o".to_string(),
-        "root".to_string(),
-        "-g".to_string(),
-        "wheel".to_string(),
-        "-m".to_string(),
-        "0440".to_string(),
-        candidate.display().to_string(),
-        SUDOERS_DROP_IN.to_string(),
+/// Root's three commands: install the checked candidate to the staging name, root's own
+/// `visudo -c -f` of the installed file, then one rename onto the drop-in.
+fn sudoers_root_commands(candidate: &Path) -> [Vec<String>; 3] {
+    let candidate = candidate.display().to_string();
+    [
+        strings(&[
+            INSTALL,
+            "-S",
+            "-o",
+            "root",
+            "-g",
+            "wheel",
+            "-m",
+            "0440",
+            &candidate,
+            SUDOERS_STAGED,
+        ]),
+        strings(&[VISUDO, "-c", "-f", SUDOERS_STAGED]),
+        strings(&[MV, "-f", SUDOERS_STAGED, SUDOERS_DROP_IN]),
     ]
 }
 
@@ -835,7 +849,9 @@ fn render(action: &Action) -> Vec<String> {
                 "{} (as the developer)",
                 visudo_words(&work.candidate).join(" ")
             ));
-            lines.push(format!("sudo {}", install_words(&work.candidate).join(" ")));
+            for words in sudoers_root_commands(&work.candidate) {
+                lines.push(format!("sudo {}", words.join(" ")));
+            }
             lines
         }
     }
@@ -1277,8 +1293,13 @@ fn execute(host: &mut impl Host, action: &Action, snapshot: &Snapshot) -> Result
                 &work.candidate,
             )?;
             println!("xtask provision-agent: {PROMPT_NOTICE}");
-            let words = install_words(&work.candidate);
-            outcome_result(INSTALL, &decode_command(INSTALL, &host.run_as_root(&words)))
+            let [install, check, rename] = sudoers_root_commands(&work.candidate);
+            outcome_result(
+                INSTALL,
+                &decode_command(INSTALL, &host.run_as_root(&install)),
+            )?;
+            decode_visudo(&host.run_as_root(&check), Path::new(SUDOERS_STAGED))?;
+            outcome_result(MV, &decode_command(MV, &host.run_as_root(&rename)))
         }
     }
 }
@@ -1665,20 +1686,51 @@ mod tests {
         })
     }
 
-    /// The one file root writes: the checked candidate, root's, mode 0440, in `sudoers.d`.
-    fn install_rule_words() -> Vec<String> {
-        strings(&[
-            INSTALL,
-            "-S",
-            "-o",
-            "root",
-            "-g",
-            "wheel",
-            "-m",
-            "0440",
-            "/Users/frits/.tycho/provision/tycho-agent",
-            "/etc/sudoers.d/tycho-agent",
-        ])
+    /// The one file root writes, in three steps: the checked candidate installed root's at
+    /// 0440 under a name outside `sudoers.d`, checked again by root's `visudo`, then renamed
+    /// onto the drop-in.
+    fn install_rule_commands() -> [Vec<String>; 3] {
+        [
+            strings(&[
+                INSTALL,
+                "-S",
+                "-o",
+                "root",
+                "-g",
+                "wheel",
+                "-m",
+                "0440",
+                "/Users/frits/.tycho/provision/tycho-agent",
+                "/etc/tycho-agent.sudoers.tmp",
+            ]),
+            strings(&[VISUDO, "-c", "-f", "/etc/tycho-agent.sudoers.tmp"]),
+            strings(&[
+                MV,
+                "-f",
+                "/etc/tycho-agent.sudoers.tmp",
+                "/etc/sudoers.d/tycho-agent",
+            ]),
+        ]
+    }
+
+    /// No command root runs leaves a file in `sudoers.d` but the rename onto the drop-in, whose
+    /// name sudo reads only once it is complete.
+    #[test]
+    fn nothing_but_the_final_rename_writes_in_the_sudoers_directory() {
+        let [install, check, rename] = install_rule_commands();
+        for words in [&install, &check] {
+            assert!(
+                !words.iter().any(|word| word.starts_with("/etc/sudoers.d/")),
+                "{words:?}"
+            );
+        }
+        assert_eq!(rename.last().map(String::as_str), Some(SUDOERS_DROP_IN));
+        assert_eq!(
+            Path::new(SUDOERS_STAGED).parent(),
+            Path::new(SUDOERS_DROP_IN).parent().and_then(Path::parent),
+            "install writes its temporary file beside the staging name, outside sudoers.d, on \
+             the volume of the rename"
+        );
     }
 
     fn createhomedir_words() -> Vec<String> {
@@ -1746,9 +1798,14 @@ mod tests {
             self.order
                 .push(format!("root {}", words.first().map_or("", String::as_str)));
             self.root_calls.push(words.to_vec());
-            self.root_results
-                .pop_front()
-                .unwrap_or_else(|| captured(Exit::Code(0), "", ""))
+            self.root_results.pop_front().unwrap_or_else(|| {
+                if words.first().map(String::as_str) == Some(VISUDO) {
+                    let file = words.last().map_or("", String::as_str);
+                    captured(Exit::Code(0), &format!("{file}: parsed OK\n"), "")
+                } else {
+                    captured(Exit::Code(0), "", "")
+                }
+            })
         }
 
         fn prepare_directory(
@@ -2098,16 +2155,17 @@ mod tests {
         let mut examined = 0_u32;
         for snapshot in [all_missing(), stranger, all_present(), wide_home] {
             for remedy in REMEDIES {
-                if let Some(words) =
-                    action(remedy, &snapshot).and_then(|action| action.root_words())
-                {
+                let commands = action(remedy, &snapshot)
+                    .map(|action| action.root_commands())
+                    .unwrap_or_default();
+                for words in commands {
                     examined = examined.saturating_add(1);
                     let program = words.first().map(String::as_str);
                     assert!(
                         matches!(program, Some(DSEDITGROUP | SYSADMINCTL | RMDIR))
                             || words == createhomedir_words()
                             || words == chmod_home_words()
-                            || words == install_rule_words(),
+                            || install_rule_commands().contains(&words),
                         "{remedy:?} runs {words:?} as root"
                     );
                 }
@@ -2115,9 +2173,8 @@ mod tests {
         }
         assert!(examined >= 30, "only {examined} root commands examined");
         assert_eq!(
-            action(Remedy::InstallSudoersRule, &all_present())
-                .and_then(|action| action.root_words()),
-            Some(install_rule_words())
+            action(Remedy::InstallSudoersRule, &all_present()).map(|action| action.root_commands()),
+            Some(install_rule_commands().to_vec())
         );
         assert_eq!(
             action(Remedy::CreateAgentHome, &all_present()),
@@ -2686,7 +2743,7 @@ mod tests {
         assert_eq!(plan(&stale).steps, vec![Remedy::InstallSudoersRule]);
         let mut host = RecordingHost::new(vec![stale, all_present()]);
         assert_eq!(provision(Mode::Apply, true, &mut host), 0);
-        assert_eq!(host.root_calls, [install_rule_words()]);
+        assert_eq!(host.root_calls, install_rule_commands());
         let (_, content) = &host.private_writes[0];
         assert!(content.contains("/zmx/0.8.1/zmx") && !content.contains("0.7.1"));
     }
@@ -2726,13 +2783,15 @@ mod tests {
                 format!("write {candidate}"),
                 format!("developer {VISUDO}"),
                 format!("root {INSTALL}"),
+                format!("root {VISUDO}"),
+                format!("root {MV}"),
             ]
         );
         assert_eq!(
             host.developer_calls,
             [strings(&[VISUDO, "-c", "-f", candidate])]
         );
-        assert_eq!(host.root_calls, [install_rule_words()]);
+        assert_eq!(host.root_calls, install_rule_commands());
         let (_, content) = &host.private_writes[0];
         assert_eq!(
             content,
@@ -2769,10 +2828,32 @@ mod tests {
     }
 
     #[test]
+    fn a_staged_rule_root_s_visudo_refuses_is_never_renamed_into_place() {
+        let mut host = RecordingHost::new(vec![rule_missing()]);
+        host.root_results.push_back(captured(Exit::Code(0), "", ""));
+        host.root_results.push_back(captured(
+            Exit::Code(1),
+            "",
+            "/etc/tycho-agent.sudoers.tmp:2:7: syntax error\n",
+        ));
+        assert_eq!(provision(Mode::Apply, true, &mut host), 1);
+        let [install, check, _] = install_rule_commands();
+        assert_eq!(host.root_calls, [install, check]);
+        let mut failed_install = RecordingHost::new(vec![rule_missing()]);
+        failed_install.root_results.push_back(captured(
+            Exit::Code(71),
+            "",
+            "install: permission denied\n",
+        ));
+        assert_eq!(provision(Mode::Apply, true, &mut failed_install), 1);
+        assert_eq!(failed_install.root_calls.len(), 1);
+    }
+
+    #[test]
     fn an_installed_rule_whose_probe_still_fails_stops_the_run() {
         let mut host = RecordingHost::new(vec![rule_missing()]);
         assert_eq!(provision(Mode::Apply, true, &mut host), 1);
-        assert_eq!(host.root_calls, [install_rule_words()]);
+        assert_eq!(host.root_calls, install_rule_commands());
         assert_eq!(host.reports, 0);
     }
 
@@ -2812,7 +2893,20 @@ mod tests {
             .any(|line| line == "  frits ALL = (tycho-agent) NOPASSWD: /Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx"));
         assert_eq!(
             lines.last().map(String::as_str),
-            Some("sudo /usr/bin/install -S -o root -g wheel -m 0440 /Users/frits/.tycho/provision/tycho-agent /etc/sudoers.d/tycho-agent")
+            Some("sudo /bin/mv -f /etc/tycho-agent.sudoers.tmp /etc/sudoers.d/tycho-agent")
+        );
+        let root_lines: Vec<&str> = lines
+            .iter()
+            .map(String::as_str)
+            .filter(|line| line.starts_with("sudo "))
+            .collect();
+        assert_eq!(
+            root_lines,
+            [
+                "sudo /usr/bin/install -S -o root -g wheel -m 0440 /Users/frits/.tycho/provision/tycho-agent /etc/tycho-agent.sudoers.tmp",
+                "sudo /usr/sbin/visudo -c -f /etc/tycho-agent.sudoers.tmp",
+                "sudo /bin/mv -f /etc/tycho-agent.sudoers.tmp /etc/sudoers.d/tycho-agent",
+            ]
         );
     }
 
