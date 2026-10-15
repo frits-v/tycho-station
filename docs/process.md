@@ -724,6 +724,10 @@ trace; some but not all is an error.
   headless run's thinking blocks carry no text; a block the server sent without a summary
   shows as omitted. A message's final output count arrives only in its `message_delta`
   partial event; a message the run ended before then keeps its first count, marked partial.
+  Each message carries a share of the pass's `total_cost_usd`, split by its tokens at
+  the price ratios of input, output, cache reads and one-hour cache writes, so the trace's
+  cost is the CLI's figure; the thinking-token estimate is metadata, since thinking tokens
+  are part of the output count.
 - Each tool call is a tool span under its message, with the tool's input and the first
   16 KiB of its result, the full size beside it.
 - Events in the stream the decoder does not know are counted and named on the pass, never

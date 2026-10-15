@@ -25,6 +25,12 @@ const TRACE_ID_HEX_CHARS: usize = 32;
 const SPAN_ID_HEX_CHARS: usize = 16;
 /// Spans sent in one request, so a long review is several requests of a bounded size.
 const SPANS_PER_REQUEST: usize = 100;
+/// Token kinds weighted by their price relative to input, in tenths: output 5x, cache reads
+/// 0.1x and one-hour cache writes 2x, the writes the review's runs make.
+const WEIGHT_INPUT: u128 = 10;
+const WEIGHT_OUTPUT: u128 = 50;
+const WEIGHT_CACHE_READ: u128 = 1;
+const WEIGHT_CACHE_WRITE: u128 = 20;
 
 /// Where traces and prompts go and the Basic credential they carry.
 pub struct Langfuse {
@@ -239,6 +245,7 @@ impl Spans<'_> {
                 .unwrap_or(fallback)
         };
         let mut boundary = pass.launched.unwrap_or(pass.started);
+        let shares = cost_shares(pass.usage.cost, &transcript.turns);
         for (turn_index, turn) in transcript.turns.iter().enumerate() {
             let ended = at(turn.last_seen, pass.ended);
             let turn_path = format!("{path}/turn/{turn_index}");
@@ -252,7 +259,13 @@ impl Spans<'_> {
                 Some(&path),
                 &format!("{} turn {}", pass.name, turn_index.saturating_add(1)),
                 (boundary, ended),
-                turn_attributes(turn, transcript, model, pass.prompt.as_ref()),
+                turn_attributes(
+                    turn,
+                    transcript,
+                    model,
+                    pass.prompt.as_ref(),
+                    shares.get(turn_index).copied().unwrap_or(0),
+                ),
             );
             boundary = ended;
             for &call_index in &turn.tool_calls {
@@ -307,11 +320,49 @@ fn pass_attributes(pass: &Pass) -> Vec<Value> {
     attributes
 }
 
+/// The pass's reported cost in micro-dollars shared across its messages by their tokens at
+/// price-ratio weights; the shares add up to the reported total exactly, so the trace's cost
+/// is the CLI's figure whatever price Langfuse knows for the model.
+fn cost_shares(total: u64, turns: &[Turn]) -> Vec<u64> {
+    let weights: Vec<u128> = turns
+        .iter()
+        .map(|turn| {
+            let usage = turn.usage;
+            u128::from(usage.input)
+                .saturating_mul(WEIGHT_INPUT)
+                .saturating_add(u128::from(usage.output).saturating_mul(WEIGHT_OUTPUT))
+                .saturating_add(u128::from(usage.cache_read).saturating_mul(WEIGHT_CACHE_READ))
+                .saturating_add(u128::from(usage.cache_creation).saturating_mul(WEIGHT_CACHE_WRITE))
+        })
+        .collect();
+    let sum = weights
+        .iter()
+        .fold(0_u128, |sum, weight| sum.saturating_add(*weight));
+    let mut shares: Vec<u64> = weights
+        .iter()
+        .map(|weight| {
+            u128::from(total)
+                .saturating_mul(*weight)
+                .checked_div(sum)
+                .and_then(|share| u64::try_from(share).ok())
+                .unwrap_or(0)
+        })
+        .collect();
+    let allocated = shares
+        .iter()
+        .fold(0_u64, |sum, share| sum.saturating_add(*share));
+    if let Some(last) = shares.last_mut() {
+        *last = last.saturating_add(total.saturating_sub(allocated));
+    }
+    shares
+}
+
 fn turn_attributes(
     turn: &Turn,
     transcript: &Transcript,
     model: &str,
     prompt: Option<&PromptLink>,
+    cost: u64,
 ) -> Vec<Value> {
     let thinking: Vec<Value> = turn
         .thinking
@@ -332,22 +383,33 @@ fn turn_attributes(
         })
         .collect();
     let output = json!({"thinking": thinking, "text": turn.text, "tool_calls": tool_calls});
-    let mut usage = json!({
+    let usage = json!({
         "input": turn.usage.input,
         "output": turn.usage.output,
         "cache_read_input_tokens": turn.usage.cache_read,
         "cache_creation_input_tokens": turn.usage.cache_creation,
     });
-    if let (Some(estimate), Some(object)) = (turn.usage.thinking_estimate, usage.as_object_mut()) {
-        object.insert("thinking_estimate".to_string(), json!(estimate));
-    }
     let mut attributes = vec![
         text("langfuse.observation.type", "generation"),
         text("langfuse.observation.model.name", model),
         text("langfuse.observation.output", &output.to_string()),
         text("langfuse.observation.usage_details", &usage.to_string()),
+        text(
+            "langfuse.observation.cost_details",
+            &json!({"total": dollars(cost)}).to_string(),
+        ),
+        text(
+            "langfuse.observation.metadata.cost_source",
+            "a share of the pass's total_cost_usd, by tokens at price-ratio weights",
+        ),
         text("langfuse.observation.metadata.message_id", &turn.message_id),
     ];
+    if let Some(estimate) = turn.usage.thinking_estimate {
+        attributes.push(text(
+            "langfuse.observation.metadata.thinking_tokens_estimate",
+            &estimate.to_string(),
+        ));
+    }
     if !turn.usage.output_final {
         attributes.push(text(
             "langfuse.observation.metadata.output_tokens",
@@ -678,6 +740,66 @@ pub mod tests {
         assert_eq!(
             second_turn.get("startTimeUnixNano"),
             read_call.get("endTimeUnixNano")
+        );
+    }
+
+    #[test]
+    fn the_messages_costs_add_up_to_the_pass_s_reported_cost() {
+        let spans = spans(&trace(), "seed");
+        let costs: Vec<f64> = spans
+            .iter()
+            .filter_map(|span| attribute(span, "langfuse.observation.cost_details"))
+            .filter_map(|value| value.get("stringValue")?.as_str())
+            .filter_map(|cost| {
+                serde_json::from_str::<Value>(cost)
+                    .ok()?
+                    .get("total")?
+                    .as_f64()
+            })
+            .collect();
+        assert_eq!(costs.len(), 2);
+        assert!((costs.iter().sum::<f64>() - 1.5).abs() < 1e-9, "{costs:?}");
+        for span in &spans {
+            if let Some(usage) = attribute(span, "langfuse.observation.usage_details") {
+                assert!(!usage.to_string().contains("thinking"), "{usage}");
+            }
+        }
+    }
+
+    #[test]
+    fn cost_shares_follow_the_token_weights_and_sum_exactly() {
+        let turn = |input: u64, output: u64, cache_read: u64, cache_creation: u64| {
+            let mut turn = stream::read(
+                r#"{"type":"assistant","message":{"id":"m","model":"x","content":[]}}"#,
+                &[],
+            )
+            .turns
+            .remove(0);
+            turn.usage = stream::TurnUsage {
+                input,
+                output,
+                cache_read,
+                cache_creation,
+                ..turn.usage
+            };
+            turn
+        };
+        assert_eq!(cost_shares(1000, &[]), Vec::<u64>::new());
+        assert_eq!(
+            cost_shares(1000, &[turn(0, 0, 0, 0), turn(0, 0, 0, 0)]),
+            [0, 1000]
+        );
+        assert_eq!(
+            cost_shares(600, &[turn(0, 10, 0, 0), turn(50, 0, 0, 0)]),
+            [300, 300]
+        );
+        assert_eq!(
+            cost_shares(7, &[turn(1, 0, 0, 0), turn(1, 0, 0, 0), turn(1, 0, 0, 0)]),
+            [2, 2, 3]
+        );
+        assert_eq!(
+            cost_shares(30, &[turn(0, 0, 20, 0), turn(0, 0, 0, 1)]),
+            [15, 15]
         );
     }
 
