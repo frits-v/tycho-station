@@ -7,6 +7,7 @@
 )]
 
 pub mod agent_call;
+pub mod agent_switch;
 pub mod envelope;
 pub mod exit;
 pub mod git_environment;

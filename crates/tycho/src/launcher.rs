@@ -1164,6 +1164,7 @@ mod tests {
             credential,
         )
         .unwrap();
+        server.bind_launcher(std::process::id());
         settings.credential_socket = Some(server.path().to_path_buf());
         settings.core_uid = Some(current_uid());
         server

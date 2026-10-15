@@ -8,6 +8,8 @@ use tycho_types::session::SessionName;
 
 use std::io::Write;
 
+use nix::unistd::{Uid, User};
+
 use crate::agent_files::open_append;
 use crate::config::{AgentDirs, ConfigError, CorePorts, ToolPrefix, LOG_DIR};
 use crate::credentials::{self, Credential, CredentialVendor};
@@ -73,7 +75,9 @@ pub fn kill_line(session: &SessionName, pid: u32, report: &KillReport) -> String
 
 impl LauncherSpawner {
     /// A spawner whose launcher is the prefix's `tycho` and whose sessions run under the
-    /// prefix's recorded zmx, so a session starts from the prefix and from nothing else.
+    /// prefix's recorded zmx, so a session starts from the prefix and from nothing else. An
+    /// agent other than the caller gets its sessions through the sudoers rule: `zmx run` as
+    /// that user, so the session daemon and the launcher are the agent's.
     pub fn for_prefix(
         tool_prefix: ToolPrefix,
         dirs: AgentDirs,
@@ -86,8 +90,16 @@ impl LauncherSpawner {
         let zmx_binary = tool_prefix.tool("zmx").ok_or_else(|| {
             ConfigError::ToolPrefixManifest("station.json records no zmx".to_string())
         })?;
+        let zmx = if agent_uid == Uid::current().as_raw() {
+            Zmx::agent(zmx_binary, &dirs.socket_dir)
+        } else {
+            let agent = User::from_uid(Uid::from_raw(agent_uid))
+                .map_err(|error| ConfigError::UserLookup(error.to_string()))?
+                .ok_or_else(|| ConfigError::NoAgentUser(format!("uid {agent_uid}")))?;
+            Zmx::agent_as(zmx_binary, &dirs.socket_dir, &agent.name)
+        };
         Ok(Self {
-            zmx: Zmx::agent(zmx_binary, &dirs.socket_dir),
+            zmx,
             tycho: tool_prefix.tycho(),
             dirs,
             home,
@@ -226,6 +238,33 @@ mod tests {
             spawner.zmx.binary(),
             Path::new("/Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx")
         );
+        let uid_one = User::from_uid(Uid::from_raw(1)).unwrap().unwrap().name;
+        assert_eq!(
+            spawner.zmx.switched_to(),
+            Some(uid_one.as_str()),
+            "another uid's sessions start through sudo as that user"
+        );
+        let as_caller = |uid: u32| {
+            LauncherSpawner::for_prefix(
+                crate::config::tool_prefix::tests::production(),
+                AgentDirs::new(PathBuf::from("/a")).unwrap(),
+                PathBuf::from("/h"),
+                PathBuf::from("/c"),
+                uid,
+                HeartbeatTarget::Session,
+                CorePorts::PRODUCTION,
+            )
+        };
+        let same = as_caller(Uid::current().as_raw()).unwrap();
+        assert_eq!(
+            same.zmx.switched_to(),
+            None,
+            "the caller's own sessions need no sudo"
+        );
+        assert!(matches!(
+            as_caller(3_999_999),
+            Err(ConfigError::NoAgentUser(_))
+        ));
         let bare = ToolPrefix::new(PathBuf::from("/tmp/prefix")).unwrap();
         assert!(LauncherSpawner::for_prefix(
             bare,

@@ -1357,6 +1357,9 @@ fn preflight() -> (Agent, SharedZmx, TerminalState) {
         }
         Err(error) => println!("attach: before the run, the shared directory: {error}"),
     }
+    // The agent's zmx would otherwise create `logs` as its own, where the core then refuses it.
+    tycho::zmx::prepare_shared_log(dir)
+        .unwrap_or_else(|refusal| panic!("attach: the shared zmx log: {refusal}"));
     probe_sudo();
     (
         agent,
@@ -1386,8 +1389,8 @@ fn probe_sudo() {
             println!("attach: sudo asks for the developer's password once, on this terminal");
         }
         SudoProbe::NoPasswordRule => panic!(
-            "attach: a sudoers rule runs commands as {AGENT_USER_DEFAULT} with no password; \
-             the station installs none while the identity switch is undecided"
+            "attach: a sudoers rule runs commands other than the prefix's zmx as \
+             {AGENT_USER_DEFAULT} with no password; the station's rule covers only zmx"
         ),
         SudoProbe::Refused(line) => panic!("attach: could not look: {line}"),
         SudoProbe::Unrecognised(text) => panic!("attach: sudo -n answered {text}"),

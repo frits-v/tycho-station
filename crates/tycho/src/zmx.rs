@@ -2,9 +2,16 @@
 //! socket directory.
 
 use std::ffi::OsString;
+use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
+use nix::fcntl::OFlag;
+use nix::unistd::Uid;
+
+use tycho_types::agent_switch::SUDO;
 use tycho_types::lease::PID_MAX;
 
 use nix::sys::signal::Signal;
@@ -21,6 +28,14 @@ pub const SESSION_ENV: &str = "ZMX_SESSION";
 const CORE_DIR_MODE: &str = "0700";
 /// Matches `AGENT_DIR_MODE`: the agent user and the developer share the group.
 const AGENT_ZMX_DIR_MODE: &str = "0770";
+/// The log zmx appends to stays writable by the other side of the shared group.
+const AGENT_ZMX_LOG_MODE: &str = "0660";
+/// zmx masks the socket, directory and log modes with the process umask, so every zmx run in
+/// the shared directory, the developer's clients included, runs under 007.
+const SHELL: &str = "/bin/sh";
+const UMASK_EXEC: &str = "umask 007; exec \"$0\" \"$@\"";
+/// `zmx run` starts `bash` through `PATH`; the shared directory's sessions get the system's.
+const AGENT_PATH: &str = "/usr/bin:/bin";
 
 /// One line of `zmx list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,32 +173,291 @@ pub fn count_named(entries: &[ListEntry], name: &str) -> usize {
         .count()
 }
 
+/// The directory and file zmx 0.8.1 logs to under `ZMX_DIR`.
+///
+/// zmx appends to `logs/zmx.log` by path, following a link, opens it before any subcommand and
+/// exits if it cannot, and truncates it by path past 2 MiB. It reads no variable that moves the
+/// log. In the shared directory the log directory is therefore the developer's, closed to group
+/// writes, and the log a regular file of the developer's the shared group can append to: the
+/// agent can neither replace the log nor rename the directory, which the sticky bit on the
+/// shared directory protects.
+pub const LOG_DIR: &str = "logs";
+pub const LOG_FILE: &str = "zmx.log";
+const LOG_DIR_MODE: u32 = 0o750;
+const LOG_FILE_MODE: u32 = 0o660;
+const GROUP_WRITE: u32 = 0o020;
+const STICKY: u32 = 0o1000;
+/// Modes a log directory and file are created with before the exact mode is set on the
+/// descriptor.
+const CREATE_DIR_MODE: u32 = 0o700;
+const CREATE_FILE_MODE: u32 = 0o600;
+
+/// Why the shared directory's log is not one the developer may append to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogRefusal {
+    /// The shared directory lets its group rename entries: no sticky bit.
+    NotSticky {
+        dir: PathBuf,
+        mode: u32,
+    },
+    NotDirectory(PathBuf),
+    Foreign {
+        path: PathBuf,
+        uid: u32,
+    },
+    /// A link, a FIFO, a directory or anything else that is not a regular file.
+    NotRegular(PathBuf),
+    HardLinked {
+        path: PathBuf,
+        links: u64,
+    },
+    Io {
+        path: PathBuf,
+        error: String,
+    },
+}
+
+impl std::fmt::Display for LogRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotSticky { dir, mode } => write!(
+                formatter,
+                "{} has mode {mode:04o}: group-writable without the sticky bit, so the agent \
+                 could rename the core's entries; `xtask provision-agent` sets 3770",
+                dir.display()
+            ),
+            Self::NotDirectory(path) => write!(formatter, "{} is not a directory", path.display()),
+            Self::Foreign { path, uid } => write!(
+                formatter,
+                "{} belongs to uid {uid}, not the core; remove it as its owner",
+                path.display()
+            ),
+            Self::NotRegular(path) => write!(
+                formatter,
+                "{} is not a regular file; zmx would follow or block on it",
+                path.display()
+            ),
+            Self::HardLinked { path, links } => write!(
+                formatter,
+                "{} has {links} links; zmx would append to every one",
+                path.display()
+            ),
+            Self::Io { path, error } => write!(formatter, "{}: {error}", path.display()),
+        }
+    }
+}
+
+fn io_refusal(path: &Path) -> impl Fn(io::Error) -> LogRefusal + '_ {
+    move |error| LogRefusal::Io {
+        path: path.to_path_buf(),
+        error: error.to_string(),
+    }
+}
+
+/// The shared directory itself: a directory whose group cannot rename entries it does not own.
+pub fn check_shared_dir(kind_is_dir: bool, mode: u32, dir: &Path) -> Result<(), LogRefusal> {
+    if !kind_is_dir {
+        return Err(LogRefusal::NotDirectory(dir.to_path_buf()));
+    }
+    if mode & GROUP_WRITE != 0 && mode & STICKY == 0 {
+        return Err(LogRefusal::NotSticky {
+            dir: dir.to_path_buf(),
+            mode: mode & 0o7777,
+        });
+    }
+    Ok(())
+}
+
+/// The opened log directory: a directory of the core's; its mode is then set exactly.
+pub fn check_log_dir(
+    kind_is_dir: bool,
+    uid: u32,
+    core_uid: u32,
+    path: &Path,
+) -> Result<(), LogRefusal> {
+    if !kind_is_dir {
+        return Err(LogRefusal::NotDirectory(path.to_path_buf()));
+    }
+    if uid != core_uid {
+        return Err(LogRefusal::Foreign {
+            path: path.to_path_buf(),
+            uid,
+        });
+    }
+    Ok(())
+}
+
+/// The opened log: a regular file of the core's with one link; its mode is then set exactly.
+pub fn check_log_file(
+    kind_is_file: bool,
+    uid: u32,
+    links: u64,
+    core_uid: u32,
+    path: &Path,
+) -> Result<(), LogRefusal> {
+    if !kind_is_file {
+        return Err(LogRefusal::NotRegular(path.to_path_buf()));
+    }
+    if uid != core_uid {
+        return Err(LogRefusal::Foreign {
+            path: path.to_path_buf(),
+            uid,
+        });
+    }
+    if links != 1 {
+        return Err(LogRefusal::HardLinked {
+            path: path.to_path_buf(),
+            links,
+        });
+    }
+    Ok(())
+}
+
+fn set_exact_mode(file: &File, mode: u32, path: &Path) -> Result<(), LogRefusal> {
+    let found = file.metadata().map_err(io_refusal(path))?.mode() & 0o7777;
+    if found != mode {
+        file.set_permissions(Permissions::from_mode(mode))
+            .map_err(io_refusal(path))?;
+    }
+    Ok(())
+}
+
+/// Opens an existing log directory without following a link, or creates it new.
+fn open_log_dir(path: &Path) -> Result<File, LogRefusal> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => DirBuilder::new()
+            .mode(CREATE_DIR_MODE)
+            .create(path)
+            .map_err(io_refusal(path))?,
+        Err(error) => return Err(io_refusal(path)(error)),
+    }
+    OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY | OFlag::O_NONBLOCK).bits())
+        .open(path)
+        .map_err(|error| match error.raw_os_error() {
+            Some(code) if code == libc_eloop() || code == libc_enotdir() => {
+                LogRefusal::NotDirectory(path.to_path_buf())
+            }
+            _ => io_refusal(path)(error),
+        })
+}
+
+/// Opens an existing log without following a link or blocking on a FIFO, or creates it new.
+fn open_log_file(path: &Path) -> Result<File, LogRefusal> {
+    let flags = (OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK).bits();
+    let opened = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .custom_flags(flags)
+        .open(path);
+    match opened {
+        Ok(file) => Ok(file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create_new(true)
+            .mode(CREATE_FILE_MODE)
+            .custom_flags(flags)
+            .open(path)
+            .map_err(io_refusal(path)),
+        Err(error) if error.raw_os_error() == Some(libc_eloop()) => {
+            Err(LogRefusal::NotRegular(path.to_path_buf()))
+        }
+        Err(error) => Err(io_refusal(path)(error)),
+    }
+}
+
+const fn libc_eloop() -> i32 {
+    nix::errno::Errno::ELOOP as i32
+}
+
+const fn libc_enotdir() -> i32 {
+    nix::errno::Errno::ENOTDIR as i32
+}
+
+/// Makes the shared directory's zmx log safe for the core to append to.
+///
+/// Runs before any zmx command there: the directory sticky when its group can write it, `logs`
+/// the core's at 0750, and `zmx.log` a regular file of the core's with one link at 0660. A
+/// caller who does not own the shared directory, the agent's own launcher, has nothing of its
+/// own to protect and is left alone.
+pub fn prepare_shared_log(socket_dir: &Path) -> Result<(), LogRefusal> {
+    let core_uid = Uid::current().as_raw();
+    let shared = fs::symlink_metadata(socket_dir).map_err(io_refusal(socket_dir))?;
+    if shared.uid() != core_uid {
+        return Ok(());
+    }
+    check_shared_dir(shared.file_type().is_dir(), shared.mode(), socket_dir)?;
+    let dir_path = socket_dir.join(LOG_DIR);
+    let dir = open_log_dir(&dir_path)?;
+    let facts = dir.metadata().map_err(io_refusal(&dir_path))?;
+    check_log_dir(facts.file_type().is_dir(), facts.uid(), core_uid, &dir_path)?;
+    set_exact_mode(&dir, LOG_DIR_MODE, &dir_path)?;
+    let file_path = dir_path.join(LOG_FILE);
+    let file = open_log_file(&file_path)?;
+    let facts = file.metadata().map_err(io_refusal(&file_path))?;
+    check_log_file(
+        facts.file_type().is_file(),
+        facts.uid(),
+        facts.nlink(),
+        core_uid,
+        &file_path,
+    )?;
+    set_exact_mode(&file, LOG_FILE_MODE, &file_path)
+}
+
 #[derive(Debug)]
 pub enum ZmxError {
+    Log(LogRefusal),
     Command(CommandError),
     List(ListError),
     RunFailed(ExitStatus),
+    /// `zmx run` through sudo as the agent failed; sudo's refusal is not captured, since the
+    /// session daemon would inherit a capture pipe.
+    SwitchedRunFailed {
+        agent: String,
+        status: ExitStatus,
+    },
 }
 
 impl std::fmt::Display for ZmxError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Log(refusal) => write!(formatter, "{refusal}"),
             Self::Command(error) => write!(formatter, "{error}"),
             Self::List(ListError::TooManySessions(count)) => write!(
                 formatter,
                 "zmx list has {count} sessions; limit is {LIST_SESSIONS_MAX}"
             ),
             Self::RunFailed(status) => write!(formatter, "zmx run exited with {status}"),
+            Self::SwitchedRunFailed { agent, status } => write!(
+                formatter,
+                "sudo -n -u {agent} zmx run exited with {status}; `xtask setup` reads the \
+                 sudoers rule back and `xtask provision-agent` installs it"
+            ),
         }
     }
 }
 
-/// zmx bound to the core's own socket directory.
+/// Which socket directory a `Zmx` drives, and as whom it starts sessions there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Directory {
+    /// The core's private directory, as the caller.
+    Core,
+    /// The directory the developer's group shares with the agent. With an agent user, `run`
+    /// goes through the sudoers rule as that user; every other subcommand is the caller's,
+    /// over the socket the shared group can connect to.
+    Shared { agent: Option<String> },
+}
+
+/// zmx bound to one socket directory.
 #[derive(Debug, Clone)]
 pub struct Zmx {
     binary: PathBuf,
     socket_dir: String,
-    dir_mode: &'static str,
+    directory: Directory,
 }
 
 impl Zmx {
@@ -192,17 +466,31 @@ impl Zmx {
         Self {
             binary: binary.to_path_buf(),
             socket_dir: socket_dir.display().to_string(),
-            dir_mode: CORE_DIR_MODE,
+            directory: Directory::Core,
         }
     }
 
-    /// zmx bound to the agent socket directory, which the developer's group shares.
+    /// zmx bound to the agent socket directory, which the developer's group shares; sessions
+    /// start as the caller.
     #[must_use]
     pub fn agent(binary: &Path, socket_dir: &Path) -> Self {
         Self {
             binary: binary.to_path_buf(),
             socket_dir: socket_dir.display().to_string(),
-            dir_mode: AGENT_ZMX_DIR_MODE,
+            directory: Directory::Shared { agent: None },
+        }
+    }
+
+    /// zmx bound to the agent socket directory, starting each session as `agent` through
+    /// `sudo -n`, which the sudoers rule lets the developer run with no password.
+    #[must_use]
+    pub fn agent_as(binary: &Path, socket_dir: &Path, agent: &str) -> Self {
+        Self {
+            binary: binary.to_path_buf(),
+            socket_dir: socket_dir.display().to_string(),
+            directory: Directory::Shared {
+                agent: Some(agent.to_string()),
+            },
         }
     }
 
@@ -216,29 +504,84 @@ impl Zmx {
         &self.socket_dir
     }
 
-    const fn environment(&self) -> [(&str, &str); 2] {
-        [
-            ("ZMX_DIR", self.socket_dir.as_str()),
-            ("ZMX_DIR_MODE", self.dir_mode),
-        ]
+    /// The user `run` starts sessions as, when it is not the caller.
+    #[must_use]
+    pub fn switched_to(&self) -> Option<&str> {
+        match &self.directory {
+            Directory::Shared { agent: Some(agent) } => Some(agent),
+            Directory::Shared { agent: None } | Directory::Core => None,
+        }
+    }
+
+    fn environment(&self) -> Vec<(&str, &str)> {
+        match self.directory {
+            Directory::Core => vec![
+                ("ZMX_DIR", self.socket_dir.as_str()),
+                ("ZMX_DIR_MODE", CORE_DIR_MODE),
+            ],
+            Directory::Shared { .. } => vec![
+                ("ZMX_DIR", self.socket_dir.as_str()),
+                ("ZMX_DIR_MODE", AGENT_ZMX_DIR_MODE),
+                ("ZMX_LOG_MODE", AGENT_ZMX_LOG_MODE),
+                ("PATH", AGENT_PATH),
+            ],
+        }
+    }
+
+    /// The program and arguments that run zmx with `arguments`: directly in the core
+    /// directory; under umask 007 in the shared one, and through sudo as the agent for a
+    /// switched `run`.
+    #[must_use]
+    pub fn invocation(&self, arguments: &[&str]) -> (PathBuf, Vec<String>) {
+        let zmx = self.binary.display().to_string();
+        let words = |prefix: &[&str]| -> Vec<String> {
+            prefix
+                .iter()
+                .copied()
+                .chain(arguments.iter().copied())
+                .map(str::to_string)
+                .collect()
+        };
+        match &self.directory {
+            Directory::Core => (self.binary.clone(), words(&[])),
+            Directory::Shared { agent: Some(agent) } if arguments.first() == Some(&"run") => (
+                PathBuf::from(SHELL),
+                words(&["-c", UMASK_EXEC, SUDO, "-n", "-u", agent, "--", &zmx]),
+            ),
+            Directory::Shared { .. } => (PathBuf::from(SHELL), words(&["-c", UMASK_EXEC, &zmx])),
+        }
     }
 
     /// zmx with this directory's environment and no inherited session, for a caller that
     /// drives a subcommand this type does not wrap, such as a viewer's attach.
     #[must_use]
     pub fn command(&self, arguments: &[&str]) -> std::process::Command {
-        let mut command = std::process::Command::new(&self.binary);
+        let (program, words) = self.invocation(arguments);
+        let mut command = std::process::Command::new(program);
         command
-            .args(arguments)
+            .args(words)
             .envs(self.environment())
             .env_remove(SESSION_ENV);
         command
     }
 
+    /// Every command in the shared directory first checks the log zmx will append to.
+    fn prepare(&self) -> Result<(), ZmxError> {
+        match self.directory {
+            Directory::Core => Ok(()),
+            Directory::Shared { .. } => {
+                prepare_shared_log(Path::new(&self.socket_dir)).map_err(ZmxError::Log)
+            }
+        }
+    }
+
     fn status(&self, arguments: &[&str], max_bytes: usize) -> Result<Captured, ZmxError> {
+        self.prepare()?;
+        let (program, words) = self.invocation(arguments);
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
         command::run_status_capped(
-            &self.binary,
-            arguments,
+            &program,
+            &words,
             &self.environment(),
             &[OsString::from(SESSION_ENV)],
             COMMAND_TIMEOUT,
@@ -260,16 +603,26 @@ impl Zmx {
     }
 
     fn detached(&self, arguments: &[&str]) -> Result<(), ZmxError> {
+        self.prepare()?;
+        let (program, words) = self.invocation(arguments);
+        let words: Vec<&str> = words.iter().map(String::as_str).collect();
         let status = command::run_detached(
-            &self.binary,
-            arguments,
+            &program,
+            &words,
             &self.environment(),
             &[OsString::from(SESSION_ENV)],
             COMMAND_TIMEOUT,
         )
         .map_err(ZmxError::Command)?;
         if !status.success() {
-            return Err(ZmxError::RunFailed(status));
+            return Err(self
+                .switched_to()
+                .map_or(ZmxError::RunFailed(status), |agent| {
+                    ZmxError::SwitchedRunFailed {
+                        agent: agent.to_string(),
+                        status,
+                    }
+                }));
         }
         Ok(())
     }
@@ -588,6 +941,249 @@ mod tests {
         let entries = decode_list(&format!("{RUNNING}{RUNNING}")).unwrap();
         assert_eq!(count_named(&entries, "core.restate"), 2);
         assert_eq!(presence(&entries, "core.restate"), Presence::Unrecognised);
+    }
+
+    #[test]
+    fn only_a_switched_run_goes_through_sudo_and_every_shared_command_sets_the_umask() {
+        let zmx = Path::new("/p/zmx");
+        let dir = Path::new("/Users/Shared/tycho-agent-zmx");
+        let switched = Zmx::agent_as(zmx, dir, "tycho-agent");
+        let run = ["run", "s", "-d", "exec", "/usr/bin/env"];
+        assert_eq!(
+            switched.invocation(&run),
+            (
+                PathBuf::from("/bin/sh"),
+                [
+                    "-c",
+                    UMASK_EXEC,
+                    "/usr/bin/sudo",
+                    "-n",
+                    "-u",
+                    "tycho-agent",
+                    "--",
+                    "/p/zmx",
+                    "run",
+                    "s",
+                    "-d",
+                    "exec",
+                    "/usr/bin/env"
+                ]
+                .map(str::to_string)
+                .to_vec()
+            )
+        );
+        for arguments in [
+            &["list"][..],
+            &["kill", "s", "--force"],
+            &["history", "s"],
+            &["send", "s", "x"],
+            &["attach", "s"],
+        ] {
+            let (program, words) = switched.invocation(arguments);
+            assert_eq!(program, PathBuf::from("/bin/sh"));
+            assert_eq!(&words[..3], ["-c", UMASK_EXEC, "/p/zmx"], "{arguments:?}");
+            assert!(!words.iter().any(|word| word == "/usr/bin/sudo"));
+        }
+        let unswitched = Zmx::agent(zmx, dir);
+        assert_eq!(unswitched.switched_to(), None);
+        assert_eq!(switched.switched_to(), Some("tycho-agent"));
+        let (_, words) = unswitched.invocation(&run);
+        assert_eq!(&words[..3], ["-c", UMASK_EXEC, "/p/zmx"]);
+        let core = Zmx::new(zmx, Path::new("/h/.tycho/zmx"));
+        assert_eq!(
+            core.invocation(&["list"]),
+            (PathBuf::from("/p/zmx"), vec!["list".to_string()])
+        );
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the stand-in lives in a scratch directory no other user can write"
+    )]
+    fn a_shared_directory_command_runs_with_umask_007_and_the_shared_modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("tycho-zmx-umask-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("zmx-stand-in");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s %s %s %s %s\\n' \"$(umask)\" \"$ZMX_DIR_MODE\" \"$ZMX_LOG_MODE\" \"$PATH\" \"${ZMX_SESSION-unset}\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let shared = Zmx::agent(&script, &dir);
+        let seen = shared.history("s", COMMAND_OUTPUT_MAX_BYTES).unwrap();
+        assert_eq!(seen.trim(), "0007 0770 0660 /usr/bin:/bin unset");
+        let core = Zmx::new(&script, &dir);
+        let seen = core.history("s", COMMAND_OUTPUT_MAX_BYTES).unwrap();
+        assert!(seen.contains(" 0700 "), "{seen}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture lives in a scratch directory no other user can write"
+    )]
+    fn shared_scratch(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tzl-{test}-{}", std::process::id()));
+        if dir.exists() {
+            fs::remove_dir_all(&dir).unwrap();
+        }
+        DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        fs::set_permissions(&dir, Permissions::from_mode(0o1770)).unwrap();
+        dir
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        fs::symlink_metadata(path).unwrap().mode() & 0o7777
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture lives in a scratch directory no other user can write"
+    )]
+    fn a_fresh_shared_directory_gets_the_core_s_log_at_its_modes_and_keeps_its_content() {
+        let dir = shared_scratch("fresh");
+        prepare_shared_log(&dir).unwrap();
+        let logs = dir.join(LOG_DIR);
+        let log = logs.join(LOG_FILE);
+        assert_eq!(mode_of(&logs), LOG_DIR_MODE);
+        assert_eq!(mode_of(&log), LOG_FILE_MODE);
+        fs::write(&log, "kept\n").unwrap();
+        fs::set_permissions(&logs, Permissions::from_mode(0o770)).unwrap();
+        prepare_shared_log(&dir).unwrap();
+        assert_eq!(
+            mode_of(&logs),
+            LOG_DIR_MODE,
+            "a group-writable log directory is narrowed"
+        );
+        assert_eq!(fs::read_to_string(&log).unwrap(), "kept\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture lives in a scratch directory no other user can write"
+    )]
+    fn a_planted_link_at_the_log_is_refused_its_target_untouched_and_zmx_never_runs() {
+        let dir = shared_scratch("link");
+        prepare_shared_log(&dir).unwrap();
+        let target = dir.join("developer-file");
+        fs::write(&target, "keep\n").unwrap();
+        let log = dir.join(LOG_DIR).join(LOG_FILE);
+        fs::remove_file(&log).unwrap();
+        std::os::unix::fs::symlink(&target, &log).unwrap();
+        let marker = dir.join("ran");
+        let script = dir.join("zmx-stand-in");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho appended >> \"$ZMX_DIR/logs/zmx.log\"; : > {}\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, Permissions::from_mode(0o700)).unwrap();
+        let zmx = Zmx::agent(&script, &dir);
+        assert!(matches!(
+            zmx.list(),
+            Err(ZmxError::Log(LogRefusal::NotRegular(_)))
+        ));
+        assert!(matches!(
+            zmx.run_words("s", &["/bin/true".to_string()]),
+            Err(ZmxError::Log(LogRefusal::NotRegular(_)))
+        ));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep\n");
+        assert!(!marker.exists(), "zmx ran against a planted log");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture lives in a scratch directory no other user can write"
+    )]
+    fn a_hard_linked_or_fifo_log_and_a_linked_log_directory_are_refused() {
+        let dir = shared_scratch("links");
+        prepare_shared_log(&dir).unwrap();
+        let log = dir.join(LOG_DIR).join(LOG_FILE);
+        let other = dir.join("other-name");
+        fs::hard_link(&log, &other).unwrap();
+        assert!(matches!(
+            prepare_shared_log(&dir),
+            Err(LogRefusal::HardLinked { links: 2, .. })
+        ));
+        fs::remove_file(&other).unwrap();
+        fs::remove_file(&log).unwrap();
+        nix::unistd::mkfifo(&log, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        assert!(matches!(
+            prepare_shared_log(&dir),
+            Err(LogRefusal::NotRegular(_))
+        ));
+        fs::remove_dir_all(dir.join(LOG_DIR)).unwrap();
+        let elsewhere = dir.join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir.join(LOG_DIR)).unwrap();
+        assert!(matches!(
+            prepare_shared_log(&dir),
+            Err(LogRefusal::NotDirectory(_))
+        ));
+        assert!(!elsewhere.join(LOG_FILE).exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture lives in a scratch directory no other user can write"
+    )]
+    fn a_group_writable_shared_directory_needs_the_sticky_bit() {
+        let dir = shared_scratch("sticky");
+        fs::set_permissions(&dir, Permissions::from_mode(0o2770)).unwrap();
+        assert!(matches!(
+            prepare_shared_log(&dir),
+            Err(LogRefusal::NotSticky { .. })
+        ));
+        assert!(!dir.join(LOG_DIR).exists());
+        fs::set_permissions(&dir, Permissions::from_mode(0o3770)).unwrap();
+        prepare_shared_log(&dir).unwrap();
+        fs::set_permissions(&dir, Permissions::from_mode(0o750)).unwrap();
+        prepare_shared_log(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_log_or_log_directory_of_another_user_is_refused() {
+        let path = Path::new("/shared/logs");
+        assert_eq!(check_log_dir(true, 501, 501, path), Ok(()));
+        assert!(matches!(
+            check_log_dir(true, 503, 501, path),
+            Err(LogRefusal::Foreign { uid: 503, .. })
+        ));
+        assert!(matches!(
+            check_log_dir(false, 501, 501, path),
+            Err(LogRefusal::NotDirectory(_))
+        ));
+        assert_eq!(check_log_file(true, 501, 1, 501, path), Ok(()));
+        assert!(matches!(
+            check_log_file(true, 503, 1, 501, path),
+            Err(LogRefusal::Foreign { uid: 503, .. })
+        ));
+        assert!(matches!(
+            check_log_file(false, 501, 1, 501, path),
+            Err(LogRefusal::NotRegular(_))
+        ));
+        assert!(matches!(
+            check_shared_dir(true, 0o40770, path),
+            Err(LogRefusal::NotSticky { mode: 0o770, .. })
+        ));
+        assert_eq!(check_shared_dir(true, 0o43770, path), Ok(()));
     }
 
     #[test]

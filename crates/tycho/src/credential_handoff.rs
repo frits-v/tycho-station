@@ -2,9 +2,12 @@
 //! step binds in the core's spec directory for one session and serves until the launcher's
 //! lease appears.
 //!
-//! The core answers only a peer of the agent's uid that names the session and its secret,
-//! answers once, and then removes the socket. The launcher talks only to a peer of the core's
-//! uid. Nothing here writes the credential to a file, an argument or a log.
+//! The core answers only a peer of the agent's uid whose pid is the launcher's as `zmx list`
+//! reports it, and which names the session and its secret; it answers once, and then removes
+//! the socket. The session secret sits in a spec any process of the agent's uid can read, so the
+//! uid and the secret alone would answer any of them. A connection that arrives before the spawn
+//! step has read the launcher's pid is held until it has. The launcher talks only to a peer of
+//! the core's uid. Nothing here writes the credential to a file, an argument or a log.
 
 use std::fmt;
 use std::fs;
@@ -13,7 +16,7 @@ use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -40,6 +43,17 @@ const ACCEPT_POLL: Duration = Duration::from_millis(50);
 /// The server's own bound: the spawn step stops it sooner, once the lease appears.
 pub const SERVE_POLLS_MAX: u32 = 600;
 const STREAM_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the launcher waits for its answer: the server may hold its connection until the
+/// spawn step has read the launcher's pid from `zmx list`.
+pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the server holds a connection for the launcher's pid: the launcher's answer wait,
+/// less the stream timeout the request and the answer each get after it.
+pub const HOLD_MAX: Duration = ANSWER_TIMEOUT
+    .saturating_sub(STREAM_TIMEOUT)
+    .saturating_sub(STREAM_TIMEOUT);
+
+/// Pid 0 is never a process `zmx list` reports, and stands for a pid not yet read.
+const LAUNCHER_PID_UNKNOWN: u32 = 0;
 
 /// Hex digits of the session name's SHA-256 in the socket's name.
 const SOCKET_NAME_HEX: usize = 16;
@@ -88,8 +102,17 @@ pub enum HandoffOutcome {
 /// Why one connection was not answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
-    PeerUid { found: u32 },
+    PeerUid {
+        found: u32,
+    },
     PeerUnknown(String),
+    /// The peer is not the process `zmx list` reports for the session.
+    PeerPid {
+        found: u32,
+        expected: u32,
+    },
+    /// The spawn step did not read the launcher's pid within the hold.
+    LauncherUnknown,
     Request(String),
     Session,
     Secret,
@@ -161,20 +184,71 @@ fn read_bounded(stream: &mut UnixStream, max: usize) -> io::Result<Option<Vec<u8
     Ok(Some(bytes))
 }
 
+/// The pid of the process at the other end of a connected Unix socket, as the kernel recorded
+/// it at connect.
+#[cfg(target_os = "macos")]
+pub fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
+    let pid = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerPid)
+        .map_err(io::Error::from)?;
+    u32::try_from(pid).map_err(|_| io::Error::other(format!("peer pid {pid}")))
+}
+
+/// The pid of the process at the other end of a connected Unix socket, as the kernel recorded
+/// it at connect.
+#[cfg(target_os = "linux")]
+pub fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
+    let pid = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
+        .map(|credentials| credentials.pid())
+        .map_err(io::Error::from)?;
+    u32::try_from(pid).map_err(|_| io::Error::other(format!("peer pid {pid}")))
+}
+
 /// What the server answers with, and to whom.
 struct Grant {
     agent_uid: u32,
+    /// The launcher's pid from `zmx list`, `LAUNCHER_PID_UNKNOWN` until the spawn step reads it.
+    launcher_pid: Arc<AtomicU32>,
+    hold: Duration,
     session: SessionName,
     secret: SessionSecret,
     credential: Credential,
 }
 
 impl Grant {
+    /// The launcher's pid, waiting for the spawn step within the hold; `None` past it or once
+    /// the server is told to stop.
+    fn launcher_pid(&self, stop: &AtomicBool) -> Option<u32> {
+        let polls = self
+            .hold
+            .as_millis()
+            .checked_div(ACCEPT_POLL.as_millis())
+            .unwrap_or(0);
+        for _ in 0..=polls {
+            let pid = self.launcher_pid.load(Ordering::SeqCst);
+            if pid != LAUNCHER_PID_UNKNOWN {
+                return Some(pid);
+            }
+            if stop.load(Ordering::SeqCst) {
+                return None;
+            }
+            thread::sleep(ACCEPT_POLL);
+        }
+        None
+    }
+
     /// Answers one connection, or names why it was refused.
-    fn answer(&self, stream: &mut UnixStream) -> Result<(), Refusal> {
+    fn answer(&self, stream: &mut UnixStream, stop: &AtomicBool) -> Result<(), Refusal> {
         let found = peer_uid(stream).map_err(|error| Refusal::PeerUnknown(error.to_string()))?;
         if found != self.agent_uid {
             return Err(Refusal::PeerUid { found });
+        }
+        let peer = peer_pid(stream).map_err(|error| Refusal::PeerUnknown(error.to_string()))?;
+        let expected = self.launcher_pid(stop).ok_or(Refusal::LauncherUnknown)?;
+        if peer != expected {
+            return Err(Refusal::PeerPid {
+                found: peer,
+                expected,
+            });
         }
         let request = read_bounded(stream, REQUEST_MAX_BYTES)
             .map_err(|error| Refusal::Request(error.to_string()))?
@@ -200,9 +274,9 @@ impl Grant {
     }
 }
 
-fn configure(stream: &UnixStream) -> io::Result<()> {
+fn configure(stream: &UnixStream, read_timeout: Duration) -> io::Result<()> {
     stream.set_nonblocking(false)?;
-    stream.set_read_timeout(Some(STREAM_TIMEOUT))?;
+    stream.set_read_timeout(Some(read_timeout))?;
     stream.set_write_timeout(Some(STREAM_TIMEOUT))
 }
 
@@ -214,9 +288,9 @@ fn serve_loop(listener: &UnixListener, grant: &Grant, stop: &AtomicBool) -> Hand
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let answered = configure(&stream)
+                let answered = configure(&stream, STREAM_TIMEOUT)
                     .map_err(|error| Refusal::Request(error.to_string()))
-                    .and_then(|()| grant.answer(&mut stream));
+                    .and_then(|()| grant.answer(&mut stream, stop));
                 drop(stream.shutdown(Shutdown::Both));
                 if answered.is_ok() {
                     return HandoffOutcome::Answered;
@@ -238,6 +312,7 @@ fn serve_loop(listener: &UnixListener, grant: &Grant, stop: &AtomicBool) -> Hand
 pub struct HandoffServer {
     path: PathBuf,
     stop: Arc<AtomicBool>,
+    launcher_pid: Arc<AtomicU32>,
     thread: Option<JoinHandle<HandoffOutcome>>,
 }
 
@@ -250,6 +325,18 @@ impl HandoffServer {
         session: &SessionName,
         secret: &SessionSecret,
         credential: Credential,
+    ) -> Result<Self, HandoffError> {
+        Self::start_holding(dirs, agent_uid, session, secret, credential, HOLD_MAX)
+    }
+
+    /// `start` with the hold a connection waits for the launcher's pid.
+    pub fn start_holding(
+        dirs: &AgentDirs,
+        agent_uid: u32,
+        session: &SessionName,
+        secret: &SessionSecret,
+        credential: Credential,
+        hold: Duration,
     ) -> Result<Self, HandoffError> {
         let path = socket_path(dirs, session);
         check_path(&path)?;
@@ -267,8 +354,11 @@ impl HandoffServer {
             return Err(HandoffError::Bind(path, error));
         }
         let stop = Arc::new(AtomicBool::new(false));
+        let launcher_pid = Arc::new(AtomicU32::new(LAUNCHER_PID_UNKNOWN));
         let grant = Grant {
             agent_uid,
+            launcher_pid: Arc::clone(&launcher_pid),
+            hold,
             session: session.clone(),
             secret: secret.clone(),
             credential,
@@ -278,8 +368,15 @@ impl HandoffServer {
         Ok(Self {
             path,
             stop,
+            launcher_pid,
             thread: Some(thread),
         })
+    }
+
+    /// The launcher's pid as `zmx list` reports it under the session's name; the server
+    /// answers only a connection from that process.
+    pub fn bind_launcher(&self, pid: u32) {
+        self.launcher_pid.store(pid, Ordering::SeqCst);
     }
 
     #[must_use]
@@ -340,7 +437,7 @@ pub fn fetch(
             expected: core_uid,
         });
     }
-    configure(&stream).map_err(HandoffError::Io)?;
+    configure(&stream, ANSWER_TIMEOUT).map_err(HandoffError::Io)?;
     let request = serde_json::to_vec(&Request {
         session: session.to_string(),
         secret: secret.expose().to_string(),
@@ -403,11 +500,132 @@ mod tests {
         Credential::parse(CredentialVendor::Claude, CLAUDE_TOKEN.as_bytes()).unwrap()
     }
 
+    /// A server whose launcher is this test process, as `zmx list` would report it.
+    fn started(server: Result<HandoffServer, HandoffError>) -> HandoffServer {
+        let server = server.unwrap();
+        server.bind_launcher(std::process::id());
+        server
+    }
+
+    fn fetch_here(path: &Path) -> Result<Credential, HandoffError> {
+        fetch(
+            path,
+            current_uid(),
+            &session(),
+            &secret(),
+            CredentialVendor::Claude,
+        )
+    }
+
+    #[test]
+    fn a_connection_before_the_pid_is_read_is_held_and_answered_once_it_is_the_launcher_s() {
+        let dirs = dirs("held");
+        let server =
+            HandoffServer::start(&dirs, current_uid(), &session(), &secret(), claude()).unwrap();
+        let path = server.path().to_path_buf();
+        let asking = std::thread::spawn(move || fetch_here(&path));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !asking.is_finished(),
+            "answered before the launcher's pid was read"
+        );
+        server.bind_launcher(std::process::id());
+        assert_eq!(asking.join().unwrap().unwrap().expose(), CLAUDE_TOKEN);
+        assert_eq!(server.finish(), HandoffOutcome::Answered);
+        fs::remove_dir_all(&dirs.socket_dir).unwrap();
+    }
+
+    #[test]
+    fn a_peer_that_is_not_the_listed_launcher_is_refused_even_with_the_secret() {
+        let dirs = dirs("pid");
+        let server =
+            HandoffServer::start(&dirs, current_uid(), &session(), &secret(), claude()).unwrap();
+        let other = std::process::id().wrapping_add(1);
+        server.bind_launcher(other);
+        let refused = fetch_here(server.path());
+        assert!(
+            refused.is_err(),
+            "a peer with the secret but another pid was answered"
+        );
+        assert_eq!(server.finish(), HandoffOutcome::NotAsked { refused: 1 });
+        let (mut near, _far) = UnixStream::pair().unwrap();
+        let grant = Grant {
+            agent_uid: current_uid(),
+            launcher_pid: Arc::new(AtomicU32::new(other)),
+            hold: Duration::ZERO,
+            session: session(),
+            secret: secret(),
+            credential: claude(),
+        };
+        let grant_refusal = grant.answer(&mut near, &AtomicBool::new(false));
+        assert_eq!(
+            grant_refusal,
+            Err(Refusal::PeerPid {
+                found: std::process::id(),
+                expected: other
+            })
+        );
+        fs::remove_dir_all(&dirs.socket_dir).unwrap();
+    }
+
+    #[test]
+    fn a_server_whose_launcher_pid_is_never_read_answers_nobody() {
+        let dirs = dirs("unbound");
+        let server = HandoffServer::start_holding(
+            &dirs,
+            current_uid(),
+            &session(),
+            &secret(),
+            claude(),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(fetch_here(server.path()).is_err());
+        assert_eq!(server.finish(), HandoffOutcome::NotAsked { refused: 1 });
+        let (mut near, _far) = UnixStream::pair().unwrap();
+        let grant = Grant {
+            agent_uid: current_uid(),
+            launcher_pid: Arc::new(AtomicU32::new(LAUNCHER_PID_UNKNOWN)),
+            hold: Duration::ZERO,
+            session: session(),
+            secret: secret(),
+            credential: claude(),
+        };
+        assert_eq!(
+            grant.answer(&mut near, &AtomicBool::new(false)),
+            Err(Refusal::LauncherUnknown)
+        );
+        fs::remove_dir_all(&dirs.socket_dir).unwrap();
+    }
+
+    #[test]
+    fn the_hold_leaves_the_launcher_its_request_and_answer_within_its_wait() {
+        assert_eq!(
+            HOLD_MAX
+                .saturating_add(STREAM_TIMEOUT)
+                .saturating_add(STREAM_TIMEOUT),
+            ANSWER_TIMEOUT
+        );
+        assert!(HOLD_MAX >= Duration::from_secs(5), "{HOLD_MAX:?}");
+    }
+
+    #[test]
+    fn the_peer_pid_is_the_connecting_process() {
+        let (near, far) = UnixStream::pair().unwrap();
+        assert_eq!(peer_pid(&near).unwrap(), std::process::id());
+        assert_eq!(peer_pid(&far).unwrap(), std::process::id());
+    }
+
     #[test]
     fn the_launcher_gets_the_credential_once_and_the_socket_is_gone() {
         let dirs = dirs("once");
-        let server =
-            HandoffServer::start(&dirs, current_uid(), &session(), &secret(), claude()).unwrap();
+        let server = started(HandoffServer::start(
+            &dirs,
+            current_uid(),
+            &session(),
+            &secret(),
+            claude(),
+        ));
         let path = server.path().to_path_buf();
         let mode = fs::symlink_metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, SOCKET_MODE);
@@ -436,8 +654,13 @@ mod tests {
     #[test]
     fn a_wrong_secret_or_session_is_refused_and_the_right_one_still_answered() {
         let dirs = dirs("refused");
-        let server =
-            HandoffServer::start(&dirs, current_uid(), &session(), &secret(), claude()).unwrap();
+        let server = started(HandoffServer::start(
+            &dirs,
+            current_uid(),
+            &session(),
+            &secret(),
+            claude(),
+        ));
         let path = server.path().to_path_buf();
         let wrong = SessionSecret::parse("ffffffffffffffffffffffffffffffff").unwrap();
         let refused = fetch(
@@ -490,8 +713,13 @@ mod tests {
             server.finish(),
             HandoffOutcome::NotAsked { refused: 1 }
         ));
-        let server =
-            HandoffServer::start(&dirs, current_uid(), &session(), &secret(), claude()).unwrap();
+        let server = started(HandoffServer::start(
+            &dirs,
+            current_uid(),
+            &session(),
+            &secret(),
+            claude(),
+        ));
         let refusal = fetch(
             server.path(),
             other,
@@ -509,8 +737,13 @@ mod tests {
     #[test]
     fn the_server_stops_after_its_refusal_cap() {
         let dirs = dirs("cap");
-        let server =
-            HandoffServer::start(&dirs, current_uid(), &session(), &secret(), claude()).unwrap();
+        let server = started(HandoffServer::start(
+            &dirs,
+            current_uid(),
+            &session(),
+            &secret(),
+            claude(),
+        ));
         let path = server.path().to_path_buf();
         let wrong = SessionSecret::parse("ffffffffffffffffffffffffffffffff").unwrap();
         for _ in 0..REFUSALS_MAX {
@@ -538,8 +771,13 @@ mod tests {
     fn a_codex_answer_is_refused_where_claude_was_asked_for() {
         let dirs = dirs("vendor");
         let codex = Credential::parse(CredentialVendor::Codex, CODEX_AUTH.as_bytes()).unwrap();
-        let server =
-            HandoffServer::start(&dirs, current_uid(), &session(), &secret(), codex).unwrap();
+        let server = started(HandoffServer::start(
+            &dirs,
+            current_uid(),
+            &session(),
+            &secret(),
+            codex,
+        ));
         let refusal = fetch(
             server.path(),
             current_uid(),
@@ -558,8 +796,13 @@ mod tests {
     #[test]
     fn a_dropped_server_removes_its_socket_and_a_long_path_is_refused() {
         let dirs = dirs("drop");
-        let server =
-            HandoffServer::start(&dirs, current_uid(), &session(), &secret(), claude()).unwrap();
+        let server = started(HandoffServer::start(
+            &dirs,
+            current_uid(),
+            &session(),
+            &secret(),
+            claude(),
+        ));
         let path = server.path().to_path_buf();
         drop(server);
         assert!(!path.exists());
