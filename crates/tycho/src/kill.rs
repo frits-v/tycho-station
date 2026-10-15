@@ -303,10 +303,22 @@ fn signal_if_still(zmx: &Zmx, expected: &Expected<'_>, group: bool) -> KillVerdi
     }
 }
 
-/// The throwaway session that carries one signal; no launcher's session name starts so.
-#[must_use]
-pub fn reap_session_name(pid: u32) -> String {
-    format!("reap.{pid}")
+/// Random bytes in the reap session's name, so no process of the agent's can hold the name
+/// before the core asks for it.
+const REAP_NAME_RANDOM_BYTES: usize = 8;
+
+/// The throwaway session that carries one signal: `reap.<pid>.<16 random hex digits>`. No
+/// launcher's session name starts so.
+pub fn reap_session_name(pid: u32) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut bytes = [0_u8; REAP_NAME_RANDOM_BYTES];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let suffix: String = bytes
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 0x0f])
+        .map(|nibble| char::from_digit(u32::from(nibble), 16).unwrap_or('0'))
+        .collect();
+    Ok(format!("reap.{pid}.{suffix}"))
 }
 
 /// The words the reap session types: `kill` replaces its shell, so nothing else runs there.
@@ -328,15 +340,29 @@ fn delivery_failed(why: impl std::fmt::Display) -> KillVerdict {
 
 /// Runs `/bin/kill` in a zmx session of its own, as whoever `zmx` starts sessions as.
 ///
-/// It waits for that session to end, removes it by name, and reports whether `pid` is gone. A name
-/// already listed is refused rather than typed into.
+/// It waits for that session to end, removes it by name, and reports whether `pid` is gone.
 pub fn deliver_through(
     zmx: &Zmx,
     pid: u32,
     group: bool,
     facts: &dyn Fn(u32) -> ProcessFacts,
 ) -> KillVerdict {
-    let name = reap_session_name(pid);
+    match reap_session_name(pid) {
+        Ok(name) => deliver_named(zmx, &name, pid, group, facts),
+        Err(error) => delivery_failed(format!("no random reap name: {error}")),
+    }
+}
+
+/// `deliver_through` under a given name; a name already listed is refused rather than typed
+/// into.
+fn deliver_named(
+    zmx: &Zmx,
+    name: &str,
+    pid: u32,
+    group: bool,
+    facts: &dyn Fn(u32) -> ProcessFacts,
+) -> KillVerdict {
+    let name = name.to_string();
     match zmx.list().map(|entries| presence(&entries, &name)) {
         Ok(Presence::Absent) => {}
         Ok(taken) => return delivery_failed(format!("{name} is listed already: {taken:?}")),
@@ -434,8 +460,13 @@ mod tests {
             reap_words(4242, false),
             ["exec", "/bin/kill", "-KILL", "--", "4242"]
         );
-        assert_eq!(reap_session_name(4242), "reap.4242");
-        assert!(tycho_types::session::SessionName::parse("reap.4242").is_err());
+        let first = reap_session_name(4242).unwrap();
+        let second = reap_session_name(4242).unwrap();
+        assert_ne!(first, second, "the reap name is predictable");
+        let suffix = first.strip_prefix("reap.4242.").unwrap();
+        assert_eq!(suffix.len(), REAP_NAME_RANDOM_BYTES * 2);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(tycho_types::session::SessionName::parse(&first).is_err());
     }
 
     /// A stand-in zmx that lists the sessions it was told about, and runs a `run`'s words,
@@ -478,10 +509,21 @@ mod tests {
         assert!(reaper.join().unwrap().is_ok());
         assert_eq!(verdict, KillVerdict::SignalledThroughRule);
         let runs = std::fs::read_to_string(dir.join("runs")).unwrap();
+        let lines: Vec<&str> = runs.lines().collect();
+        let [run, kill] = lines.as_slice() else {
+            panic!("{runs}");
+        };
+        let name = run
+            .strip_prefix("run ")
+            .and_then(|rest| rest.split_once(' '))
+            .map(|(name, _)| name)
+            .unwrap();
+        assert!(name.starts_with(&format!("reap.{pid}.")), "{name}");
         assert_eq!(
-            runs,
-            format!("run reap.{pid} -d exec /bin/kill -KILL -- -{pid}\nkill reap.{pid}\n")
+            *run,
+            format!("run {name} -d exec /bin/kill -KILL -- -{pid}")
         );
+        assert_eq!(*kill, format!("kill {name}"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -491,11 +533,13 @@ mod tests {
         let zmx = Zmx::agent(&reaping_zmx(&dir), &dir);
         std::fs::write(
             dir.join("listed"),
-            "  name=reap.4242\tpid=77\tclients=0\tcreated=1\n",
+            "  name=reap.4242.squatted\tpid=77\tclients=0\tcreated=1\n",
         )
         .unwrap();
         assert!(matches!(
-            deliver_through(&zmx, 4242, true, &|_| ProcessFacts::Gone),
+            deliver_named(&zmx, "reap.4242.squatted", 4242, true, &|_| {
+                ProcessFacts::Gone
+            }),
             KillVerdict::Refused(KillRefusal::DeliveryFailed(_))
         ));
         assert!(!dir.join("runs").exists(), "a listed name was typed into");

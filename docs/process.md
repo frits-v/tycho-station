@@ -119,9 +119,11 @@ developer's regular file. Two more ignored tests need no terminal. One starts a 
 through the rule with `Zmx::agent_as` running `/bin/sleep`, requires the pid `zmx list`
 reports to be the agent's and to run that program, and the session socket to be the agent's
 at 0770, then kills it by name as the developer and requires it gone. The other starts
-`tycho session-leader -- /bin/sleep` as the agent the same way and requires the kill path's
-delivery through the rule, a `reap.<pid>` session typing `exec /bin/kill -KILL -- -<group>`,
-to end the group. Both print whether a uid is the agent's, never the uid. If either fails on
+`tycho session-leader -- /bin/sleep` as the agent the same way, as a background child of a
+shell whose `$!` it prints, since the shell zmx starts already leads the pty's session and
+`setsid` refuses a session leader; it requires that child to be the agent's and to lead its
+own group, then the kill path's delivery through the rule, a `reap.<pid>.<random>` session
+typing `exec /bin/kill -KILL -- -<group>`, to end the group. Both print whether a uid is the agent's, never the uid. If either fails on
 connecting to the agent's socket, check `id` in the shell that runs the suite: a login session
 that began before the developer joined `tycho-zmx` does not list the group, while
 `id <developer>` and `dseditgroup` do; log out and in, then run the suite again.
@@ -328,7 +330,10 @@ agent's before the typed line; sudo also sets `SHELL`, `USER`, `LOGNAME`, `MAIL`
 
 Setup reads the rule back, since the developer cannot read a 0440 root file. `sudo -n -k -l`
 lists every entry of the developer with its tags and the bound defaults, one line each when
-written to a pipe; `-k` ignores a cached ticket without removing it, and with no entry that
+written to a pipe (to a terminal sudo wraps each line at the terminal's width; setup and the
+boundary suite both capture it through pipes), except that sudo 1.9.17 glues the first
+command-bound `Defaults!` line onto the last runas-bound `Defaults>` line, which the decoder
+splits; `-k` ignores a cached ticket without removing it, and with no entry that
 needs no password sudo answers `sudo: a password is required`, which reads as no rule. The
 listing must hold exactly `(tycho-agent) NOPASSWD: <pinned zmx>` and its `Defaults!<pinned zmx>`
 line with the four kept variables, `umask=0007` and `umask_override`, and no other `NOPASSWD`

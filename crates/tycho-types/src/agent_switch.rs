@@ -446,7 +446,9 @@ fn read_listing(stdout: &str, expected: &Expected<'_>) -> Listing {
                     accumulator.matching(body);
                     Ok(())
                 }
-                Section::Bound => accumulator.bound(body, expected),
+                Section::Bound => bound_lines(body)
+                    .into_iter()
+                    .try_for_each(|line| accumulator.bound(&line, expected)),
                 Section::Privileges => accumulator.privileges(body, expected),
             };
             if let Err(unread) = read {
@@ -469,11 +471,34 @@ fn read_listing(stdout: &str, expected: &Expected<'_>) -> Listing {
     })
 }
 
+/// The bound defaults one printed line holds. sudo 1.9.17 prints the runas-bound lines, then
+/// the command-bound ones, starting each type's count again, so the first command-bound line
+/// is glued onto the last runas-bound one with no line break between them
+/// (`display_bound_defaults_by_type` in `plugins/sudoers/display.c`).
+fn bound_lines(body: &str) -> Vec<String> {
+    let glue = format!("{INDENT}Defaults");
+    let mut lines = Vec::new();
+    let mut rest = body;
+    for _ in 0..body.len() {
+        match rest.find(&glue) {
+            Some(at) => {
+                let (line, tail) = rest.split_at(at);
+                lines.push(line.to_string());
+                rest = tail.strip_prefix(INDENT).unwrap_or(tail);
+            }
+            None => break,
+        }
+    }
+    lines.push(rest.to_string());
+    lines
+}
+
 /// Decodes `sudo -n -k -l` against the rule.
 ///
 /// sudo prints three sections: the matching defaults, the runas- and command-bound defaults,
-/// and the entries, one line each when its output is a pipe, as sudo 1.9.17's `display_privs`
-/// does.
+/// and the entries, as sudo 1.9.17's `display_privs` does. The decoder holds only for sudo's
+/// output to a pipe: written to a terminal, sudo wraps each line at the terminal's width.
+/// Setup and the boundary suite both capture it through pipes.
 #[must_use]
 pub fn decode_listing(
     exit: Option<i32>,
@@ -669,6 +694,23 @@ mod tests {
             "{MATCHING}{BOUND}User frits may run the following commands on h:\n    (tycho-agent) NOPASSWD: /Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx, PASSWD: /bin/sh\n"
         ));
         assert!(tag_reset.is_exact(), "{tag_reset:?}");
+    }
+
+    /// sudo 1.9.17 glues the first command-bound line onto the last runas-bound one.
+    #[test]
+    fn a_command_bound_line_glued_onto_a_runas_bound_one_is_read_as_two() {
+        let glued = |runas: &str| {
+            format!(
+                "{MATCHING}Runas and Command-specific defaults for frits:\n    Defaults>{runas}    Defaults!{ZMX} env_keep=\"HOME ZMX_DIR ZMX_DIR_MODE ZMX_LOG_MODE\", umask=0007, umask_override\n\n{PRIVILEGES}"
+            )
+        };
+        let harmless = reading(&glued("root env_keep+=SSH_AUTH_SOCK"));
+        assert!(harmless.is_exact(), "{harmless:?}");
+        let no_password = reading(&glued("root !authenticate"));
+        assert_eq!(no_password.entry, Entry::Exact);
+        assert_eq!(no_password.defaults, DefaultsLine::Exact);
+        assert_eq!(no_password.others, ["Defaults>root !authenticate"]);
+        assert!(!no_password.is_exact());
     }
 
     #[test]

@@ -760,6 +760,62 @@ fn a_session_started_through_the_rule_runs_as_the_agent() {
     );
 }
 
+/// Starts `tycho session-leader -- /bin/sleep <seconds>` as a background child of a shell and
+/// prints the child's pid, as `$!` names it. The shell zmx starts is the leader of the pty's
+/// session already, and `setsid` refuses a session leader, so a program typed with `exec`
+/// in place of the shell cannot lead a session of its own; a child can.
+const GROUP_LEADER_SCRIPT: &str =
+    "\"$0\" session-leader -- /bin/sleep \"$1\" & printf 'reap-leader %s\\n' \"$!\"; wait";
+const LEADER_MARKER: &str = "reap-leader ";
+
+fn group_leader_words(tycho: &str, seconds: &str) -> Vec<String> {
+    ["/bin/sh", "-c", GROUP_LEADER_SCRIPT, tycho, seconds]
+        .map(str::to_string)
+        .to_vec()
+}
+
+/// The pid a line of output names as the group leader; the echoed command line, whose marker
+/// is followed by the format, never matches.
+fn leader_pid(output: &str) -> Option<u32> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(LEADER_MARKER)
+            .filter(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+            .and_then(|digits| digits.parse().ok())
+    })
+}
+
+/// What `ps` says of `pid` once it leads its own group, or at the end of the session wait:
+/// `$!` names the child before its `setsid` has run.
+fn once_leading(pid: u32) -> ProcessFacts {
+    let started = std::time::Instant::now();
+    loop {
+        let facts = process_facts(pid);
+        let leads = matches!(&facts, ProcessFacts::Running(running) if running.pgid == pid);
+        if leads || started.elapsed() >= SESSION_WAIT {
+            return facts;
+        }
+        std::thread::sleep(SESSION_POLL);
+    }
+}
+
+/// The group leader's pid from the session's scrollback, within the session wait.
+fn leader_from_history(zmx: &Zmx, name: &str) -> Option<u32> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < SESSION_WAIT {
+        if let Some(pid) = zmx
+            .history(name, PROBE_OUTPUT_MAX_BYTES)
+            .ok()
+            .as_deref()
+            .and_then(leader_pid)
+        {
+            return Some(pid);
+        }
+        std::thread::sleep(SESSION_POLL);
+    }
+    None
+}
+
 /// The kill path's delivery through the rule: a group leader running as the agent, as a vendor
 /// runs under `tycho session-leader`, is killed by a throwaway session the core starts as the
 /// agent and then removes.
@@ -780,23 +836,32 @@ fn a_group_of_the_agent_is_killed_through_the_rule() {
         .display()
         .to_string();
     let name = format!("tycho-boundary-reap-{}", std::process::id());
-    let program = ["exec", &tycho, "session-leader", "--", "/bin/sleep", "600"].map(str::to_string);
+    let mut program = vec!["exec".to_string()];
+    program.extend(group_leader_words(&tycho, "600"));
     zmx.run_words(&name, &program)
         .unwrap_or_else(|error| panic!("boundary: {error}"));
-    let seen = SessionEvidence::read(&zmx, shared, &name, agent_uid);
-    let leader = match presence(&zmx.list().unwrap(), &name) {
-        Presence::Running { pid, .. } => pid,
-        other => panic!("boundary: {name} is {other:?}"),
+    let leader = leader_from_history(&zmx, &name);
+    let (leader_is_agent, leads_its_group, command) = match leader.map(once_leading) {
+        Some(ProcessFacts::Running(facts)) => (
+            facts.uid == agent_uid,
+            Some(facts.pgid) == leader,
+            facts.command,
+        ),
+        other => (false, false, format!("{other:?}")),
     };
-    let verdict = tycho::kill::deliver_through(&zmx, leader, true, &process_facts);
+    let verdict = leader.map(|pid| tycho::kill::deliver_through(&zmx, pid, true, &process_facts));
     let removed = zmx.kill(&name);
     println!(
-        "evidence: the group leader is the agent's {}, runs {:?}; the kill through the rule: \
-         {verdict:?}; {name} removed: {removed:?}",
-        seen.listed_is_agent, seen.command
+        "evidence: the group leader is the agent's {leader_is_agent}, leads its group \
+         {leads_its_group}, runs {command:?}; the kill through the rule: {verdict:?}; {name} \
+         removed: {removed:?}"
     );
-    assert!(seen.listed_is_agent, "the group leader is not the agent's");
-    assert_eq!(verdict, tycho::kill::KillVerdict::SignalledThroughRule);
+    assert!(leader_is_agent, "the group leader is not the agent's");
+    assert!(leads_its_group, "the child does not lead its own group");
+    assert_eq!(
+        verdict,
+        Some(tycho::kill::KillVerdict::SignalledThroughRule)
+    );
 }
 
 /// The gate's throwaway directories, removed when the test ends.
@@ -1171,6 +1236,80 @@ mod probes {
             matches!(refused, Outcome::Denied(Refusal::ConnectionRefused, _)),
             "{refused:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod group_leader {
+    //! The reap test's program run as the test's own user, under a session leader as zmx runs
+    //! its shell.
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
+
+    #[test]
+    fn a_program_typed_with_exec_in_a_session_leader_cannot_lead_a_session() {
+        let status = Command::new(TYCHO)
+            .args([
+                "session-leader",
+                "--",
+                "/bin/sh",
+                "-c",
+                "exec \"$0\" session-leader -- /bin/sleep 1",
+                TYCHO,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "setsid succeeded in a session leader");
+    }
+
+    #[test]
+    fn a_child_of_a_session_leader_leads_its_own_group_and_names_its_pid() {
+        let mut shell = Command::new(TYCHO)
+            .arg("session-leader")
+            .arg("--")
+            .args(group_leader_words(TYCHO, "30"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(shell.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let leader = leader_pid(&line).unwrap_or_else(|| panic!("no leader in {line:?}"));
+        let facts = once_leading(leader);
+        let killed = tycho::process::send(leader, true, nix::sys::signal::Signal::SIGKILL);
+        let ended = shell.wait();
+        match facts {
+            ProcessFacts::Running(facts) => {
+                assert_eq!(facts.pgid, leader, "the child is not its group's leader");
+                assert!(facts.command.contains("sleep 30"), "{}", facts.command);
+            }
+            other => panic!("ps answered {other:?}"),
+        }
+        assert!(killed.is_ok(), "{killed:?}");
+        assert!(ended.is_ok());
+    }
+
+    #[test]
+    fn only_a_marker_followed_by_digits_names_the_leader() {
+        assert_eq!(leader_pid("reap-leader 4242\r\n"), Some(4242));
+        assert_eq!(
+            leader_pid("$ /bin/sh -c '\"$0\" ... printf '\\''reap-leader %s\\n'"),
+            None
+        );
+        assert_eq!(
+            leader_pid("reap-leader %s\\n' \"$!\"; wait\nreap-leader 7\n"),
+            Some(7)
+        );
+        assert_eq!(leader_pid("reap-leader \n"), None);
     }
 }
 
