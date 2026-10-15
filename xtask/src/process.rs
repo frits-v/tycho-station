@@ -6,7 +6,7 @@ use std::io::{PipeReader, Read, Write};
 use std::process::{ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -96,6 +96,111 @@ fn run_merged<W: Write + Send + 'static>(
         stdout,
         stderr: String::new(),
     }
+}
+
+/// A run whose stdout lines were timed: the run, and when each line had arrived, measured from
+/// the spawn. Past `LINE_TIMES_MAX` lines the rest carry no time.
+#[derive(Debug)]
+pub struct TimedLines {
+    pub captured: Captured,
+    pub line_ends: Vec<Duration>,
+}
+
+const LINE_TIMES_MAX: usize = 1 << 18;
+
+/// Runs a command with stdin closed and stderr inherited, capturing stdout up to `max_bytes`
+/// and the time each of its lines arrived.
+pub fn run_bounded_timed_lines(
+    command: &mut Command,
+    timeout: Duration,
+    max_bytes: u64,
+) -> TimedLines {
+    println!("xtask: {}", describe(command));
+    let spawned = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            return TimedLines {
+                captured: Captured {
+                    exit: Exit::NotStarted(error.to_string()),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                },
+                line_ends: Vec::new(),
+            }
+        }
+    };
+    let started = Instant::now();
+    let (times_sender, times_receiver) = mpsc::channel();
+    let reader = child
+        .stdout
+        .take()
+        .map(|pipe| read_timed(pipe, max_bytes, started, times_sender));
+    let exit = wait_with_deadline(&mut child, timeout);
+    let (stdout, exit) = collect(reader, exit);
+    TimedLines {
+        captured: Captured {
+            exit,
+            stdout,
+            stderr: String::new(),
+        },
+        line_ends: times_receiver.try_recv().unwrap_or_default(),
+    }
+}
+
+fn read_timed(
+    pipe: ChildStdout,
+    max_bytes: u64,
+    started: Instant,
+    times: mpsc::Sender<Vec<Duration>>,
+) -> ReaderResult {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut line_ends = Vec::new();
+        let mut limited = pipe.take(max_bytes.saturating_add(1));
+        let mut chunk = [0_u8; 8192];
+        let mut state = None;
+        let mut reading = true;
+        while reading {
+            match limited.read(&mut chunk) {
+                Ok(0) => reading = false,
+                Ok(count) => {
+                    let part = chunk.get(..count).unwrap_or_default();
+                    let arrived = started.elapsed();
+                    let lines = part.iter().fold(0_usize, |lines, byte| {
+                        lines.saturating_add(usize::from(*byte == b'\n'))
+                    });
+                    let room = LINE_TIMES_MAX.saturating_sub(line_ends.len());
+                    line_ends.extend(std::iter::repeat_n(arrived, lines.min(room)));
+                    kept.extend_from_slice(part);
+                }
+                Err(_) => {
+                    state = Some(Exit::OutputUnreadable);
+                    reading = false;
+                }
+            }
+        }
+        let mut rest = limited.into_inner();
+        if std::io::copy(&mut rest, &mut std::io::sink()).is_err() {
+            state = Some(Exit::OutputUnreadable);
+        }
+        if u64::try_from(kept.len()).map_or(true, |n| n > max_bytes) {
+            state = Some(Exit::OutputTooLarge);
+        }
+        // The times go first, so they are there once the collector has the text.
+        if times.send(line_ends).is_err() {
+            eprintln!("xtask: line times arrived after the reader deadline");
+        }
+        if sender.send((kept, state)).is_err() {
+            eprintln!("xtask: output arrived after the reader deadline");
+        }
+    });
+    receiver
 }
 
 type ReaderResult = mpsc::Receiver<(Vec<u8>, Option<Exit>)>;
@@ -322,6 +427,37 @@ mod tests {
         assert_eq!(large.exit, Exit::OutputTooLarge);
         let missing = run_bounded(&mut Command::new("no-such-program-xtask"), QUICK_TIMEOUT);
         assert!(matches!(missing.exit, Exit::NotStarted(_)));
+    }
+
+    #[test]
+    fn timed_lines_carry_when_each_line_arrived_and_the_cap_is_the_callers() {
+        let timed = run_bounded_timed_lines(
+            Command::new("sh").args(["-c", "echo one; sleep 0.4; echo two"]),
+            QUICK_TIMEOUT,
+            1024,
+        );
+        assert_eq!(timed.captured.exit, Exit::Code(0));
+        assert_eq!(timed.captured.stdout, "one\ntwo\n");
+        assert_eq!(timed.line_ends.len(), 2);
+        let gap = timed
+            .line_ends
+            .get(1)
+            .unwrap()
+            .saturating_sub(*timed.line_ends.first().unwrap());
+        assert!(gap >= Duration::from_millis(300), "{gap:?}");
+        let over = run_bounded_timed_lines(
+            Command::new("sh").args(["-c", "head -c 2048 /dev/zero"]),
+            QUICK_TIMEOUT,
+            1024,
+        );
+        assert_eq!(over.captured.exit, Exit::OutputTooLarge);
+        let missing = run_bounded_timed_lines(
+            &mut Command::new("no-such-program-xtask"),
+            QUICK_TIMEOUT,
+            1024,
+        );
+        assert!(matches!(missing.captured.exit, Exit::NotStarted(_)));
+        assert!(missing.line_ends.is_empty());
     }
 
     #[test]

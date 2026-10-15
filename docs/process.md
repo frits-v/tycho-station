@@ -706,12 +706,40 @@ check out, build and run it.
 
 When `LANGFUSE_BASE_URL`, `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are all set, the
 xtask sends one trace per run to `<base>/api/public/otel/v1/traces` as OTLP/JSON, with Basic
-authentication and `x-langfuse-ingestion-version: 4`. The root span is the review (input the
-commit range, output the verdict and its reason, the counts as metadata) and each pass is a
-generation span with its instructions, its output, the model alias, its token counts and its
-cost. Runs of one pull request share the session `owner/name#<number>`; a dry run's session is
+authentication and `x-langfuse-ingestion-version: 4`, at most 100 spans per request. Runs of
+one pull request share the session `owner/name#<number>`; a dry run's session is
 `dry-run:<head>`. Each trace is tagged `post` or `dry-run`. None of the three set means no
 trace; some but not all is an error.
+
+- The root span is the review: its input the pull request, the commit range and the diff;
+  its output the verdict and its reason; the counts, the candidates and the confirmed as
+  metadata.
+- Each pass is an agent span: its input the values its template was rendered with, its
+  output the structured answer or how the run ended, and its model, cost, token counts,
+  turns and tool calls as metadata.
+- Each assistant message of a pass is a generation linked to the prompt version it ran,
+  with the resolved model, its token counts and its output: the thinking summary, the text
+  and the tool calls. The CLI runs with `--output-format stream-json --verbose
+  --include-partial-messages --thinking-display summarized`. Without `--thinking-display` a
+  headless run's thinking blocks carry no text; a block the server sent without a summary
+  shows as omitted. A message's final output count arrives only in its `message_delta`
+  partial event; a message the run ended before then keeps its first count, marked partial.
+  Each message carries a share of the pass's `total_cost_usd`, split by its tokens at
+  the price ratios of input, output, cache reads and one-hour cache writes, so the trace's
+  cost is the CLI's figure; the thinking-token estimate is metadata, since thinking tokens
+  are part of the output count.
+- Each tool call is a tool span under its message, with the tool's input and the first
+  16 KiB of its result, the full size beside it.
+- Events in the stream the decoder does not know are counted and named on the pass, never
+  dropped silently.
+
+The two templates, `xtask/prompts/review-find.md` and `review-verify.md`, are registered in
+Langfuse's prompt management as text prompts `review-find` and `review-verify`, their
+configuration the model, the limits and the output schema. Each run reads the version
+labelled `latest` and creates a new one when the text or configuration differs, so the
+repository stays the templates' source and every version a run used is in Langfuse. A
+registration that fails leaves that pass unlinked and fails the run's exit code, as a failed
+export does.
 
 ### Setup, once
 
