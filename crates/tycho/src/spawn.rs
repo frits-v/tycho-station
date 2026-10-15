@@ -5,12 +5,13 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, DirBuilder};
+use std::fs::{self, DirBuilder, OpenOptions, Permissions};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::thread;
 
+use nix::fcntl::OFlag;
 use nix::unistd::Uid;
 use tycho_types::envelope::ShortText;
 use tycho_types::launcher::{AwaitableDigest, LauncherEnv};
@@ -36,7 +37,7 @@ use crate::launcher::{
 use crate::private_dir;
 use crate::process::now_unix_ms;
 use crate::services::spawner::{LeaseRead, SpawnerError};
-use crate::zmx::{presence, Presence, Zmx};
+use crate::zmx::{prepare_shared_log, presence, Presence, Zmx};
 
 /// Enabled, no unsandboxed retry, fail if unavailable, no excluded commands, and a network
 /// allowlist that admits nothing until the adapter names the hosts a worker needs.
@@ -44,6 +45,9 @@ pub const CLAUDE_SANDBOX_SETTINGS: &str = r#"{"sandbox":{"enabled":true,"failIfU
 pub const SCROLLBACK_MAX_BYTES: usize = 4 * 1024 * 1024;
 const OTHER_BITS: u32 = 0o007;
 const GROUP_WRITE_BIT: u32 = 0o020;
+/// The shared directory's group can write it, so it is sticky: the agent cannot rename or
+/// remove the core's entries there.
+const STICKY_BIT: u32 = 0o1000;
 /// Only the core writes specs; the agent's group reads them.
 pub const SPEC_DIR_MODE: u32 = 0o750;
 /// Readable by the agent's group until the core removes it once the lease appears.
@@ -179,21 +183,41 @@ pub fn spawn_session(request: &SpawnRequest<'_>) -> Result<SpawnOutcome, Spawner
     start_detached(request).map(|pid| SpawnOutcome::Spawned { pid })
 }
 
-/// Creates the agent directories group-shared, refusing any another user can reach.
+/// Sets a directory this call just created to its exact mode on a descriptor opened without
+/// following a link: `mkdir` applies the umask and, on macOS, drops the sticky bit.
+fn set_created_mode(dir: &Path, mode: u32) -> Result<(), SpawnerError> {
+    let opened = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY | OFlag::O_NONBLOCK).bits())
+        .open(dir)
+        .and_then(|directory| {
+            directory.set_permissions(Permissions::from_mode(mode))?;
+            Ok(directory)
+        });
+    opened
+        .map(drop)
+        .map_err(|error| transient(format!("{}: {error}", dir.display())))
+}
+
+/// Creates the agent directories group-shared, refusing any another user can reach, then
+/// prepares the zmx log there.
 pub fn ensure_agent_dirs(dirs: &AgentDirs) -> Result<(), SpawnerError> {
     let current = Uid::current().as_raw();
     for (dir, mode) in [
-        (dirs.socket_dir.clone(), AGENT_DIR_MODE),
+        (dirs.socket_dir.clone(), AGENT_DIR_MODE | STICKY_BIT),
         (dirs.lease_dir(), AGENT_DIR_MODE),
         (dirs.spool_root(), AGENT_DIR_MODE),
         (dirs.spec_dir(), SPEC_DIR_MODE),
     ] {
         match fs::symlink_metadata(&dir) {
             Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => DirBuilder::new()
-                .mode(mode)
-                .create(&dir)
-                .map_err(|error| transient(format!("{}: {error}", dir.display())))?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                DirBuilder::new()
+                    .mode(mode & 0o777)
+                    .create(&dir)
+                    .map_err(|error| transient(format!("{}: {error}", dir.display())))?;
+                set_created_mode(&dir, mode)?;
+            }
             Err(error) => return Err(transient(error)),
         }
         let metadata = fs::symlink_metadata(&dir).map_err(transient)?;
@@ -209,7 +233,8 @@ pub fn ensure_agent_dirs(dirs: &AgentDirs) -> Result<(), SpawnerError> {
             )));
         }
     }
-    Ok(())
+    prepare_shared_log(&dirs.socket_dir)
+        .map_err(|refusal| SpawnerError::Refused(refusal.to_string()))
 }
 
 /// A pty in canonical mode keeps 1024 bytes of one typed line; the rest is lost.
@@ -334,14 +359,17 @@ pub fn start_detached(request: &SpawnRequest<'_>) -> Result<u32, SpawnerError> {
         drop(fs::remove_file(&spec_path));
         return Err(transient(error));
     }
-    let pid = wait_for_pid(request, &name);
+    let found = wait_for_pid(request, &name);
+    if let (Some(server), Ok(Found::Listed(pid))) = (handoff.as_ref(), found.as_ref()) {
+        server.bind_launcher(*pid);
+    }
     remove_spec_after_lease(request, &spec_path, handoff.as_ref());
     // A launcher that got no credential refuses to start its vendor and reports that as its
     // exit state, so the outcome here only closes the socket.
     if let Some(server) = handoff {
         drop(server.finish());
     }
-    pid
+    found.map(Found::pid)
 }
 
 /// Binds the session's hand-off socket before the launcher can look for it.
@@ -402,11 +430,28 @@ fn write_spec(path: &Path, spec: &LaunchSpec) -> Result<(), SpawnerError> {
         .map_err(|error| SpawnerError::Refused(format!("{}: {error}", path.display())))
 }
 
-fn wait_for_pid(request: &SpawnRequest<'_>, name: &str) -> Result<u32, SpawnerError> {
+/// Where the spawned launcher's pid came from. Only a pid `zmx list` reports for a running
+/// session is the launcher's; a lease's pid is the agent's own word, a hint, never bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Found {
+    Listed(u32),
+    FromLease(u32),
+}
+
+impl Found {
+    #[must_use]
+    pub const fn pid(self) -> u32 {
+        match self {
+            Self::Listed(pid) | Self::FromLease(pid) => pid,
+        }
+    }
+}
+
+fn wait_for_pid(request: &SpawnRequest<'_>, name: &str) -> Result<Found, SpawnerError> {
     for _ in 0..SESSION_WAIT_POLLS_MAX {
         let entries = request.zmx.list().map_err(transient)?;
         match presence(&entries, name) {
-            Presence::Running { pid, .. } => return Ok(pid),
+            Presence::Running { pid, .. } => return Ok(Found::Listed(pid)),
             Presence::Ended { pid } => return ended_launcher(request, pid),
             Presence::Absent => {}
             Presence::Unrecognised => return Err(transient("zmx list is unrecognised")),
@@ -415,7 +460,7 @@ fn wait_for_pid(request: &SpawnRequest<'_>, name: &str) -> Result<u32, SpawnerEr
             read_lease(request.dirs, &request.env.session_name, request.agent_uid)
         {
             if *lease.awaitable_sha256() == AwaitableDigest::of(&request.env.awaitable_id) {
-                return Ok(lease.pid());
+                return Ok(Found::FromLease(lease.pid()));
             }
         }
         thread::sleep(POLL_INTERVAL);
@@ -424,12 +469,12 @@ fn wait_for_pid(request: &SpawnRequest<'_>, name: &str) -> Result<u32, SpawnerEr
 }
 
 /// A launcher that already ended counts as spawned only if it wrote this awaitable's lease.
-fn ended_launcher(request: &SpawnRequest<'_>, pid: u32) -> Result<u32, SpawnerError> {
+fn ended_launcher(request: &SpawnRequest<'_>, pid: u32) -> Result<Found, SpawnerError> {
     match read_lease(request.dirs, &request.env.session_name, request.agent_uid) {
         LeaseRead::Present { lease }
             if *lease.awaitable_sha256() == AwaitableDigest::of(&request.env.awaitable_id) =>
         {
-            Ok(lease.pid())
+            Ok(Found::FromLease(lease.pid()))
         }
         _ => Err(SpawnerError::Refused(format!(
             "launcher pid {pid} ended without writing its lease"
@@ -782,6 +827,23 @@ mod tests {
     }
 
     #[test]
+    fn the_identity_switch_adds_nothing_to_the_typed_line() {
+        let dirs = AgentDirs::new(PathBuf::from("/Users/Shared/tycho-agent-zmx")).unwrap();
+        let zmx = Zmx::agent(Path::new("/opt/zmx"), &dirs.socket_dir);
+        let switched = Zmx::agent_as(Path::new("/opt/zmx"), &dirs.socket_dir, "tycho-agent");
+        let env = env();
+        let vendor = ["/bin/sh".to_string()];
+        let spec = dirs.spec_path(&env.session_name);
+        let caller = typed_words(&shared_request(&dirs, &zmx, &env, &vendor), &spec).unwrap();
+        let agent = typed_words(&shared_request(&dirs, &switched, &env, &vendor), &spec).unwrap();
+        assert_eq!(caller, agent);
+        assert!(!agent.iter().any(|word| word.contains("sudo")), "{agent:?}");
+        let (program, words) = switched.invocation(&["run", "s", "-d"]);
+        assert_eq!(program, PathBuf::from("/bin/sh"));
+        assert!(words.iter().any(|word| word == "/usr/bin/sudo"));
+    }
+
+    #[test]
     fn a_typed_line_is_submitted_with_a_carriage_return() {
         let text = ShortText::parse("status?").unwrap();
         assert_eq!(typed_line(&text), "status?\r");
@@ -911,6 +973,129 @@ mod tests {
             "the spec directory was never made"
         );
         assert!(!socket_path(&dirs, &env.session_name).exists());
+        fs::remove_dir_all(&dirs.socket_dir).unwrap();
+    }
+
+    /// A zmx stand-in whose `run` succeeds and whose `list` shows the session running as
+    /// `listed_pid`.
+    fn listing_zmx(dir: &Path, listed_pid: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("zmx-stand-in");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in list) printf '  name={NAME}\\tpid={listed_pid}\\tclients=0\\tcreated=1\\n' ;; esac\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        script
+    }
+
+    /// Spawns with a credential while a thread plays the launcher from this process: it asks
+    /// for the credential, then removes the spec as a launcher that read it would.
+    fn spawn_with_launcher_here(tag: &str, listed_pid: u32) -> (Result<u32, SpawnerError>, bool) {
+        use crate::credential_handoff::fetch;
+        use crate::credentials::tests::CLAUDE_TOKEN;
+        use crate::credentials::CredentialVendor;
+        let dirs = AgentDirs::new(PathBuf::from(format!(
+            "/tmp/tsb-{tag}-{}",
+            std::process::id()
+        )))
+        .unwrap();
+        if dirs.socket_dir.exists() {
+            fs::remove_dir_all(&dirs.socket_dir).unwrap();
+        }
+        ensure_agent_dirs(&dirs).unwrap();
+        let zmx = Zmx::agent(&listing_zmx(&dirs.socket_dir, listed_pid), &dirs.socket_dir);
+        let env = env();
+        let vendor = ["/bin/true".to_string()];
+        let credential =
+            Credential::parse(CredentialVendor::Claude, CLAUDE_TOKEN.as_bytes()).unwrap();
+        let request = SpawnRequest {
+            credential: Some(&credential),
+            ..shared_request(&dirs, &zmx, &env, &vendor)
+        };
+        let socket = socket_path(&dirs, &env.session_name);
+        let spec = dirs.spec_path(&env.session_name);
+        let session = env.session_name.clone();
+        let secret = env.session_secret.clone();
+        let launcher = thread::spawn(move || {
+            for _ in 0..200 {
+                if socket.exists() && spec.exists() {
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let fetched = fetch(
+                &socket,
+                current_uid(),
+                &session,
+                &secret,
+                CredentialVendor::Claude,
+            );
+            drop(fs::remove_file(&spec));
+            fetched.is_ok_and(|credential| credential.expose() == CLAUDE_TOKEN)
+        });
+        let spawned = start_detached(&request);
+        let handed = launcher.join().unwrap();
+        fs::remove_dir_all(&dirs.socket_dir).unwrap();
+        (spawned, handed)
+    }
+
+    #[test]
+    fn the_credential_goes_only_to_the_process_zmx_lists_for_the_session() {
+        let here = std::process::id();
+        let (spawned, handed) = spawn_with_launcher_here("own", here);
+        assert_eq!(spawned, Ok(here));
+        assert!(handed, "the listed launcher did not get its credential");
+        let (spawned, handed) = spawn_with_launcher_here("other", here.wrapping_add(1));
+        assert_eq!(spawned, Ok(here.wrapping_add(1)));
+        assert!(!handed, "a process zmx does not list got the credential");
+    }
+
+    #[test]
+    fn a_lease_pid_is_reported_but_never_taken_for_the_listed_launcher() {
+        let dirs = scratch("found");
+        ensure_agent_dirs(&dirs).unwrap();
+        let env = env();
+        let vendor = ["/bin/true".to_string()];
+        let silent = Zmx::agent(Path::new("/usr/bin/true"), &dirs.socket_dir);
+        let request = shared_request(&dirs, &silent, &env, &vendor);
+        let session = SessionName::parse(NAME).unwrap();
+        write_durable(
+            &dirs.lease_path(&session),
+            &lease(now_unix_ms()).to_bytes().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wait_for_pid(&request, NAME), Ok(Found::FromLease(4242)));
+        let listing = Zmx::agent(&listing_zmx(&dirs.socket_dir, 5150), &dirs.socket_dir);
+        let listed = SpawnRequest {
+            zmx: &listing,
+            ..request
+        };
+        assert_eq!(wait_for_pid(&listed, NAME), Ok(Found::Listed(5150)));
+        fs::remove_dir_all(&dirs.socket_dir).unwrap();
+    }
+
+    #[test]
+    fn created_directories_get_their_exact_modes_and_an_unsticky_shared_one_is_refused() {
+        let dirs = scratch("sticky");
+        ensure_agent_dirs(&dirs).unwrap();
+        let mode_of = |dir: &Path| fs::symlink_metadata(dir).unwrap().mode() & 0o7777;
+        assert_eq!(mode_of(&dirs.socket_dir), AGENT_DIR_MODE | STICKY_BIT);
+        assert_eq!(
+            mode_of(&dirs.lease_dir()),
+            AGENT_DIR_MODE,
+            "the agent writes its lease"
+        );
+        assert_eq!(mode_of(&dirs.spool_root()), AGENT_DIR_MODE);
+        assert_eq!(mode_of(&dirs.spec_dir()), SPEC_DIR_MODE);
+        fs::set_permissions(&dirs.socket_dir, Permissions::from_mode(AGENT_DIR_MODE)).unwrap();
+        assert!(matches!(
+            ensure_agent_dirs(&dirs),
+            Err(SpawnerError::Refused(why)) if why.contains("sticky")
+        ));
         fs::remove_dir_all(&dirs.socket_dir).unwrap();
     }
 

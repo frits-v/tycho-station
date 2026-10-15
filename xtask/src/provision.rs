@@ -7,10 +7,12 @@
 //! root-owned `/Users`, where no other user can swap it. In `/Users/Shared`, which every user
 //! can write, the entry's owner could swap it for a link between the probe and the change.
 //! The shared tool prefix needs no root step: the developer creates and fills it
-//! (`prefix_install`).
+//! (`prefix_install`). The last step installs the sudoers rule that lets the developer start
+//! the prefix's zmx as the agent: written to a private directory, checked with `visudo -c -f`
+//! as the developer, and installed by root with `install`, the one file root writes.
 
 use std::fs::{self, DirBuilder, File, OpenOptions, Permissions};
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,6 +29,7 @@ use crate::tool_prefix::{
     self, AgentTool, DirectoryState, Prefix, StationState, ToolState, TreeState,
     MISE_PINNED_VERSION,
 };
+use tycho_types::agent_switch::{self, DefaultsLine, Entry, Listing, SUDOERS_DROP_IN};
 
 const PROVISION_STEPS_MAX: usize = 16;
 /// Long enough for sudo's and sysadminctl's prompts to be answered at a terminal.
@@ -37,6 +40,21 @@ const SYSADMINCTL: &str = "/usr/sbin/sysadminctl";
 const CREATEHOMEDIR: &str = "/usr/sbin/createhomedir";
 const RMDIR: &str = "/bin/rmdir";
 const CHMOD: &str = "/bin/chmod";
+const INSTALL: &str = "/usr/bin/install";
+const VISUDO: &str = "/usr/sbin/visudo";
+const MV: &str = "/bin/mv";
+/// Where root installs the checked rule before it is renamed into `sudoers.d`: a root-owned
+/// directory sudo does not read, on the same volume. `install` writes its own temporary file
+/// (`INS@XXXXXX`, no dot) in the target's directory, and sudo reads every name in `sudoers.d`
+/// without a dot or a trailing `~`, so a partial file there makes sudo refuse every command
+/// for every user. Only the rename touches `sudoers.d`.
+const SUDOERS_STAGED: &str = "/etc/tycho-agent.sudoers.tmp";
+/// Where the candidate rule is written before root installs it, under the core home; the
+/// directory is the developer's at 0700, so only the developer and root read it.
+const CANDIDATE_DIR_RELATIVE: [&str; 2] = [".tycho", "provision"];
+const CANDIDATE_NAME: &str = "tycho-agent";
+const PRIVATE_MODE: u32 = 0o700;
+const CANDIDATE_MODE: u32 = 0o600;
 /// For a step run as the developer; the prompts of root steps get `REMEDY_TIMEOUT`.
 const DEVELOPER_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const PROMPT_NOTICE: &str =
@@ -119,9 +137,10 @@ enum Remedy {
     InstallMise,
     InstallAgentTools,
     InstallStationBinaries,
+    InstallSudoersRule,
 }
 
-const REMEDIES: [Remedy; 15] = [
+const REMEDIES: [Remedy; 16] = [
     Remedy::CreateAgentGroup,
     Remedy::CreateAgentUser,
     Remedy::CreateAgentHome,
@@ -137,6 +156,7 @@ const REMEDIES: [Remedy; 15] = [
     Remedy::InstallMise,
     Remedy::InstallAgentTools,
     Remedy::InstallStationBinaries,
+    Remedy::InstallSudoersRule,
 ];
 const _: () = assert!(REMEDIES.len() <= PROVISION_STEPS_MAX);
 
@@ -174,6 +194,9 @@ impl Remedy {
             Self::InstallMise => "install the pinned mise into the tool prefix",
             Self::InstallAgentTools => "install the agent's tools into the tool prefix",
             Self::InstallStationBinaries => "build and install the station binaries",
+            Self::InstallSudoersRule => {
+                "install the sudoers rule that starts the prefix's zmx as the agent"
+            }
         }
     }
 
@@ -194,6 +217,7 @@ impl Remedy {
             Self::InstallMise => &[Check::PrefixMise],
             Self::InstallAgentTools => &[Check::PrefixClaude, Check::PrefixCodex, Check::PrefixZmx],
             Self::InstallStationBinaries => &[Check::PrefixStationXtask, Check::PrefixStationTycho],
+            Self::InstallSudoersRule => &[Check::SudoersRule],
         }
     }
 }
@@ -213,6 +237,8 @@ pub struct Snapshot {
     core_parent_missing: bool,
     /// The prefix probe the prefix findings were made from.
     prefix: tool_prefix::Probe,
+    /// The `sudo -l` listing the sudoers finding was made from.
+    sudoers: Listing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,6 +425,24 @@ fn station_need(probe: &tool_prefix::Probe) -> Need {
     need
 }
 
+/// Decided on the listing, not the finding: an absent or stale entry, or the rule's entry with
+/// another `Defaults!` line, is the station's own file to write again; other no-password
+/// entries are the operator's to remove, and do not keep the rule from being installed.
+fn sudoers_need(snapshot: &Snapshot) -> Need {
+    match &snapshot.sudoers {
+        Listing::PasswordRequired | Listing::NotAllowed => Need::Run,
+        Listing::Listed(reading) => {
+            if reading.entry == Entry::Exact && reading.defaults == DefaultsLine::Exact {
+                Need::Skip
+            } else {
+                Need::Run
+            }
+        }
+        Listing::Refused(why) => Need::Blocked(why.clone()),
+        Listing::Unrecognised(text) => Need::Blocked(format!("sudo -l answered {text}")),
+    }
+}
+
 fn need(remedy: Remedy, snapshot: &Snapshot) -> Need {
     let absence = |check| need_for_absence(&status_of(snapshot, check));
     match remedy {
@@ -421,6 +465,7 @@ fn need(remedy: Remedy, snapshot: &Snapshot) -> Need {
             tool_need(probe.tools.iter().map(|(_, _, state)| state))
         }),
         Remedy::InstallStationBinaries => prefix_need(snapshot, station_need),
+        Remedy::InstallSudoersRule => sudoers_need(snapshot),
     }
 }
 
@@ -495,6 +540,99 @@ enum Action {
     },
     /// A step of the shared tool prefix, as the developer.
     Prefix(PrefixStep),
+    /// The sudoers rule: written and checked as the developer, installed by root.
+    Sudoers(SudoersWork),
+}
+
+#[cfg(test)]
+impl Action {
+    /// What the action runs through sudo, in order.
+    fn root_commands(&self) -> Vec<Vec<String>> {
+        match self {
+            Self::Root(words) => vec![words.clone()],
+            Self::Sudoers(work) => sudoers_root_commands(&work.candidate).to_vec(),
+            Self::Directory(_) | Self::OnOwnDirectory { .. } | Self::Prefix(_) => Vec::new(),
+        }
+    }
+}
+
+/// The candidate rule, the private directories it is written under, and the rule itself, or
+/// why no rule can be written for this developer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SudoersWork {
+    levels: Vec<PathBuf>,
+    candidate: PathBuf,
+    rule: Result<String, String>,
+}
+
+/// Root's three commands: install the checked candidate to the staging name, root's own
+/// `visudo -c -f` of the installed file, then one rename onto the drop-in.
+fn sudoers_root_commands(candidate: &Path) -> [Vec<String>; 3] {
+    let candidate = candidate.display().to_string();
+    [
+        strings(&[
+            INSTALL,
+            "-S",
+            "-o",
+            "root",
+            "-g",
+            "wheel",
+            "-m",
+            "0440",
+            &candidate,
+            SUDOERS_STAGED,
+        ]),
+        strings(&[VISUDO, "-c", "-f", SUDOERS_STAGED]),
+        strings(&[MV, "-f", SUDOERS_STAGED, SUDOERS_DROP_IN]),
+    ]
+}
+
+fn visudo_words(candidate: &Path) -> Vec<String> {
+    vec![
+        VISUDO.to_string(),
+        "-c".to_string(),
+        "-f".to_string(),
+        candidate.display().to_string(),
+    ]
+}
+
+fn sudoers_work(snapshot: &Snapshot) -> Option<SudoersWork> {
+    let home = snapshot.developer_home.clone()?;
+    let mut levels = Vec::new();
+    let mut level = home;
+    for part in CANDIDATE_DIR_RELATIVE {
+        level = level.join(part);
+        levels.push(level.clone());
+    }
+    let candidate = level.join(CANDIDATE_NAME);
+    let rule = setup::rule_zmx().and_then(|(zmx, _)| {
+        agent_switch::rule(&snapshot.developer.username, AGENT_USER_NAME, &zmx)
+            .map_err(|error| error.to_string())
+    });
+    Some(SudoersWork {
+        levels,
+        candidate,
+        rule,
+    })
+}
+
+/// `visudo -c -f` prints `<file>: parsed OK` and exits 0 for a rule it accepts, and names the
+/// line and column of what it refuses on stderr with exit 1.
+fn decode_visudo(captured: &Captured, candidate: &Path) -> Result<(), String> {
+    let accepted = format!("{}: parsed OK", candidate.display());
+    let stdout: Vec<&str> = meaningful_lines(&captured.stdout).collect();
+    let quiet = meaningful_lines(&captured.stderr).next().is_none();
+    match &captured.exit {
+        Exit::Code(0) if stdout == [accepted.as_str()] && quiet => Ok(()),
+        Exit::Code(1) => Err(format!(
+            "visudo refused the rule: {}",
+            first_meaningful(&captured.stdout, &captured.stderr)
+        )),
+        other => Err(format!(
+            "visudo answered {other:?} with unrecognised output: {}",
+            first_meaningful(&captured.stdout, &captured.stderr)
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -659,6 +797,7 @@ fn action(remedy: Remedy, snapshot: &Snapshot) -> Option<Action> {
         Remedy::InstallMise => Action::Prefix(PrefixStep::InstallMise),
         Remedy::InstallAgentTools => Action::Prefix(PrefixStep::InstallAgentTools),
         Remedy::InstallStationBinaries => Action::Prefix(PrefixStep::InstallStation),
+        Remedy::InstallSudoersRule => Action::Sudoers(sudoers_work(snapshot)?),
     })
 }
 
@@ -697,6 +836,24 @@ fn render(action: &Action) -> Vec<String> {
             vec![shown.join(" "), "(as the developer)".to_string()]
         }
         Action::Prefix(step) => render_prefix(*step, &Prefix::production()),
+        Action::Sudoers(work) => {
+            let candidate = work.candidate.display();
+            let mut lines = vec![format!(
+                "write {candidate}, mode {CANDIDATE_MODE:04o}, in a {PRIVATE_MODE:04o} directory (as the developer):"
+            )];
+            match &work.rule {
+                Ok(rule) => lines.extend(rule.lines().map(|line| format!("  {line}"))),
+                Err(why) => lines.push(format!("  no rule can be written: {why}")),
+            }
+            lines.push(format!(
+                "{} (as the developer)",
+                visudo_words(&work.candidate).join(" ")
+            ));
+            for words in sudoers_root_commands(&work.candidate) {
+                lines.push(format!("sudo {}", words.join(" ")));
+            }
+            lines
+        }
     }
 }
 
@@ -824,6 +981,17 @@ pub trait Host {
     ) -> Result<Captured, String>;
     /// Runs one step of the shared tool prefix as the developer.
     fn run_prefix_step(&mut self, step: PrefixStep, developer: &Identity) -> Result<(), String>;
+    /// Writes `content` new at `file`, under `levels` created or checked as the developer's
+    /// own private directories.
+    fn write_private(
+        &mut self,
+        levels: &[PathBuf],
+        file: &Path,
+        content: &str,
+        developer_uid: u32,
+    ) -> Result<(), String>;
+    /// Runs a program as the developer with stdin closed.
+    fn run_as_developer(&mut self, words: &[String]) -> Captured;
     /// Prints the setup report and returns its exit code.
     fn report(&mut self, developer: &Identity) -> i32;
 }
@@ -838,6 +1006,8 @@ impl Host for SystemHost {
         findings.extend(setup::agent_record_findings());
         let prefix = tool_prefix::Probe::read(&Prefix::production(), &developer);
         findings.extend(prefix.findings());
+        let (sudoers_finding, sudoers) = setup::sudoers_rule_probe();
+        findings.push(sudoers_finding);
         let developer_home = setup::resolve_home(&developer.username).ok();
         let core_dir = developer_home
             .as_deref()
@@ -861,6 +1031,7 @@ impl Host for SystemHost {
             developer,
             findings,
             prefix,
+            sudoers,
         })
     }
 
@@ -911,6 +1082,25 @@ impl Host for SystemHost {
             }
             PrefixStep::InstallStation => prefix_install::install_station(&prefix),
         }
+    }
+
+    fn write_private(
+        &mut self,
+        levels: &[PathBuf],
+        file: &Path,
+        content: &str,
+        developer_uid: u32,
+    ) -> Result<(), String> {
+        write_private(levels, file, content, developer_uid)
+    }
+
+    fn run_as_developer(&mut self, words: &[String]) -> Captured {
+        let (program, arguments) = words
+            .split_first()
+            .map_or(("", &[][..]), |(program, rest)| (program.as_str(), rest));
+        let mut command = Command::new(program);
+        command.args(arguments).current_dir("/");
+        process::run_bounded_capturing_stderr(&mut command, DEVELOPER_COMMAND_TIMEOUT)
     }
 
     fn report(&mut self, developer: &Identity) -> i32 {
@@ -968,6 +1158,46 @@ pub fn create_level(path: &Path, developer_uid: u32) -> Result<(), String> {
             .map_err(|error| format!("mkdir {}: {error}", path.display())),
         Err(error) => Err(format!("{}: {error}", path.display())),
     }
+}
+
+/// Creates or checks each level as the developer's own, makes the last one 0700 on its
+/// descriptor, then writes the file new there, removing an earlier candidate first: no other
+/// user can reach the directory, so nothing can be swapped in between.
+fn write_private(
+    levels: &[PathBuf],
+    file: &Path,
+    content: &str,
+    developer_uid: u32,
+) -> Result<(), String> {
+    for level in levels {
+        create_level(level, developer_uid)?;
+    }
+    let last = levels
+        .last()
+        .ok_or_else(|| "a private file with no directory".to_string())?;
+    let directory = open_own_directory(last, developer_uid)?;
+    directory
+        .set_permissions(Permissions::from_mode(PRIVATE_MODE))
+        .map_err(|error| format!("chmod {PRIVATE_MODE:04o} {}: {error}", last.display()))?;
+    if file.parent() != Some(last.as_path()) {
+        return Err(format!("{} is not in {}", file.display(), last.display()));
+    }
+    match fs::remove_file(file) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("{}: {error}", file.display())),
+    }
+    let mut written = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(CANDIDATE_MODE)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(file)
+        .map_err(|error| format!("{}: {error}", file.display()))?;
+    written
+        .write_all(content.as_bytes())
+        .and_then(|()| written.sync_all())
+        .map_err(|error| format!("{}: {error}", file.display()))
 }
 
 fn prepare_directory(work: &DirectoryWork, developer_uid: u32) -> Result<(), String> {
@@ -1055,6 +1285,22 @@ fn execute(host: &mut impl Host, action: &Action, snapshot: &Snapshot) -> Result
             host.prepare_directory(work, snapshot.developer.uid)
         }
         Action::Prefix(step) => host.run_prefix_step(*step, &snapshot.developer),
+        Action::Sudoers(work) => {
+            let rule = work.rule.as_ref().map_err(Clone::clone)?;
+            host.write_private(&work.levels, &work.candidate, rule, snapshot.developer.uid)?;
+            decode_visudo(
+                &host.run_as_developer(&visudo_words(&work.candidate)),
+                &work.candidate,
+            )?;
+            println!("xtask provision-agent: {PROMPT_NOTICE}");
+            let [install, check, rename] = sudoers_root_commands(&work.candidate);
+            outcome_result(
+                INSTALL,
+                &decode_command(INSTALL, &host.run_as_root(&install)),
+            )?;
+            decode_visudo(&host.run_as_root(&check), Path::new(SUDOERS_STAGED))?;
+            outcome_result(MV, &decode_command(MV, &host.run_as_root(&rename)))
+        }
     }
 }
 
@@ -1253,6 +1499,7 @@ mod tests {
     use super::*;
     use crate::setup::{Differs, HomeMismatch};
     use std::collections::VecDeque;
+    use tycho_types::agent_switch::Reading;
 
     const DEVELOPER_UID: u32 = 501;
     const AGENT_GID: u32 = 502;
@@ -1317,6 +1564,7 @@ mod tests {
             developer: identity("frits", DEVELOPER_UID),
             findings: RECORD_CHECKS
                 .iter()
+                .chain(std::iter::once(&Check::SudoersRule))
                 .map(|&check| Finding::new(check, Status::Present))
                 .collect(),
             agent_group_gid: Some(AGENT_GID),
@@ -1330,6 +1578,7 @@ mod tests {
             core_dir: Some(PathBuf::from("/Users/frits/.tycho/zmx")),
             core_parent_missing: false,
             prefix: settled_prefix(),
+            sudoers: Listing::Listed(exact_reading()),
         };
         with_prefix(snapshot, settled_prefix())
     }
@@ -1375,12 +1624,20 @@ mod tests {
                 (Check::CoreDirIsDirectory, absent.clone()),
                 (Check::CoreDirOwnerUid, absent.clone()),
                 (Check::CoreDirMode, absent),
+                (
+                    Check::SudoersRule,
+                    Status::Unreachable {
+                        why: "sudo: /Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx: command not found"
+                            .to_string(),
+                    },
+                ),
             ],
         );
         snapshot.agent_group_gid = None;
         snapshot.shared_group_gid = None;
         snapshot.agent_dir_owner = None;
         snapshot.core_parent_missing = true;
+        snapshot.sudoers = Listing::PasswordRequired;
         with_home(
             with_prefix(snapshot, empty_prefix()),
             None,
@@ -1429,6 +1686,53 @@ mod tests {
         })
     }
 
+    /// The one file root writes, in three steps: the checked candidate installed root's at
+    /// 0440 under a name outside `sudoers.d`, checked again by root's `visudo`, then renamed
+    /// onto the drop-in.
+    fn install_rule_commands() -> [Vec<String>; 3] {
+        [
+            strings(&[
+                INSTALL,
+                "-S",
+                "-o",
+                "root",
+                "-g",
+                "wheel",
+                "-m",
+                "0440",
+                "/Users/frits/.tycho/provision/tycho-agent",
+                "/etc/tycho-agent.sudoers.tmp",
+            ]),
+            strings(&[VISUDO, "-c", "-f", "/etc/tycho-agent.sudoers.tmp"]),
+            strings(&[
+                MV,
+                "-f",
+                "/etc/tycho-agent.sudoers.tmp",
+                "/etc/sudoers.d/tycho-agent",
+            ]),
+        ]
+    }
+
+    /// No command root runs leaves a file in `sudoers.d` but the rename onto the drop-in, whose
+    /// name sudo reads only once it is complete.
+    #[test]
+    fn nothing_but_the_final_rename_writes_in_the_sudoers_directory() {
+        let [install, check, rename] = install_rule_commands();
+        for words in [&install, &check] {
+            assert!(
+                !words.iter().any(|word| word.starts_with("/etc/sudoers.d/")),
+                "{words:?}"
+            );
+        }
+        assert_eq!(rename.last().map(String::as_str), Some(SUDOERS_DROP_IN));
+        assert_eq!(
+            Path::new(SUDOERS_STAGED).parent(),
+            Path::new(SUDOERS_DROP_IN).parent().and_then(Path::parent),
+            "install writes its temporary file beside the staging name, outside sudoers.d, on \
+             the volume of the rename"
+        );
+    }
+
     fn createhomedir_words() -> Vec<String> {
         strings(&[CREATEHOMEDIR, "-c", "-u", "tycho-agent"])
     }
@@ -1452,6 +1756,10 @@ mod tests {
         snapshots: VecDeque<Snapshot>,
         root_results: VecDeque<Captured>,
         root_calls: Vec<Vec<String>>,
+        visudo_results: VecDeque<Captured>,
+        private_writes: Vec<(PathBuf, String)>,
+        /// Every action in the order it was taken, by kind and first word.
+        order: Vec<String>,
         developer_calls: Vec<Vec<String>>,
         directory_calls: Vec<DirectoryWork>,
         prefix_calls: Vec<PrefixStep>,
@@ -1487,10 +1795,17 @@ mod tests {
         }
 
         fn run_as_root(&mut self, words: &[String]) -> Captured {
+            self.order
+                .push(format!("root {}", words.first().map_or("", String::as_str)));
             self.root_calls.push(words.to_vec());
-            self.root_results
-                .pop_front()
-                .unwrap_or_else(|| captured(Exit::Code(0), "", ""))
+            self.root_results.pop_front().unwrap_or_else(|| {
+                if words.first().map(String::as_str) == Some(VISUDO) {
+                    let file = words.last().map_or("", String::as_str);
+                    captured(Exit::Code(0), &format!("{file}: parsed OK\n"), "")
+                } else {
+                    captured(Exit::Code(0), "", "")
+                }
+            })
         }
 
         fn prepare_directory(
@@ -1521,6 +1836,32 @@ mod tests {
             Ok(())
         }
 
+        fn write_private(
+            &mut self,
+            levels: &[PathBuf],
+            file: &Path,
+            content: &str,
+            _developer_uid: u32,
+        ) -> Result<(), String> {
+            assert_eq!(levels.last().map(PathBuf::as_path), file.parent());
+            self.order.push(format!("write {}", file.display()));
+            self.private_writes
+                .push((file.to_path_buf(), content.to_string()));
+            Ok(())
+        }
+
+        fn run_as_developer(&mut self, words: &[String]) -> Captured {
+            self.order.push(format!(
+                "developer {}",
+                words.first().map_or("", String::as_str)
+            ));
+            self.developer_calls.push(words.to_vec());
+            self.visudo_results.pop_front().unwrap_or_else(|| {
+                let file = words.last().map_or("", String::as_str);
+                captured(Exit::Code(0), &format!("{file}: parsed OK\n"), "")
+            })
+        }
+
         fn report(&mut self, _developer: &Identity) -> i32 {
             self.reports = self.reports.saturating_add(1);
             0
@@ -1548,6 +1889,7 @@ mod tests {
                 Remedy::InstallMise,
                 Remedy::InstallAgentTools,
                 Remedy::InstallStationBinaries,
+                Remedy::InstallSudoersRule,
             ]
         );
         assert!(planned.blocked.is_empty());
@@ -1744,7 +2086,7 @@ mod tests {
         );
         let mut root_owned = with(
             all_present(),
-            &[(Check::AgentDirMode, wrong("0755", "2770"))],
+            &[(Check::AgentDirMode, wrong("0755", "3770"))],
         );
         root_owned.agent_dir_owner = Some(0);
         assert_eq!(
@@ -1805,24 +2147,35 @@ mod tests {
             all_present(),
             &[
                 (Check::AgentDirOwnerUid, wrong("503", "501 or 0")),
-                (Check::AgentDirMode, wrong("0777", "2770")),
+                (Check::AgentDirMode, wrong("0777", "3770")),
             ],
         );
         stranger.agent_dir_owner = Some(503);
         let wide_home = with_home(all_present(), Some(AGENT_HOME), home_mode(0o750));
+        let mut examined = 0_u32;
         for snapshot in [all_missing(), stranger, all_present(), wide_home] {
             for remedy in REMEDIES {
-                if let Some(Action::Root(words)) = action(remedy, &snapshot) {
+                let commands = action(remedy, &snapshot)
+                    .map(|action| action.root_commands())
+                    .unwrap_or_default();
+                for words in commands {
+                    examined = examined.saturating_add(1);
                     let program = words.first().map(String::as_str);
                     assert!(
                         matches!(program, Some(DSEDITGROUP | SYSADMINCTL | RMDIR))
                             || words == createhomedir_words()
-                            || words == chmod_home_words(),
+                            || words == chmod_home_words()
+                            || install_rule_commands().contains(&words),
                         "{remedy:?} runs {words:?} as root"
                     );
                 }
             }
         }
+        assert!(examined >= 30, "only {examined} root commands examined");
+        assert_eq!(
+            action(Remedy::InstallSudoersRule, &all_present()).map(|action| action.root_commands()),
+            Some(install_rule_commands().to_vec())
+        );
         assert_eq!(
             action(Remedy::CreateAgentHome, &all_present()),
             Some(Action::Root(createhomedir_words()))
@@ -2354,5 +2707,227 @@ mod tests {
             ]
         );
         assert!(commands.iter().all(|command| !command.starts_with("sudo")));
+    }
+
+    fn exact_reading() -> Reading {
+        Reading {
+            entry: Entry::Exact,
+            defaults: DefaultsLine::Exact,
+            others: Vec::new(),
+        }
+    }
+
+    fn rule_missing() -> Snapshot {
+        let mut snapshot = with(all_present(), &[(Check::SudoersRule, Status::Missing)]);
+        snapshot.sudoers = Listing::PasswordRequired;
+        snapshot
+    }
+
+    fn with_listing(listing: Listing, status: Status) -> Snapshot {
+        let mut snapshot = with(all_present(), &[(Check::SudoersRule, status)]);
+        snapshot.sudoers = listing;
+        snapshot
+    }
+
+    #[test]
+    fn a_rule_a_pin_bump_left_is_installed_again_for_the_new_zmx() {
+        let old = "/Users/Shared/tycho/mise/installs/zmx/0.7.1/zmx".to_string();
+        let stale = with_listing(
+            Listing::Listed(Reading {
+                entry: Entry::Stale(old.clone()),
+                defaults: DefaultsLine::Stale(old),
+                others: Vec::new(),
+            }),
+            wrong("the rule for 0.7.1", "the rule for 0.8.1"),
+        );
+        assert_eq!(plan(&stale).steps, vec![Remedy::InstallSudoersRule]);
+        let mut host = RecordingHost::new(vec![stale, all_present()]);
+        assert_eq!(provision(Mode::Apply, true, &mut host), 0);
+        assert_eq!(host.root_calls, install_rule_commands());
+        let (_, content) = &host.private_writes[0];
+        assert!(content.contains("/zmx/0.8.1/zmx") && !content.contains("0.7.1"));
+    }
+
+    #[test]
+    fn an_unrelated_no_password_entry_does_not_keep_the_rule_from_being_installed() {
+        let vpn = with_listing(
+            Listing::Listed(Reading {
+                entry: Entry::Absent,
+                defaults: DefaultsLine::Absent,
+                others: vec!["(root) NOPASSWD: /usr/local/bin/vpn-helper".to_string()],
+            }),
+            wrong("also without a password", "only the rule"),
+        );
+        assert_eq!(plan(&vpn).steps, vec![Remedy::InstallSudoersRule]);
+        let differs = with_listing(
+            Listing::Listed(Reading {
+                entry: Entry::Exact,
+                defaults: DefaultsLine::Differs("Defaults!x umask=0022".to_string()),
+                others: Vec::new(),
+            }),
+            wrong("its Defaults line", "the rule's"),
+        );
+        assert_eq!(plan(&differs).steps, vec![Remedy::InstallSudoersRule]);
+    }
+
+    #[test]
+    fn the_rule_is_written_privately_checked_by_visudo_then_installed_by_root() {
+        let missing = rule_missing();
+        assert_eq!(plan(&missing).steps, vec![Remedy::InstallSudoersRule]);
+        let mut host = RecordingHost::new(vec![missing, all_present()]);
+        assert_eq!(provision(Mode::Apply, true, &mut host), 0);
+        let candidate = "/Users/frits/.tycho/provision/tycho-agent";
+        assert_eq!(
+            host.order,
+            [
+                format!("write {candidate}"),
+                format!("developer {VISUDO}"),
+                format!("root {INSTALL}"),
+                format!("root {VISUDO}"),
+                format!("root {MV}"),
+            ]
+        );
+        assert_eq!(
+            host.developer_calls,
+            [strings(&[VISUDO, "-c", "-f", candidate])]
+        );
+        assert_eq!(host.root_calls, install_rule_commands());
+        let (_, content) = &host.private_writes[0];
+        assert_eq!(
+            content,
+            &agent_switch::rule(
+                "frits",
+                "tycho-agent",
+                "/Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx"
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn a_rule_visudo_refuses_never_reaches_root() {
+        let mut host = RecordingHost::new(vec![rule_missing()]);
+        host.visudo_results.push_back(captured(
+            Exit::Code(1),
+            "",
+            "/Users/frits/.tycho/provision/tycho-agent:3:7: syntax error\n",
+        ));
+        assert_eq!(provision(Mode::Apply, true, &mut host), 1);
+        assert!(host.root_calls.is_empty(), "{:?}", host.root_calls);
+        for (exit, stdout) in [
+            (Exit::Code(0), "something else\n"),
+            (Exit::Code(0), ""),
+            (Exit::Code(2), ""),
+            (Exit::TimedOut, ""),
+        ] {
+            let mut host = RecordingHost::new(vec![rule_missing()]);
+            host.visudo_results.push_back(captured(exit, stdout, ""));
+            assert_eq!(provision(Mode::Apply, true, &mut host), 1);
+            assert!(host.root_calls.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_staged_rule_root_s_visudo_refuses_is_never_renamed_into_place() {
+        let mut host = RecordingHost::new(vec![rule_missing()]);
+        host.root_results.push_back(captured(Exit::Code(0), "", ""));
+        host.root_results.push_back(captured(
+            Exit::Code(1),
+            "",
+            "/etc/tycho-agent.sudoers.tmp:2:7: syntax error\n",
+        ));
+        assert_eq!(provision(Mode::Apply, true, &mut host), 1);
+        let [install, check, _] = install_rule_commands();
+        assert_eq!(host.root_calls, [install, check]);
+        let mut failed_install = RecordingHost::new(vec![rule_missing()]);
+        failed_install.root_results.push_back(captured(
+            Exit::Code(71),
+            "",
+            "install: permission denied\n",
+        ));
+        assert_eq!(provision(Mode::Apply, true, &mut failed_install), 1);
+        assert_eq!(failed_install.root_calls.len(), 1);
+    }
+
+    #[test]
+    fn an_installed_rule_whose_probe_still_fails_stops_the_run() {
+        let mut host = RecordingHost::new(vec![rule_missing()]);
+        assert_eq!(provision(Mode::Apply, true, &mut host), 1);
+        assert_eq!(host.root_calls, install_rule_commands());
+        assert_eq!(host.reports, 0);
+    }
+
+    #[test]
+    fn a_wider_rule_is_left_to_the_operator_and_an_unreadable_one_blocks() {
+        let wider = with_listing(
+            Listing::Listed(Reading {
+                others: vec!["(ALL) NOPASSWD: ALL".to_string()],
+                ..exact_reading()
+            }),
+            wrong("a wider rule", "zmx alone"),
+        );
+        assert!(plan(&wider).steps.is_empty());
+        assert_eq!(unremedied(&wider, &[]).len(), 1);
+        let unreadable = with_listing(
+            Listing::Unrecognised("garbage".to_string()),
+            Status::Unreachable {
+                why: "sudo answered something".to_string(),
+            },
+        );
+        assert_eq!(plan(&unreadable).blocked.len(), 1);
+    }
+
+    #[test]
+    fn the_rule_is_planned_while_sudo_asks_a_password_and_printed_in_full() {
+        let snapshot = all_missing();
+        assert_eq!(need(Remedy::InstallSudoersRule, &snapshot), Need::Run);
+        let lines = action(Remedy::InstallSudoersRule, &snapshot)
+            .map(|action| render(&action))
+            .unwrap();
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("write /Users/frits/.tycho/provision/tycho-agent, mode 0600, in a 0700 directory (as the developer):")
+        );
+        assert!(lines
+            .iter()
+            .any(|line| line == "  frits ALL = (tycho-agent) NOPASSWD: /Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx"));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("sudo /bin/mv -f /etc/tycho-agent.sudoers.tmp /etc/sudoers.d/tycho-agent")
+        );
+        let root_lines: Vec<&str> = lines
+            .iter()
+            .map(String::as_str)
+            .filter(|line| line.starts_with("sudo "))
+            .collect();
+        assert_eq!(
+            root_lines,
+            [
+                "sudo /usr/bin/install -S -o root -g wheel -m 0440 /Users/frits/.tycho/provision/tycho-agent /etc/tycho-agent.sudoers.tmp",
+                "sudo /usr/sbin/visudo -c -f /etc/tycho-agent.sudoers.tmp",
+                "sudo /bin/mv -f /etc/tycho-agent.sudoers.tmp /etc/sudoers.d/tycho-agent",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_private_candidate_is_written_new_at_0600_in_a_0700_directory() {
+        let root = scratch("candidate");
+        let uid = fs::metadata(&root).expect("stat").uid();
+        let levels = vec![root.join("a"), root.join("a").join("b")];
+        let file = root.join("a").join("b").join("rule");
+        write_private(&levels, &file, "first\n", uid).unwrap();
+        write_private(&levels, &file, "second\n", uid).unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "second\n");
+        assert_eq!(fs::metadata(&file).unwrap().mode() & 0o777, CANDIDATE_MODE);
+        assert_eq!(
+            fs::metadata(&levels[1]).unwrap().mode() & 0o777,
+            PRIVATE_MODE
+        );
+        assert!(write_private(&levels, &root.join("elsewhere"), "x", uid).is_err());
+        fs::remove_file(&file).unwrap();
+        fs::remove_dir(&levels[1]).unwrap();
+        fs::remove_dir(&levels[0]).unwrap();
+        fs::remove_dir(&root).unwrap();
     }
 }

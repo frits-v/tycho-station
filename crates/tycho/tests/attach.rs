@@ -41,6 +41,7 @@ use tycho::config::{
     ToolPrefix, AGENT_SOCKET_DIR_DEFAULT, AGENT_USER_DEFAULT, TOOL_PREFIX_DEFAULT,
 };
 use tycho::zmx::{self, ListEntry, Presence, Zmx, SESSION_ENV};
+use tycho_types::agent_switch::{decode_wider, wider_probe_arguments, WiderProbe};
 
 const SUDO: &str = "/usr/bin/sudo";
 const SCRIPT: &str = "/usr/bin/script";
@@ -546,29 +547,6 @@ fn run_as_agent(agent: &Agent, script: &str, arguments: &[&str]) -> AgentRun {
         FileRun::Finished { stdout, stderr } => decode_agent_run(&stdout, &stderr, agent.uid),
         FileRun::TimedOut(text) | FileRun::CouldNotStart(text) => AgentRun::CouldNotRun(text),
         FileRun::Unreadable(text) => AgentRun::Unrecognised(text),
-    }
-}
-
-/// What `sudo -n` answered after `sudo -k` dropped any cached credential.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SudoProbe {
-    PasswordRequired,
-    NoPasswordRule,
-    Refused(String),
-    Unrecognised(String),
-}
-
-fn decode_sudo_probe(success: bool, stderr: &str) -> SudoProbe {
-    if success {
-        return SudoProbe::NoPasswordRule;
-    }
-    let first = stderr.lines().next().unwrap_or("").to_string();
-    if first == "sudo: a password is required" {
-        SudoProbe::PasswordRequired
-    } else if first.starts_with("sudo:") {
-        SudoProbe::Refused(first)
-    } else {
-        SudoProbe::Unrecognised(cut(stderr.trim()))
     }
 }
 
@@ -1357,6 +1335,9 @@ fn preflight() -> (Agent, SharedZmx, TerminalState) {
         }
         Err(error) => println!("attach: before the run, the shared directory: {error}"),
     }
+    // The agent's zmx would otherwise create `logs` as its own, where the core then refuses it.
+    tycho::zmx::prepare_shared_log(dir)
+        .unwrap_or_else(|refusal| panic!("attach: the shared zmx log: {refusal}"));
     probe_sudo();
     (
         agent,
@@ -1372,25 +1353,27 @@ fn probe_sudo() {
     let forget = Command::new(SUDO).arg("-k").status().unwrap();
     assert!(forget.success(), "attach: sudo -k exited {forget}");
     let probe = Command::new(SUDO)
-        .args(["-n", "-u", AGENT_USER_DEFAULT, "--", "/usr/bin/true"])
+        .args(wider_probe_arguments(AGENT_USER_DEFAULT))
         .current_dir("/")
         .output()
         .unwrap();
-    let seen = decode_sudo_probe(
-        probe.status.success(),
+    let seen = decode_wider(
+        probe.status.code(),
+        &String::from_utf8_lossy(&probe.stdout),
         &String::from_utf8_lossy(&probe.stderr),
     );
-    println!("attach: sudo -n -u {AGENT_USER_DEFAULT} after sudo -k: {seen:?}");
+    println!("attach: sudo -n -k -u {AGENT_USER_DEFAULT} -- /usr/bin/true: {seen:?}");
     match seen {
-        SudoProbe::PasswordRequired => {
+        WiderProbe::PasswordRequired => {
             println!("attach: sudo asks for the developer's password once, on this terminal");
         }
-        SudoProbe::NoPasswordRule => panic!(
-            "attach: a sudoers rule runs commands as {AGENT_USER_DEFAULT} with no password; \
-             the station installs none while the identity switch is undecided"
+        WiderProbe::RanWithoutPassword => panic!(
+            "attach: a sudoers rule runs commands other than the prefix's zmx as \
+             {AGENT_USER_DEFAULT} with no password; the station's rule covers only zmx"
         ),
-        SudoProbe::Refused(line) => panic!("attach: could not look: {line}"),
-        SudoProbe::Unrecognised(text) => panic!("attach: sudo -n answered {text}"),
+        WiderProbe::UnknownUser(user) => panic!("attach: sudo knows no user {user}"),
+        WiderProbe::Refused(line) => panic!("attach: could not look: {line}"),
+        WiderProbe::Unrecognised(text) => panic!("attach: sudo -n answered {text}"),
     }
 }
 

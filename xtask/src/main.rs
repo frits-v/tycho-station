@@ -23,6 +23,7 @@ mod config;
 mod credentials;
 mod figures;
 mod github_api;
+mod ledger;
 mod opengrep;
 mod prefix_install;
 mod prefix_manifest;
@@ -54,7 +55,7 @@ const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
 const DOC_DIRS: [&str; 1] = ["docs"];
 const RULES_DIR: &str = ".claude/rules";
 const RULE_MAX_LINES: usize = 24;
-const COMMANDS: [(&str, &str); 26] = [
+const COMMANDS: [(&str, &str); 27] = [
     (
         "ci",
         "format check, clippy, tests, workflow audits, opengrep, repository checks, PR title",
@@ -100,6 +101,10 @@ const COMMANDS: [(&str, &str); 26] = [
     (
         "check-rules",
         "rule files carry paths frontmatter and stay short",
+    ),
+    (
+        "check-ledger",
+        "every function a ledger row cites as enforcement exists in the sources",
     ),
     (
         "check-credentials",
@@ -182,6 +187,16 @@ const COMMENTS_RULES: [Rule<'static>; 2] = [
     Rule {
         id: "check-comments/ticket-reference",
         description: "A Rust comment names a ticket or issue number",
+    },
+];
+const LEDGER_RULES: [Rule<'static>; 2] = [
+    Rule {
+        id: "check-ledger/undefined",
+        description: "A ledger row cites a function or module nothing in the sources defines",
+    },
+    Rule {
+        id: "check-ledger/stale-exception",
+        description: "A name listed as defined elsewhere is no longer cited, or is defined here",
     },
 ];
 const RULES_RULES: [Rule<'static>; 2] = [
@@ -386,10 +401,11 @@ fn ci() -> i32 {
         ),
         ("opengrep", step(opengrep::opengrep() == 0)),
     ];
-    let checks: [(&str, Check); 6] = [
+    let checks: [(&str, Check); 7] = [
         ("check-names", check_names),
         ("check-comments", check_comments),
         ("check-rules", check_rules),
+        ("check-ledger", check_ledger),
         ("check-credentials", credentials::check_credentials),
         ("check-figures", figures::check_figures),
         ("check-config", config::check_config),
@@ -798,6 +814,58 @@ fn check_rules() -> i32 {
     finish_findings("check-rules", &RULES_RULES, files.len(), "", &defects)
 }
 
+/// Reads a file the check needs whole, refusing one over the bound rather than reading part.
+fn read_bounded_text(path: &Path) -> Result<String, String> {
+    let size = fs::metadata(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?
+        .len();
+    if size > ledger::LEDGER_MAX_BYTES {
+        return Err(format!(
+            "{} is {size} bytes; the limit is {}",
+            path.display(),
+            ledger::LEDGER_MAX_BYTES
+        ));
+    }
+    fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+fn check_ledger() -> i32 {
+    let texts = read_bounded_text(Path::new(ledger::LEDGER)).and_then(|ledger_text| {
+        read_bounded_text(Path::new(ledger::ELSEWHERE)).map(|listed| (ledger_text, listed))
+    });
+    let (ledger_text, listed) = match texts {
+        Ok(texts) => texts,
+        Err(why) => {
+            eprintln!("xtask check-ledger: {why}");
+            return 1;
+        }
+    };
+    let cited = ledger::cited_names(&ledger_text);
+    if cited.is_empty() {
+        eprintln!("xtask check-ledger: examined 0 cited names; a check over nothing is a failure");
+        return 1;
+    }
+    let sources = walk(&SOURCE_DIRS, "rs");
+    let mut defined = std::collections::BTreeSet::new();
+    for path in &sources {
+        if let Some(stem) = path.file_stem().and_then(OsStr::to_str) {
+            defined.insert(stem.to_string());
+        }
+        if let Ok(text) = fs::read_to_string(path) {
+            defined.extend(ledger::defined_names(&text));
+        }
+    }
+    let defects = ledger::ledger_defects(&cited, &defined, &ledger::elsewhere_names(&listed));
+    let note = format!(" for {} cited names", cited.len());
+    finish_findings(
+        "check-ledger",
+        &LEDGER_RULES,
+        sources.len(),
+        &note,
+        &defects,
+    )
+}
+
 fn capture(program: &str, args: &[&str]) -> Option<Output> {
     Command::new(program).args(args).output().ok()
 }
@@ -832,6 +900,7 @@ fn hook_post_tool_use() -> i32 {
         Some("md") => {
             check_comments();
             check_rules();
+            check_ledger();
             0
         }
         _ => 0,
@@ -909,6 +978,7 @@ fn main() {
         Some("check-names") => check_names(),
         Some("check-comments") => check_comments(),
         Some("check-rules") => check_rules(),
+        Some("check-ledger") => check_ledger(),
         Some("check-credentials") => credentials::check_credentials(),
         Some("render-figures") => figures::render_figures(),
         Some("check-figures") => figures::check_figures(),

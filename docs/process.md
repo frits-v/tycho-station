@@ -21,7 +21,7 @@ is a defect.
 | Layer | Location | Runs |
 |---|---|---|
 | Lints | `Cargo.toml` `[workspace.lints]`, `clippy.toml` | every build, ci, post-edit hook |
-| Repository checks | `xtask` (`check-names`, `check-comments`, `check-rules`, `check-credentials`, `check-figures`, `check-config`, `check-commit-msg`, `check-pr-title`, `opengrep`, `workflows`, `codeql`) | ci, post-edit hook, lefthook |
+| Repository checks | `xtask` (`check-names`, `check-comments`, `check-rules`, `check-ledger`, `check-credentials`, `check-figures`, `check-config`, `check-commit-msg`, `check-pr-title`, `opengrep`, `workflows`, `codeql`) | ci, post-edit hook, lefthook |
 | Source rules | `opengrep/rust.yml`, each rule with fixture lines in `opengrep/rust.rs` | `xtask opengrep` in ci and in lefthook pre-push when Rust or a rule changes |
 | Workflow rules | `.github/workflow-policy.cue`; zizmor, jactionlint; CodeQL's Actions queries | `xtask workflows` in ci and pre-push; `xtask codeql` in pre-push when `.github` changes; code scanning on every pull request |
 | Git hooks | `lefthook.json`, each command `cargo run -q -p xtask -- <command>` | commit-msg, pre-commit, pre-push |
@@ -96,12 +96,12 @@ The suites that start real processes are ignored tests, run by their mise tasks 
 | `worker-tests` | a Claude token in the core's store (`tycho credentials set claude`), which the suite copies into its test core and hands its worker, and `graph-plugin`; never beside `control-tests` |
 | `control-tests` | a Claude token in the core's store, which the suite copies into its test core and hands each control session; never beside `worker-tests` |
 | `graph-tests` | `mise run graph-plugin` |
-| `boundary-tests` | a terminal and the provisioned agent user: sudo asks for the developer's password on the terminal to run each probe as `tycho-agent` |
+| `boundary-tests` | a terminal, the provisioned agent user and the sudoers rule: sudo asks for the developer's password on the terminal to run each probe as `tycho-agent` |
 | `attach-tests` | a Ghostty terminal and the agent user: sudo once, again at teardown past its five-minute cache; up to two Automation dialogs (the suite's terminal, `osascript`) |
 
-The boundary suite refuses to start when stdin is not a terminal, and when `sudo -n` runs as
-the agent with no password after `sudo -k`, since nothing in the station installs such a
-rule; it prints which answer it saw, and runs `sudo -k` again when it ends. `run_as_agent`
+The boundary suite refuses to start when stdin is not a terminal, and unless the sudoers
+rule is exactly the narrow one, read back with the two probes setup makes (Provisioning the
+agent user, below); it prints both answers, and runs `sudo -k` again when it ends. `run_as_agent`
 in the suite is the one place the identity switch is made; probes run with stdin closed,
 since sudo reads the password from `/dev/tty`. Each probe ends with a line naming the uid it ran as and its exit
 status, and decodes to one of four states: denied (permission denied, not permitted, git
@@ -112,9 +112,26 @@ agent's. Only a denial passes, except the agent's settings write, a listed gap w
 is printed as a measurement. The run ends with the number of boundaries examined and the
 count of each disposition; zero examined fails. The agent's walk to the canonical
 repository names the first directory it cannot search, with `ls`'s line saying whether that
-directory refused it or was absent.
+directory refused it or was absent. Two more boundaries are the shared zmx log: the agent puts a
+link at `logs/zmx.log` and renames `logs`, both of which must be refused, and the developer's
+`zmx list` must then succeed with the link's target unchanged and the log still the
+developer's regular file. Two more ignored tests need no terminal. One starts a session
+through the rule with `Zmx::agent_as` running `/bin/sleep`, requires the pid `zmx list`
+reports to be the agent's and to run that program, and the session socket to be the agent's
+at 0770, then kills it by name as the developer and requires it gone. The other starts
+`tycho session-leader -- /bin/sleep` as the agent the same way, as a background child of a
+shell whose `$!` it prints, since the shell zmx starts already leads the pty's session and
+`setsid` refuses a session leader; it requires that child to be the agent's and to lead its
+own group, then the kill path's delivery through the rule, a `reap.<pid>.<random>` session
+typing `exec /bin/kill -KILL -- -<group>`, to end the group. Both print whether a uid is the agent's, never the uid. If either fails on
+connecting to the agent's socket, check `id` in the shell that runs the suite: a login session
+that began before the developer joined `tycho-zmx` does not list the group, while
+`id <developer>` and `dseditgroup` do; log out and in, then run the suite again.
 
-The attach suite refuses to start without a terminal and makes the same `sudo -n` check. In
+The attach suite refuses to start without a terminal, prepares the shared zmx log the way the
+core does (design section 7, the shared zmx log), and refuses a `sudo -n -k` that runs
+`/usr/bin/true` as the agent with no password, decoded by the same `agent_switch` decoder
+setup uses. In
 one sudo call it creates three sessions as the agent in `/Users/Shared/tycho-agent-zmx` with
 the prefix's zmx; each session's program reads one typed line, writes it to a marker file in
 a directory of group `tycho-zmx`, then sleeps 600 seconds. Every zmx run in the shared
@@ -268,14 +285,65 @@ what the developer side of `mise run setup` checks, in this order:
 5. a deny entry for the agent in the developer's home ACL,
    `chmod +a "user:tycho-agent deny search,list,readattr,readextattr" ~`, run as the
    developer;
-6. `/Users/Shared/tycho-agent-zmx`, owned by the developer, group `tycho-zmx`, mode 2770;
+6. `/Users/Shared/tycho-agent-zmx`, owned by the developer, group `tycho-zmx`, mode 3770: the
+   sticky bit keeps the agent from renaming or removing the developer's entries, the zmx log
+   directory among them;
 7. the core socket directory `~/.tycho/zmx`, mode 0700;
 8. the shared tool prefix `/Users/Shared/tycho` with `bin` and `mise` beneath it, each mode
    0755;
 9. the pinned mise in `/Users/Shared/tycho/bin/mise`;
 10. the agent's tools in the prefix's mise data directory, recorded with their paths and
     digests in `station.json`;
-11. release builds of `xtask` and `tycho` in `/Users/Shared/tycho/bin`.
+11. release builds of `xtask` and `tycho` in `/Users/Shared/tycho/bin`;
+12. the sudoers rule `/etc/sudoers.d/tycho-agent`, through which the core starts each
+    launcher session as the agent: the developer may run the prefix's zmx, named by its path,
+    with any arguments, as `tycho-agent` only, with no password, keeping only `HOME`,
+    `ZMX_DIR`, `ZMX_DIR_MODE` and `ZMX_LOG_MODE` (`env_keep =` replaces the default list,
+    which on macOS keeps `HOME`, `MAIL` and `SSH_AUTH_SOCK`) and under umask 007
+    (`umask_override`; otherwise sudo applies the union with its 0022 and the socket comes
+    out 0750). The task writes the candidate new at 0600 in `~/.tycho/provision`, a 0700
+    directory of the developer's, checks it with `/usr/sbin/visudo -c -f` as the developer,
+    which must answer `<file>: parsed OK`, and only then runs, as root,
+    `/usr/bin/install -S -o root -g wheel -m 0440 <candidate> /etc/tycho-agent.sudoers.tmp`,
+    `/usr/sbin/visudo -c -f /etc/tycho-agent.sudoers.tmp` (again `parsed OK`) and
+    `/bin/mv -f /etc/tycho-agent.sudoers.tmp /etc/sudoers.d/tycho-agent`. sudo reads every
+    name in `sudoers.d` without a dot or a trailing `~`, a file there that does not parse makes
+    sudo refuse every command for every user, and `install` writes its own temporary file
+    (`INS@XXXXXX`) in its target's directory; so nothing but the final rename, on the same
+    volume, touches `sudoers.d`, and a failed step leaves at most the staging file in `/etc`. The step runs while the listing below shows no rule, the rule for
+    another zmx install (a pin bump), or the rule's entry with another `Defaults!` line. Any
+    other no-password entry is reported for the operator to remove, and does not stop the
+    install.
+
+The rule names zmx, not the launcher: under sudo, zmx's session daemon and the shell it
+starts are the agent's, and the shell executes the typed `env -i … tycho launch` in place,
+so the pid `zmx list` reports is the launcher as the agent, which the kill path and the
+credential hand-off require. Measured with zmx 0.8.1 in a throwaway socket directory: a
+session started by `zmx run <name> -d exec …` lists the pid of the executed program, whose
+parent is the `zmx run` daemon; sudo typed into a developer's session instead lists sudo
+itself, real uid the developer's and effective uid 0, and sudo 1.9.17 stays the command's
+parent while `use_pty` or `pam_session` is on, both defaults. The switched run starts from
+`/` with `HOME=/var/empty`, so the login `bash` zmx starts reads no startup file of the
+agent's before the typed line; sudo also sets `SHELL`, `USER`, `LOGNAME`, `MAIL` and the
+`SUDO_*` variables, passes `PATH`, and keeps `TERM`, `TZ` and the locale variables that its
+`env_check` finds safe (design section 7, what crosses sudo).
+
+Setup reads the rule back, since the developer cannot read a 0440 root file. `sudo -n -k -l`
+lists every entry of the developer with its tags and the bound defaults, one line each when
+written to a pipe (to a terminal sudo wraps each line at the terminal's width; setup and the
+boundary suite both capture it through pipes), except that sudo 1.9.17 glues the first
+command-bound `Defaults!` line onto the last runas-bound `Defaults>` line, which the decoder
+splits; `-k` ignores a cached ticket without removing it, and with no entry that
+needs no password sudo answers `sudo: a password is required`, which reads as no rule. The
+listing must hold exactly `(tycho-agent) NOPASSWD: <pinned zmx>` and its `Defaults!<pinned zmx>`
+line with the four kept variables, `umask=0007` and `umask_override`, and no other `NOPASSWD`
+entry or `!authenticate` default; then `sudo -n -k -u tycho-agent -- /usr/bin/true` must
+answer `sudo: a password is required`. `sudo -l <command>` is no probe of the rule: the
+developer is in `admin`, which may run anything as anyone with a password, and once one entry
+needs none sudo lists without a password and answers "permitted" for any command. The
+listing's form was read from sudo 1.9.17's source (`display.c`, `fmtsudoers.c`), not captured;
+a line the decoder cannot place reads as unreachable. That zmx itself runs with no password is
+shown by the boundary suite's session.
 
 The agent's own primary group does not keep it out of the developer's home: macOS makes
 every local account a member of `staff` through the `localaccounts` group, and a home is
@@ -290,7 +358,9 @@ or a group the agent is in, search it.
   the terminal; the task prints a notice before each one. The xtask never reads or passes a
   password, and refuses to start when stdin is not a terminal, as the agent user, or as root.
 - Root never changes the owner of a path, and changes one mode: the agent home's, whose
-  entry sits in root-owned `/Users`, where no other user can swap it for a link. A home
+  entry sits in root-owned `/Users`, where no other user can swap it for a link. Root writes
+  one file, the sudoers rule, by `install` into root-owned `/etc/sudoers.d`, from a
+  candidate in a directory only the developer can reach. A home
   owned by another user, with another group, or with a mode narrower than 0700 is reported
   with its fix, not changed. A socket directory owned by another user, or owned by root
   with the wrong group or mode, is removed with `sudo /bin/rmdir`, which removes only an
@@ -387,7 +457,9 @@ station is built, so every binary the agent runs lives in `/Users/Shared/tycho`:
 - The developer owns the prefix and every entry beneath it, and none is writable by group
   or other, so the agent reads and executes and changes nothing. `/Users/Shared` is
   world-writable and sticky, so only the developer or root can rename or remove the
-  prefix's entry. No step runs as root and a pin bump needs no sudo.
+  prefix's entry. No prefix step runs as root, and a pin bump needs no sudo, except that a
+  zmx pin bump moves the path the sudoers rule names, so `provision-agent` installs the
+  rule again.
 - A session runs claude, codex and zmx by the absolute paths `station.json` records, and
   `PATH` holds those install directories, never mise's shims. A shim asks mise which version
   to run, and mise reads `.tool-versions` and `mise.toml` in the working directory and its
@@ -438,7 +510,8 @@ station is built, so every binary the agent runs lives in `/Users/Shared/tycho`:
   can swap is reported with its fix and nothing is installed into it.
 - `LauncherSpawner::for_prefix` builds the spawner from `ToolPrefix`, which reads
   `station.json`: zmx types the prefix's `bin/tycho` as the launcher, sessions run under the
-  recorded zmx, the launcher's `PATH` holds the prefix's `bin` and the recorded install
+  recorded zmx, started through `sudo -n -u <agent>` when the agent uid is not the core's
+  (`Zmx::agent_as`; only `run` goes through sudo), the launcher's `PATH` holds the prefix's `bin` and the recorded install
   directories, and the vendor gets the mise variables. `TYCHO_TOOL_PREFIX` moves the prefix
   for a test core home and is refused for the production one. The launcher, control, worker
   and chaos suites start their sessions this way from a scratch prefix that links the built

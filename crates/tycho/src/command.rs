@@ -183,10 +183,25 @@ pub fn run_detached(
     removed: &[OsString],
     timeout: Duration,
 ) -> Result<ExitStatus, CommandError> {
+    run_detached_from(program, arguments, environment, removed, None, timeout)
+}
+
+/// `run_detached` from `current_dir` when one is given, else from the caller's.
+pub fn run_detached_from(
+    program: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+    removed: &[OsString],
+    current_dir: Option<&Path>,
+    timeout: Duration,
+) -> Result<ExitStatus, CommandError> {
     let name = program.display().to_string();
     let mut command = Command::new(program);
     for variable in removed {
         command.env_remove(variable);
+    }
+    if let Some(dir) = current_dir {
+        command.current_dir(dir);
     }
     let mut child = command
         .args(arguments)

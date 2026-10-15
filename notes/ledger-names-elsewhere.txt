@@ -1,0 +1,3 @@
+# Names a ledger row cites that no source under crates/ or xtask/ defines, each with why.
+pr_create_without_draft  # a function of ~/.claude/hooks/git_hygiene.py, outside the repository
+mandate_thresholds_are_bounded_when_set  # the test the 2026-10-13 bounds row names as deleted

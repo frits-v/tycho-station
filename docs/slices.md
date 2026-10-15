@@ -12,7 +12,11 @@ The design is `docs/design.html`. Section numbers below refer to it.
   section 7, trust boundaries), and a deny entry for it in the developer's home ACL, since
   every local account is in `staff` through `localaccounts`. No credentials of any kind in
   that account. The core runs as the developer.
-- A group shared by the developer and the agent user, for the zmx socket directory.
+- A group shared by the developer and the agent user, for the zmx socket directory, which is
+  sticky so the agent cannot rename the developer's entries there.
+- A sudoers rule, `/etc/sudoers.d/tycho-agent`, that lets the developer run the prefix's zmx
+  as the agent user with no password and nothing wider, so the core starts each launcher
+  session as the agent (design section 7, the identity switch).
 - The shared tool prefix `/Users/Shared/tycho`, owned by the developer and closed to group
   and other writes, holding every binary the agent runs: the pinned mise, claude, codex and
   zmx, and release builds of the station (design section 7). The agent cannot search the
@@ -25,9 +29,11 @@ The design is `docs/design.html`. Section numbers below refer to it.
 - The entire CLI logged in as the developer if the entire mirror is the sync remote.
 
 `mise run provision-agent`, run as the developer from a terminal, creates the user, both
-groups, the home ACL entry and the socket directories, asking for sudo on the terminal, and
-creates and fills the tool prefix with no root step
-([provisioning](process.md#provisioning-the-agent-user)). The vendor credentials need a
+groups, the home ACL entry and the socket directories, asking for sudo on the terminal,
+creates and fills the tool prefix with no root step, and last installs the sudoers rule,
+checked with `visudo -c -f` before root installs it
+([provisioning](process.md#provisioning-the-agent-user)). After a zmx pin bump it installs
+the rule again, since the rule names the pinned path. The vendor credentials need a
 browser login by the plans' owner and stay with the operator, who stores them with the
 commands the task prints ([vendor credentials](process.md#vendor-credentials)). `mise run setup` as the developer and
 `/Users/Shared/tycho/bin/xtask setup` as the agent check every precondition above and print
@@ -70,7 +76,9 @@ Steps and the question each one answers:
 5. Boundary tests as the agent user: read the developer's keychain and config
    directories, write the agent's own settings file, reach the Restate admin port,
    write to the canonical repository, edit its hooks directory, push to its default
-   branch. All must fail. Then the positive gate path to a throwaway remote.
+   branch, put a link at the shared zmx log or rename its directory. All must fail. The
+   sudoers rule must be exactly the narrow one, and a session started through it must
+   list a pid of the agent's. Then the positive gate path to a throwaway remote.
    `crates/tycho/tests/boundary.rs`, run with `mise run boundary-tests` from a terminal,
    since sudo asks for the developer's password to run each probe as the agent.
 6. Attach tests: a Ghostty tab as the developer attaches to a zmx session owned by the

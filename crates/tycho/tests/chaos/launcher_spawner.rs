@@ -230,7 +230,12 @@ pub fn running_vendor(files: &SessionFiles) -> Option<u32> {
     .then_some(record.pid)
 }
 
-/// The test's own cleanup of a vendor left by a launcher killed with `SIGKILL`; true when one ran.
+/// The test's own cleanup of a vendor left running after its launcher died: the vendor leads its
+/// own session, so neither `zmx kill` nor the launcher's end reaches it once the launcher is
+/// killed. This suite runs the agent as the core's own user, where the kill path refuses to
+/// signal (`CoreUid`), so the vendor is orphaned and only this cleanup ends it. With sessions as
+/// the agent the core delivers the kill through the sudoers rule, which no suite here runs; true
+/// when one was running.
 pub fn kill_orphan_vendor(files: &SessionFiles) -> bool {
     let pid = running_vendor(files);
     if let Some(pid) = pid {

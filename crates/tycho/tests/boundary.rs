@@ -2,7 +2,9 @@
 //! home and credentials, the agent's own settings file, the Restate admin port of a test core
 //! and that core's canonical repository is decoded into an enumerated outcome; then, as the
 //! core, a worker's commit is fetched, verified on a fresh checkout with pinned criteria,
-//! fast-forwarded and synced to a throwaway remote. macOS only, run by
+//! fast-forwarded and synced to a throwaway remote. The sudoers rule is read back and must be
+//! exactly the narrow one; a session started through it must run as the agent; and the agent
+//! must not be able to point the developer's zmx log elsewhere. macOS only, run by
 //! `mise run boundary-tests` from a terminal, where sudo asks for the developer's password.
 #![allow(
     clippy::disallowed_methods,
@@ -30,18 +32,26 @@ mod support;
 use std::env;
 use std::fs;
 use std::io::IsTerminal;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
 use tycho::agent_files::current_uid;
 use tycho::command::{self, CommandError};
-use tycho::config::AGENT_USER_DEFAULT;
+use tycho::config::{
+    ToolPrefix, AGENT_SOCKET_DIR_DEFAULT, AGENT_USER_DEFAULT, TOOL_PREFIX_DEFAULT,
+};
+use tycho::process::{process_facts, ProcessFacts};
 use tycho::repositories::{pin_ref, unit_branch, ProjectName, Repositories};
+use tycho::zmx::{prepare_shared_log, presence, Presence, Zmx, LOG_DIR, LOG_FILE};
 use tycho_harness::content::content_ref;
 use tycho_harness::verify::{run_criteria_with, unit_passed, VerifyOptions};
 use tycho_harness::work_units::{load_default, PassCondition};
+use tycho_types::agent_switch::{
+    decode_listing, decode_wider, listing_arguments, wider_probe_arguments, Expected, Listing,
+    WiderProbe,
+};
 use tycho_types::envelope::{BranchName, CommitSha};
 use tycho_types::git_environment::{git_command, hook_environment_refusal};
 use tycho_types::service::{Attempt, WorkUnitId};
@@ -53,9 +63,9 @@ const PROBE_OUTPUT_MAX_BYTES: usize = 65_536;
 /// The agent-side shell's last line: who it ran as and what the probe exited with.
 const MARKER: &str = "tycho-probe";
 const AGENT_PATH: &str = "PATH=/usr/bin:/bin:/usr/sbin:/sbin";
-/// Whether a sudoers rule lets the developer become the agent without a password. Nothing in
-/// the station installs one while the identity switch is undecided.
-const NO_PASSWORD_RULE_EXPECTED: bool = false;
+/// How long a session started through the rule gets to appear in, and leave, `zmx list`.
+const SESSION_WAIT: Duration = Duration::from_secs(10);
+const SESSION_POLL: Duration = Duration::from_millis(250);
 /// Reached text printed for an open boundary is cut to this many characters.
 const EVIDENCE_MAX_CHARS: usize = 400;
 const PROJECT: &str = "widget";
@@ -275,31 +285,66 @@ impl Drop for ForgetSudo {
     }
 }
 
-/// What `sudo -n` answered after `sudo -k` dropped any cached credential.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SudoProbe {
-    PasswordRequired,
-    NoPasswordRule,
-    Refused(String),
-    Unrecognised(String),
+/// The prefix's zmx, which the sudoers rule names.
+fn prefix_zmx() -> PathBuf {
+    ToolPrefix::load(PathBuf::from(TOOL_PREFIX_DEFAULT))
+        .unwrap_or_else(|error| panic!("boundary: the shared tool prefix: {error}"))
+        .tool("zmx")
+        .unwrap_or_else(|| panic!("boundary: station.json records no zmx"))
+        .to_path_buf()
 }
 
-fn decode_sudo_probe(success: bool, stderr: &str) -> SudoProbe {
-    if success {
-        return SudoProbe::NoPasswordRule;
-    }
-    let first = stderr.lines().next().unwrap_or("").to_string();
-    if first == "sudo: a password is required" {
-        SudoProbe::PasswordRequired
-    } else if first.starts_with("sudo:") {
-        SudoProbe::Refused(first)
-    } else {
-        SudoProbe::Unrecognised(cut(stderr.trim()))
-    }
+fn sudo_answer(arguments: &[String]) -> (Option<i32>, String, String) {
+    let output = Command::new(SUDO)
+        .args(arguments)
+        .current_dir("/")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap_or_else(|error| panic!("boundary: sudo could not run: {error}"));
+    (
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
 }
 
-/// Refuses to start without a terminal, without the agent user, or with a sudo answer the
-/// station does not expect; prints what it saw.
+/// Requires exactly the narrow rule, with the probes setup makes: `zmx list` as the agent is
+/// listed with no password, and a command outside the rule still needs one. Neither probe uses
+/// or drops a cached ticket.
+fn require_the_narrow_rule() {
+    let zmx = prefix_zmx();
+    let zmx = zmx.to_str().unwrap();
+    let installs = Path::new(zmx)
+        .parent()
+        .and_then(Path::parent)
+        .map(|dir| format!("{}/", dir.display()))
+        .unwrap();
+    let expected = Expected {
+        agent: AGENT_USER_DEFAULT,
+        zmx,
+        zmx_installs: &installs,
+    };
+    let (exit, stdout, stderr) = sudo_answer(&listing_arguments());
+    let listing = decode_listing(exit, &stdout, &stderr, &expected);
+    println!("boundary: sudo -n -k -l: {listing:?}");
+    let (exit, stdout, stderr) = sudo_answer(&wider_probe_arguments(AGENT_USER_DEFAULT));
+    let wider = decode_wider(exit, &stdout, &stderr);
+    println!("boundary: sudo -n -k -u {AGENT_USER_DEFAULT} -- /usr/bin/true: {wider:?}");
+    assert!(
+        matches!(&listing, Listing::Listed(reading) if reading.is_exact()),
+        "boundary: the sudoers listing is not exactly the rule for the prefix's zmx; run \
+         `mise run setup`, then `mise run provision-agent`"
+    );
+    assert_eq!(
+        wider,
+        WiderProbe::PasswordRequired,
+        "boundary: a sudoers rule runs commands outside the prefix's zmx as \
+         {AGENT_USER_DEFAULT} with no password"
+    );
+}
+
+/// Refuses to start without a terminal, without the agent user, or without exactly the narrow
+/// sudoers rule; prints what it saw.
 fn preflight() -> Agent {
     assert!(
         std::io::stdin().is_terminal(),
@@ -321,28 +366,8 @@ fn preflight() -> Agent {
     );
     let forget = Command::new(SUDO).arg("-k").status().unwrap();
     assert!(forget.success(), "boundary: sudo -k exited {forget}");
-    let probe = Command::new(SUDO)
-        .args(["-n", "-u", AGENT_USER_DEFAULT, "--", "/usr/bin/true"])
-        .current_dir("/")
-        .output()
-        .unwrap();
-    let seen = decode_sudo_probe(
-        probe.status.success(),
-        &String::from_utf8_lossy(&probe.stderr),
-    );
-    println!("boundary: sudo -n -u {AGENT_USER_DEFAULT} after sudo -k: {seen:?}");
-    match seen {
-        SudoProbe::PasswordRequired => {
-            println!("boundary: sudo asks for the developer's password once, on this terminal");
-        }
-        SudoProbe::NoPasswordRule if NO_PASSWORD_RULE_EXPECTED => {}
-        SudoProbe::NoPasswordRule => panic!(
-            "boundary: a sudoers rule runs commands as {AGENT_USER_DEFAULT} with no password; \
-             the station installs none while the identity switch is undecided"
-        ),
-        SudoProbe::Refused(line) => panic!("boundary: could not look: {line}"),
-        SudoProbe::Unrecognised(text) => panic!("boundary: sudo -n answered {text}"),
-    }
+    require_the_narrow_rule();
+    println!("boundary: sudo asks for the developer's password once, on this terminal");
     agent
 }
 
@@ -361,6 +386,13 @@ const WRITE_SETTINGS: &str =
      else : > \"$1\" && /bin/rm -f \"$1\" && echo \"created and removed $1\"; fi";
 const ADMIN_HEALTH: &str =
     "/usr/bin/curl -sS -m 5 -o /dev/null -w 'admin answered %{http_code}' \"http://$1/health\"";
+/// Puts a link at the developer's zmx log, so the developer's next zmx command would append
+/// to `$2`; the log directory is the developer's and closed to group writes.
+const PLANT_LOG_LINK: &str =
+    "/bin/ln -sf \"$2\" \"$1/logs/zmx.log\" && echo \"linked $1/logs/zmx.log to $2\"";
+/// Moves the developer's log directory aside, so the agent could make its own in its place;
+/// the shared directory is sticky.
+const RENAME_LOG_DIR: &str = "/bin/mv \"$1/logs\" \"$1/logs.agent\" && echo \"renamed $1/logs\"";
 const WRITE_OBJECTS: &str = ": > \"$1/objects/tycho-boundary-probe\" && echo \"wrote $1/objects\"";
 const WRITE_HOOK: &str = "/bin/mkdir -p \"$1/hooks\" && printf '#!/bin/sh\\nexit 0\\n' > \
      \"$1/hooks/pre-receive\" && echo \"wrote $1/hooks/pre-receive\"";
@@ -554,7 +586,14 @@ fn the_agent_user_is_refused_at_every_boundary() {
         .status();
     println!("evidence: the admin port {admin} answers the developer with {answered}");
     assert!(answered.is_success(), "the probe needs a live admin port");
-    let results: Vec<(String, Expectation, Outcome)> = boundaries(&agent, &admin, &canonical)
+    let shared = Path::new(AGENT_SOCKET_DIR_DEFAULT);
+    prepare_shared_log(shared)
+        .unwrap_or_else(|refusal| panic!("boundary: the shared zmx log: {refusal}"));
+    let target = core.config.home.join("developer-file");
+    fs::write(&target, "kept\n").unwrap();
+    let mut list = boundaries(&agent, &admin, &canonical);
+    list.extend(log_boundaries(shared, &target));
+    let results: Vec<(String, Expectation, Outcome)> = list
         .into_iter()
         .map(|boundary| {
             let arguments: Vec<&str> = boundary.arguments.iter().map(String::as_str).collect();
@@ -564,10 +603,264 @@ fn the_agent_user_is_refused_at_every_boundary() {
         .collect();
     let layer = run_as_agent(&agent, LAYER_WALK, &[canonical.to_str().unwrap()]);
     println!("evidence: the agent's walk to the canonical repository: {layer:?}");
+    developer_log_is_intact(shared, &target);
     let failures = report(&results);
     assert_eq!(
         failures, 0,
         "{failures} boundaries are open or could not be examined"
+    );
+}
+
+/// The agent's attempts on the developer's zmx log, both refused when the shared directory is
+/// sticky and the log directory the developer's.
+fn log_boundaries(shared: &Path, target: &Path) -> [Boundary; 2] {
+    let shared = shared.display().to_string();
+    [
+        Boundary {
+            name: format!("put a link at {shared}/logs/zmx.log"),
+            expectation: Expectation::Refused,
+            script: PLANT_LOG_LINK,
+            arguments: vec![shared.clone(), target.display().to_string()],
+        },
+        Boundary {
+            name: format!("rename {shared}/logs"),
+            expectation: Expectation::Refused,
+            script: RENAME_LOG_DIR,
+            arguments: vec![shared],
+        },
+    ]
+}
+
+/// After the agent's attempts, the developer's zmx appends to its own log and nowhere else.
+fn developer_log_is_intact(shared: &Path, target: &Path) {
+    let listed = Zmx::agent(&prefix_zmx(), shared).list();
+    let kept = fs::read_to_string(target).unwrap();
+    println!(
+        "evidence: after the agent's attempts the developer's zmx list answered {:?} and the \
+         link target holds {kept:?}",
+        listed.as_ref().map(Vec::len)
+    );
+    assert!(listed.is_ok(), "the developer's zmx refused its own log");
+    assert_eq!(
+        kept, "kept\n",
+        "the developer's zmx appended through the agent's link"
+    );
+    let log = shared.join(LOG_DIR).join(LOG_FILE);
+    let log_facts = fs::symlink_metadata(&log).unwrap();
+    assert!(
+        log_facts.file_type().is_file() && log_facts.uid() == current_uid(),
+        "{} is no longer the developer's regular file",
+        log.display()
+    );
+}
+
+/// What `ps` says of the pid zmx lists for `name`, once it runs the typed program or the wait
+/// ends.
+fn listed_program(zmx: &Zmx, name: &str) -> ProcessFacts {
+    let mut seen = Presence::Absent;
+    let started = std::time::Instant::now();
+    while started.elapsed() < SESSION_WAIT {
+        seen = presence(&zmx.list().unwrap(), name);
+        if let Presence::Running { pid, .. } = seen {
+            if let ProcessFacts::Running(facts) = process_facts(pid) {
+                if facts.command.starts_with("/bin/sleep") {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(SESSION_POLL);
+    }
+    match seen {
+        Presence::Running { pid, .. } => process_facts(pid),
+        other => panic!("boundary: {name} is {other:?} in zmx list"),
+    }
+}
+
+/// Whether `name` left `zmx list` within the wait.
+fn gone_within(zmx: &Zmx, name: &str) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < SESSION_WAIT {
+        if presence(&zmx.list().unwrap(), name) == Presence::Absent {
+            return true;
+        }
+        std::thread::sleep(SESSION_POLL);
+    }
+    false
+}
+
+/// What a session started through the rule shows, as comparisons: the uids themselves are
+/// never printed.
+struct SessionEvidence {
+    listed_is_agent: bool,
+    command: String,
+    socket_is_agent: bool,
+    socket_mode: u32,
+}
+
+impl SessionEvidence {
+    fn read(zmx: &Zmx, shared: &Path, name: &str, agent_uid: u32) -> Self {
+        let (listed_is_agent, command) = match listed_program(zmx, name) {
+            ProcessFacts::Running(facts) => (facts.uid == agent_uid, facts.command),
+            ProcessFacts::Gone => (false, "gone".to_string()),
+            ProcessFacts::Unrecognised(text) => (false, format!("ps answered {text}")),
+        };
+        let socket = fs::symlink_metadata(shared.join(name)).unwrap();
+        Self {
+            listed_is_agent,
+            command,
+            socket_is_agent: socket.uid() == agent_uid,
+            socket_mode: socket.mode() & 0o777,
+        }
+    }
+}
+
+/// A session started through the sudoers rule, as the spawner starts a launcher: zmx must list a
+/// pid of the agent's running the typed program, and the session's socket must be the agent's.
+#[test]
+#[ignore = "starts a session as the agent through the sudoers rule; run with mise run boundary-tests"]
+fn a_session_started_through_the_rule_runs_as_the_agent() {
+    require_the_narrow_rule();
+    let agent_uid = nix::unistd::User::from_name(AGENT_USER_DEFAULT)
+        .unwrap()
+        .unwrap_or_else(|| panic!("boundary: no user {AGENT_USER_DEFAULT}"))
+        .uid
+        .as_raw();
+    let shared = Path::new(AGENT_SOCKET_DIR_DEFAULT);
+    let zmx = Zmx::agent_as(&prefix_zmx(), shared, AGENT_USER_DEFAULT);
+    let name = format!("tycho-boundary-{}", std::process::id());
+    let program = ["exec", "/bin/sleep", "120"].map(str::to_string);
+    zmx.run_words(&name, &program)
+        .unwrap_or_else(|error| panic!("boundary: {error}"));
+    let seen = SessionEvidence::read(&zmx, shared, &name, agent_uid);
+    println!(
+        "evidence: {name}: the listed pid is the agent's {}, runs {:?}; the socket is the \
+         agent's {}, mode {:o}",
+        seen.listed_is_agent, seen.command, seen.socket_is_agent, seen.socket_mode
+    );
+    let killed = zmx.kill(&name);
+    let gone = gone_within(&zmx, &name);
+    println!("evidence: zmx kill {name} by name as the developer: {killed:?}; gone {gone}");
+    assert!(seen.listed_is_agent, "the listed pid is not the agent's");
+    assert!(
+        seen.command.starts_with("/bin/sleep 120"),
+        "{}",
+        seen.command
+    );
+    assert!(
+        seen.socket_is_agent,
+        "the session socket is not the agent's"
+    );
+    assert_eq!(
+        seen.socket_mode, 0o770,
+        "the developer's group cannot connect"
+    );
+    assert!(
+        gone,
+        "the developer's kill by name did not end the agent's session"
+    );
+}
+
+/// Starts `tycho session-leader -- /bin/sleep <seconds>` as a background child of a shell and
+/// prints the child's pid, as `$!` names it. The shell zmx starts is the leader of the pty's
+/// session already, and `setsid` refuses a session leader, so a program typed with `exec`
+/// in place of the shell cannot lead a session of its own; a child can.
+const GROUP_LEADER_SCRIPT: &str =
+    "\"$0\" session-leader -- /bin/sleep \"$1\" & printf 'reap-leader %s\\n' \"$!\"; wait";
+const LEADER_MARKER: &str = "reap-leader ";
+
+fn group_leader_words(tycho: &str, seconds: &str) -> Vec<String> {
+    ["/bin/sh", "-c", GROUP_LEADER_SCRIPT, tycho, seconds]
+        .map(str::to_string)
+        .to_vec()
+}
+
+/// The pid a line of output names as the group leader; the echoed command line, whose marker
+/// is followed by the format, never matches.
+fn leader_pid(output: &str) -> Option<u32> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix(LEADER_MARKER)
+            .filter(|digits| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+            .and_then(|digits| digits.parse().ok())
+    })
+}
+
+/// What `ps` says of `pid` once it leads its own group, or at the end of the session wait:
+/// `$!` names the child before its `setsid` has run.
+fn once_leading(pid: u32) -> ProcessFacts {
+    let started = std::time::Instant::now();
+    loop {
+        let facts = process_facts(pid);
+        let leads = matches!(&facts, ProcessFacts::Running(running) if running.pgid == pid);
+        if leads || started.elapsed() >= SESSION_WAIT {
+            return facts;
+        }
+        std::thread::sleep(SESSION_POLL);
+    }
+}
+
+/// The group leader's pid from the session's scrollback, within the session wait.
+fn leader_from_history(zmx: &Zmx, name: &str) -> Option<u32> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < SESSION_WAIT {
+        if let Some(pid) = zmx
+            .history(name, PROBE_OUTPUT_MAX_BYTES)
+            .ok()
+            .as_deref()
+            .and_then(leader_pid)
+        {
+            return Some(pid);
+        }
+        std::thread::sleep(SESSION_POLL);
+    }
+    None
+}
+
+/// The kill path's delivery through the rule: a group leader running as the agent, as a vendor
+/// runs under `tycho session-leader`, is killed by a throwaway session the core starts as the
+/// agent and then removes.
+#[test]
+#[ignore = "kills a process group of the agent through the sudoers rule; run with mise run boundary-tests"]
+fn a_group_of_the_agent_is_killed_through_the_rule() {
+    require_the_narrow_rule();
+    let agent_uid = nix::unistd::User::from_name(AGENT_USER_DEFAULT)
+        .unwrap()
+        .unwrap_or_else(|| panic!("boundary: no user {AGENT_USER_DEFAULT}"))
+        .uid
+        .as_raw();
+    let shared = Path::new(AGENT_SOCKET_DIR_DEFAULT);
+    let zmx = Zmx::agent_as(&prefix_zmx(), shared, AGENT_USER_DEFAULT);
+    let tycho = ToolPrefix::load(PathBuf::from(TOOL_PREFIX_DEFAULT))
+        .unwrap()
+        .tycho()
+        .display()
+        .to_string();
+    let name = format!("tycho-boundary-reap-{}", std::process::id());
+    let mut program = vec!["exec".to_string()];
+    program.extend(group_leader_words(&tycho, "600"));
+    zmx.run_words(&name, &program)
+        .unwrap_or_else(|error| panic!("boundary: {error}"));
+    let leader = leader_from_history(&zmx, &name);
+    let (leader_is_agent, leads_its_group, command) = match leader.map(once_leading) {
+        Some(ProcessFacts::Running(facts)) => (
+            facts.uid == agent_uid,
+            Some(facts.pgid) == leader,
+            facts.command,
+        ),
+        other => (false, false, format!("{other:?}")),
+    };
+    let verdict = leader.map(|pid| tycho::kill::deliver_through(&zmx, pid, true, &process_facts));
+    let removed = zmx.kill(&name);
+    println!(
+        "evidence: the group leader is the agent's {leader_is_agent}, leads its group \
+         {leads_its_group}, runs {command:?}; the kill through the rule: {verdict:?}; {name} \
+         removed: {removed:?}"
+    );
+    assert!(leader_is_agent, "the group leader is not the agent's");
+    assert!(leads_its_group, "the child does not lead its own group");
+    assert_eq!(
+        verdict,
+        Some(tycho::kill::KillVerdict::SignalledThroughRule)
     );
 }
 
@@ -947,6 +1240,80 @@ mod probes {
 }
 
 #[cfg(test)]
+mod group_leader {
+    //! The reap test's program run as the test's own user, under a session leader as zmx runs
+    //! its shell.
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
+
+    #[test]
+    fn a_program_typed_with_exec_in_a_session_leader_cannot_lead_a_session() {
+        let status = Command::new(TYCHO)
+            .args([
+                "session-leader",
+                "--",
+                "/bin/sh",
+                "-c",
+                "exec \"$0\" session-leader -- /bin/sleep 1",
+                TYCHO,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "setsid succeeded in a session leader");
+    }
+
+    #[test]
+    fn a_child_of_a_session_leader_leads_its_own_group_and_names_its_pid() {
+        let mut shell = Command::new(TYCHO)
+            .arg("session-leader")
+            .arg("--")
+            .args(group_leader_words(TYCHO, "30"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(shell.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let leader = leader_pid(&line).unwrap_or_else(|| panic!("no leader in {line:?}"));
+        let facts = once_leading(leader);
+        let killed = tycho::process::send(leader, true, nix::sys::signal::Signal::SIGKILL);
+        let ended = shell.wait();
+        match facts {
+            ProcessFacts::Running(facts) => {
+                assert_eq!(facts.pgid, leader, "the child is not its group's leader");
+                assert!(facts.command.contains("sleep 30"), "{}", facts.command);
+            }
+            other => panic!("ps answered {other:?}"),
+        }
+        assert!(killed.is_ok(), "{killed:?}");
+        assert!(ended.is_ok());
+    }
+
+    #[test]
+    fn only_a_marker_followed_by_digits_names_the_leader() {
+        assert_eq!(leader_pid("reap-leader 4242\r\n"), Some(4242));
+        assert_eq!(
+            leader_pid("$ /bin/sh -c '\"$0\" ... printf '\\''reap-leader %s\\n'"),
+            None
+        );
+        assert_eq!(
+            leader_pid("reap-leader %s\\n' \"$!\"; wait\nreap-leader 7\n"),
+            Some(7)
+        );
+        assert_eq!(leader_pid("reap-leader \n"), None);
+    }
+}
+
+#[cfg(test)]
 mod decoders {
     //! Samples captured on macOS by running each probe as the developer against a directory
     //! the developer owns and one owned by root, and from sudo itself.
@@ -1139,22 +1506,5 @@ mod decoders {
         ];
         assert_eq!(report(&results), 2);
         assert_eq!(report(&[]), 1, "examining nothing fails");
-    }
-
-    #[test]
-    fn sudo_without_a_prompt_is_told_apart_from_one_that_needs_a_password() {
-        assert_eq!(
-            decode_sudo_probe(false, "sudo: a password is required\n"),
-            SudoProbe::PasswordRequired
-        );
-        assert_eq!(decode_sudo_probe(true, ""), SudoProbe::NoPasswordRule);
-        assert!(matches!(
-            decode_sudo_probe(false, "sudo: unknown user tycho-agent\n"),
-            SudoProbe::Refused(_)
-        ));
-        assert!(matches!(
-            decode_sudo_probe(false, "something else\n"),
-            SudoProbe::Unrecognised(_)
-        ));
     }
 }
