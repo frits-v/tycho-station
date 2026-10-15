@@ -547,9 +547,9 @@ check out, build and run it.
 - A pull request opens as a draft (`gh pr create --draft`) and is marked ready with
   `gh pr ready <number>` once its ci passes; GitHub sends `ready_for_review` only when a
   draft is marked ready, so a pull request opened ready starts no review. The agent hook
-  `xtask hook pre-tool-use` refuses a `gh pr create` without `--draft`, and a
-  `gh pr create` or `gh pr edit` whose title is not literal text or fails the commit
-  subject check.
+  `xtask hook pre-tool-use` refuses a `gh pr create` or `gh pr new` without `--draft`, and a
+  title on either or on `gh pr edit` that is not literal text or fails the commit subject
+  check.
 - The `review` workflow starts on `pull_request_target` when a pull request whose author is
   an owner, member or collaborator is marked ready for review, and on `issue_comment` when a
   comment on a pull request, any pull request a fork's included, mentions

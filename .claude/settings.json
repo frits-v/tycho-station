@@ -11,6 +11,11 @@
           },
           {
             "type": "command",
+            "if": "Bash(gh pr new *)",
+            "command": "cargo run -q -p xtask -- hook pre-tool-use"
+          },
+          {
+            "type": "command",
             "if": "Bash(gh pr edit *)",
             "command": "cargo run -q -p xtask -- hook pre-tool-use"
           }

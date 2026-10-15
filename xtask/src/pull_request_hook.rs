@@ -13,7 +13,7 @@ const COMMAND_MAX_CHARS: usize = 256 * 1024;
 const WORDS_MAX: usize = 8192;
 /// The `gh pr create` and `gh pr edit` flags that take a value, so the value is never read as
 /// a flag of its own.
-const VALUE_FLAGS: [&str; 32] = [
+const VALUE_FLAGS: [&str; 31] = [
     "-a",
     "--assignee",
     "-B",
@@ -45,7 +45,6 @@ const VALUE_FLAGS: [&str; 32] = [
     "--remove-label",
     "--remove-project",
     "--remove-reviewer",
-    "--remove-milestone",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,10 +132,62 @@ impl Lexer<'_> {
                     }
                     None => return Err("a double quote is never closed".to_string()),
                 },
+                Some('$') if self.chars.peek() == Some(&'(') => {
+                    self.chars.next();
+                    self.substitution()?;
+                }
                 Some(inner) => self.push(inner),
             }
         }
         self.in_word = true;
+        Ok(())
+    }
+
+    /// Consumes a quoted region inside a command substitution through its closing quote.
+    fn skip_quoted(&mut self, quote: char) -> Result<(), String> {
+        loop {
+            match self.chars.next() {
+                None => return Err("a command substitution is never closed".to_string()),
+                Some('\\') if quote == '"' => {
+                    self.chars.next();
+                }
+                Some(character) if character == quote => return Ok(()),
+                Some(_) => {}
+            }
+        }
+    }
+
+    /// Consumes a command substitution after its `$(` through the matching `)`, with the
+    /// quotes and heredoc bodies inside it, so none of its text closes an outer quote or
+    /// counts as a word of the command. The word it is part of is not literal.
+    fn substitution(&mut self) -> Result<(), String> {
+        self.push('$');
+        self.word.push_str("(...)");
+        let mut depth = 1_usize;
+        let mut pending: Vec<String> = Vec::new();
+        while depth > 0 {
+            match self.chars.next() {
+                None => return Err("a command substitution is never closed".to_string()),
+                Some('\\') => {
+                    self.chars.next();
+                }
+                Some(quote @ ('\'' | '"')) => self.skip_quoted(quote)?,
+                Some('(') => depth = depth.saturating_add(1),
+                Some(')') => depth = depth.saturating_sub(1),
+                Some('<') if self.chars.peek() == Some(&'<') => {
+                    self.chars.next();
+                    if self.chars.next_if_eq(&'<').is_none() {
+                        pending.push(self.heredoc_delimiter()?);
+                    }
+                }
+                Some('\n') => {
+                    for delimiter in std::mem::take(&mut pending) {
+                        self.skip_heredoc_body(&delimiter)?;
+                    }
+                }
+                Some(_) => {}
+            }
+        }
         Ok(())
     }
 
@@ -204,6 +255,10 @@ impl Lexer<'_> {
                 },
                 '\'' => self.single_quoted()?,
                 '"' => self.double_quoted()?,
+                '$' if self.chars.peek() == Some(&'(') => {
+                    self.chars.next();
+                    self.substitution()?;
+                }
                 '<' if self.chars.peek() == Some(&'<') => {
                     self.chars.next();
                     if self.chars.next_if_eq(&'<').is_some() {
@@ -318,7 +373,7 @@ fn judge_pull_request(
             remaining.next();
         }
     }
-    if verb == "create" && !draft {
+    if verb != "edit" && !draft {
         return Err(
             "`gh pr create` opens a pull request ready for review; open it as a \
                     draft with `--draft` and run `gh pr ready <number>` when it is ready, \
@@ -360,7 +415,7 @@ pub fn decide(command: &str) -> Decision {
             [gh, pr, verb, ..]
                 if gh.text == "gh"
                     && pr.text == "pr"
-                    && matches!(verb.text.as_str(), "create" | "edit") =>
+                    && matches!(verb.text.as_str(), "create" | "new" | "edit") =>
             {
                 verb.text.as_str()
             }
@@ -532,6 +587,47 @@ mod tests {
         ] {
             assert_eq!(decide(command), Decision::Allow, "{command}");
         }
+    }
+
+    #[test]
+    fn gh_pr_new_is_gh_pr_create() {
+        assert!(denied("gh pr new --fill").contains("--draft"));
+        assert_eq!(decide("gh pr new --draft --fill"), Decision::Allow);
+        assert!(denied("gh pr new --draft --title 'Fix: a'").contains("subject check"));
+    }
+
+    #[test]
+    fn a_boolean_flag_takes_no_value_so_the_title_after_it_is_checked() {
+        assert!(
+            denied("gh pr edit 3 --remove-milestone --title 'Bad title.'")
+                .contains("fails the commit subject check")
+        );
+    }
+
+    #[test]
+    fn a_heredoc_inside_a_command_substitution_is_one_word_whatever_it_holds() {
+        let body = |text: &str, draft: &str| {
+            format!(
+                "gh pr create {draft}--title 'fix: a b' --body \"$(cat <<'EOF'\n{text}\nEOF\n)\"\ngh pr view"
+            )
+        };
+        assert_eq!(
+            decide(&body("The \"ci\" check is (fixed", "--draft ")),
+            Decision::Allow
+        );
+        assert!(denied(&body("say \"x --draft y\"", "")).contains("--draft"));
+        assert_eq!(
+            texts(&body("a ) b", "--draft ")),
+            vec![
+                vec!["gh", "pr", "create", "--draft", "--title", "fix: a b", "--body", "$(...)"],
+                vec!["gh", "pr", "view"],
+            ]
+        );
+        assert_eq!(
+            decide("gh pr create --draft --fill --body $(cat notes.md)"),
+            Decision::Allow
+        );
+        assert!(denied("gh pr create --draft --body \"$(cat x").contains("never closed"));
     }
 
     #[test]
