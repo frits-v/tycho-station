@@ -400,9 +400,9 @@ fn checked_log(file: File, core_uid: u32, path: &Path) -> Result<File, LogRefusa
     Ok(file)
 }
 
-/// The log, created new when absent, and replaced when it is a link, a FIFO, another user's
-/// or has a second link: the core owns the log directory, so it unlinks the name, which follows
-/// nothing, and a link the agent made elsewhere keeps only the old inode.
+/// The log, created new when absent or when the name holds a link, a FIFO, another user's file
+/// or a file with a second link: the core owns the log directory, so it unlinks the name, which
+/// follows nothing, and a link the agent made elsewhere keeps only the old inode.
 fn core_log(path: &Path, core_uid: u32) -> Result<File, LogRefusal> {
     let existing = open_existing_log(path).and_then(|file| {
         file.map(|file| checked_log(file, core_uid, path))
