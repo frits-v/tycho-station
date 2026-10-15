@@ -1320,6 +1320,26 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture lives in a scratch directory no other user can write"
+    )]
+    fn a_group_writable_shared_directory_needs_the_sticky_bit() {
+        let dir = shared_scratch("sticky");
+        fs::set_permissions(&dir, Permissions::from_mode(0o2770)).unwrap();
+        assert!(matches!(
+            prepare_shared_log(&dir),
+            Err(LogRefusal::NotSticky { .. })
+        ));
+        assert!(!dir.join(LOG_DIR).exists());
+        fs::set_permissions(&dir, Permissions::from_mode(0o3770)).unwrap();
+        prepare_shared_log(&dir).unwrap();
+        fs::set_permissions(&dir, Permissions::from_mode(0o750)).unwrap();
+        prepare_shared_log(&dir).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_log_or_log_directory_of_another_user_is_refused() {
         let path = Path::new("/shared/logs");
         assert_eq!(check_log_dir(true, 501, 501, path), Ok(()));

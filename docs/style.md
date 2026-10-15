@@ -58,6 +58,7 @@ check is not repeated in any instruction file. "review" means a reader rejects i
 | A check that reports findings at a file and line writes them as SARIF under `target/sarif`, which the `code-scanning` job uploads | `finish_findings` in the xtask; review for new checks |
 | Figures are stencil documents authored in CUE under `figures/`, rendered to `docs/figures/` and the design page, and checked in ci | `xtask check-figures` (`cue vet`, `stencil check`, byte comparison) in ci and the post-edit hook; `xtask render-figures` writes them |
 | Rule files carry `paths` frontmatter and stay short | `xtask check-rules` |
+| Every function or module a ledger row cites as enforcement exists in the sources; a name kept elsewhere is listed with its reason in `notes/ledger-names-elsewhere.txt` | `xtask check-ledger` in ci and the post-edit hook |
 
 ## Credentials
 
