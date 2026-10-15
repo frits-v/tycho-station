@@ -1,5 +1,5 @@
 //! One headless Claude CLI run of the review: its command line, its environment and the
-//! decoding of its JSON result.
+//! decoding of the result line that ends its event stream.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -89,7 +89,8 @@ pub fn command(
 ) -> Command {
     let mut command = Command::new(program);
     command
-        .args(["-p", "--output-format", "json", "--model", MODEL])
+        .args(["-p", "--output-format", "stream-json", "--verbose"])
+        .args(["--thinking-display", "summarized", "--model", MODEL])
         .args(["--tools", TOOLS, "--permission-mode", "dontAsk"])
         .args(["--setting-sources", "", "--strict-mcp-config"])
         .arg("--no-session-persistence")
@@ -151,21 +152,24 @@ fn plain_word(text: &str) -> String {
         .collect()
 }
 
-/// Decodes the single JSON result of `claude -p --output-format json`. The CLI exits 0 with
-/// `is_error` false and 1 with it true; any other pairing is unrecognised.
+/// Decodes the last `result` line of the run's output, the event stream of
+/// `--output-format stream-json` or the one line of `--output-format json`. The CLI exits 0
+/// with `is_error` false and 1 with it true; any other pairing is unrecognised.
 pub fn decode(exit: Exit, stdout: &str) -> RunOutcome {
     let code = match exit {
         Exit::Code(code @ (0 | 1)) => code,
         other => return RunOutcome::Ended(other),
     };
-    let Ok(result) = serde_json::from_str::<Value>(stdout.trim()) else {
+    let result = stdout
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Value>(line.trim()).ok())
+        .find(|value| value.get("type").and_then(Value::as_str) == Some("result"));
+    let Some(result) = result else {
         return RunOutcome::Unrecognised(format!(
-            "exit {code} with output that is not one JSON value; the CLI's message is above"
+            "exit {code} with no result line in the output; the CLI's message is above"
         ));
     };
-    if result.get("type").and_then(Value::as_str) != Some("result") {
-        return RunOutcome::Unrecognised("the output is not a result".to_string());
-    }
     let Some(cost) = result.get("total_cost_usd").and_then(micro_dollars) else {
         return RunOutcome::Unrecognised("the result has no usable total_cost_usd".to_string());
     };
@@ -222,6 +226,10 @@ mod tests {
     const MAX_TURNS: &str = include_str!("../../fixtures/review/claude-max-turns.json");
     const MAX_BUDGET: &str = include_str!("../../fixtures/review/claude-max-budget.json");
     const UNAUTHORIZED: &str = include_str!("../../fixtures/review/claude-unauthorized.json");
+    /// Event streams captured from the pinned CLI with `--thinking-display summarized`.
+    const STREAM_SUCCESS: &str = include_str!("../../fixtures/review/claude-stream-success.jsonl");
+    const STREAM_MAX_TURNS: &str =
+        include_str!("../../fixtures/review/claude-stream-max-turns.jsonl");
 
     #[test]
     fn the_command_line_has_exact_text() {
@@ -246,7 +254,10 @@ mod tests {
                 "/opt/claude/2.1.280/claude",
                 "-p",
                 "--output-format",
-                "json",
+                "stream-json",
+                "--verbose",
+                "--thinking-display",
+                "summarized",
                 "--model",
                 "opus",
                 "--tools",
@@ -356,6 +367,31 @@ mod tests {
                 usage: Usage::default()
             }
         );
+    }
+
+    #[test]
+    fn a_stream_decodes_by_its_last_result_line() {
+        match decode(Exit::Code(0), STREAM_SUCCESS) {
+            RunOutcome::Answered { output, usage } => {
+                assert!(output.get("findings").is_some_and(Value::is_array));
+                assert_eq!(usage.output_tokens, 291);
+                assert_eq!(usage.cost, 46_079);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            decode(Exit::Code(1), STREAM_MAX_TURNS),
+            RunOutcome::MaxTurns { .. }
+        ));
+        let without_result: String = STREAM_SUCCESS
+            .lines()
+            .filter(|line| !line.contains(r#""type":"result""#))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(matches!(
+            decode(Exit::Code(0), &without_result),
+            RunOutcome::Unrecognised(reason) if reason.contains("no result line")
+        ));
     }
 
     #[test]

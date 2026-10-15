@@ -15,9 +15,11 @@ mod diff;
 mod findings;
 mod langfuse;
 mod passes;
+mod prompt_registry;
 mod pull_request;
 mod report;
 mod setup;
+mod stream;
 mod verdict;
 
 use std::path::{Path, PathBuf};
@@ -26,7 +28,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::anthropic_token;
 use crate::app_token::{self, InstallationToken};
-use langfuse::{Generation, Langfuse, Trace};
+use langfuse::{Langfuse, Pass, Trace};
 use pull_request::{Posted, PullRequest};
 use verdict::Event;
 
@@ -130,7 +132,12 @@ struct Tally {
     outside: usize,
     failed: Vec<String>,
     cost: u64,
-    generations: Vec<Generation>,
+    passes: Vec<Pass>,
+    prompts: passes::Prompts,
+    /// Why part of the trace could not be recorded; each one fails the run, like a failed export.
+    trace_failures: Vec<String>,
+    /// The reviewed diff, the trace's input.
+    diff: String,
 }
 
 /// `xtask review --dry-run` or `xtask review --post`.
@@ -177,7 +184,8 @@ fn review(
     let deadline = started
         .checked_add(grants.run_time)
         .ok_or("the run deadline overflows")?;
-    let map = diff::parse_diff(&passes::prepare(context)?)?;
+    tally.diff = passes::prepare(context)?;
+    let map = diff::parse_diff(&tally.diff)?;
     if map.commentable.is_empty() {
         return Err(format!(
             "the diff {}...{} has no file with head-side lines to review once {} are excluded",
@@ -188,6 +196,7 @@ fn review(
     }
     tally.files = map.files;
     tally.hunks = map.hunks;
+    passes::register_prompts(context, tally);
     let candidates = passes::find(context, grants, deadline, tally)?;
     let confirmed = passes::verify(context, grants, &candidates, deadline, tally);
     let checks = match (&context.github, &grants.app) {
@@ -238,14 +247,22 @@ fn trace(
         tags: vec![context.tag.to_string()],
         started,
         ended: SystemTime::now(),
-        input: format!("{}...{}", context.base, context.head),
+        input: serde_json::json!({
+            "pull_request": context.session,
+            "base": context.base.as_str(),
+            "head": context.head.as_str(),
+            "diff": tally.diff,
+        })
+        .to_string(),
         output,
         metadata: vec![
             ("verdict".to_string(), verdict.to_string()),
             ("head".to_string(), context.head.to_string()),
             ("counts".to_string(), report::counts(tally)),
+            ("candidates".to_string(), tally.candidates.to_string()),
+            ("confirmed".to_string(), tally.confirmed.to_string()),
         ],
-        generations: tally.generations.clone(),
+        passes: tally.passes.clone(),
     }
 }
 
@@ -272,6 +289,9 @@ fn finish(
     for failure in &tally.failed {
         eprintln!("xtask review: a verify pass gave no verdict: {failure}");
     }
+    for failure in &tally.trace_failures {
+        eprintln!("xtask review: the trace: {failure}");
+    }
     let traced = context.langfuse.as_ref().map_or_else(
         || {
             println!("xtask review: Langfuse is not configured; no trace sent");
@@ -284,6 +304,7 @@ fn finish(
         },
     );
     let revoked = revoke(grants);
+    let traced = traced && tally.trace_failures.is_empty();
     i32::from(reviewed.is_err() || !tally.failed.is_empty() || !traced || !revoked)
 }
 
