@@ -15,7 +15,9 @@ jobs:
   review-dry-run:
     name: review-dry-run
     # Holds only the Langfuse key, for any branch.
-    environment: review-dry-run
+    environment:
+      name: review-dry-run
+      deployment: false
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
