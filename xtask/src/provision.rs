@@ -29,7 +29,7 @@ use crate::tool_prefix::{
     self, AgentTool, DirectoryState, Prefix, StationState, ToolState, TreeState,
     MISE_PINNED_VERSION,
 };
-use tycho_types::agent_switch::{self, SUDOERS_DROP_IN};
+use tycho_types::agent_switch::{self, DefaultsLine, Entry, Listing, SUDOERS_DROP_IN};
 
 const PROVISION_STEPS_MAX: usize = 16;
 /// Long enough for sudo's and sysadminctl's prompts to be answered at a terminal.
@@ -230,6 +230,8 @@ pub struct Snapshot {
     core_parent_missing: bool,
     /// The prefix probe the prefix findings were made from.
     prefix: tool_prefix::Probe,
+    /// The `sudo -l` listing the sudoers finding was made from.
+    sudoers: Listing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -416,24 +418,21 @@ fn station_need(probe: &tool_prefix::Probe) -> Need {
     need
 }
 
-/// The rule names the prefix's zmx, which `sudo -l` cannot probe before it exists; until the
-/// tools step has installed it the rule is planned, and decided again once it has. A rule
-/// wider than zmx is the operator's to remove.
+/// Decided on the listing, not the finding: an absent or stale entry, or the rule's entry with
+/// another `Defaults!` line, is the station's own file to write again; other no-password
+/// entries are the operator's to remove, and do not keep the rule from being installed.
 fn sudoers_need(snapshot: &Snapshot) -> Need {
-    let zmx_installed = snapshot
-        .prefix
-        .tools
-        .iter()
-        .any(|(tool, _, state)| *tool == AgentTool::Zmx && *state == ToolState::Pinned);
-    let status = status_of(snapshot, Check::SudoersRule);
-    if !zmx_installed && !status.is_pass() {
-        return prefix_need(snapshot, |_| Need::Run);
-    }
-    match status {
-        Status::Present | Status::Wrong { .. } => Need::Skip,
-        Status::Missing => Need::Run,
-        Status::Unreachable { why } => Need::Blocked(why),
-        status @ Status::Deferred { .. } => Need::Blocked(status.to_string()),
+    match &snapshot.sudoers {
+        Listing::PasswordRequired | Listing::NotAllowed => Need::Run,
+        Listing::Listed(reading) => {
+            if reading.entry == Entry::Exact && reading.defaults == DefaultsLine::Exact {
+                Need::Skip
+            } else {
+                Need::Run
+            }
+        }
+        Listing::Refused(why) => Need::Blocked(why.clone()),
+        Listing::Unrecognised(text) => Need::Blocked(format!("sudo -l answered {text}")),
     }
 }
 
@@ -562,6 +561,7 @@ pub struct SudoersWork {
 fn install_words(candidate: &Path) -> Vec<String> {
     vec![
         INSTALL.to_string(),
+        "-S".to_string(),
         "-o".to_string(),
         "root".to_string(),
         "-g".to_string(),
@@ -582,16 +582,6 @@ fn visudo_words(candidate: &Path) -> Vec<String> {
     ]
 }
 
-/// The prefix's zmx at its pin, as the rule names it.
-fn prefix_zmx() -> Result<String, String> {
-    tool_prefix::pinned_version(AgentTool::Zmx).map(|version| {
-        Prefix::production()
-            .tool_binary(AgentTool::Zmx, &version)
-            .display()
-            .to_string()
-    })
-}
-
 fn sudoers_work(snapshot: &Snapshot) -> Option<SudoersWork> {
     let home = snapshot.developer_home.clone()?;
     let mut levels = Vec::new();
@@ -601,7 +591,7 @@ fn sudoers_work(snapshot: &Snapshot) -> Option<SudoersWork> {
         levels.push(level.clone());
     }
     let candidate = level.join(CANDIDATE_NAME);
-    let rule = prefix_zmx().and_then(|zmx| {
+    let rule = setup::rule_zmx().and_then(|(zmx, _)| {
         agent_switch::rule(&snapshot.developer.username, AGENT_USER_NAME, &zmx)
             .map_err(|error| error.to_string())
     });
@@ -1000,7 +990,8 @@ impl Host for SystemHost {
         findings.extend(setup::agent_record_findings());
         let prefix = tool_prefix::Probe::read(&Prefix::production(), &developer);
         findings.extend(prefix.findings());
-        findings.push(setup::sudoers_rule_finding());
+        let (sudoers_finding, sudoers) = setup::sudoers_rule_probe();
+        findings.push(sudoers_finding);
         let developer_home = setup::resolve_home(&developer.username).ok();
         let core_dir = developer_home
             .as_deref()
@@ -1024,6 +1015,7 @@ impl Host for SystemHost {
             developer,
             findings,
             prefix,
+            sudoers,
         })
     }
 
@@ -1486,6 +1478,7 @@ mod tests {
     use super::*;
     use crate::setup::{Differs, HomeMismatch};
     use std::collections::VecDeque;
+    use tycho_types::agent_switch::Reading;
 
     const DEVELOPER_UID: u32 = 501;
     const AGENT_GID: u32 = 502;
@@ -1564,6 +1557,7 @@ mod tests {
             core_dir: Some(PathBuf::from("/Users/frits/.tycho/zmx")),
             core_parent_missing: false,
             prefix: settled_prefix(),
+            sudoers: Listing::Listed(exact_reading()),
         };
         with_prefix(snapshot, settled_prefix())
     }
@@ -1622,6 +1616,7 @@ mod tests {
         snapshot.shared_group_gid = None;
         snapshot.agent_dir_owner = None;
         snapshot.core_parent_missing = true;
+        snapshot.sudoers = Listing::PasswordRequired;
         with_home(
             with_prefix(snapshot, empty_prefix()),
             None,
@@ -1674,6 +1669,7 @@ mod tests {
     fn install_rule_words() -> Vec<String> {
         strings(&[
             INSTALL,
+            "-S",
             "-o",
             "root",
             "-g",
@@ -2656,8 +2652,65 @@ mod tests {
         assert!(commands.iter().all(|command| !command.starts_with("sudo")));
     }
 
+    fn exact_reading() -> Reading {
+        Reading {
+            entry: Entry::Exact,
+            defaults: DefaultsLine::Exact,
+            others: Vec::new(),
+        }
+    }
+
     fn rule_missing() -> Snapshot {
-        with(all_present(), &[(Check::SudoersRule, Status::Missing)])
+        let mut snapshot = with(all_present(), &[(Check::SudoersRule, Status::Missing)]);
+        snapshot.sudoers = Listing::PasswordRequired;
+        snapshot
+    }
+
+    fn with_listing(listing: Listing, status: Status) -> Snapshot {
+        let mut snapshot = with(all_present(), &[(Check::SudoersRule, status)]);
+        snapshot.sudoers = listing;
+        snapshot
+    }
+
+    #[test]
+    fn a_rule_a_pin_bump_left_is_installed_again_for_the_new_zmx() {
+        let old = "/Users/Shared/tycho/mise/installs/zmx/0.7.1/zmx".to_string();
+        let stale = with_listing(
+            Listing::Listed(Reading {
+                entry: Entry::Stale(old.clone()),
+                defaults: DefaultsLine::Stale(old),
+                others: Vec::new(),
+            }),
+            wrong("the rule for 0.7.1", "the rule for 0.8.1"),
+        );
+        assert_eq!(plan(&stale).steps, vec![Remedy::InstallSudoersRule]);
+        let mut host = RecordingHost::new(vec![stale, all_present()]);
+        assert_eq!(provision(Mode::Apply, true, &mut host), 0);
+        assert_eq!(host.root_calls, [install_rule_words()]);
+        let (_, content) = &host.private_writes[0];
+        assert!(content.contains("/zmx/0.8.1/zmx") && !content.contains("0.7.1"));
+    }
+
+    #[test]
+    fn an_unrelated_no_password_entry_does_not_keep_the_rule_from_being_installed() {
+        let vpn = with_listing(
+            Listing::Listed(Reading {
+                entry: Entry::Absent,
+                defaults: DefaultsLine::Absent,
+                others: vec!["(root) NOPASSWD: /usr/local/bin/vpn-helper".to_string()],
+            }),
+            wrong("also without a password", "only the rule"),
+        );
+        assert_eq!(plan(&vpn).steps, vec![Remedy::InstallSudoersRule]);
+        let differs = with_listing(
+            Listing::Listed(Reading {
+                entry: Entry::Exact,
+                defaults: DefaultsLine::Differs("Defaults!x umask=0022".to_string()),
+                others: Vec::new(),
+            }),
+            wrong("its Defaults line", "the rule's"),
+        );
+        assert_eq!(plan(&differs).steps, vec![Remedy::InstallSudoersRule]);
     }
 
     #[test]
@@ -2725,26 +2778,26 @@ mod tests {
 
     #[test]
     fn a_wider_rule_is_left_to_the_operator_and_an_unreadable_one_blocks() {
-        let wider = with(
-            all_present(),
-            &[(Check::SudoersRule, wrong("a wider rule", "zmx alone"))],
+        let wider = with_listing(
+            Listing::Listed(Reading {
+                others: vec!["(ALL) NOPASSWD: ALL".to_string()],
+                ..exact_reading()
+            }),
+            wrong("a wider rule", "zmx alone"),
         );
         assert!(plan(&wider).steps.is_empty());
         assert_eq!(unremedied(&wider, &[]).len(), 1);
-        let unreadable = with(
-            all_present(),
-            &[(
-                Check::SudoersRule,
-                Status::Unreachable {
-                    why: "sudo answered something".to_string(),
-                },
-            )],
+        let unreadable = with_listing(
+            Listing::Unrecognised("garbage".to_string()),
+            Status::Unreachable {
+                why: "sudo answered something".to_string(),
+            },
         );
         assert_eq!(plan(&unreadable).blocked.len(), 1);
     }
 
     #[test]
-    fn the_rule_is_planned_before_zmx_exists_and_printed_in_full() {
+    fn the_rule_is_planned_while_sudo_asks_a_password_and_printed_in_full() {
         let snapshot = all_missing();
         assert_eq!(need(Remedy::InstallSudoersRule, &snapshot), Need::Run);
         let lines = action(Remedy::InstallSudoersRule, &snapshot)
@@ -2756,10 +2809,10 @@ mod tests {
         );
         assert!(lines
             .iter()
-            .any(|line| line == "  frits ALL = (tycho-agent) NOPASSWD: TYCHO_AGENT_ZMX"));
+            .any(|line| line == "  frits ALL = (tycho-agent) NOPASSWD: /Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx"));
         assert_eq!(
             lines.last().map(String::as_str),
-            Some("sudo /usr/bin/install -o root -g wheel -m 0440 /Users/frits/.tycho/provision/tycho-agent /etc/sudoers.d/tycho-agent")
+            Some("sudo /usr/bin/install -S -o root -g wheel -m 0440 /Users/frits/.tycho/provision/tycho-agent /etc/sudoers.d/tycho-agent")
         );
     }
 

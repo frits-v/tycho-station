@@ -256,7 +256,7 @@ impl Drop for Pty {
 
 /// The `clients=` count `zmx list` shows for the session; zmx's own field, not a decoded entry.
 fn attached_clients(spawner: &LauncherSpawner, name: &str) -> String {
-    let listing = spawner.zmx().command(&["list"]).output().unwrap();
+    let listing = spawner.zmx().command(&["list"]).unwrap().output().unwrap();
     let prefix = format!("name={name}\t");
     String::from_utf8_lossy(&listing.stdout)
         .lines()

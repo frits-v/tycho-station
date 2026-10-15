@@ -49,7 +49,7 @@ use tycho_harness::content::content_ref;
 use tycho_harness::verify::{run_criteria_with, unit_passed, VerifyOptions};
 use tycho_harness::work_units::{load_default, PassCondition};
 use tycho_types::agent_switch::{
-    decode_narrow, decode_wider, narrow_probe_arguments, wider_probe_arguments, NarrowProbe,
+    decode_listing, decode_wider, listing_arguments, wider_probe_arguments, Expected, Listing,
     WiderProbe,
 };
 use tycho_types::envelope::{BranchName, CommitSha};
@@ -314,17 +314,26 @@ fn sudo_answer(arguments: &[String]) -> (Option<i32>, String, String) {
 fn require_the_narrow_rule() {
     let zmx = prefix_zmx();
     let zmx = zmx.to_str().unwrap();
-    let (exit, stdout, stderr) = sudo_answer(&narrow_probe_arguments(AGENT_USER_DEFAULT, zmx));
-    let narrow = decode_narrow(exit, &stdout, &stderr, zmx);
-    println!("boundary: sudo -n -k -l -u {AGENT_USER_DEFAULT} -- {zmx} list: {narrow:?}");
+    let installs = Path::new(zmx)
+        .parent()
+        .and_then(Path::parent)
+        .map(|dir| format!("{}/", dir.display()))
+        .unwrap();
+    let expected = Expected {
+        agent: AGENT_USER_DEFAULT,
+        zmx,
+        zmx_installs: &installs,
+    };
+    let (exit, stdout, stderr) = sudo_answer(&listing_arguments());
+    let listing = decode_listing(exit, &stdout, &stderr, &expected);
+    println!("boundary: sudo -n -k -l: {listing:?}");
     let (exit, stdout, stderr) = sudo_answer(&wider_probe_arguments(AGENT_USER_DEFAULT));
     let wider = decode_wider(exit, &stdout, &stderr);
     println!("boundary: sudo -n -k -u {AGENT_USER_DEFAULT} -- /usr/bin/true: {wider:?}");
-    assert_eq!(
-        narrow,
-        NarrowProbe::Permitted,
-        "boundary: the sudoers rule for the prefix's zmx is not in place; run \
-         `mise run provision-agent`"
+    assert!(
+        matches!(&listing, Listing::Listed(reading) if reading.is_exact()),
+        "boundary: the sudoers listing is not exactly the rule for the prefix's zmx; run \
+         `mise run setup`, then `mise run provision-agent`"
     );
     assert_eq!(
         wider,
@@ -679,6 +688,32 @@ fn gone_within(zmx: &Zmx, name: &str) -> bool {
     false
 }
 
+/// What a session started through the rule shows, as comparisons: the uids themselves are
+/// never printed.
+struct SessionEvidence {
+    listed_is_agent: bool,
+    command: String,
+    socket_is_agent: bool,
+    socket_mode: u32,
+}
+
+impl SessionEvidence {
+    fn read(zmx: &Zmx, shared: &Path, name: &str, agent_uid: u32) -> Self {
+        let (listed_is_agent, command) = match listed_program(zmx, name) {
+            ProcessFacts::Running(facts) => (facts.uid == agent_uid, facts.command),
+            ProcessFacts::Gone => (false, "gone".to_string()),
+            ProcessFacts::Unrecognised(text) => (false, format!("ps answered {text}")),
+        };
+        let socket = fs::symlink_metadata(shared.join(name)).unwrap();
+        Self {
+            listed_is_agent,
+            command,
+            socket_is_agent: socket.uid() == agent_uid,
+            socket_mode: socket.mode() & 0o777,
+        }
+    }
+}
+
 /// A session started through the sudoers rule, as the spawner starts a launcher: zmx must list a
 /// pid of the agent's running the typed program, and the session's socket must be the agent's.
 #[test]
@@ -696,41 +731,72 @@ fn a_session_started_through_the_rule_runs_as_the_agent() {
     let program = ["exec", "/bin/sleep", "120"].map(str::to_string);
     zmx.run_words(&name, &program)
         .unwrap_or_else(|error| panic!("boundary: {error}"));
-    let facts = listed_program(&zmx, &name);
-    let socket = fs::symlink_metadata(shared.join(&name)).unwrap();
+    let seen = SessionEvidence::read(&zmx, shared, &name, agent_uid);
     println!(
-        "evidence: {name} lists {facts:?}; its socket is uid {} mode {:o}",
-        socket.uid(),
-        socket.mode() & 0o7777
+        "evidence: {name}: the listed pid is the agent's {}, runs {:?}; the socket is the \
+         agent's {}, mode {:o}",
+        seen.listed_is_agent, seen.command, seen.socket_is_agent, seen.socket_mode
     );
     let killed = zmx.kill(&name);
     let gone = gone_within(&zmx, &name);
     println!("evidence: zmx kill {name} by name as the developer: {killed:?}; gone {gone}");
-    match facts {
-        ProcessFacts::Running(facts) => {
-            assert_eq!(facts.uid, agent_uid, "the listed pid is not the agent's");
-            assert!(
-                facts.command.starts_with("/bin/sleep 120"),
-                "{}",
-                facts.command
-            );
-        }
-        other => panic!("boundary: ps answered {other:?} for the listed pid"),
-    }
-    assert_eq!(
-        socket.uid(),
-        agent_uid,
+    assert!(seen.listed_is_agent, "the listed pid is not the agent's");
+    assert!(
+        seen.command.starts_with("/bin/sleep 120"),
+        "{}",
+        seen.command
+    );
+    assert!(
+        seen.socket_is_agent,
         "the session socket is not the agent's"
     );
     assert_eq!(
-        socket.mode() & 0o777,
-        0o770,
+        seen.socket_mode, 0o770,
         "the developer's group cannot connect"
     );
     assert!(
         gone,
         "the developer's kill by name did not end the agent's session"
     );
+}
+
+/// The kill path's delivery through the rule: a group leader running as the agent, as a vendor
+/// runs under `tycho session-leader`, is killed by a throwaway session the core starts as the
+/// agent and then removes.
+#[test]
+#[ignore = "kills a process group of the agent through the sudoers rule; run with mise run boundary-tests"]
+fn a_group_of_the_agent_is_killed_through_the_rule() {
+    require_the_narrow_rule();
+    let agent_uid = nix::unistd::User::from_name(AGENT_USER_DEFAULT)
+        .unwrap()
+        .unwrap_or_else(|| panic!("boundary: no user {AGENT_USER_DEFAULT}"))
+        .uid
+        .as_raw();
+    let shared = Path::new(AGENT_SOCKET_DIR_DEFAULT);
+    let zmx = Zmx::agent_as(&prefix_zmx(), shared, AGENT_USER_DEFAULT);
+    let tycho = ToolPrefix::load(PathBuf::from(TOOL_PREFIX_DEFAULT))
+        .unwrap()
+        .tycho()
+        .display()
+        .to_string();
+    let name = format!("tycho-boundary-reap-{}", std::process::id());
+    let program = ["exec", &tycho, "session-leader", "--", "/bin/sleep", "600"].map(str::to_string);
+    zmx.run_words(&name, &program)
+        .unwrap_or_else(|error| panic!("boundary: {error}"));
+    let seen = SessionEvidence::read(&zmx, shared, &name, agent_uid);
+    let leader = match presence(&zmx.list().unwrap(), &name) {
+        Presence::Running { pid, .. } => pid,
+        other => panic!("boundary: {name} is {other:?}"),
+    };
+    let verdict = tycho::kill::deliver_through(&zmx, leader, true, &process_facts);
+    let removed = zmx.kill(&name);
+    println!(
+        "evidence: the group leader is the agent's {}, runs {:?}; the kill through the rule: \
+         {verdict:?}; {name} removed: {removed:?}",
+        seen.listed_is_agent, seen.command
+    );
+    assert!(seen.listed_is_agent, "the group leader is not the agent's");
+    assert_eq!(verdict, tycho::kill::KillVerdict::SignalledThroughRule);
 }
 
 /// The gate's throwaway directories, removed when the test ends.

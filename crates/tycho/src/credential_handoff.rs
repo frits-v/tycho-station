@@ -184,8 +184,8 @@ fn read_bounded(stream: &mut UnixStream, max: usize) -> io::Result<Option<Vec<u8
     Ok(Some(bytes))
 }
 
-/// The pid of the process at the other end of a connected Unix socket, as the kernel recorded
-/// it at connect.
+/// The pid `LOCAL_PEERPID` reports: the last process to use the peer's socket, which is the
+/// connector only until another process holding the descriptor uses it.
 #[cfg(target_os = "macos")]
 pub fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
     let pid = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::LocalPeerPid)
@@ -193,14 +193,26 @@ pub fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
     u32::try_from(pid).map_err(|_| io::Error::other(format!("peer pid {pid}")))
 }
 
-/// The pid of the process at the other end of a connected Unix socket, as the kernel recorded
-/// it at connect.
+/// The pid `SO_PEERCRED` reports: the connector's, recorded at connect.
 #[cfg(target_os = "linux")]
 pub fn peer_pid(stream: &UnixStream) -> io::Result<u32> {
     let pid = nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)
         .map(|credentials| credentials.pid())
         .map_err(io::Error::from)?;
     u32::try_from(pid).map_err(|_| io::Error::other(format!("peer pid {pid}")))
+}
+
+/// The peer's pid must be the launcher's as `zmx list` reports it.
+fn require_launcher(stream: &UnixStream, expected: u32) -> Result<(), Refusal> {
+    let peer = peer_pid(stream).map_err(|error| Refusal::PeerUnknown(error.to_string()))?;
+    if peer == expected {
+        Ok(())
+    } else {
+        Err(Refusal::PeerPid {
+            found: peer,
+            expected,
+        })
+    }
 }
 
 /// What the server answers with, and to whom.
@@ -242,17 +254,14 @@ impl Grant {
         if found != self.agent_uid {
             return Err(Refusal::PeerUid { found });
         }
-        let peer = peer_pid(stream).map_err(|error| Refusal::PeerUnknown(error.to_string()))?;
         let expected = self.launcher_pid(stop).ok_or(Refusal::LauncherUnknown)?;
-        if peer != expected {
-            return Err(Refusal::PeerPid {
-                found: peer,
-                expected,
-            });
-        }
+        require_launcher(stream, expected)?;
         let request = read_bounded(stream, REQUEST_MAX_BYTES)
             .map_err(|error| Refusal::Request(error.to_string()))?
             .ok_or_else(|| Refusal::Request(format!("over {REQUEST_MAX_BYTES} bytes")))?;
+        // On macOS the pid is the last user of the peer's socket, so it is read again once the
+        // request has been written: a process that wrote it is the one answered.
+        require_launcher(stream, expected)?;
         let request: Request = serde_json::from_slice(&request)
             .map_err(|error| Refusal::Request(error.to_string()))?;
         if request.session != self.session.to_string() {
@@ -614,6 +623,30 @@ mod tests {
         let (near, far) = UnixStream::pair().unwrap();
         assert_eq!(peer_pid(&near).unwrap(), std::process::id());
         assert_eq!(peer_pid(&far).unwrap(), std::process::id());
+    }
+
+    /// A child that writes on an inherited descriptor: on macOS the peer pid becomes the
+    /// child's, on Linux it stays the creator's. Either way the server binds only the pid
+    /// `zmx list` reports, and reads the peer pid again after the request.
+    #[test]
+    fn the_peer_pid_follows_the_last_writer_on_macos_and_the_connector_on_linux() {
+        let (mut near, far) = UnixStream::pair().unwrap();
+        let _kept_open = far.try_clone().unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "echo x"])
+            .stdout(std::process::Stdio::from(std::os::fd::OwnedFd::from(far)))
+            .spawn()
+            .unwrap();
+        let child_pid = child.id();
+        assert!(child.wait().unwrap().success());
+        let mut line = [0_u8; 2];
+        near.read_exact(&mut line).unwrap();
+        let peer = peer_pid(&near).unwrap();
+        if cfg!(target_os = "macos") {
+            assert_eq!(peer, child_pid);
+        } else {
+            assert_eq!(peer, std::process::id());
+        }
     }
 
     #[test]

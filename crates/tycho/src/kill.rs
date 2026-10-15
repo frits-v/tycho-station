@@ -6,6 +6,12 @@
 //! command line is the launcher's (or which leads its own process group, for the vendor). Any
 //! mismatch, an absent or mismatched lease included, is an enumerated refusal in the report,
 //! and `zmx kill` by name is all that happens.
+//!
+//! The core cannot signal a process of another uid. When sessions run as the agent, a verified
+//! pid is signalled through the sudoers rule instead: a throwaway zmx session started as the
+//! agent whose typed line is `exec /bin/kill -KILL -- <pid or -group>`, which the core then
+//! removes by name. The vendor leads its own session, so `zmx kill` of the launcher's session
+//! does not reach it.
 
 use std::fmt;
 use std::path::Path;
@@ -16,7 +22,7 @@ use tycho_types::lease::Lease;
 use tycho_types::session::SessionName;
 
 use crate::agent_files::read_checked;
-use crate::config::AgentDirs;
+use crate::config::{AgentDirs, POLL_INTERVAL, SESSION_WAIT_POLLS_MAX};
 use crate::launcher::{check_tier, SessionFiles, VendorRecord, VENDOR_RECORD_MAX_BYTES};
 use crate::process::{process_facts, send, start_matches, Facts, ProcessFacts};
 use crate::services::spawner::{LeaseRead, SpawnerError};
@@ -48,6 +54,8 @@ pub enum KillRefusal {
         pgid: u32,
     },
     SignalFailed(String),
+    /// The signal through the sudoers rule could not be delivered, or the process outlived it.
+    DeliveryFailed(String),
 }
 
 impl fmt::Display for KillRefusal {
@@ -60,6 +68,8 @@ impl fmt::Display for KillRefusal {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KillVerdict {
     Signalled,
+    /// Signalled as the agent through the sudoers rule, and gone after it.
+    SignalledThroughRule,
     /// Verified before `zmx kill`, gone after it.
     EndedByZmx,
     Refused(KillRefusal),
@@ -147,7 +157,7 @@ pub struct ReapReport {
 pub fn reap(zmx: &Zmx, dirs: &AgentDirs, session: &SessionName, agent_uid: u32) -> ReapReport {
     let zmx_kill = kill_by_name(zmx, session);
     let path = SessionFiles::new(dirs, session).vendor;
-    let vendor = vendor_verdict(read_vendor(&path, agent_uid), agent_uid);
+    let vendor = vendor_verdict(zmx, read_vendor(&path, agent_uid), agent_uid);
     ReapReport { zmx_kill, vendor }
 }
 
@@ -203,7 +213,7 @@ pub fn kill_session(request: &KillRequest<'_>) -> KillReport {
         .kill(&session)
         .map_err(|error| error.to_string());
     let launcher = match verified {
-        Ok(expected) => signal_if_still(&expected, false),
+        Ok(expected) => signal_if_still(request.zmx, &expected, false),
         Err(refusal) => KillVerdict::Refused(refusal),
     };
     KillReport {
@@ -238,17 +248,21 @@ fn checked_lease(request: &KillRequest<'_>) -> Result<Lease, KillRefusal> {
 /// The vendor's group, signalled only as an agent-owned group leader started when recorded.
 fn kill_vendor(request: &KillRequest<'_>) -> Option<KillVerdict> {
     let path = SessionFiles::new(request.dirs, request.session).vendor;
-    vendor_verdict(read_vendor(&path, request.agent_uid), request.agent_uid)
+    vendor_verdict(
+        request.zmx,
+        read_vendor(&path, request.agent_uid),
+        request.agent_uid,
+    )
 }
 
-fn vendor_verdict(read: VendorRead, agent_uid: u32) -> Option<KillVerdict> {
+fn vendor_verdict(zmx: &Zmx, read: VendorRead, agent_uid: u32) -> Option<KillVerdict> {
     let vendor = match vendor_expectation(read, agent_uid, Uid::current().as_raw()) {
         Ok(None) => return None,
         Ok(Some(vendor)) => vendor,
         Err(refusal) => return Some(KillVerdict::Refused(refusal)),
     };
     Some(match judge(&process_facts(vendor.pid), &vendor) {
-        Ok(()) => signal_if_still(&vendor, true),
+        Ok(()) => signal_if_still(zmx, &vendor, true),
         Err(refusal) => KillVerdict::Refused(refusal),
     })
 }
@@ -273,15 +287,84 @@ pub fn vendor_expectation(
     }
 }
 
-/// Re-checks the same process and sends SIGKILL; gone by now means zmx ended it.
-fn signal_if_still(expected: &Expected<'_>, group: bool) -> KillVerdict {
+/// Re-checks the same process and sends SIGKILL, itself or, when `zmx` starts sessions as
+/// another user, through the sudoers rule; gone by now means zmx ended it.
+fn signal_if_still(zmx: &Zmx, expected: &Expected<'_>, group: bool) -> KillVerdict {
     match judge(&process_facts(expected.pid), expected) {
+        Ok(()) if zmx.switched_to().is_some() => {
+            deliver_through(zmx, expected.pid, group, &process_facts)
+        }
         Ok(()) => match send(expected.pid, group, Signal::SIGKILL) {
             Ok(()) => KillVerdict::Signalled,
             Err(error) => KillVerdict::Refused(KillRefusal::SignalFailed(error)),
         },
         Err(KillRefusal::Gone) => KillVerdict::EndedByZmx,
         Err(refusal) => KillVerdict::Refused(refusal),
+    }
+}
+
+/// The throwaway session that carries one signal; no launcher's session name starts so.
+#[must_use]
+pub fn reap_session_name(pid: u32) -> String {
+    format!("reap.{pid}")
+}
+
+/// The words the reap session types: `kill` replaces its shell, so nothing else runs there.
+#[must_use]
+pub fn reap_words(pid: u32, group: bool) -> Vec<String> {
+    let target = if group {
+        format!("-{pid}")
+    } else {
+        pid.to_string()
+    };
+    ["exec", "/bin/kill", "-KILL", "--", &target]
+        .map(str::to_string)
+        .to_vec()
+}
+
+fn delivery_failed(why: impl std::fmt::Display) -> KillVerdict {
+    KillVerdict::Refused(KillRefusal::DeliveryFailed(why.to_string()))
+}
+
+/// Runs `/bin/kill` in a zmx session of its own, as whoever `zmx` starts sessions as.
+///
+/// It waits for that session to end, removes it by name, and reports whether `pid` is gone. A name
+/// already listed is refused rather than typed into.
+pub fn deliver_through(
+    zmx: &Zmx,
+    pid: u32,
+    group: bool,
+    facts: &dyn Fn(u32) -> ProcessFacts,
+) -> KillVerdict {
+    let name = reap_session_name(pid);
+    match zmx.list().map(|entries| presence(&entries, &name)) {
+        Ok(Presence::Absent) => {}
+        Ok(taken) => return delivery_failed(format!("{name} is listed already: {taken:?}")),
+        Err(error) => return delivery_failed(error),
+    }
+    if let Err(error) = zmx.run_words(&name, &reap_words(pid, group)) {
+        return delivery_failed(error);
+    }
+    for _ in 0..SESSION_WAIT_POLLS_MAX {
+        let ended = matches!(
+            zmx.list().map(|entries| presence(&entries, &name)),
+            Ok(Presence::Ended { .. } | Presence::Absent)
+        );
+        if ended && facts(pid) == ProcessFacts::Gone {
+            break;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    let removed = zmx.kill(&name);
+    match (facts(pid), removed) {
+        (ProcessFacts::Gone, Ok(())) => KillVerdict::SignalledThroughRule,
+        (ProcessFacts::Gone, Err(error)) => {
+            delivery_failed(format!("gone, but {name} was not removed: {error}"))
+        }
+        (ProcessFacts::Running(_), _) => delivery_failed(format!("pid {pid} outlived {name}")),
+        (ProcessFacts::Unrecognised(text), _) => {
+            KillVerdict::Refused(KillRefusal::Unrecognised(text))
+        }
     }
 }
 
@@ -340,6 +423,91 @@ mod tests {
     }
 
     const STARTED: u64 = STARTED_MS / 1000;
+
+    #[test]
+    fn the_reap_session_types_one_kill_of_the_verified_pid_or_its_group() {
+        assert_eq!(
+            reap_words(4242, true),
+            ["exec", "/bin/kill", "-KILL", "--", "-4242"]
+        );
+        assert_eq!(
+            reap_words(4242, false),
+            ["exec", "/bin/kill", "-KILL", "--", "4242"]
+        );
+        assert_eq!(reap_session_name(4242), "reap.4242");
+        assert!(tycho_types::session::SessionName::parse("reap.4242").is_err());
+    }
+
+    /// A stand-in zmx that lists the sessions it was told about, and runs a `run`'s words,
+    /// so the delivery reaches a real process group.
+    fn reaping_zmx(dir: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("zmx-stand-in");
+        let script_text = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  list) cat {listed} 2>/dev/null || true ;;\n  run) printf '%s\\n' \"$*\" >> {runs}; shift 3; \"$@\" ;;\n  kill) printf 'kill %s\\n' \"$2\" >> {runs} ;;\nesac\n",
+            listed = dir.join("listed").display(),
+            runs = dir.join("runs").display(),
+        );
+        std::fs::write(&script, script_text).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        script
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tycho-reap-{tag}-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_group_is_reaped_through_a_session_of_its_own_which_is_then_removed() {
+        use std::os::unix::process::CommandExt;
+        let dir = scratch_dir("group");
+        let zmx = Zmx::agent(&reaping_zmx(&dir), &dir);
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let reaper = std::thread::spawn(move || child.wait());
+        let verdict = deliver_through(&zmx, pid, true, &process_facts);
+        assert!(reaper.join().unwrap().is_ok());
+        assert_eq!(verdict, KillVerdict::SignalledThroughRule);
+        let runs = std::fs::read_to_string(dir.join("runs")).unwrap();
+        assert_eq!(
+            runs,
+            format!("run reap.{pid} -d exec /bin/kill -KILL -- -{pid}\nkill reap.{pid}\n")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_listed_reap_name_is_refused_and_a_survivor_is_reported() {
+        let dir = scratch_dir("taken");
+        let zmx = Zmx::agent(&reaping_zmx(&dir), &dir);
+        std::fs::write(
+            dir.join("listed"),
+            "  name=reap.4242\tpid=77\tclients=0\tcreated=1\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            deliver_through(&zmx, 4242, true, &|_| ProcessFacts::Gone),
+            KillVerdict::Refused(KillRefusal::DeliveryFailed(_))
+        ));
+        assert!(!dir.join("runs").exists(), "a listed name was typed into");
+        std::fs::remove_file(dir.join("listed")).unwrap();
+        let alive = |_| facts(AGENT, PID, STARTED, "claude");
+        let refused = Zmx::agent(Path::new("/usr/bin/true"), &dir);
+        assert!(matches!(
+            deliver_through(&refused, PID, true, &alive),
+            KillVerdict::Refused(KillRefusal::DeliveryFailed(why)) if why.contains("outlived")
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn a_verified_launcher_may_be_signalled() {

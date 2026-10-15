@@ -792,7 +792,7 @@ impl<I: Ingress> Run<'_, I> {
 
     /// The exit trap's last step; zmx also hangs up this process, which the signal flag absorbs.
     fn end_own_session(&mut self) {
-        let zmx = Zmx::agent(&self.settings.zmx, &self.settings.dirs.socket_dir);
+        let zmx = Zmx::from_agent(&self.settings.zmx, &self.settings.dirs.socket_dir);
         if let Err(error) = zmx.kill(&self.settings.env.session_name.to_string()) {
             self.log
                 .line(&format!("zmx kill of the own session failed: {error}"));

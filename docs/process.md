@@ -115,14 +115,21 @@ repository names the first directory it cannot search, with `ls`'s line saying w
 directory refused it or was absent. Two more boundaries are the shared zmx log: the agent puts a
 link at `logs/zmx.log` and renames `logs`, both of which must be refused, and the developer's
 `zmx list` must then succeed with the link's target unchanged and the log still the
-developer's regular file. A second ignored test, which needs no terminal, starts a session
+developer's regular file. Two more ignored tests need no terminal. One starts a session
 through the rule with `Zmx::agent_as` running `/bin/sleep`, requires the pid `zmx list`
 reports to be the agent's and to run that program, and the session socket to be the agent's
-at 0770, then kills it by name as the developer and requires it gone.
+at 0770, then kills it by name as the developer and requires it gone. The other starts
+`tycho session-leader -- /bin/sleep` as the agent the same way and requires the kill path's
+delivery through the rule, a `reap.<pid>` session typing `exec /bin/kill -KILL -- -<group>`,
+to end the group. Both print whether a uid is the agent's, never the uid. If either fails on
+connecting to the agent's socket, check `id` in the shell that runs the suite: a login session
+that began before the developer joined `tycho-zmx` does not list the group, while
+`id <developer>` and `dseditgroup` do; log out and in, then run the suite again.
 
 The attach suite refuses to start without a terminal, prepares the shared zmx log the way the
-core does (design section 7, the shared zmx log), and refuses a `sudo -n` that runs
-`/usr/bin/true` as the agent with no password. In
+core does (design section 7, the shared zmx log), and refuses a `sudo -n -k` that runs
+`/usr/bin/true` as the agent with no password, decoded by the same `agent_switch` decoder
+setup uses. In
 one sudo call it creates three sessions as the agent in `/Users/Shared/tycho-agent-zmx` with
 the prefix's zmx; each session's program reads one typed line, writes it to a marker file in
 a directory of group `tycho-zmx`, then sleeps 600 seconds. Every zmx run in the shared
@@ -287,18 +294,20 @@ what the developer side of `mise run setup` checks, in this order:
     digests in `station.json`;
 11. release builds of `xtask` and `tycho` in `/Users/Shared/tycho/bin`;
 12. the sudoers rule `/etc/sudoers.d/tycho-agent`, through which the core starts each
-    launcher session as the agent: the developer may run the prefix's zmx, with any
-    arguments, as `tycho-agent` only, with no password, keeping only `ZMX_DIR`,
-    `ZMX_DIR_MODE` and `ZMX_LOG_MODE` (`env_keep =` replaces the default list, which on
-    macOS keeps `HOME`, `MAIL` and `SSH_AUTH_SOCK`) and under umask 007 (`umask_override`;
-    otherwise sudo applies the union with its 0022 and the socket comes out 0750). The task
-    writes the candidate new at 0600 in `~/.tycho/provision`, a 0700 directory of the
-    developer's, checks it with `/usr/sbin/visudo -c -f` as the developer, which must answer
-    `<file>: parsed OK`, and only then runs
-    `sudo /usr/bin/install -o root -g wheel -m 0440 <candidate> /etc/sudoers.d/tycho-agent`.
-    The rule is planned while zmx is not yet in the prefix and decided again once it is,
-    since `sudo -l` answers "command not found" for a missing binary. A rule that is wider
-    is reported, not changed.
+    launcher session as the agent: the developer may run the prefix's zmx, named by its path,
+    with any arguments, as `tycho-agent` only, with no password, keeping only `HOME`,
+    `ZMX_DIR`, `ZMX_DIR_MODE` and `ZMX_LOG_MODE` (`env_keep =` replaces the default list,
+    which on macOS keeps `HOME`, `MAIL` and `SSH_AUTH_SOCK`) and under umask 007
+    (`umask_override`; otherwise sudo applies the union with its 0022 and the socket comes
+    out 0750). The task writes the candidate new at 0600 in `~/.tycho/provision`, a 0700
+    directory of the developer's, checks it with `/usr/sbin/visudo -c -f` as the developer,
+    which must answer `<file>: parsed OK`, and only then runs
+    `sudo /usr/bin/install -S -o root -g wheel -m 0440 <candidate> /etc/sudoers.d/tycho-agent`.
+    macOS's `install` writes a temporary file beside the target and renames it into place;
+    `-S` flushes it first. The step runs while the listing below shows no rule, the rule for
+    another zmx install (a pin bump), or the rule's entry with another `Defaults!` line. Any
+    other no-password entry is reported for the operator to remove, and does not stop the
+    install.
 
 The rule names zmx, not the launcher: under sudo, zmx's session daemon and the shell it
 starts are the agent's, and the shell executes the typed `env -i … tycho launch` in place,
@@ -307,15 +316,25 @@ credential hand-off require. Measured with zmx 0.8.1 in a throwaway socket direc
 session started by `zmx run <name> -d exec …` lists the pid of the executed program, whose
 parent is the `zmx run` daemon; sudo typed into a developer's session instead lists sudo
 itself, real uid the developer's and effective uid 0, and sudo 1.9.17 stays the command's
-parent while `use_pty` or `pam_session` is on, both defaults. Setup reads the rule back, since
-the developer cannot read a 0440 root file:
-`sudo -n -k -l -u tycho-agent -- <zmx> list` must be permitted, and
-`sudo -n -k -u tycho-agent -- /usr/bin/true` must answer `sudo: a password is required`.
-`-k` with a command ignores a cached ticket without removing it. The developer is in
-`admin`, which may run anything as anyone with a password, so once one entry needs no
-password `sudo -l` answers "permitted" for any command; only running one outside the rule
-shows the rule is no wider. Neither probe shows which entry matched, so that zmx itself
-runs with no password is shown by the boundary suite's session.
+parent while `use_pty` or `pam_session` is on, both defaults. The switched run starts from
+`/` with `HOME=/var/empty`, so the login `bash` zmx starts reads no startup file of the
+agent's before the typed line; sudo also sets `SHELL`, `USER`, `LOGNAME`, `MAIL` and the
+`SUDO_*` variables, passes `PATH`, and keeps `TERM`, `TZ` and the locale variables that its
+`env_check` finds safe (design section 7, what crosses sudo).
+
+Setup reads the rule back, since the developer cannot read a 0440 root file. `sudo -n -k -l`
+lists every entry of the developer with its tags and the bound defaults, one line each when
+written to a pipe; `-k` ignores a cached ticket without removing it, and with no entry that
+needs no password sudo answers `sudo: a password is required`, which reads as no rule. The
+listing must hold exactly `(tycho-agent) NOPASSWD: <pinned zmx>` and its `Defaults!<pinned zmx>`
+line with the four kept variables, `umask=0007` and `umask_override`, and no other `NOPASSWD`
+entry or `!authenticate` default; then `sudo -n -k -u tycho-agent -- /usr/bin/true` must
+answer `sudo: a password is required`. `sudo -l <command>` is no probe of the rule: the
+developer is in `admin`, which may run anything as anyone with a password, and once one entry
+needs none sudo lists without a password and answers "permitted" for any command. The
+listing's form was read from sudo 1.9.17's source (`display.c`, `fmtsudoers.c`), not captured;
+a line the decoder cannot place reads as unreachable. That zmx itself runs with no password is
+shown by the boundary suite's session.
 
 The agent's own primary group does not keep it out of the developer's home: macOS makes
 every local account a member of `staff` through the `localaccounts` group, and a home is

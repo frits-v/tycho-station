@@ -18,8 +18,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tycho_types::agent_switch::{
-    decode_narrow, decode_wider, narrow_probe_arguments, wider_probe_arguments, NarrowProbe,
-    WiderProbe, SUDO,
+    decode_listing, decode_wider, listing_arguments, wider_probe_arguments, DefaultsLine, Entry,
+    Expected, Listing, Reading, WiderProbe, SUDO, WIDER_PROBE_COMMAND,
 };
 use tycho_types::session::{SESSION_NAME_MAX_BYTES, SOCKET_PATH_MAX_BYTES};
 
@@ -348,7 +348,7 @@ const CATALOGUE: [CheckSpec; 53] = [
     ),
     spec(
         Check::SudoersRule,
-        "sudoers: the developer runs the prefix's zmx as tycho-agent with no password, and nothing wider",
+        "sudoers: exactly the rule that runs the prefix's zmx as tycho-agent with no password, and no other entry without one",
         Side::Developer,
     ),
     spec(
@@ -2111,39 +2111,87 @@ pub fn developer_findings(identity: &Identity) -> Vec<Finding> {
     findings.extend(stored_credential_findings(identity));
     findings
         .extend(tool_prefix::Probe::read(&tool_prefix::Prefix::production(), identity).findings());
-    findings.push(sudoers_rule_finding());
+    findings.push(sudoers_rule_probe().0);
     findings
 }
 
 const SUDOERS_HINT: &str = "run mise run provision-agent, which installs /etc/sudoers.d/tycho-agent (docs/process.md, Provisioning the agent user)";
+const SUDOERS_WIDER_HINT: &str = "remove every other no-password entry and !authenticate default from the sudoers configuration; the station installs only /etc/sudoers.d/tycho-agent";
 
 /// A probe's answer: its exit code, when it exited, and its output.
 pub type SudoAnswer = (Option<i32>, String, String);
 
-/// The sudoers rule as two answers decode: the narrow probe permitted, and a command outside
-/// the rule still asking for a password. The rule file is root's at 0440, so the developer
-/// reads it back through sudo itself. `sudo -l` cannot show which entry matched, so that the
-/// prefix's zmx runs with no password is proven by the boundary suite's session, not here.
+/// The pinned zmx the rule names, and the directory every zmx install of the prefix lives in.
+pub fn rule_zmx() -> Result<(String, String), String> {
+    let prefix = tool_prefix::Prefix::production();
+    let version = tool_prefix::pinned_version(tool_prefix::AgentTool::Zmx)?;
+    let zmx = prefix.tool_binary(tool_prefix::AgentTool::Zmx, &version);
+    let installs = zmx
+        .parent()
+        .and_then(Path::parent)
+        .map(|dir| format!("{}/", dir.display()))
+        .ok_or_else(|| format!("{} has no install directory", zmx.display()))?;
+    Ok((zmx.display().to_string(), installs))
+}
+
+/// The sudoers rule from two answers: the full `sudo -n -k -l` listing, which must hold
+/// exactly the rule's entry and its `Defaults!` line and no other way to run anything without
+/// a password, and a command outside the rule run as the agent, which sudo must still ask a
+/// password for. The rule file is root's at 0440, so the developer reads it back through sudo.
+/// A command probe with `sudo -l <command>` shows nothing here: once any entry needs no
+/// password, it answers "permitted" for anything the developer may run with one.
 pub fn sudoers_rule_status(
-    zmx: &str,
+    expected: &Expected<'_>,
+    run: &mut dyn FnMut(&[String]) -> Result<SudoAnswer, String>,
+) -> (Status, Listing) {
+    let listing = match run(&listing_arguments()) {
+        Ok((exit, stdout, stderr)) => decode_listing(exit, &stdout, &stderr, expected),
+        Err(why) => {
+            return (
+                Status::Unreachable { why: why.clone() },
+                Listing::Refused(why),
+            )
+        }
+    };
+    let status = match &listing {
+        Listing::PasswordRequired | Listing::NotAllowed => Status::Missing,
+        Listing::Refused(line) => Status::Unreachable { why: line.clone() },
+        Listing::Unrecognised(text) => Status::Unreachable {
+            why: format!("sudo -l answered {text}"),
+        },
+        Listing::Listed(reading) => reading_status(reading, expected, run),
+    };
+    (status, listing)
+}
+
+fn reading_status(
+    reading: &Reading,
+    expected: &Expected<'_>,
     run: &mut dyn FnMut(&[String]) -> Result<SudoAnswer, String>,
 ) -> Status {
-    let narrow = match run(&narrow_probe_arguments(AGENT_USER_NAME, zmx)) {
-        Ok((exit, stdout, stderr)) => decode_narrow(exit, &stdout, &stderr, zmx),
-        Err(why) => return Status::Unreachable { why },
-    };
-    match narrow {
-        NarrowProbe::Permitted => {}
-        NarrowProbe::PasswordRequired | NarrowProbe::NotPermitted => return Status::Missing,
-        NarrowProbe::UnknownUser(user) => {
-            return Status::Unreachable {
-                why: format!("sudo knows no user {user}"),
+    let wanted = format!(
+        "only ({}) NOPASSWD: {} and its Defaults line",
+        expected.agent, expected.zmx
+    );
+    if !reading.others.is_empty() {
+        return Status::Wrong {
+            found: format!("also without a password: {}", reading.others.join("; ")),
+            wanted,
+        };
+    }
+    match (&reading.entry, &reading.defaults) {
+        (Entry::Absent, _) => return Status::Missing,
+        (Entry::Stale(path), _) => {
+            return Status::Wrong {
+                found: format!("the rule for {path}, which a zmx pin bump left"),
+                wanted,
             }
         }
-        NarrowProbe::Refused(line) => return Status::Unreachable { why: line },
-        NarrowProbe::Unrecognised(text) => {
-            return Status::Unreachable {
-                why: format!("sudo -l answered {text}"),
+        (Entry::Exact, DefaultsLine::Exact) => {}
+        (Entry::Exact, defaults) => {
+            return Status::Wrong {
+                found: format!("its Defaults line {defaults:?}"),
+                wanted,
             }
         }
     }
@@ -2154,8 +2202,8 @@ pub fn sudoers_rule_status(
     match wider {
         WiderProbe::PasswordRequired => Status::Present,
         WiderProbe::RanWithoutPassword => Status::Wrong {
-            found: format!("a no-password rule that runs /usr/bin/true as {AGENT_USER_NAME}"),
-            wanted: format!("no password for {zmx} alone"),
+            found: format!("{WIDER_PROBE_COMMAND} runs as {AGENT_USER_NAME} with no password"),
+            wanted,
         },
         WiderProbe::UnknownUser(user) => Status::Unreachable {
             why: format!("sudo knows no user {user}"),
@@ -2178,22 +2226,30 @@ fn run_sudo(arguments: &[String]) -> Result<SudoAnswer, String> {
     }
 }
 
-pub fn sudoers_rule_finding() -> Finding {
-    let zmx = tool_prefix::pinned_version(tool_prefix::AgentTool::Zmx).map(|version| {
-        tool_prefix::Prefix::production()
-            .tool_binary(tool_prefix::AgentTool::Zmx, &version)
-            .display()
-            .to_string()
-    });
-    let status = match zmx {
-        Ok(zmx) => sudoers_rule_status(&zmx, &mut run_sudo),
-        Err(why) => Status::Unreachable { why },
+/// The sudoers finding, and the listing it was made from, which provisioning decides on.
+pub fn sudoers_rule_probe() -> (Finding, Listing) {
+    let (status, listing) = match rule_zmx() {
+        Ok((zmx, installs)) => {
+            let expected = Expected {
+                agent: AGENT_USER_NAME,
+                zmx: &zmx,
+                zmx_installs: &installs,
+            };
+            sudoers_rule_status(&expected, &mut run_sudo)
+        }
+        Err(why) => (
+            Status::Unreachable { why: why.clone() },
+            Listing::Refused(why),
+        ),
     };
-    if status.is_pass() {
-        Finding::new(Check::SudoersRule, status)
-    } else {
-        Finding::with_hint(Check::SudoersRule, status, SUDOERS_HINT)
-    }
+    let finding = match &listing {
+        _ if status.is_pass() => Finding::new(Check::SudoersRule, status),
+        Listing::Listed(reading) if !reading.others.is_empty() => {
+            Finding::with_hint(Check::SudoersRule, status, SUDOERS_WIDER_HINT)
+        }
+        _ => Finding::with_hint(Check::SudoersRule, status, SUDOERS_HINT),
+    };
+    (finding, listing)
 }
 
 /// A vendor's stored credential as setup reports it: the check, the file name in the store,
@@ -2588,15 +2644,22 @@ mod tests {
     const ZMX: &str = "/Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx";
     const PASSWORD: &str = "sudo: a password is required\n";
 
-    /// Answers each probe by its argument list, and counts how many were asked.
+    const INSTALLS: &str = "/Users/Shared/tycho/mise/installs/zmx/";
+    const EXPECTED: Expected<'static> = Expected {
+        agent: AGENT_USER_NAME,
+        zmx: ZMX,
+        zmx_installs: INSTALLS,
+    };
+    const RULE_LISTING: &str = "Matching Defaults entries for frits on h:\n    env_reset\n\nRunas and Command-specific defaults for frits:\n    Defaults!/Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx env_keep=\"HOME ZMX_DIR ZMX_DIR_MODE ZMX_LOG_MODE\", umask=0007, umask_override\n\nUser frits may run the following commands on h:\n    (ALL) ALL\n    (tycho-agent) NOPASSWD: /Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx\n";
+
+    /// Answers each probe by its argument list.
     fn answering(
-        narrow: Result<SudoAnswer, String>,
+        listing: Result<SudoAnswer, String>,
         wider: Result<SudoAnswer, String>,
     ) -> impl FnMut(&[String]) -> Result<SudoAnswer, String> {
         move |arguments: &[String]| {
-            if arguments.iter().any(|word| word == "-l") {
-                assert_eq!(arguments, narrow_probe_arguments(AGENT_USER_NAME, ZMX));
-                narrow.clone()
+            if arguments == listing_arguments() {
+                listing.clone()
             } else {
                 assert_eq!(arguments, wider_probe_arguments(AGENT_USER_NAME));
                 wider.clone()
@@ -2612,31 +2675,47 @@ mod tests {
         Ok((Some(exit), stdout.to_string(), stderr.to_string()))
     }
 
+    fn status_of_answers(
+        listing: Result<SudoAnswer, String>,
+        wider: Result<SudoAnswer, String>,
+    ) -> Status {
+        sudoers_rule_status(&EXPECTED, &mut answering(listing, wider)).0
+    }
+
     #[test]
-    fn the_sudoers_rule_is_present_only_when_it_is_exactly_the_narrow_one() {
-        let permitted = answer(0, &format!("{ZMX} list\n"), "");
+    fn the_sudoers_rule_is_present_only_when_the_listing_holds_exactly_it() {
         let asked = answer(1, "", PASSWORD);
-        let status = |narrow, wider| sudoers_rule_status(ZMX, &mut answering(narrow, wider));
-        assert_eq!(status(permitted.clone(), asked.clone()), Status::Present);
-        assert_eq!(status(asked.clone(), asked.clone()), Status::Missing);
-        assert_eq!(status(answer(1, "", ""), asked.clone()), Status::Missing);
+        assert_eq!(
+            status_of_answers(answer(0, RULE_LISTING, ""), asked.clone()),
+            Status::Present
+        );
+        assert_eq!(
+            status_of_answers(asked.clone(), asked.clone()),
+            Status::Missing
+        );
         assert!(matches!(
-            status(permitted.clone(), answer(0, "", "")),
+            status_of_answers(answer(0, RULE_LISTING, ""), answer(0, "", "")),
             Status::Wrong { .. }
         ));
         for unreachable in [
-            status(
+            status_of_answers(
                 Err("sudo did not finish: TimedOut".to_string()),
                 asked.clone(),
             ),
-            status(permitted.clone(), Err("sudo did not finish".to_string())),
-            status(
+            status_of_answers(
+                answer(0, RULE_LISTING, ""),
+                Err("sudo did not finish".to_string()),
+            ),
+            status_of_answers(
                 answer(1, "", "sudo: unknown user tycho-agent\n"),
                 asked.clone(),
             ),
-            status(answer(0, "/usr/bin/true list\n", ""), asked.clone()),
-            status(permitted, answer(1, "", "something else\n")),
-            status(Ok((None, String::new(), String::new())), asked),
+            status_of_answers(answer(0, "garbage\n", ""), asked.clone()),
+            status_of_answers(
+                answer(0, RULE_LISTING, ""),
+                answer(1, "", "something else\n"),
+            ),
+            status_of_answers(Ok((None, String::new(), String::new())), asked),
         ] {
             assert!(
                 matches!(unreachable, Status::Unreachable { .. }),
@@ -2645,16 +2724,62 @@ mod tests {
         }
     }
 
+    /// An unrelated no-password entry makes sudo list without a password, which a probe with
+    /// `sudo -l <command>` read as the rule; the listing shows the rule is absent.
     #[test]
-    fn a_missing_narrow_rule_skips_the_wider_probe() {
+    fn an_unrelated_no_password_entry_is_not_taken_for_the_rule() {
+        let vpn = "User frits may run the following commands on h:\n    (ALL) ALL\n    (root) NOPASSWD: /usr/local/bin/vpn-helper\n";
+        let (status, listing) = sudoers_rule_status(
+            &EXPECTED,
+            &mut answering(answer(0, vpn, ""), answer(1, "", PASSWORD)),
+        );
+        assert!(matches!(status, Status::Wrong { .. }), "{status:?}");
+        assert!(matches!(
+            listing,
+            Listing::Listed(Reading {
+                entry: Entry::Absent,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_rule_a_pin_bump_left_reads_wrong_and_names_the_old_path() {
+        let old = RULE_LISTING.replace("0.8.1", "0.7.1");
+        let (status, listing) = sudoers_rule_status(
+            &EXPECTED,
+            &mut answering(answer(0, &old, ""), answer(1, "", PASSWORD)),
+        );
+        assert!(
+            matches!(&status, Status::Wrong { found, .. } if found.contains("/zmx/0.7.1/zmx")),
+            "{status:?}"
+        );
+        assert!(matches!(
+            listing,
+            Listing::Listed(Reading {
+                entry: Entry::Stale(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_missing_rule_skips_the_wider_probe() {
         let mut asked = 0_u32;
         let mut run = |arguments: &[String]| {
             asked = asked.saturating_add(1);
-            assert!(arguments.iter().any(|word| word == "-l"), "{arguments:?}");
+            assert_eq!(arguments, listing_arguments());
             answer(1, "", PASSWORD)
         };
-        assert_eq!(sudoers_rule_status(ZMX, &mut run), Status::Missing);
+        assert_eq!(sudoers_rule_status(&EXPECTED, &mut run).0, Status::Missing);
         assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn the_rule_names_the_pinned_zmx_under_the_prefix_installs() {
+        let (zmx, installs) = rule_zmx().unwrap();
+        assert_eq!(zmx, ZMX);
+        assert_eq!(installs, INSTALLS);
     }
 
     const EXPECTED_SIDES: [(&str, Side); 53] = [
@@ -2747,7 +2872,7 @@ mod tests {
             Side::Developer,
         ),
         (
-            "sudoers: the developer runs the prefix's zmx as tycho-agent with no password, and nothing wider",
+            "sudoers: exactly the rule that runs the prefix's zmx as tycho-agent with no password, and no other entry without one",
             Side::Developer,
         ),
         ("agent user is a member of the shared group", Side::Agent),
