@@ -187,6 +187,7 @@ const LOG_DIR_MODE: u32 = 0o750;
 const LOG_FILE_MODE: u32 = 0o660;
 const GROUP_WRITE: u32 = 0o020;
 const STICKY: u32 = 0o1000;
+const SHARED_DIR_MODE: u32 = 0o1770;
 /// Modes a log directory and file are created with before the exact mode is set on the
 /// descriptor.
 const CREATE_DIR_MODE: u32 = 0o700;
@@ -322,6 +323,21 @@ fn set_exact_mode(file: &File, mode: u32, path: &Path) -> Result<(), LogRefusal>
     Ok(())
 }
 
+/// Makes a missing shared directory as zmx would, group-shared, and sticky; a provisioned one
+/// already exists with the shared group.
+fn create_shared_dir(path: &Path) -> Result<(), LogRefusal> {
+    DirBuilder::new()
+        .mode(CREATE_DIR_MODE)
+        .create(path)
+        .map_err(io_refusal(path))?;
+    let dir = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_NOFOLLOW | OFlag::O_DIRECTORY | OFlag::O_NONBLOCK).bits())
+        .open(path)
+        .map_err(io_refusal(path))?;
+    set_exact_mode(&dir, SHARED_DIR_MODE, path)
+}
+
 /// Opens an existing log directory without following a link, or creates it new.
 fn open_log_dir(path: &Path) -> Result<File, LogRefusal> {
     match fs::symlink_metadata(path) {
@@ -379,13 +395,21 @@ const fn libc_enotdir() -> i32 {
 
 /// Makes the shared directory's zmx log safe for the core to append to.
 ///
-/// Runs before any zmx command there: the directory sticky when its group can write it, `logs`
+/// Runs before any zmx command there: the directory sticky when its group can write it, and
+/// made so when it is missing, as zmx would otherwise make it without the sticky bit; `logs`
 /// the core's at 0750, and `zmx.log` a regular file of the core's with one link at 0660. A
 /// caller who does not own the shared directory, the agent's own launcher, has nothing of its
 /// own to protect and is left alone.
 pub fn prepare_shared_log(socket_dir: &Path) -> Result<(), LogRefusal> {
     let core_uid = Uid::current().as_raw();
-    let shared = fs::symlink_metadata(socket_dir).map_err(io_refusal(socket_dir))?;
+    let shared = match fs::symlink_metadata(socket_dir) {
+        Ok(facts) => facts,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            create_shared_dir(socket_dir)?;
+            fs::symlink_metadata(socket_dir).map_err(io_refusal(socket_dir))?
+        }
+        Err(error) => return Err(io_refusal(socket_dir)(error)),
+    };
     if shared.uid() != core_uid {
         return Ok(());
     }
@@ -1156,6 +1180,21 @@ mod tests {
         fs::set_permissions(&dir, Permissions::from_mode(0o750)).unwrap();
         prepare_shared_log(&dir).unwrap();
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the fixture lives in a scratch directory no other user can write"
+    )]
+    fn a_missing_shared_directory_is_made_sticky_before_zmx_can_make_it() {
+        let parent = shared_scratch("missing");
+        let dir = parent.join("agent");
+        let zmx = Zmx::agent(Path::new("/usr/bin/true"), &dir);
+        assert!(zmx.list().is_ok());
+        assert_eq!(mode_of(&dir), SHARED_DIR_MODE);
+        assert_eq!(mode_of(&dir.join(LOG_DIR)), LOG_DIR_MODE);
+        fs::remove_dir_all(&parent).unwrap();
     }
 
     #[test]

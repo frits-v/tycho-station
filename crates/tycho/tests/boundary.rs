@@ -645,6 +645,40 @@ fn developer_log_is_intact(shared: &Path, target: &Path) {
     );
 }
 
+/// What `ps` says of the pid zmx lists for `name`, once it runs the typed program or the wait
+/// ends.
+fn listed_program(zmx: &Zmx, name: &str) -> ProcessFacts {
+    let mut seen = Presence::Absent;
+    let started = std::time::Instant::now();
+    while started.elapsed() < SESSION_WAIT {
+        seen = presence(&zmx.list().unwrap(), name);
+        if let Presence::Running { pid, .. } = seen {
+            if let ProcessFacts::Running(facts) = process_facts(pid) {
+                if facts.command.starts_with("/bin/sleep") {
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(SESSION_POLL);
+    }
+    match seen {
+        Presence::Running { pid, .. } => process_facts(pid),
+        other => panic!("boundary: {name} is {other:?} in zmx list"),
+    }
+}
+
+/// Whether `name` left `zmx list` within the wait.
+fn gone_within(zmx: &Zmx, name: &str) -> bool {
+    let started = std::time::Instant::now();
+    while started.elapsed() < SESSION_WAIT {
+        if presence(&zmx.list().unwrap(), name) == Presence::Absent {
+            return true;
+        }
+        std::thread::sleep(SESSION_POLL);
+    }
+    false
+}
+
 /// A session started through the sudoers rule, as the spawner starts a launcher: zmx must list a
 /// pid of the agent's running the typed program, and the session's socket must be the agent's.
 #[test]
@@ -662,23 +696,7 @@ fn a_session_started_through_the_rule_runs_as_the_agent() {
     let program = ["exec", "/bin/sleep", "120"].map(str::to_string);
     zmx.run_words(&name, &program)
         .unwrap_or_else(|error| panic!("boundary: {error}"));
-    let mut seen = Presence::Absent;
-    let started = std::time::Instant::now();
-    while started.elapsed() < SESSION_WAIT {
-        seen = presence(&zmx.list().unwrap(), &name);
-        if let Presence::Running { pid, .. } = seen {
-            if let ProcessFacts::Running(facts) = process_facts(pid) {
-                if facts.command.starts_with("/bin/sleep") {
-                    break;
-                }
-            }
-        }
-        std::thread::sleep(SESSION_POLL);
-    }
-    let facts = match seen {
-        Presence::Running { pid, .. } => process_facts(pid),
-        other => panic!("boundary: {name} is {other:?} in zmx list"),
-    };
+    let facts = listed_program(&zmx, &name);
     let socket = fs::symlink_metadata(shared.join(&name)).unwrap();
     println!(
         "evidence: {name} lists {facts:?}; its socket is uid {} mode {:o}",
@@ -686,12 +704,7 @@ fn a_session_started_through_the_rule_runs_as_the_agent() {
         socket.mode() & 0o7777
     );
     let killed = zmx.kill(&name);
-    let mut gone = false;
-    let started = std::time::Instant::now();
-    while started.elapsed() < SESSION_WAIT && !gone {
-        gone = presence(&zmx.list().unwrap(), &name) == Presence::Absent;
-        std::thread::sleep(SESSION_POLL);
-    }
+    let gone = gone_within(&zmx, &name);
     println!("evidence: zmx kill {name} by name as the developer: {killed:?}; gone {gone}");
     match facts {
         ProcessFacts::Running(facts) => {
