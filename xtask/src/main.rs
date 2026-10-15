@@ -28,6 +28,7 @@ mod prefix_install;
 mod prefix_manifest;
 mod process;
 mod provision;
+mod pull_request_hook;
 mod release;
 mod review;
 mod sarif;
@@ -53,7 +54,7 @@ const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
 const DOC_DIRS: [&str; 1] = ["docs"];
 const RULES_DIR: &str = ".claude/rules";
 const RULE_MAX_LINES: usize = 24;
-const COMMANDS: [(&str, &str); 25] = [
+const COMMANDS: [(&str, &str); 26] = [
     (
         "ci",
         "format check, clippy, tests, workflow audits, opengrep, repository checks, PR title",
@@ -139,6 +140,10 @@ const COMMANDS: [(&str, &str); 25] = [
     (
         "hook post-tool-use",
         "after an edit: format and lint Rust, check documents and CUE",
+    ),
+    (
+        "hook pre-tool-use",
+        "before gh pr create or edit: a draft, and a title that passes the subject check",
     ),
     (
         "setup",
@@ -923,8 +928,11 @@ fn main() {
         Some("hook") if args.get(1).map(String::as_str) == Some("post-tool-use") => {
             hook_post_tool_use()
         }
+        Some("hook") if args.get(1).map(String::as_str) == Some("pre-tool-use") => {
+            pull_request_hook::hook_pre_tool_use()
+        }
         Some("hook") => {
-            eprintln!("usage: xtask hook post-tool-use");
+            eprintln!("usage: xtask hook post-tool-use | pre-tool-use");
             2
         }
         Some("setup") => setup::run(),
