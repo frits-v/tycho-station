@@ -550,6 +550,9 @@ check out, build and run it.
   `xtask hook pre-tool-use` refuses a `gh pr create` or `gh pr new` without `--draft`, and a
   title on either or on `gh pr edit` that is not literal text or fails the commit subject
   check.
+- A branch is brought up to date with `main` by a local rebase pushed with
+  `--force-with-lease`. `gh pr update-branch` rebases or merges on GitHub, whose commits are
+  unsigned, and the ruleset requires signed commits; the agent hook refuses it.
 - The `review` workflow starts on `pull_request_target` when a pull request whose author is
   an owner, member or collaborator is marked ready for review, and on `issue_comment` when a
   comment on a pull request, any pull request a fork's included, mentions

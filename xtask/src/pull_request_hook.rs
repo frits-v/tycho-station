@@ -1,6 +1,7 @@
 //! `xtask hook pre-tool-use`: refuses a `gh pr create` that opens a pull request ready for
-//! review, and a `gh pr create` or `gh pr edit` whose title fails the commit subject check.
-//! A review starts on `ready_for_review`, which GitHub sends only when a draft is marked ready.
+//! review, a `gh pr create` or `gh pr edit` whose title fails the commit subject check, and
+//! `gh pr update-branch`. A review starts on `ready_for_review`, which GitHub sends only when a
+//! draft is marked ready; a branch GitHub updates carries commits it cannot sign.
 
 use std::collections::HashMap;
 use std::io::{self, Read};
@@ -349,6 +350,15 @@ fn judge_title(title: &str, literal: bool) -> Result<(), String> {
     }
 }
 
+/// A boolean flag's value as gh's flag parser reads it; the last one given wins.
+fn flag_value(value: &str) -> Option<bool> {
+    match value {
+        "1" | "t" | "T" | "true" | "TRUE" | "True" => Some(true),
+        "0" | "f" | "F" | "false" | "FALSE" | "False" => Some(false),
+        _ => None,
+    }
+}
+
 fn judge_pull_request(
     verb: &str,
     arguments: &[Word],
@@ -367,8 +377,14 @@ fn judge_pull_request(
             judge_title(&title.text, title.literal)?;
         } else if let Some(title) = text.strip_prefix("-t").filter(|_| !text.starts_with("--")) {
             judge_title(title, argument.literal)?;
-        } else if matches!(text, "--draft" | "-d" | "--draft=true") {
+        } else if matches!(text, "--draft" | "-d") {
             draft = true;
+        } else if let Some(value) = text
+            .strip_prefix("--draft=")
+            .or_else(|| text.strip_prefix("-d="))
+        {
+            draft = flag_value(value)
+                .ok_or_else(|| format!("`{text}` is not a value gh reads as true or false"))?;
         } else if VALUE_FLAGS.contains(&text) {
             remaining.next();
         }
@@ -415,12 +431,23 @@ pub fn decide(command: &str) -> Decision {
             [gh, pr, verb, ..]
                 if gh.text == "gh"
                     && pr.text == "pr"
-                    && matches!(verb.text.as_str(), "create" | "new" | "edit") =>
+                    && matches!(
+                        verb.text.as_str(),
+                        "create" | "new" | "edit" | "update-branch"
+                    ) =>
             {
                 verb.text.as_str()
             }
             _ => continue,
         };
+        if verb == "update-branch" {
+            return Decision::Deny(
+                "`gh pr update-branch` rebases or merges on GitHub, which cannot sign the \
+                 commits, and the ruleset's required signatures then block the merge; rebase \
+                 onto origin/main locally and push with --force-with-lease"
+                    .to_string(),
+            );
+        }
         let arguments = rest.get(3..).unwrap_or_default();
         if let Err(reason) = judge_pull_request(verb, arguments, &variables) {
             return Decision::Deny(reason);
@@ -673,6 +700,46 @@ mod tests {
             "gh pr create --draft --title \"fix: `id`\"",
         ] {
             assert!(denied(command).contains("is not literal text"), "{command}");
+        }
+    }
+
+    #[test]
+    fn the_last_draft_value_given_wins_as_gh_reads_it() {
+        for command in [
+            "gh pr create --draft --fill --draft=false",
+            "gh pr create --draft --fill --draft=0",
+            "gh pr create -d --fill -d=F",
+        ] {
+            assert!(
+                denied(command).contains("opens a pull request ready"),
+                "{command}"
+            );
+        }
+        for command in [
+            "gh pr create --draft=false --draft --fill",
+            "gh pr create --fill --draft=1",
+            "gh pr create --fill --draft=True",
+        ] {
+            assert_eq!(decide(command), Decision::Allow, "{command}");
+        }
+        assert!(denied("gh pr create --fill --draft=maybe").contains("true or false"));
+    }
+
+    #[test]
+    fn a_variable_reassigned_to_an_expansion_no_longer_resolves() {
+        assert!(denied(
+            "T='fix: ok'; T=\"$(git log -1 --format=%s)\"; gh pr create --draft --title \"$T\""
+        )
+        .contains("is not literal text"));
+    }
+
+    #[test]
+    fn updating_a_branch_on_github_is_refused_since_it_cannot_sign() {
+        for command in [
+            "gh pr update-branch 117",
+            "gh pr update-branch 117 --rebase",
+        ] {
+            assert!(denied(command).contains("required signatures"), "{command}");
         }
     }
 
