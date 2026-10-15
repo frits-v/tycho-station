@@ -90,6 +90,7 @@ pub fn command(
     let mut command = Command::new(program);
     command
         .args(["-p", "--output-format", "stream-json", "--verbose"])
+        .arg("--include-partial-messages")
         .args(["--thinking-display", "summarized", "--model", MODEL])
         .args(["--tools", TOOLS, "--permission-mode", "dontAsk"])
         .args(["--setting-sources", "", "--strict-mcp-config"])
@@ -256,6 +257,7 @@ mod tests {
                 "--output-format",
                 "stream-json",
                 "--verbose",
+                "--include-partial-messages",
                 "--thinking-display",
                 "summarized",
                 "--model",

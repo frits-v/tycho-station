@@ -27,6 +27,9 @@ pub struct TurnUsage {
     pub cache_creation: u64,
     /// The CLI's last running estimate of the thinking tokens before this turn.
     pub thinking_estimate: Option<u64>,
+    /// Whether `output` is the message's final count, from its `message_delta` event, rather
+    /// than the count at its first content block.
+    pub output_final: bool,
 }
 
 /// One assistant message. The CLI writes one event per content block, each repeating the
@@ -116,6 +119,7 @@ impl Transcript {
                 cache_read: count("cache_read_input_tokens"),
                 cache_creation: count("cache_creation_input_tokens"),
                 thinking_estimate: estimate,
+                output_final: false,
             },
             thinking: Vec::new(),
             text: Vec::new(),
@@ -243,10 +247,59 @@ pub fn kept_prefix(text: &str, max: usize) -> &str {
     text.get(..end).unwrap_or("")
 }
 
+/// What the partial-message events of `--include-partial-messages` add: each message's final
+/// output count, which only its `message_delta` carries.
+#[derive(Debug, Default)]
+struct Partials {
+    current: Option<String>,
+    final_outputs: Vec<(String, u64)>,
+}
+
+impl Partials {
+    fn event(&mut self, event: &Value, transcript: &mut Transcript) {
+        let inner = event.get("event").unwrap_or(&Value::Null);
+        match inner.get("type").and_then(Value::as_str).unwrap_or("") {
+            "message_start" => {
+                self.current = inner
+                    .pointer("/message/id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+            }
+            "message_delta" => {
+                let output = inner
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_u64);
+                if let (Some(id), Some(output)) = (self.current.clone(), output) {
+                    self.final_outputs.push((id, output));
+                }
+            }
+            "content_block_start"
+            | "content_block_delta"
+            | "content_block_stop"
+            | "message_stop" => {}
+            other => transcript.unrecognised(&format!("stream event {other}")),
+        }
+    }
+
+    fn apply(self, transcript: &mut Transcript) {
+        for (id, output) in self.final_outputs {
+            if let Some(turn) = transcript
+                .turns
+                .iter_mut()
+                .find(|turn| turn.message_id == id)
+            {
+                turn.usage.output = output;
+                turn.usage.output_final = true;
+            }
+        }
+    }
+}
+
 /// Reads the stream; `line_ends` holds when each line arrived, from the start of the run.
 pub fn read(stdout: &str, line_ends: &[Duration]) -> Transcript {
     let mut transcript = Transcript::default();
     let mut thinking_estimate = None;
+    let mut partials = Partials::default();
     for (index, line) in stdout.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -268,7 +321,8 @@ pub fn read(stdout: &str, line_ends: &[Duration]) -> Transcript {
             ("system", "thinking_tokens") => {
                 thinking_estimate = event.get("estimated_tokens").and_then(Value::as_u64);
             }
-            ("rate_limit_event", _) => {}
+            ("system", "status") | ("rate_limit_event", _) => {}
+            ("stream_event", _) => partials.event(&event, &mut transcript),
             ("assistant", _) => {
                 transcript.assistant(&event, seen, thinking_estimate.take());
             }
@@ -277,6 +331,7 @@ pub fn read(stdout: &str, line_ends: &[Duration]) -> Transcript {
             (kind, subtype) => transcript.unrecognised(&format!("event {kind}:{subtype}")),
         }
     }
+    partials.apply(&mut transcript);
     transcript
 }
 
@@ -287,6 +342,7 @@ mod tests {
     const SUCCESS: &str = include_str!("../../fixtures/review/claude-stream-success.jsonl");
     const MAX_TURNS: &str = include_str!("../../fixtures/review/claude-stream-max-turns.jsonl");
     const THINKING: &str = include_str!("../../fixtures/review/claude-stream-thinking.jsonl");
+    const PARTIAL: &str = include_str!("../../fixtures/review/claude-stream-partial.jsonl");
 
     fn seconds(count: u64) -> Vec<Duration> {
         (0..count).map(Duration::from_secs).collect()
@@ -331,6 +387,35 @@ mod tests {
     }
 
     #[test]
+    fn each_message_takes_its_final_output_count_from_its_message_delta() {
+        let transcript = read(PARTIAL, &[]);
+        assert_eq!(
+            transcript.unrecognised_count, 0,
+            "{:?}",
+            transcript.unrecognised
+        );
+        let outputs: Vec<(u64, bool)> = transcript
+            .turns
+            .iter()
+            .map(|turn| (turn.usage.output, turn.usage.output_final))
+            .collect();
+        assert_eq!(outputs, [(119, true), (132, true)]);
+        let result: Value = serde_json::from_str(transcript.result.as_deref().unwrap()).unwrap();
+        let total: u64 = outputs.iter().map(|(output, _)| output).sum();
+        assert_eq!(
+            result.pointer("/usage/output_tokens"),
+            Some(&Value::from(total))
+        );
+        let first = transcript.tool_calls.first().unwrap();
+        assert_eq!(first.input, "{\"file_path\":\"/tmp/review-files/main.rs\"}");
+        let without_partials = read(SUCCESS, &[]);
+        assert!(without_partials
+            .turns
+            .iter()
+            .all(|turn| !turn.usage.output_final));
+    }
+
+    #[test]
     fn a_turn_written_as_several_events_is_one_turn_with_its_summary() {
         let transcript = read(THINKING, &seconds(28));
         assert_eq!(transcript.turns.len(), 1);
@@ -370,7 +455,7 @@ mod tests {
             r#"{"type":"assistant","message":{"id":"m1","model":"x","content":[{"type":"thinking","thinking":"","signature":"s"},{"type":"redacted_thinking","data":"d"},{"type":"image"}]}}"#,
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"nobody","content":"x"},{"type":"text","text":"hi"}]}}"#,
             r#"{"type":"user","message":{"content":"plain"}}"#,
-            r#"{"type":"stream_event"}"#,
+            r#"{"type":"stream_event","event":{"type":"ping"}}"#,
             r#"{"type":"system","subtype":"compact_boundary"}"#,
             "not json",
             r#"{"type":"assistant"}"#,
@@ -386,7 +471,7 @@ mod tests {
                 "a result for unknown tool call nobody",
                 "user block text",
                 "a user event without content blocks",
-                "event stream_event:",
+                "stream event ping",
                 "event system:compact_boundary",
                 "line 6 is not JSON",
                 "an assistant event without a message",

@@ -348,6 +348,12 @@ fn turn_attributes(
         text("langfuse.observation.usage_details", &usage.to_string()),
         text("langfuse.observation.metadata.message_id", &turn.message_id),
     ];
+    if !turn.usage.output_final {
+        attributes.push(text(
+            "langfuse.observation.metadata.output_tokens",
+            "partial: the run ended before the message's final count",
+        ));
+    }
     if let Some(prompt) = prompt {
         attributes.push(text("langfuse.observation.prompt.name", &prompt.name));
         attributes.push(integer(

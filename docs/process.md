@@ -720,8 +720,10 @@ trace; some but not all is an error.
 - Each assistant message of a pass is a generation linked to the prompt version it ran,
   with the resolved model, its token counts and its output: the thinking summary, the text
   and the tool calls. The CLI runs with `--output-format stream-json --verbose
-  --thinking-display summarized`; without the last flag a headless run's thinking blocks
-  carry no text. A block the server sent without a summary shows as omitted.
+  --include-partial-messages --thinking-display summarized`. Without `--thinking-display` a
+  headless run's thinking blocks carry no text; a block the server sent without a summary
+  shows as omitted. A message's final output count arrives only in its `message_delta`
+  partial event; a message the run ended before then keeps its first count, marked partial.
 - Each tool call is a tool span under its message, with the tool's input and the first
   16 KiB of its result, the full size beside it.
 - Events in the stream the decoder does not know are counted and named on the pass, never

@@ -106,7 +106,7 @@ pub struct TimedLines {
     pub line_ends: Vec<Duration>,
 }
 
-const LINE_TIMES_MAX: usize = 1 << 16;
+const LINE_TIMES_MAX: usize = 1 << 18;
 
 /// Runs a command with stdin closed and stderr inherited, capturing stdout up to `max_bytes`
 /// and the time each of its lines arrived.
