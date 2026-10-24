@@ -3,16 +3,16 @@
 use std::fmt;
 use std::thread;
 
-use tycho_types::service::{handler, Service, RECONCILER_KEY};
+use tycho_types::service::{RECONCILER_KEY, Service, handler};
 
 use crate::config::{
-    CoreConfig, CorePorts, CoreRole, COMMAND_TIMEOUT, HEALTH_WAIT_POLLS_MAX, POLL_INTERVAL,
+    COMMAND_TIMEOUT, CoreConfig, CorePorts, CoreRole, HEALTH_WAIT_POLLS_MAX, POLL_INTERVAL,
 };
 use crate::health::{self, Health};
 use crate::http::{Http, Outcome, TIMED_OUT};
 use crate::services::operator;
 use crate::watchdog::{OnceReport, Supervisor};
-use crate::zmx::{presence, Presence};
+use crate::zmx::{Presence, presence};
 
 /// The watchdog's pass, then the operator secret and the reconciler's tick chain.
 #[derive(Debug)]
@@ -276,7 +276,7 @@ pub fn status(supervisor: &Supervisor) -> StatusReport {
             return StatusReport {
                 roles: Vec::new(),
                 failure: Some(format!("zmx list: {error}")),
-            }
+            };
         }
     };
     let roles = CoreRole::ALL
@@ -370,9 +370,11 @@ mod tests {
             ),
         );
         assert_eq!(starts, 1);
-        assert!(kicked
-            .unwrap()
-            .starts_with("generation 5, read from the view"));
+        assert!(
+            kicked
+                .unwrap()
+                .starts_with("generation 5, read from the view")
+        );
         let mut fresh = 0;
         let first = kick_reconciler(
             &mut counted_timeouts(&mut fresh),
@@ -392,9 +394,11 @@ mod tests {
                 r#"{"generation":4,"expected":[]}"#,
             ),
         );
-        assert!(kicked
-            .unwrap()
-            .starts_with("generation 5, after a start that"));
+        assert!(
+            kicked
+                .unwrap()
+                .starts_with("generation 5, after a start that")
+        );
         assert!(answers.is_empty());
     }
 

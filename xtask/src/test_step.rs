@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use crate::process::{run_bounded_merged, Exit};
+use crate::process::{Exit, run_bounded_merged};
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const BINARIES_MAX: usize = 512;

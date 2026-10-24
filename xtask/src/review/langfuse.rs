@@ -6,7 +6,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::claude_run::Usage;
 use super::stream::{Thinking, ToolCall, Transcript, Turn};
@@ -540,10 +540,10 @@ fn export_with(
                 decode_export(status, &body).map_err(|reason| format!("{reason} ({part})"))?;
             }
             Reply::BodyTooLarge => {
-                return Err(format!("the Langfuse response to {part} is over its cap"))
+                return Err(format!("the Langfuse response to {part} is over its cap"));
             }
             Reply::Failed(reason) => {
-                return Err(format!("sending {part} of the trace to Langfuse: {reason}"))
+                return Err(format!("sending {part} of the trace to Langfuse: {reason}"));
             }
         }
     }
@@ -847,12 +847,16 @@ pub mod tests {
         let langfuse = langfuse(&base);
         let client = PlainClient::loopback();
         assert_eq!(export_with(&client, &langfuse, &trace(), "s"), Ok(()));
-        assert!(export_with(&client, &langfuse, &trace(), "s")
-            .unwrap_err()
-            .contains("rejected 1 spans of the trace (part 1 of 1)"));
-        assert!(export_with(&client, &langfuse, &trace(), "s")
-            .unwrap_err()
-            .contains("HTTP 401"));
+        assert!(
+            export_with(&client, &langfuse, &trace(), "s")
+                .unwrap_err()
+                .contains("rejected 1 spans of the trace (part 1 of 1)")
+        );
+        assert!(
+            export_with(&client, &langfuse, &trace(), "s")
+                .unwrap_err()
+                .contains("HTTP 401")
+        );
         let requests = seen.recv().unwrap();
         let raw = requests.first().unwrap();
         let lower = raw.to_ascii_lowercase();

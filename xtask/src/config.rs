@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use crate::process::{run_bounded, Exit};
+use crate::process::{Exit, run_bounded};
 
 const CONFIG_DIR: &str = "config";
 const CONFIG_SCHEMA: &str = "config/schema.cue";

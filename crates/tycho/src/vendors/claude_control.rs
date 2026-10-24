@@ -17,7 +17,7 @@ use nix::fcntl::OFlag;
 use nix::sys::signal;
 use nix::unistd::Pid;
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tycho_types::envelope::{ShortText, TEXT_MAX_BYTES};
 use tycho_types::lease::PID_MAX;
 use tycho_types::session::{SessionName, Vendor};
@@ -28,8 +28,8 @@ use crate::config::AgentDirs;
 use crate::launch_spec::VendorTerminal;
 use crate::relay::{remove_relay_dir, write_instruction};
 use crate::vendors::control::{
-    bounded, AddressTarget, ContextReport, ControlCommand, ControlLaunch, Delivery, Observation,
-    PermissionMode, SessionVendor, VendorError, VendorSessionId, WaitingFor, MODEL_NAME_MAX_BYTES,
+    AddressTarget, ContextReport, ControlCommand, ControlLaunch, Delivery, MODEL_NAME_MAX_BYTES,
+    Observation, PermissionMode, SessionVendor, VendorError, VendorSessionId, WaitingFor, bounded,
 };
 
 /// One `ShortText`, far below the inbox's documented 1,048,576-character message limit.
@@ -349,14 +349,14 @@ pub fn post_on(channel: &mut impl Channel, label: String, line: &str) -> Deliver
             return Delivery::WriteFailed {
                 socket: label,
                 reason: bounded(&error.to_string()),
-            }
+            };
         }
         Err(error) => {
             return Delivery::WriteInterrupted {
                 socket: label,
                 sent,
                 reason: bounded(&error.to_string()),
-            }
+            };
         }
         Ok(()) => {}
     }
@@ -413,12 +413,12 @@ pub fn post(socket: &Path, line: &str, listener_uid: u32) -> Delivery {
                 reason: format!(
                     "{label}: the listener runs as uid {uid}, expected uid {listener_uid}"
                 ),
-            }
+            };
         }
         Err(error) => {
             return Delivery::Untrusted {
                 reason: bounded(&format!("{label}: peer credentials: {error}")),
-            }
+            };
         }
     }
     let timeouts = stream
@@ -534,7 +534,7 @@ pub fn check_socket(path: &Path, agent_uid: u32) -> Result<(), Delivery> {
         DirState::Missing => {
             return Err(Delivery::NoSocket {
                 socket: path.display().to_string(),
-            })
+            });
         }
         DirState::Refused(reason) => return Err(Delivery::Untrusted { reason }),
         DirState::Unreadable(error) => return Err(connect_failure(path, &error)),
@@ -611,7 +611,7 @@ fn read_tail(path: &Path, agent_uid: u32) -> Result<Option<String>, ContextRepor
         Err(error) if error.raw_os_error() == Some(Errno::ELOOP as i32) => {
             return Err(ContextReport::Unrecognised {
                 reason: bounded(&format!("{}: a link, not a transcript", path.display())),
-            })
+            });
         }
         Err(error) => return Err(unreadable_at(path, &error)),
     };
@@ -707,10 +707,10 @@ impl ClaudeControl {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Located::Absent,
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                return Located::Denied(bounded(&format!("{}: {error}", dir.display())))
+                return Located::Denied(bounded(&format!("{}: {error}", dir.display())));
             }
             Err(error) => {
-                return Located::Unreadable(bounded(&format!("{}: {error}", dir.display())))
+                return Located::Unreadable(bounded(&format!("{}: {error}", dir.display())));
             }
         };
         let mut found = Vec::new();
@@ -899,12 +899,12 @@ impl SessionVendor for ClaudeControl {
             Located::Found(entry) => entry,
             Located::Absent => return ContextReport::Absent,
             Located::Unreadable(reason) | Located::Denied(reason) => {
-                return ContextReport::Unreadable { reason }
+                return ContextReport::Unreadable { reason };
             }
             Located::Ambiguous(count) => {
                 return ContextReport::Unrecognised {
                     reason: format!("{count} live processes hold the session id"),
-                }
+                };
             }
         };
         match self.transcript_tail(&entry) {

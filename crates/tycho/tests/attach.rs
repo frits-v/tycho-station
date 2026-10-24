@@ -32,16 +32,16 @@ use std::time::{Duration, Instant};
 
 use nix::fcntl::OFlag;
 use nix::sys::termios::{
-    tcgetattr, tcsetattr, InputFlags, LocalFlags, SetArg, SpecialCharacterIndices, Termios,
+    InputFlags, LocalFlags, SetArg, SpecialCharacterIndices, Termios, tcgetattr, tcsetattr,
 };
-use nix::unistd::{access, getpgrp, tcgetpgrp, AccessFlags, Group, User};
+use nix::unistd::{AccessFlags, Group, User, access, getpgrp, tcgetpgrp};
 use tycho::agent_files::current_uid;
 use tycho::command::{self, CommandError};
 use tycho::config::{
-    ToolPrefix, AGENT_SOCKET_DIR_DEFAULT, AGENT_USER_DEFAULT, TOOL_PREFIX_DEFAULT,
+    AGENT_SOCKET_DIR_DEFAULT, AGENT_USER_DEFAULT, TOOL_PREFIX_DEFAULT, ToolPrefix,
 };
-use tycho::zmx::{self, ListEntry, Presence, Zmx, SESSION_ENV};
-use tycho_types::agent_switch::{decode_wider, wider_probe_arguments, WiderProbe};
+use tycho::zmx::{self, ListEntry, Presence, SESSION_ENV, Zmx};
+use tycho_types::agent_switch::{WiderProbe, decode_wider, wider_probe_arguments};
 
 const SUDO: &str = "/usr/bin/sudo";
 const SCRIPT: &str = "/usr/bin/script";
@@ -1285,6 +1285,18 @@ fn terminal_for_the_run() -> Result<TerminalState, String> {
     controlling_terminal().and_then(TerminalState::save)
 }
 
+fn agent_user() -> Agent {
+    let agent = User::from_name(AGENT_USER_DEFAULT)
+        .unwrap_or_else(|error| panic!("attach: cannot look up {AGENT_USER_DEFAULT}: {error}"))
+        .unwrap_or_else(|| {
+            panic!("attach: no user {AGENT_USER_DEFAULT}; run `mise run provision-agent`")
+        });
+    Agent {
+        uid: agent.uid.as_raw(),
+        home: agent.dir,
+    }
+}
+
 /// Refuses to start without a terminal, the agent user, the prefix's zmx, or the shared
 /// directory, or with a sudo answer the station does not expect; prints what it saw.
 fn preflight() -> (Agent, SharedZmx, TerminalState) {
@@ -1292,15 +1304,7 @@ fn preflight() -> (Agent, SharedZmx, TerminalState) {
         panic!("{refusal}");
     }
     let terminal = terminal_for_the_run().unwrap_or_else(|error| panic!("attach: {error}"));
-    let agent = User::from_name(AGENT_USER_DEFAULT)
-        .unwrap_or_else(|error| panic!("attach: cannot look up {AGENT_USER_DEFAULT}: {error}"))
-        .unwrap_or_else(|| {
-            panic!("attach: no user {AGENT_USER_DEFAULT}; run `mise run provision-agent`")
-        });
-    let agent = Agent {
-        uid: agent.uid.as_raw(),
-        home: agent.dir,
-    };
+    let agent = agent_user();
     let prefix = ToolPrefix::load(PathBuf::from(TOOL_PREFIX_DEFAULT))
         .unwrap_or_else(|error| panic!("attach: the shared tool prefix: {error}"));
     let binary = prefix
@@ -1325,7 +1329,11 @@ fn preflight() -> (Agent, SharedZmx, TerminalState) {
         metadata.uid() == current_uid(),
         Some(metadata.gid()) == shared_gid,
         metadata.permissions().mode() & 0o7777,
-        if Path::new(GHOSTTY_APP).exists() { "present" } else { "absent" }
+        if Path::new(GHOSTTY_APP).exists() {
+            "present"
+        } else {
+            "absent"
+        }
     );
     match shared_entries(dir, agent.uid) {
         Ok(entries) => {
@@ -1850,7 +1858,9 @@ fn a_client_through_a_pty_reaches_a_developer_session_and_detaches() {
     );
     let left = shared.listed(&target.session);
     fs::remove_dir_all(&root).unwrap();
-    println!("attach: self-check: spawn {spawned}, socket mode {socket:?}, {outcome:?}, kill {killed}, then {left:?}");
+    println!(
+        "attach: self-check: spawn {spawned}, socket mode {socket:?}, {outcome:?}, kill {killed}, then {left:?}"
+    );
     assert!(spawned.success());
     assert_eq!(
         socket.unwrap(),
@@ -1956,13 +1966,17 @@ mod decoders {
         let (_master, tty) = pty_slave();
         raw_mode(&tty);
         let wanted = prompt_repair(&tcgetattr(&tty).unwrap()).unwrap();
-        assert!(wanted
-            .local_flags
-            .contains(LocalFlags::ICANON | LocalFlags::ECHO));
+        assert!(
+            wanted
+                .local_flags
+                .contains(LocalFlags::ICANON | LocalFlags::ECHO)
+        );
         assert!(wanted.input_flags.contains(InputFlags::ICRNL));
-        assert!(!wanted
-            .input_flags
-            .intersects(InputFlags::IGNCR | InputFlags::INLCR));
+        assert!(
+            !wanted
+                .input_flags
+                .intersects(InputFlags::IGNCR | InputFlags::INLCR)
+        );
         assert_eq!(
             wanted.control_chars[SpecialCharacterIndices::VERASE as usize],
             ERASE_DELETE
@@ -1980,9 +1994,11 @@ mod decoders {
         odd.control_chars[SpecialCharacterIndices::VERASE as usize] = 0x08;
         tcsetattr(&tty, SetArg::TCSANOW, &odd).unwrap();
         let wanted = prompt_repair(&tcgetattr(&tty).unwrap()).unwrap();
-        assert!(!wanted
-            .input_flags
-            .intersects(InputFlags::IGNCR | InputFlags::INLCR));
+        assert!(
+            !wanted
+                .input_flags
+                .intersects(InputFlags::IGNCR | InputFlags::INLCR)
+        );
         let line = describe_terminal(42, 42, &wanted);
         for part in [
             "pgrp 42",
@@ -2164,10 +2180,22 @@ mod decoders {
                 "/tmp/open-tab.applescript:18:67: execution error: Not authorized to send Apple events to Ghostty. (-1743)\n",
                 "consent",
             ),
-            ("execution error: Ghostty got an error: Consent would be required. (-1744)\n", "consent"),
-            ("6:31: execution error: Ghostty is not running. (-600)\n", "unavailable"),
-            ("5:42: syntax error: Can\u{2019}t get application id \"dev.tycho.absent-app\". (-1728)\n", "unavailable"),
-            ("execution error: Ghostty got an error: AppleEvent timed out. (-1712)\n", "no answer"),
+            (
+                "execution error: Ghostty got an error: Consent would be required. (-1744)\n",
+                "consent",
+            ),
+            (
+                "6:31: execution error: Ghostty is not running. (-600)\n",
+                "unavailable",
+            ),
+            (
+                "5:42: syntax error: Can\u{2019}t get application id \"dev.tycho.absent-app\". (-1728)\n",
+                "unavailable",
+            ),
+            (
+                "execution error: Ghostty got an error: AppleEvent timed out. (-1712)\n",
+                "no answer",
+            ),
             (
                 "/tmp/open-tab.applescript:15:43: execution error: Ghostty got an error: Can\u{2019}t get terminal id \"6F1C\". (-1728)\n",
                 "unrecognised",

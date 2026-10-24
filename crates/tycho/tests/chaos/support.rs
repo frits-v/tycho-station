@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use restate_sdk::prelude::HttpServer;
 use tycho::config::{
-    CoreConfig, CorePorts, PortClaim, HOME_ENV, MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
+    CoreConfig, CorePorts, HOME_ENV, MISE_NO_INSTALL, PortClaim, RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
 use tycho::endpoint;
@@ -388,14 +388,16 @@ fn plan_file(core: &Core, tasks: &[&str]) -> PathBuf {
 
 /// Starts the epic, lists `wu01`, dispatches it through the operator, and returns the invocation.
 pub fn dispatch(core: &Core, tasks: &[&str]) -> String {
-    assert!(core
-        .tycho(&["epic", "start", "cf7a", "the synthetic epic"])
-        .status
-        .success());
-    assert!(core
-        .tycho(&["epic", "add-unit", "cf7a", "wu01"])
-        .status
-        .success());
+    assert!(
+        core.tycho(&["epic", "start", "cf7a", "the synthetic epic"])
+            .status
+            .success()
+    );
+    assert!(
+        core.tycho(&["epic", "add-unit", "cf7a", "wu01"])
+            .status
+            .success()
+    );
     let plan = plan_file(core, tasks);
     let dispatched = core.tycho(&["epic", "dispatch", "cf7a", "wu01", plan.to_str().unwrap()]);
     assert!(dispatched.status.success());

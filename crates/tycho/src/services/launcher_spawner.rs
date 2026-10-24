@@ -11,15 +11,15 @@ use std::io::Write;
 use nix::unistd::{Uid, User};
 
 use crate::agent_files::open_append;
-use crate::config::{AgentDirs, ConfigError, CorePorts, ToolPrefix, LOG_DIR};
+use crate::config::{AgentDirs, ConfigError, CorePorts, LOG_DIR, ToolPrefix};
 use crate::credentials::{self, Credential, CredentialVendor};
-use crate::kill::{kill_by_name, kill_session, KillReport, KillRequest};
+use crate::kill::{KillReport, KillRequest, kill_by_name, kill_session};
 use crate::launch_spec::{HeartbeatTarget, VendorTerminal};
 use crate::private_dir;
 use crate::process::now_unix_ms;
 use crate::services::spawner::{LeaseRead, SpawnSpec, SpawnTerminal, Spawner, SpawnerError};
 use crate::spawn::{
-    read_lease, save_scrollback, send_line, spawn_session, split_tier, SpawnOutcome, SpawnRequest,
+    SpawnOutcome, SpawnRequest, read_lease, save_scrollback, send_line, spawn_session, split_tier,
 };
 use crate::zmx::Zmx;
 
@@ -266,16 +266,18 @@ mod tests {
             Err(ConfigError::NoAgentUser(_))
         ));
         let bare = ToolPrefix::new(PathBuf::from("/tmp/prefix")).unwrap();
-        assert!(LauncherSpawner::for_prefix(
-            bare,
-            AgentDirs::new(PathBuf::from("/a")).unwrap(),
-            PathBuf::from("/h"),
-            PathBuf::from("/c"),
-            1,
-            HeartbeatTarget::Session,
-            CorePorts::PRODUCTION,
-        )
-        .is_err());
+        assert!(
+            LauncherSpawner::for_prefix(
+                bare,
+                AgentDirs::new(PathBuf::from("/a")).unwrap(),
+                PathBuf::from("/h"),
+                PathBuf::from("/c"),
+                1,
+                HeartbeatTarget::Session,
+                CorePorts::PRODUCTION,
+            )
+            .is_err()
+        );
     }
 
     #[test]

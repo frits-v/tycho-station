@@ -23,11 +23,11 @@ use tycho_types::session::SessionName;
 
 use crate::agent_files::read_checked;
 use crate::config::{AgentDirs, POLL_INTERVAL, SESSION_WAIT_POLLS_MAX};
-use crate::launcher::{check_tier, SessionFiles, VendorRecord, VENDOR_RECORD_MAX_BYTES};
-use crate::process::{process_facts, send, start_matches, Facts, ProcessFacts};
+use crate::launcher::{SessionFiles, VENDOR_RECORD_MAX_BYTES, VendorRecord, check_tier};
+use crate::process::{Facts, ProcessFacts, process_facts, send, start_matches};
 use crate::services::spawner::{LeaseRead, SpawnerError};
 use crate::spawn::read_lease;
-use crate::zmx::{presence, ListEntry, Presence, Zmx};
+use crate::zmx::{ListEntry, Presence, Zmx, presence};
 
 /// Why no signal was sent to a pid.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -231,7 +231,7 @@ fn checked_lease(request: &KillRequest<'_>) -> Result<Lease, KillRefusal> {
         LeaseRead::Absent => {
             return Err(KillRefusal::LeaseMismatch(format!(
                 "{session} has no lease"
-            )))
+            )));
         }
         LeaseRead::Unreadable { reason } => return Err(KillRefusal::LeaseMismatch(reason)),
     };
@@ -740,9 +740,11 @@ mod tests {
             None,
             "a core-owned process was signalled"
         );
-        assert!(std::fs::read_to_string(&log)
-            .unwrap()
-            .contains(&format!("kill {session}")));
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains(&format!("kill {session}"))
+        );
         child.kill().unwrap();
         child.wait().unwrap();
         std::fs::remove_dir_all(&dirs.socket_dir).unwrap();
@@ -828,9 +830,11 @@ mod tests {
             Some(KillVerdict::Refused(KillRefusal::CoreUid))
         );
         assert_eq!(child.try_wait().unwrap(), None, "the vendor was signalled");
-        assert!(std::fs::read_to_string(&log)
-            .unwrap()
-            .contains(&format!("kill {session}")));
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .contains(&format!("kill {session}"))
+        );
         std::fs::remove_file(SessionFiles::new(&dirs, &session).vendor).unwrap();
         let report = reap(&zmx, &dirs, &session, crate::agent_files::current_uid());
         assert_eq!(report.vendor, None);

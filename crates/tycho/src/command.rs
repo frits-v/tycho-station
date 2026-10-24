@@ -262,12 +262,12 @@ fn collect(
     let bytes = match reader.recv_timeout(remaining) {
         Ok(read) => read.map_err(CommandError::Wait)?,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            return Err(CommandError::TimedOut(name.to_string(), timeout))
+            return Err(CommandError::TimedOut(name.to_string(), timeout));
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
             return Err(CommandError::Wait(io::Error::other(
                 "output reader thread ended without a result",
-            )))
+            )));
         }
     };
     if bytes.len() > output_max_bytes {
@@ -403,9 +403,11 @@ mod tests {
         )
         .unwrap();
         assert!(captured.stdout.contains("TYCHO_COMMAND_SET=kept"));
-        assert!(!captured
-            .stdout
-            .lines()
-            .any(|line| line.starts_with("HOME=")));
+        assert!(
+            !captured
+                .stdout
+                .lines()
+                .any(|line| line.starts_with("HOME="))
+        );
     }
 }

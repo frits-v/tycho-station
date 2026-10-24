@@ -3,7 +3,7 @@
 //! run uses, creates a new version; the run's generations link to that version. The
 //! repository stays the source of the templates.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::langfuse::{Langfuse, PromptLink};
 use crate::github_api::{Credential, Method, PlainClient, Reply};
@@ -173,10 +173,12 @@ mod tests {
         );
         let requests = seen.recv().unwrap();
         assert_eq!(requests.len(), 1);
-        assert!(requests
-            .first()
-            .unwrap()
-            .starts_with("GET /api/public/v2/prompts/review-find?label=latest HTTP/1.1\r\n"));
+        assert!(
+            requests
+                .first()
+                .unwrap()
+                .starts_with("GET /api/public/v2/prompts/review-find?label=latest HTTP/1.1\r\n")
+        );
     }
 
     #[test]
@@ -241,8 +243,10 @@ mod tests {
             &template(),
             "post",
         );
-        assert!(unreachable
-            .unwrap_err()
-            .starts_with("looking up prompt review-find: "));
+        assert!(
+            unreachable
+                .unwrap_err()
+                .starts_with("looking up prompt review-find: ")
+        );
     }
 }

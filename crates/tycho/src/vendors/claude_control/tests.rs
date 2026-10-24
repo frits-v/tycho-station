@@ -6,7 +6,7 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
@@ -117,10 +117,12 @@ fn the_command_line_is_exact_and_resume_re_passes_the_settings() {
     let mut expected_resume = expected.map(str::to_string).to_vec();
     expected_resume[9] = "--resume".to_string();
     assert_eq!(resumed.argv, expected_resume);
-    assert!(command
-        .argv
-        .iter()
-        .all(|word| ShortText::parse(word).is_ok()));
+    assert!(
+        command
+            .argv
+            .iter()
+            .all(|word| ShortText::parse(word).is_ok())
+    );
 }
 
 #[test]
@@ -515,9 +517,11 @@ fn a_socket_or_registry_of_another_user_sends_the_instruction_to_the_relay() {
     let file = crate::relay::relay_file_name(&ShortText::parse("wu03:task_packet:1").unwrap());
     assert_eq!(go(&relaying), Delivery::Relayed { file: file.clone() });
     let written = crate::relay::relay_dir(&agent, &target().session).join(&file);
-    assert!(fs::read_to_string(written)
-        .unwrap()
-        .contains("\"content\":\"go\""));
+    assert!(
+        fs::read_to_string(written)
+            .unwrap()
+            .contains("\"content\":\"go\"")
+    );
     fs::set_permissions(dir.join("sessions"), fs::Permissions::from_mode(0o000)).unwrap();
     assert!(matches!(relaying.locate(&session()), Located::Denied(_)));
     assert_eq!(go(&relaying), Delivery::Relayed { file: file.clone() });

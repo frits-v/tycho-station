@@ -25,13 +25,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tycho::config::{
-    CoreConfig, CorePorts, CoreRole, PortClaim, HOME_ENV, LAUNCHD_LABEL, MISE_NO_INSTALL,
+    CoreConfig, CorePorts, CoreRole, HOME_ENV, LAUNCHD_LABEL, MISE_NO_INSTALL, PortClaim,
     RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::health::{self, Health};
 use tycho::http::Http;
 use tycho::launchd::{Agent, AgentState, THROTTLE_SECONDS};
-use tycho::zmx::{count_named, presence, Presence, Zmx};
+use tycho::zmx::{Presence, Zmx, count_named, presence};
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(120);

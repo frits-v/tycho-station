@@ -3,11 +3,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::envelope::{
-    check_count, BranchName, ContentRef, EnvelopeError, ShortText, CRITERIA_MAX_ITEMS,
-    REFS_MAX_ITEMS,
+    BranchName, CRITERIA_MAX_ITEMS, ContentRef, EnvelopeError, REFS_MAX_ITEMS, ShortText,
+    check_count,
 };
 use crate::session::Vendor;
-use crate::token::{check_slug, check_text, checked_string, TokenError};
+use crate::token::{TokenError, check_slug, check_text, checked_string};
 
 pub const PATH_MAX_BYTES: usize = 1024;
 pub const PATHS_MAX_ITEMS: usize = 64;

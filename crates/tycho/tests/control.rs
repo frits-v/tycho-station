@@ -24,8 +24,8 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,12 +33,12 @@ use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tycho::agent_files::current_uid;
 use tycho::config::{
-    self, AgentDirs, CoreConfig, CorePorts, PortClaim, ToolPrefix, AGENT_USER_ENV, HOME_ENV,
-    MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
+    self, AGENT_USER_ENV, AgentDirs, CoreConfig, CorePorts, HOME_ENV, MISE_NO_INSTALL, PortClaim,
+    RESTATE_SERVER_ENV, ToolPrefix, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
-use tycho::credentials::{self, Credential, CredentialVendor, CLAUDE_TOKEN_ENV};
-use tycho::kill::{kill_session, KillRequest};
+use tycho::credentials::{self, CLAUDE_TOKEN_ENV, Credential, CredentialVendor};
+use tycho::kill::{KillRequest, kill_session};
 use tycho::launch_probe::LaunchProbe;
 use tycho::launcher::{HeartbeatTarget, SessionFiles, VendorRecord, VendorTerminal};
 use tycho::relay::relay_dir;
@@ -52,8 +52,8 @@ use tycho::services::session::{
 use tycho::services::spawner::{LeaseRead, SpawnSpec, SpawnTerminal, Spawner, SpawnerError};
 use tycho::services::{Ports, Timing};
 use tycho::spawn::{
-    read_lease, save_scrollback, send_line, spawn_session, SpawnOutcome as LaunchOutcome,
-    SpawnRequest, CLAUDE_SANDBOX_SETTINGS,
+    CLAUDE_SANDBOX_SETTINGS, SpawnOutcome as LaunchOutcome, SpawnRequest, read_lease,
+    save_scrollback, send_line, spawn_session,
 };
 use tycho::vendors::claude_control::{ClaudeControl, RelayMode};
 use tycho::vendors::control::{
@@ -1004,9 +1004,11 @@ fn dont_ask_never_waits(harness: &mut Harness) {
         "evidence: control-three.txt exists: {}",
         harness.file("control-three.txt").exists()
     );
-    assert!(!observed
-        .iter()
-        .any(|seen| matches!(seen, Observation::Waiting { .. })));
+    assert!(
+        !observed
+            .iter()
+            .any(|seen| matches!(seen, Observation::Waiting { .. }))
+    );
     assert!(matches!(observed.last(), Some(Observation::Idle { .. })));
     harness.kill(&dont_ask);
 }

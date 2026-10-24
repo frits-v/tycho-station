@@ -4,7 +4,7 @@
 use serde_json::Value;
 
 use super::verdict::Event;
-use crate::github_api::{github_message, Client, Method, Reply};
+use crate::github_api::{Client, Method, Reply, github_message};
 
 const PER_PAGE: usize = 30;
 const PAGES_MAX: usize = 10;
@@ -273,7 +273,7 @@ fn listing(client: &Client, token: &str, path: &str) -> Result<Vec<Value>, Strin
                     github_message(&body)
                         .map(|m| format!(", {m}"))
                         .unwrap_or_default()
-                ))
+                ));
             }
             Reply::BodyTooLarge => return Err(format!("a page of {path} is over its cap")),
             Reply::Failed(reason) => return Err(format!("listing {path}: {reason}")),
@@ -506,10 +506,12 @@ mod tests {
         let fetched = fetch(&Client::loopback(&base), "t", "o/r", 12).unwrap();
         assert_eq!(fetched.head.as_str(), HEAD);
         let requests = seen.recv().unwrap();
-        assert!(requests
-            .first()
-            .unwrap()
-            .starts_with("GET /repos/o/r/pulls/12 "));
+        assert!(
+            requests
+                .first()
+                .unwrap()
+                .starts_with("GET /repos/o/r/pulls/12 ")
+        );
     }
 
     fn comment(body: &str) -> Value {
@@ -550,14 +552,18 @@ mod tests {
         assert_eq!(earlier.reviews, 2);
         assert_eq!(earlier.posted.first().unwrap().excerpt, "a.rs:3: x");
         let requests = seen.recv().unwrap();
-        assert!(requests
-            .get(1)
-            .unwrap()
-            .starts_with("GET /repos/o/r/pulls/12/comments?per_page=30&page=2 "));
-        assert!(requests
-            .get(2)
-            .unwrap()
-            .starts_with("GET /repos/o/r/pulls/12/reviews?per_page=30&page=1 "));
+        assert!(
+            requests
+                .get(1)
+                .unwrap()
+                .starts_with("GET /repos/o/r/pulls/12/comments?per_page=30&page=2 ")
+        );
+        assert!(
+            requests
+                .get(2)
+                .unwrap()
+                .starts_with("GET /repos/o/r/pulls/12/reviews?per_page=30&page=1 ")
+        );
     }
 
     #[test]

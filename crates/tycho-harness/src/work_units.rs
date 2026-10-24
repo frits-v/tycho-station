@@ -6,9 +6,9 @@ use std::fmt;
 use serde::Deserialize;
 use tycho_types::envelope::{CRITERIA_MAX_ITEMS, REFS_MAX_ITEMS};
 use tycho_types::task_packet::{
-    TaskPacketPayload, BUDGET_TOKENS_MAX_COUNT, BUDGET_WALL_CLOCK_MAX_MS, PATHS_MAX_ITEMS,
+    BUDGET_TOKENS_MAX_COUNT, BUDGET_WALL_CLOCK_MAX_MS, PATHS_MAX_ITEMS, TaskPacketPayload,
 };
-use tycho_types::token::{check_slug, TokenError};
+use tycho_types::token::{TokenError, check_slug};
 
 /// A fixture larger than this is rejected before it is parsed.
 pub const FIXTURE_MAX_BYTES: usize = 65_536;

@@ -52,10 +52,10 @@ pub fn cited_names(ledger: &str) -> Vec<(usize, String)> {
     let mut found = Vec::new();
     for (index, line) in ledger.lines().enumerate() {
         for (position, span) in line.split('`').enumerate() {
-            if position % 2 == 1 {
-                if let Some(name) = cited_name(span) {
-                    found.push((index.saturating_add(1), name.to_string()));
-                }
+            if position % 2 == 1
+                && let Some(name) = cited_name(span)
+            {
+                found.push((index.saturating_add(1), name.to_string()));
             }
         }
     }
@@ -72,10 +72,10 @@ pub fn defined_names(source: &str) -> BTreeSet<String> {
             .filter(|word| !word.is_empty())
             .collect();
         for pair in words.windows(2) {
-            if let [keyword, name] = pair {
-                if *keyword == "fn" || *keyword == "mod" {
-                    names.insert((*name).to_string());
-                }
+            if let [keyword, name] = pair
+                && (*keyword == "fn" || *keyword == "mod")
+            {
+                names.insert((*name).to_string());
             }
         }
     }

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use tycho_types::envelope::{Envelope, Payload, ENVELOPE_MAX_BYTES};
+use tycho_types::envelope::{ENVELOPE_MAX_BYTES, Envelope, Payload};
 use tycho_types::exit::ExitState;
 use tycho_types::launcher::{AwaitableId, IdempotencyKey};
 use tycho_types::rejection::encode_escalation;
@@ -289,7 +289,7 @@ pub fn deliver_with_backoff(
                 return Delivery::Refused {
                     attempts,
                     reason: format!("status {status}: {body}"),
-                }
+                };
             }
             Ack::Retry(reason) | Ack::Unrecognised(reason) => last = reason,
         }
@@ -318,7 +318,7 @@ pub fn mark_acknowledged(path: &Path) -> io::Result<PathBuf> {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("{} exists", done.display()),
-            ))
+            ));
         }
     }
     fs::rename(path, &done)?;
@@ -631,9 +631,11 @@ mod tests {
             write_spool(&path, &record(ExitState::Failed)),
             Err(SpoolError::Io(..))
         ));
-        assert!(replay(&ingress, &path, current_uid(), &mut |_| {})
-            .unwrap()
-            .acknowledged());
+        assert!(
+            replay(&ingress, &path, current_uid(), &mut |_| {})
+                .unwrap()
+                .acknowledged()
+        );
         assert!(matches!(
             replay(&ingress, &path, current_uid(), &mut |_| {}),
             Err(SpoolError::Missing(_))

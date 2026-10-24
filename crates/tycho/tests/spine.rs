@@ -24,18 +24,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use restate_sdk::prelude::HttpServer;
 use tycho::config::{
-    CoreConfig, CorePorts, PortClaim, HOME_ENV, MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
+    CoreConfig, CorePorts, HOME_ENV, MISE_NO_INSTALL, PortClaim, RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
 use tycho::endpoint;
-use tycho::services::doubles::{FixedGate, RecordingSpawner, RecordingVendor, DOUBLE_SOCKET};
+use tycho::services::doubles::{DOUBLE_SOCKET, FixedGate, RecordingSpawner, RecordingVendor};
 use tycho::services::merge_gate::{GateVerdict, MergeGate, NoGate};
 use tycho::services::operator::read_secret_file;
 use tycho::services::spawner::{SpawnSpec, Spawner};
@@ -47,7 +47,7 @@ use tycho_types::envelope::{
     CommitSha, EscalationOption, EscalationPayload, QuestionType, Reversibility, ShortText,
 };
 use tycho_types::rejection::encode_escalation;
-use tycho_types::service::{handler, Service, RECONCILER_KEY};
+use tycho_types::service::{RECONCILER_KEY, Service, handler};
 use tycho_types::session::Level;
 use tycho_types::session::SessionName;
 
@@ -418,10 +418,11 @@ fn epic_starts_and_adds_units_only_through_the_operator() {
         serde_json::Value::Null,
         "no state after refusals"
     );
-    assert!(core
-        .tycho(&["epic", "start", "cf7a", "split the orders table"])
-        .status
-        .success());
+    assert!(
+        core.tycho(&["epic", "start", "cf7a", "split the orders table"])
+            .status
+            .success()
+    );
     let added = core.tycho(&["epic", "add-unit", "cf7a", "wu01"]);
     assert_eq!(String::from_utf8_lossy(&added.stdout).trim(), "\"added\"");
     let again = core.tycho(&["epic", "add-unit", "cf7a", "wu01"]);
@@ -604,14 +605,16 @@ fn dispatch(core: &Core, tasks: &[&str]) -> String {
 }
 
 fn dispatch_plan(core: &Core, plan: &Path) -> String {
-    assert!(core
-        .tycho(&["epic", "start", "cf7a", "split the orders table"])
-        .status
-        .success());
-    assert!(core
-        .tycho(&["epic", "add-unit", "cf7a", "wu01"])
-        .status
-        .success());
+    assert!(
+        core.tycho(&["epic", "start", "cf7a", "split the orders table"])
+            .status
+            .success()
+    );
+    assert!(
+        core.tycho(&["epic", "add-unit", "cf7a", "wu01"])
+            .status
+            .success()
+    );
     let dispatched = core.tycho(&["epic", "dispatch", "cf7a", "wu01", plan.to_str().unwrap()]);
     assert!(dispatched.status.success());
     let body: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
@@ -879,9 +882,11 @@ fn a_cancel_during_spawn_kills_settles_and_starts_no_second_attempt() {
         "reaped by name, no pid known"
     );
     let status_path = format!("/Session/{}/status", log.spawned[0].0);
-    assert!(call(core_ports, &status_path, "", None)
-        .1
-        .contains("\"phase\":\"lost\""));
+    assert!(
+        call(core_ports, &status_path, "", None)
+            .1
+            .contains("\"phase\":\"lost\"")
+    );
     assert_eq!(
         epic_status(core_ports)["worker_slots"]["used"],
         0,
@@ -919,9 +924,11 @@ fn an_error_while_watching_kills_the_session_before_settling() {
     println!("evidence: spawner log {log:?}");
     assert_eq!(log.killed.len(), 1, "killed on the error path");
     assert_eq!(log.killed[0].0, session);
-    assert!(call(core_ports, &status_path, "", None)
-        .1
-        .contains("\"phase\":\"killed\""));
+    assert!(
+        call(core_ports, &status_path, "", None)
+            .1
+            .contains("\"phase\":\"killed\"")
+    );
     assert_eq!(
         epic_status(core_ports)["worker_slots"]["used"],
         0,
@@ -1027,7 +1034,9 @@ fn forced_escalation_question() -> EscalationPayload {
             EscalationOption {
                 label: text("leave the ceiling and ask for a council ruling"),
                 reversibility: Reversibility::TwoWay,
-                blast_radius: text("the trivial unit stays under the current ceiling until the ruling"),
+                blast_radius: text(
+                    "the trivial unit stays under the current ceiling until the ruling",
+                ),
             },
         ],
         proposed_ruling: Some(unit.packet.inputs[0].clone()),
@@ -1208,9 +1217,11 @@ fn a_malformed_or_stale_verdict_is_rejected_and_the_unit_stays_escalated() {
     fs::create_dir(&other_epic).unwrap();
     fs::set_permissions(&other_epic, fs::Permissions::from_mode(0o700)).unwrap();
     let elsewhere = other_epic.join("wu01-1.verdict");
-    assert!(rule_by_file(&core, &elsewhere, "continue\n")
-        .status
-        .success());
+    assert!(
+        rule_by_file(&core, &elsewhere, "continue\n")
+            .status
+            .success()
+    );
     let reason = fs::read_to_string(sibling(&elsewhere, "reason")).unwrap();
     println!("evidence: wrong-epic verdict reason: {reason}");
     assert!(

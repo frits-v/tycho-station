@@ -9,7 +9,7 @@ use std::env;
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
-use super::{core_home, is_shell_safe, is_test_home, user_home, ConfigError};
+use super::{ConfigError, core_home, is_shell_safe, is_test_home, user_home};
 use crate::agent_files::{current_uid, read_checked};
 
 /// The shared tool prefix: honoured only for a test core home, like the port offset.
@@ -162,8 +162,15 @@ impl ToolPrefix {
     /// no project configuration, no network and no install of a missing version.
     #[must_use]
     pub fn mise_environment(&self) -> [(&'static str, String); 7] {
-        let [data, global, cache, config_names, tool_versions, offline, auto_install] =
-            MISE_PREFIX_ENV;
+        let [
+            data,
+            global,
+            cache,
+            config_names,
+            tool_versions,
+            offline,
+            auto_install,
+        ] = MISE_PREFIX_ENV;
         [
             (data, self.root.join("mise").display().to_string()),
             (global, self.root.join("mise.toml").display().to_string()),

@@ -66,7 +66,7 @@ pub fn query(checkout: &str, kind: &str, argument: &str) -> Result<String, Strin
         _ => {
             return Err(format!(
                 "unknown query {kind}; use definitions, callers or impact"
-            ))
+            ));
         }
     };
     report.map_err(|error| error.to_string())

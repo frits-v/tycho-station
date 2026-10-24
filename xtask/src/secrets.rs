@@ -24,8 +24,8 @@ static TAKEN: OnceLock<BTreeMap<&'static str, String>> = OnceLock::new();
 /// Moves each secret variable from the process environment into the store. `main` calls it
 /// first, while the process has one thread: `env::remove_var` is not thread-safe.
 #[expect(
-    clippy::disallowed_methods,
-    reason = "runs first in main, while the process has one thread"
+    unsafe_code,
+    reason = "`remove_var` is sound only while no other thread reads the environment; this runs first in main, while the process has one thread"
 )]
 pub fn take_from_environment() {
     TAKEN.get_or_init(|| {
@@ -34,7 +34,7 @@ pub fn take_from_environment() {
             if let Ok(value) = env::var(name) {
                 taken.insert(name, value);
             }
-            env::remove_var(name);
+            unsafe { env::remove_var(name) };
         }
         taken
     });

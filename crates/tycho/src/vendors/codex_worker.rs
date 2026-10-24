@@ -11,8 +11,8 @@ use tycho_types::session::Vendor;
 use tycho_types::task_packet::Effort;
 
 use crate::vendors::worker::{
-    vendor_word, CommandRefusal, Stream, VendorEnd, VersionState, WorkerError, WorkerTask,
-    WorkerVendor,
+    CommandRefusal, Stream, VendorEnd, VersionState, WorkerError, WorkerTask, WorkerVendor,
+    vendor_word,
 };
 
 pub const CODEX_PINNED_VERSION: &str = "0.160.1";

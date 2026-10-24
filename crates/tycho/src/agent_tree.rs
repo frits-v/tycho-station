@@ -13,12 +13,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use nix::NixPath;
 use nix::dir::{Dir, Type};
 use nix::errno::Errno;
-use nix::fcntl::{open, openat, renameat, AtFlags, OFlag};
-use nix::sys::stat::{fstat, fstatat, mkdirat, FileStat, Mode, SFlag};
-use nix::unistd::{fsync, unlinkat, UnlinkatFlags};
-use nix::NixPath;
+use nix::fcntl::{AtFlags, OFlag, open, openat, renameat};
+use nix::sys::stat::{FileStat, Mode, SFlag, fstat, fstatat, mkdirat};
+use nix::unistd::{UnlinkatFlags, fsync, unlinkat};
 
 /// Names listed per pass over a directory; a pass removes what it listed, then lists again.
 const SWEEP_BATCH: usize = 4096;
@@ -159,10 +159,10 @@ fn open_root(root: &Path, owners: Owners) -> Result<OwnedFd, TreeError> {
         }
         Err(error) => return Err(failed(root, error)),
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(refused(root, TreeRefusal::Symlink))
+            return Err(refused(root, TreeRefusal::Symlink));
         }
         Ok(metadata) if !metadata.is_dir() => {
-            return Err(refused(root, TreeRefusal::NotADirectory))
+            return Err(refused(root, TreeRefusal::NotADirectory));
         }
         Ok(_) => {}
     }
@@ -297,10 +297,10 @@ pub fn remove_dir(
         Err(Errno::ENOENT) => return Ok(()),
         Err(errno) => return Err(failed(&path, errno)),
         Ok(stat) if kind(&stat) == SFlag::S_IFLNK => {
-            return Err(refused(&path, TreeRefusal::Symlink))
+            return Err(refused(&path, TreeRefusal::Symlink));
         }
         Ok(stat) if kind(&stat) != SFlag::S_IFDIR => {
-            return Err(refused(&path, TreeRefusal::NotADirectory))
+            return Err(refused(&path, TreeRefusal::NotADirectory));
         }
         Ok(_) => {}
     }

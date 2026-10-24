@@ -7,11 +7,11 @@ use std::io::Read;
 use std::path::Path;
 
 use tycho_types::envelope::ShortText;
-use tycho_types::service::{handler, EpicId, WorkUnitId};
+use tycho_types::service::{EpicId, WorkUnitId, handler};
 
-use crate::config::{spine, CoreConfig, CorePorts};
+use crate::config::{CoreConfig, CorePorts, spine};
 use crate::http::{Http, Outcome};
-use crate::services::operator::{read_secret_file, AddUnitCall, DispatchUnitCall, StartEpicCall};
+use crate::services::operator::{AddUnitCall, DispatchUnitCall, StartEpicCall, read_secret_file};
 use crate::services::work_unit::{PlannedTask, WorkUnitRequest};
 
 pub const OPERATOR_SERVICE: &str = "Operator";

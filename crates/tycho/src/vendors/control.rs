@@ -211,7 +211,7 @@ pub trait SessionVendor: Send + Sync + 'static {
     fn control_command(&self, launch: &ControlLaunch) -> Result<ControlCommand, VendorError>;
     /// Posts to the session's inbox, or relays it under the key when the socket refuses the core.
     fn address(&self, target: &AddressTarget, key: &ShortText, instruction: &ShortText)
-        -> Delivery;
+    -> Delivery;
     fn observe(&self, session: &VendorSessionId) -> Observation;
     /// The handle a later `control_command` with `resume` takes.
     fn resume_handle(&self, session: &VendorSessionId) -> Result<ShortText, VendorError>;

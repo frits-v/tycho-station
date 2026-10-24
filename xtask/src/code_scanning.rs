@@ -9,11 +9,11 @@ use std::process::Command;
 use std::time::Duration;
 
 use base64::Engine as _;
-use flate2::write::GzEncoder;
 use flate2::Compression;
-use serde_json::{json, Value};
+use flate2::write::GzEncoder;
+use serde_json::{Value, json};
 
-use crate::process::{run_bounded, Exit};
+use crate::process::{Exit, run_bounded};
 use crate::sarif::{SARIF_DIR, SARIF_FILES_MAX};
 
 /// GitHub refuses a SARIF upload over 10 MB once gzipped; an uncompressed file over that

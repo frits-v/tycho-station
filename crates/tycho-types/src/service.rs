@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::token::{check_slug, checked_string, TokenError};
+use crate::token::{TokenError, check_slug, checked_string};
 
 /// Epic and work unit ids are session name segments, so the socket path limit bounds them.
 pub const ID_MAX_BYTES: usize = 16;

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use tycho_types::git_environment::git_command;
 
-use crate::process::{run_bounded, Exit};
+use crate::process::{Exit, run_bounded};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// SHA-1 and SHA-256 object names.

@@ -22,7 +22,7 @@ use tycho_types::token::check_slug;
 
 use crate::agent_files::current_uid;
 use crate::agent_tree::{self, Bounds, Owners, TreeError, TreeRefusal};
-use crate::command::{run_status_capped, Captured};
+use crate::command::{Captured, run_status_capped};
 use crate::config::COMMAND_OUTPUT_MAX_BYTES;
 use crate::private_dir;
 
@@ -425,7 +425,7 @@ impl Repositories {
                     return Err(RepositoryError::Input(format!(
                         "{} is not bare",
                         canonical.display()
-                    )))
+                    )));
                 }
                 BareRead::Unrecognised(line) => return Err(RepositoryError::Unrecognised(line)),
             }
@@ -988,6 +988,25 @@ pub(crate) mod tests {
         assert!(!report.contains("Scratch::new returned"), "{report}");
     }
 
+    fn assert_push_refused(worktree: &Path) {
+        let push = git_command()
+            .args([
+                "-C",
+                &text(worktree),
+                "push",
+                "-q",
+                "origin",
+                "HEAD:refs/heads/escape",
+            ])
+            .envs(GIT_ENVIRONMENT)
+            .output()
+            .unwrap();
+        assert!(
+            !push.status.success(),
+            "a push from the worktree reached origin"
+        );
+    }
+
     #[test]
     fn a_worktree_is_a_clone_of_the_canonical_repository_on_its_own_branch() {
         let scratch = Scratch::new("clone");
@@ -1013,30 +1032,17 @@ pub(crate) mod tests {
             git(&path, &["config", "remote.origin.pushurl"]).trim(),
             PUSH_DISABLED
         );
-        let push = git_command()
-            .args([
-                "-C",
-                &text(&path),
-                "push",
-                "-q",
-                "origin",
-                "HEAD:refs/heads/escape",
-            ])
-            .envs(GIT_ENVIRONMENT)
-            .output()
-            .unwrap();
-        assert!(
-            !push.status.success(),
-            "a push from the worktree reached origin"
-        );
+        assert_push_refused(&path);
         assert_eq!(
             git(&path, &["rev-parse", "HEAD"]).trim(),
             worktree.base.as_str()
         );
-        assert!(!path
-            .join(".git/hooks")
-            .read_dir()
-            .is_ok_and(|mut entries| entries.next().is_some()));
+        assert!(
+            !path
+                .join(".git/hooks")
+                .read_dir()
+                .is_ok_and(|mut entries| entries.next().is_some())
+        );
         let again = repositories
             .clone_worktree(&project, &path, &branch)
             .unwrap();
@@ -1044,12 +1050,16 @@ pub(crate) mod tests {
             again, worktree,
             "a repeated clone starts over in the same place"
         );
-        assert!(repositories
-            .clone_worktree(&project, &scratch.0.join("elsewhere"), &branch)
-            .is_err());
-        assert!(repositories
-            .create_canonical(&project, Path::new("/nonexistent"))
-            .is_ok());
+        assert!(
+            repositories
+                .clone_worktree(&project, &scratch.0.join("elsewhere"), &branch)
+                .is_err()
+        );
+        assert!(
+            repositories
+                .create_canonical(&project, Path::new("/nonexistent"))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1222,9 +1232,11 @@ pub(crate) mod tests {
         let staging = scratch.0.join("home").join(STAGING_DIR);
         assert_eq!(fs::read_dir(&staging).unwrap().count(), 0);
         let missing = ProjectName::parse("missing").unwrap();
-        assert!(repositories
-            .clone_worktree(&missing, &scratch.0.join("worktrees/cf7a/wu02/a1"), &branch)
-            .is_err());
+        assert!(
+            repositories
+                .clone_worktree(&missing, &scratch.0.join("worktrees/cf7a/wu02/a1"), &branch)
+                .is_err()
+        );
         assert_eq!(
             fs::read_dir(&staging).unwrap().count(),
             0,
@@ -1252,9 +1264,11 @@ pub(crate) mod tests {
         repositories.pin(&project, &worktree, &head, &pin).unwrap();
         assert_eq!(repositories.resolve(&project, &pin).unwrap(), head);
         let missing = CommitSha::parse("1123456789abcdef0123456789abcdef01234567").unwrap();
-        assert!(repositories
-            .pin(&project, &worktree, &missing, &pin_ref(&unit(), 2))
-            .is_err());
+        assert!(
+            repositories
+                .pin(&project, &worktree, &missing, &pin_ref(&unit(), 2))
+                .is_err()
+        );
         let canonical = repositories.canonical(&project);
         let stranger = scratch.0.join("stranger");
         fs::create_dir_all(&stranger).unwrap();
@@ -1273,9 +1287,11 @@ pub(crate) mod tests {
             repositories.pin(&project, &worktree, &unrelated, &pin_ref(&unit(), 3)),
             Err(RepositoryError::NotFetched(unrelated.to_string()))
         );
-        assert!(repositories
-            .resolve(&project, &pin_ref(&unit(), 3))
-            .is_err());
+        assert!(
+            repositories
+                .resolve(&project, &pin_ref(&unit(), 3))
+                .is_err()
+        );
     }
 
     /// A worker commit on top of `trunk`, fetched into the canonical repository and pinned.

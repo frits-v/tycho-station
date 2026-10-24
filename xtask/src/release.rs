@@ -7,8 +7,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::app_token::{self, AppCredentials, Repository, RELEASE};
-use crate::process::{run_bounded, Captured, Exit};
+use crate::app_token::{self, AppCredentials, RELEASE, Repository};
+use crate::process::{Captured, Exit, run_bounded};
 use std::time::Duration;
 use tycho_types::git_environment::git_command;
 

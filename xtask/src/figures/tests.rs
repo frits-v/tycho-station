@@ -141,8 +141,7 @@ fn check_lines_decode_into_each_state() {
 #[test]
 fn a_report_without_summary_or_passing_check_is_defective() {
     assert_eq!(check_report_defects("").len(), 2);
-    let all_not_applicable =
-        "check pipes-land: examined 0 pipe ends, not applicable: page has no pipes\n\
+    let all_not_applicable = "check pipes-land: examined 0 pipe ends, not applicable: page has no pipes\n\
          stencil check: 1 checks, 0 passed, 0 failed, 1 not applicable\n";
     assert!(!check_report_defects(all_not_applicable).is_empty());
 }

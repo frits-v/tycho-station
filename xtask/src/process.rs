@@ -131,7 +131,7 @@ pub fn run_bounded_timed_lines(
                     stderr: String::new(),
                 },
                 line_ends: Vec::new(),
-            }
+            };
         }
     };
     let started = Instant::now();
@@ -229,7 +229,7 @@ fn run_with(
                 exit: Exit::NotStarted(error.to_string()),
                 stdout: String::new(),
                 stderr: String::new(),
-            }
+            };
         }
     };
     let stdout_reader = child.stdout.take().map(Pipe::Out).map(read_capped);
@@ -353,11 +353,7 @@ fn collect_within(reader: Option<ReaderResult>, exit: Exit, deadline: Duration) 
 }
 
 fn clean_exit_becomes(exit: Exit, instead: Exit) -> Exit {
-    if exit == Exit::Code(0) {
-        instead
-    } else {
-        exit
-    }
+    if exit == Exit::Code(0) { instead } else { exit }
 }
 
 fn wait_with_deadline(child: &mut std::process::Child, timeout: Duration) -> Exit {

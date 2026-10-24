@@ -6,21 +6,21 @@ use std::sync::Arc;
 
 use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
-use tycho_types::agent_call::{HandoffCall, HandoffNote, HeartbeatCall, CONTEXT_TOKENS_MAX};
+use tycho_types::agent_call::{CONTEXT_TOKENS_MAX, HandoffCall, HandoffNote, HeartbeatCall};
 use tycho_types::envelope::{ProgressMarker, ShortText};
 use tycho_types::exit::ExitState;
-use tycho_types::launcher::{AwaitableId, LauncherEnv, SessionSecret, SEQUENCE_MAX};
-use tycho_types::lease::{spawn_decision, RequeueReason, SpawnDecision};
+use tycho_types::launcher::{AwaitableId, LauncherEnv, SEQUENCE_MAX, SessionSecret};
+use tycho_types::lease::{RequeueReason, SpawnDecision, spawn_decision};
 use tycho_types::service::RECONCILER_KEY;
 use tycho_types::session::{SessionName, Vendor};
 use tycho_types::task_packet::AbsolutePath;
 
 use crate::config::spine;
-use crate::services::reconciler::{fingerprint, ExpectRequest, ReconcilerClient};
+use crate::services::reconciler::{ExpectRequest, ReconcilerClient, fingerprint};
 use crate::services::spawner::{LeaseRead, SpawnSpec, SpawnTerminal, Spawner};
 use crate::services::{
-    blocking, refuse, secret, spawner_failure, wall_clock_unix_ms, Ports, Timing, CODE_BAD_REQUEST,
-    CODE_CANCELLED, CODE_CONFLICT, CODE_FORBIDDEN, CODE_INTERNAL, CODE_NOT_FOUND,
+    CODE_BAD_REQUEST, CODE_CANCELLED, CODE_CONFLICT, CODE_FORBIDDEN, CODE_INTERNAL, CODE_NOT_FOUND,
+    Ports, Timing, blocking, refuse, secret, spawner_failure, wall_clock_unix_ms,
 };
 use crate::vendors::control::{AddressTarget, Delivery, SessionVendor, VendorSessionId};
 
@@ -128,10 +128,10 @@ pub fn kept_instruction<'a>(
 #[must_use]
 pub fn remember(state: &SessionState, record: InstructionRecord) -> SessionState {
     let mut next = state.clone();
-    if let Delivery::Posted { socket } | Delivery::PostedUnclosed { socket } = &record.delivery {
-        if let Ok(path) = AbsolutePath::parse(socket) {
-            next.inbox_socket = Some(path);
-        }
+    if let Delivery::Posted { socket } | Delivery::PostedUnclosed { socket } = &record.delivery
+        && let Ok(path) = AbsolutePath::parse(socket)
+    {
+        next.inbox_socket = Some(path);
     }
     next.instructions.push(record);
     let excess = next
@@ -455,7 +455,7 @@ impl Session {
             LeaseRead::Present { lease } => Some(lease),
             LeaseRead::Absent => None,
             LeaseRead::Unreadable { reason } => {
-                return Err(refuse(CODE_INTERNAL, format!("lease unreadable: {reason}")))
+                return Err(refuse(CODE_INTERNAL, format!("lease unreadable: {reason}")));
             }
         };
         let fresh_ms = Timing::millis(self.timing.lease_fresh);
@@ -475,7 +475,7 @@ impl Session {
                 (pid, SpawnOutcome::Spawned { pid })
             }
             (SpawnDecision::Requeue(reason), _) => {
-                return Ok(Json(SpawnOutcome::Requeue { reason }))
+                return Ok(Json(SpawnOutcome::Requeue { reason }));
             }
         };
         let clock = object_context
@@ -1219,7 +1219,7 @@ mod tests {
 
     #[test]
     fn spawn_time_is_read_after_the_spawn_step() {
-        use crate::services::reconciler::{judge, Expected, Verdict};
+        use crate::services::reconciler::{Expected, Verdict, judge};
         use crate::services::spawner::LeaseRead;
         let timing = Timing::default();
         let observed_unix_ms = 1_800_000_000_000_u64;

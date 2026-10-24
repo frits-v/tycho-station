@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::envelope::{check_escalation, EnvelopeError, EscalationPayload, ENVELOPE_MAX_BYTES};
+use crate::envelope::{ENVELOPE_MAX_BYTES, EnvelopeError, EscalationPayload, check_escalation};
 use crate::exit::ExitState;
 
 const ESCALATED_WITH_QUESTION: &str = "escalated\n";
@@ -54,7 +54,7 @@ fn decode_question(tail: &str) -> Question {
                 error.classify(),
                 error.line(),
                 error.column()
-            ))
+            ));
         }
     };
     match check_escalation(&payload) {
@@ -71,7 +71,7 @@ const fn malformed(reason: String) -> Question {
 mod tests {
     use super::*;
     use crate::envelope::{
-        ContentRef, EscalationOption, QuestionType, Reversibility, ShortText, OPTIONS_MAX_ITEMS,
+        ContentRef, EscalationOption, OPTIONS_MAX_ITEMS, QuestionType, Reversibility, ShortText,
     };
     use crate::session::Level;
 

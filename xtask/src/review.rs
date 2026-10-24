@@ -392,8 +392,11 @@ mod tests {
         assert!(!workflow.contains("FRITS_CODE_REVIEW"));
         assert!(!workflow.contains("pull-requests: write"));
         assert!(workflow.contains("- run: target/debug/xtask review --dry-run"));
-        assert!(workflow
-            .contains("    environment:\n      name: review-dry-run\n      deployment: false\n"));
+        assert!(
+            workflow.contains(
+                "    environment:\n      name: review-dry-run\n      deployment: false\n"
+            )
+        );
     }
 
     #[test]
@@ -434,8 +437,10 @@ mod tests {
             &Err("the find pass ended".into()),
         );
         assert!(failed.output.starts_with("no verdict: "));
-        assert!(failed
-            .metadata
-            .contains(&("verdict".to_string(), "none".to_string())));
+        assert!(
+            failed
+                .metadata
+                .contains(&("verdict".to_string(), "none".to_string()))
+        );
     }
 }

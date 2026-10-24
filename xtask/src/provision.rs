@@ -21,13 +21,13 @@ use std::time::Duration;
 use crate::prefix_install;
 use crate::process::{self, Captured, Exit};
 use crate::setup::{
-    self, AgentHome, AgentHomeState, Check, Finding, Identity, Side, Status, AGENT_GROUP_NAME,
-    AGENT_HOME, AGENT_HOME_MODE, AGENT_SOCKET_DIR, AGENT_SOCKET_DIR_MODE, AGENT_USER_NAME,
-    CORE_SOCKET_DIR_MODE, HOME_DENY_ENTRY, SHARED_GROUP_NAME,
+    self, AGENT_GROUP_NAME, AGENT_HOME, AGENT_HOME_MODE, AGENT_SOCKET_DIR, AGENT_SOCKET_DIR_MODE,
+    AGENT_USER_NAME, AgentHome, AgentHomeState, CORE_SOCKET_DIR_MODE, Check, Finding,
+    HOME_DENY_ENTRY, Identity, SHARED_GROUP_NAME, Side, Status,
 };
 use crate::tool_prefix::{
-    self, AgentTool, DirectoryState, Prefix, StationState, ToolState, TreeState,
-    MISE_PINNED_VERSION,
+    self, AgentTool, DirectoryState, MISE_PINNED_VERSION, Prefix, StationState, ToolState,
+    TreeState,
 };
 use tycho_types::agent_switch::{self, DefaultsLine, Entry, Listing, SUDOERS_DROP_IN};
 
@@ -653,8 +653,11 @@ fn render_prefix(step: PrefixStep, prefix: &Prefix) -> Vec<String> {
             prefix.data_dir().display()
         )],
         PrefixStep::InstallMise => vec![
-            format!("download mise {MISE_PINNED_VERSION} and SHASUMS256.txt from github.com/jdx/mise releases"),
-            "require the published sha256 and the download's to equal the pinned digest".to_string(),
+            format!(
+                "download mise {MISE_PINNED_VERSION} and SHASUMS256.txt from github.com/jdx/mise releases"
+            ),
+            "require the published sha256 and the download's to equal the pinned digest"
+                .to_string(),
             format!("install as {}, mode 0755", prefix.mise().display()),
         ],
         PrefixStep::InstallAgentTools => {
@@ -676,8 +679,14 @@ fn render_prefix(step: PrefixStep, prefix: &Prefix) -> Vec<String> {
         }
         PrefixStep::InstallStation => vec![
             "mbx build --release --locked -p xtask -p tycho".to_string(),
-            format!("install target/release/xtask and tycho into {}, mode 0755", prefix.bin().display()),
-            format!("record their sha256 and the commit in {}", prefix.manifest().display()),
+            format!(
+                "install target/release/xtask and tycho into {}, mode 0755",
+                prefix.bin().display()
+            ),
+            format!(
+                "record their sha256 and the commit in {}",
+                prefix.manifest().display()
+            ),
         ],
     };
     lines.push("(as the developer)".to_string());
@@ -971,7 +980,7 @@ pub trait Host {
     fn snapshot(&mut self) -> Result<Snapshot, String>;
     fn run_as_root(&mut self, words: &[String]) -> Captured;
     fn prepare_directory(&mut self, work: &DirectoryWork, developer_uid: u32)
-        -> Result<(), String>;
+    -> Result<(), String>;
     /// Runs a program as the developer once `directory` is checked to be the developer's own.
     fn run_on_own_directory(
         &mut self,
@@ -1215,7 +1224,7 @@ fn prepare_directory(work: &DirectoryWork, developer_uid: u32) -> Result<(), Str
             name,
         }) => Some((gid, name)),
         Some(GroupTarget { gid: None, name }) => {
-            return Err(format!("the gid of {name} could not be read"))
+            return Err(format!("the gid of {name} could not be read"));
         }
         None => None,
     };
@@ -1360,7 +1369,7 @@ fn apply(host: &mut impl Host, steps: &[Remedy], initial: Snapshot) -> Result<Sn
                 continue;
             }
             Need::Blocked(why) => {
-                return Err(format!("{}: a probe could not run: {why}", remedy.label()))
+                return Err(format!("{}: a probe could not run: {why}", remedy.label()));
             }
         }
         let action = action(remedy, &latest)
@@ -1448,7 +1457,9 @@ fn refusal_for(developer: &Identity) -> Option<String> {
 
 fn provision(mode: Mode, stdin_is_terminal: bool, host: &mut impl Host) -> i32 {
     if mode == Mode::Apply && !stdin_is_terminal {
-        eprintln!("xtask provision-agent: stdin is not a terminal, and sudo and sysadminctl prompt on it; run it from a terminal, or pass --print for the plan");
+        eprintln!(
+            "xtask provision-agent: stdin is not a terminal, and sudo and sysadminctl prompt on it; run it from a terminal, or pass --print for the plan"
+        );
         return 2;
     }
     let snapshot = match host.snapshot() {
@@ -2306,7 +2317,9 @@ mod tests {
             .and_then(|finding| finding.hint.clone());
         assert_eq!(
             hint.as_deref(),
-            Some("sudo -u tycho-agent /bin/chmod 0700 /Users/tycho-agent (mise run provision-agent narrows it)")
+            Some(
+                "sudo -u tycho-agent /bin/chmod 0700 /Users/tycho-agent (mise run provision-agent narrows it)"
+            )
         );
         assert_eq!(plan(&wide).steps, vec![Remedy::NarrowAgentHomeMode]);
     }
@@ -2489,7 +2502,9 @@ mod tests {
     fn decodes_sysadminctl_log_lines() {
         let user = |stderr| decode_command(SYSADMINCTL, &captured(Exit::Code(0), "", stderr));
         assert_eq!(
-            user("2026-10-09 12:00:00.000 sysadminctl[812:9031] Creating user record\n2026-10-09 12:00:00.100 sysadminctl[812:9031] Assigning UID: 502 GID: 502\n"),
+            user(
+                "2026-10-09 12:00:00.000 sysadminctl[812:9031] Creating user record\n2026-10-09 12:00:00.100 sysadminctl[812:9031] Assigning UID: 502 GID: 502\n"
+            ),
             CommandOutcome::Succeeded
         );
         assert!(matches!(
@@ -2680,8 +2695,12 @@ mod tests {
         assert_eq!(
             commands,
             [
-                format!("{as_agent} PATH=/usr/bin:/bin /usr/bin/git config --global credential.helper \"\""),
-                format!("{as_agent} USER=tycho-agent LOGNAME=tycho-agent {environment} /Users/Shared/tycho/bin/xtask setup"),
+                format!(
+                    "{as_agent} PATH=/usr/bin:/bin /usr/bin/git config --global credential.helper \"\""
+                ),
+                format!(
+                    "{as_agent} USER=tycho-agent LOGNAME=tycho-agent {environment} /Users/Shared/tycho/bin/xtask setup"
+                ),
             ]
         );
         assert!(commands.iter().all(|command| !command.contains("shims")
@@ -2886,7 +2905,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             lines.first().map(String::as_str),
-            Some("write /Users/frits/.tycho/provision/tycho-agent, mode 0600, in a 0700 directory (as the developer):")
+            Some(
+                "write /Users/frits/.tycho/provision/tycho-agent, mode 0600, in a 0700 directory (as the developer):"
+            )
         );
         assert!(lines
             .iter()

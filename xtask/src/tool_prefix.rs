@@ -16,8 +16,8 @@ use std::time::Duration;
 use tycho_types::git_environment::git_command;
 
 use crate::prefix_manifest::{
-    install_sha256, is_commit, read_manifest, read_regular, sha256_hex, Manifest, ManifestRead,
-    StationRecord, ToolRecord, BINARY_MAX_BYTES,
+    BINARY_MAX_BYTES, Manifest, ManifestRead, StationRecord, ToolRecord, install_sha256, is_commit,
+    read_manifest, read_regular, sha256_hex,
 };
 use crate::setup::{self, Capture, Check, Finding, Identity, Status};
 
@@ -739,7 +739,7 @@ pub fn mise_state(prefix: &Prefix, environment: &ToolEnvironment) -> ToolState {
     match regular_file(&mise) {
         Ok(true) => {}
         Ok(false) => {
-            return ToolState::WrongSource(format!("{} is not a regular file", mise.display()))
+            return ToolState::WrongSource(format!("{} is not a regular file", mise.display()));
         }
         Err(state) => return state,
     }
@@ -890,7 +890,7 @@ fn recorded_tool<'manifest>(
         ManifestRead::Unrecognised => {
             return Err(ToolState::Modified(
                 "an unrecognised station.json".to_string(),
-            ))
+            ));
         }
         ManifestRead::Unreadable(why) => return Err(ToolState::Unreachable(why.clone())),
     };
@@ -921,7 +921,7 @@ pub fn installed_tool_state(
     match regular_file(&binary) {
         Ok(true) => {}
         Ok(false) => {
-            return ToolState::WrongSource(format!("{} is not a regular file", binary.display()))
+            return ToolState::WrongSource(format!("{} is not a regular file", binary.display()));
         }
         Err(state) => return state,
     }
@@ -1003,7 +1003,7 @@ pub fn station_state(
         }) => record,
         ManifestRead::Present(_) | ManifestRead::Absent => return StationState::Absent,
         ManifestRead::Unrecognised => {
-            return StationState::Modified("an unrecognised station.json".to_string())
+            return StationState::Modified("an unrecognised station.json".to_string());
         }
         ManifestRead::Unreadable(why) => return StationState::Unreachable(why.clone()),
     };
@@ -1332,9 +1332,11 @@ mod tests {
         }
         let online = prefix_command(&prefix, &environment, &prefix.mise(), &[], Network::Online);
         assert!(online.get_envs().all(|(name, _)| name != "MISE_OFFLINE"));
-        assert!(online
-            .get_envs()
-            .any(|(name, value)| name == "MISE_AUTO_INSTALL" && value.is_some()));
+        assert!(
+            online
+                .get_envs()
+                .any(|(name, value)| name == "MISE_AUTO_INSTALL" && value.is_some())
+        );
     }
 
     #[test]
@@ -1448,20 +1450,24 @@ mod tests {
 
     #[test]
     fn an_empty_walk_or_an_open_tree_never_passes() {
-        assert!(!tree_finding(
-            Check::PrefixTree,
-            &TreeState::Closed { examined: 0 },
-            TREE_OPEN_HINT
-        )
-        .status
-        .is_pass());
+        assert!(
+            !tree_finding(
+                Check::PrefixTree,
+                &TreeState::Closed { examined: 0 },
+                TREE_OPEN_HINT
+            )
+            .status
+            .is_pass()
+        );
         let open = TreeState::Open {
             first: "x".to_string(),
             count: 1,
         };
-        assert!(!tree_finding(Check::PrefixTree, &open, TREE_OPEN_HINT)
-            .status
-            .is_pass());
+        assert!(
+            !tree_finding(Check::PrefixTree, &open, TREE_OPEN_HINT)
+                .status
+                .is_pass()
+        );
         let closed = tree_finding(
             Check::PrefixTree,
             &TreeState::Closed { examined: 9 },
@@ -1716,12 +1722,16 @@ mod tests {
             ToolState::Modified("sha256".to_string()),
             ToolState::Unreachable("x".to_string()),
         ] {
-            assert!(!tool_finding(Check::PrefixClaude, &state, "2")
-                .status
-                .is_pass());
+            assert!(
+                !tool_finding(Check::PrefixClaude, &state, "2")
+                    .status
+                    .is_pass()
+            );
         }
-        assert!(tool_finding(Check::PrefixClaude, &ToolState::Pinned, "2")
-            .status
-            .is_pass());
+        assert!(
+            tool_finding(Check::PrefixClaude, &ToolState::Pinned, "2")
+                .status
+                .is_pass()
+        );
     }
 }

@@ -8,7 +8,7 @@ use std::time::Duration;
 use tycho_types::git_environment::git_command;
 
 use crate::finish_findings;
-use crate::process::{run_bounded, Exit};
+use crate::process::{Exit, run_bounded};
 use crate::sarif::{Finding, Rule};
 
 const MARKERS: [&str; 10] = [
@@ -293,12 +293,17 @@ mod tests {
         let text = "env:\n  TOKEN: ghp_abc\n  OTHER: GITHUB_PAT_11AB\nuse a Personal Access Token\na Fine-Grained Token\nRELEASE_PLZ_TOKEN: x\noauth gho_x user ghu_x refresh ghr_x\na Classic Token\nrun `GH AUTH TOKEN`\n";
         let defects = markers_found(".github/workflows/x.yml", text);
         assert_eq!(defects.len(), 10, "{defects:?}");
-        assert!(defects
-            .iter()
-            .any(|defect| defect.contains("x.yml:2:10: check-credentials/marker: `ghp_`")));
-        assert!(defects
-            .iter()
-            .any(|defect| defect.contains("x.yml:9:6: check-credentials/marker: `gh auth token`")));
+        assert!(
+            defects
+                .iter()
+                .any(|defect| defect.contains("x.yml:2:10: check-credentials/marker: `ghp_`"))
+        );
+        assert!(
+            defects
+                .iter()
+                .any(|defect| defect
+                    .contains("x.yml:9:6: check-credentials/marker: `gh auth token`"))
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::config::CueOutcome;
-use crate::process::{run_bounded, run_bounded_capturing_stderr, Captured, Exit};
+use crate::process::{Captured, Exit, run_bounded, run_bounded_capturing_stderr};
 use crate::sarif::{self, Finding, Results};
 
 const WORKFLOW_DIR: &str = ".github/workflows";
@@ -224,10 +224,10 @@ fn jactionlint(network: Network) -> Result<usize, String> {
         LintLog::Examined(0) => return Err("jactionlint examined 0 files".to_string()),
         LintLog::Examined(files) => files,
         LintLog::ShellcheckMissing => {
-            return Err("jactionlint could not run shellcheck over the run: scripts".to_string())
+            return Err("jactionlint could not run shellcheck over the run: scripts".to_string());
         }
         LintLog::Unrecognised => {
-            return Err("jactionlint printed no `Found N errors in M files` summary".to_string())
+            return Err("jactionlint printed no `Found N errors in M files` summary".to_string());
         }
     };
     let outcome = decode_jactionlint(&captured.exit, &captured.stdout);

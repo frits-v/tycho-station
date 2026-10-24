@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tycho_types::launcher::{EnvError, LauncherEnv, ENV_SESSION_NAME, ENV_VALUE_MAX_BYTES};
+use tycho_types::launcher::{ENV_SESSION_NAME, ENV_VALUE_MAX_BYTES, EnvError, LauncherEnv};
 use tycho_types::service::Service;
 
 use crate::agent_files::{read_checked, shred};
-use crate::config::{AgentDirs, CorePorts, AGENT_DIR_ENV, MISE_PREFIX_ENV, ZMX_ENV};
-use crate::config_store::{PortOffset, PortOffsetError, PORT_OFFSET_ENV};
+use crate::config::{AGENT_DIR_ENV, AgentDirs, CorePorts, MISE_PREFIX_ENV, ZMX_ENV};
+use crate::config_store::{PORT_OFFSET_ENV, PortOffset, PortOffsetError};
 use crate::credential_handoff::CREDENTIAL_SOCKET_ENV;
 use crate::launch_probe::LAUNCH_PROBE_SERVICE;
 
@@ -588,9 +588,11 @@ pub mod tests {
         );
         expected.sort_unstable();
         assert_eq!(names, expected);
-        assert!(!pairs
-            .iter()
-            .any(|(_, value)| value == SECRET || value == "sign_1abc"));
+        assert!(
+            !pairs
+                .iter()
+                .any(|(_, value)| value == SECRET || value == "sign_1abc")
+        );
         assert_eq!(
             settings.credential_socket,
             Some(PathBuf::from("/agent/specs/0123456789abcdef.cred"))

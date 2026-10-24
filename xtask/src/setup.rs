@@ -18,8 +18,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tycho_types::agent_switch::{
-    decode_listing, decode_wider, listing_arguments, wider_probe_arguments, DefaultsLine, Entry,
-    Expected, Listing, Reading, WiderProbe, SUDO, WIDER_PROBE_COMMAND,
+    DefaultsLine, Entry, Expected, Listing, Reading, SUDO, WIDER_PROBE_COMMAND, WiderProbe,
+    decode_listing, decode_wider, listing_arguments, wider_probe_arguments,
 };
 use tycho_types::session::{SESSION_NAME_MAX_BYTES, SOCKET_PATH_MAX_BYTES};
 
@@ -590,7 +590,7 @@ pub fn run_bounded_within(mut command: Command, timeout: Duration) -> Capture {
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Capture::ExecutableNotFound
+            return Capture::ExecutableNotFound;
         }
         Err(error) => return Capture::Unreachable(format!("failed to start {program}: {error}")),
     };
@@ -1440,7 +1440,7 @@ fn home_closed_status(username: &str) -> Status {
     let entries = match home_acl(&home) {
         Ok(AclListing::Entries(entries)) => entries,
         Ok(AclListing::Unrecognised(line)) => {
-            return unreachable(format!("unrecognised ls -lde line: {line:?}"))
+            return unreachable(format!("unrecognised ls -lde line: {line:?}"));
         }
         Err(why) => return unreachable(why),
     };
@@ -1732,7 +1732,9 @@ const NARROWS_NOTE: &str = "mise run provision-agent narrows it";
 fn mismatch_hint(mismatch: &HomeMismatch, home: &AgentHome) -> String {
     let path = home.path.as_deref().unwrap_or(AGENT_HOME);
     if mismatch.kind.is_some() || mismatch.owner.is_some() {
-        return format!("{path} is not a directory the agent owns; inspect it and move it aside by hand, then run mise run provision-agent again");
+        return format!(
+            "{path} is not a directory the agent owns; inspect it and move it aside by hand, then run mise run provision-agent again"
+        );
     }
     let mut steps = Vec::new();
     if let Some(group) = mismatch.group {
@@ -1898,7 +1900,7 @@ fn credential_gitconfig_finding(home: &Result<String, String>) -> Finding {
                         wanted: "no credential helper".to_string(),
                     },
                     CLEAR_CREDENTIAL_HELPERS_HINT,
-                )
+                );
             }
             CredentialHelpers::Unrecognised => Status::Unreachable {
                 why: format!(
@@ -2031,7 +2033,7 @@ fn agent_socket_dir_findings(group_gid: Result<u32, String>, developer_uid: u32)
     let metadata = match fs::symlink_metadata(AGENT_SOCKET_DIR) {
         Ok(metadata) => metadata,
         Err(error) => {
-            return directory_error_findings(Check::AgentDirExists, &AGENT_DIR_DEPENDENT, &error)
+            return directory_error_findings(Check::AgentDirExists, &AGENT_DIR_DEPENDENT, &error);
         }
     };
     vec![
@@ -2150,7 +2152,7 @@ pub fn sudoers_rule_status(
             return (
                 Status::Unreachable { why: why.clone() },
                 Listing::Refused(why),
-            )
+            );
         }
     };
     let status = match &listing {
@@ -2185,14 +2187,14 @@ fn reading_status(
             return Status::Wrong {
                 found: format!("the rule for {path}, which a zmx pin bump left"),
                 wanted,
-            }
+            };
         }
         (Entry::Exact, DefaultsLine::Exact) => {}
         (Entry::Exact, defaults) => {
             return Status::Wrong {
                 found: format!("its Defaults line {defaults:?}"),
                 wanted,
-            }
+            };
         }
     }
     let wider = match run(&wider_probe_arguments(AGENT_USER_NAME)) {
@@ -2335,7 +2337,7 @@ fn store_entry_status(path: &Path, directory: bool, uid: u32, mode: u32) -> Stat
         Err(error) => {
             return Status::Unreachable {
                 why: format!("{}: {error}", path.display()),
-            }
+            };
         }
     };
     let kind_ok = if directory {
@@ -2413,12 +2415,12 @@ fn agent_store_status(store: &Path) -> Status {
                     "{} does not exist and every directory above it let the agent search, so the store's own mode is untested",
                     store.display()
                 ),
-            }
+            };
         }
         Err(error) => {
             return Status::Unreachable {
                 why: format!("{}: {error}", store.display()),
-            }
+            };
         }
         Ok(_) => {}
     }
@@ -2435,13 +2437,13 @@ fn agent_store_status(store: &Path) -> Status {
                 return Status::Wrong {
                     found: format!("the agent opens {}", path.display()),
                     wanted: "permission denied".to_string(),
-                }
+                };
             }
             Err(error) if denied(&error) => {}
             Err(error) => {
                 return Status::Unreachable {
                     why: format!("{}: {error}", path.display()),
-                }
+                };
             }
         }
     }
@@ -2599,7 +2601,9 @@ pub fn summarize(mode: Option<Side>, findings: &[Finding]) -> i32 {
         .count();
     let mode_label = mode.map_or("unknown", Side::label);
     if examined == 0 {
-        eprintln!("xtask setup: {mode_label} mode examined 0 preconditions; a check over nothing is a failure");
+        eprintln!(
+            "xtask setup: {mode_label} mode examined 0 preconditions; a check over nothing is a failure"
+        );
         return 1;
     }
     println!(
@@ -2887,7 +2891,10 @@ mod tests {
         ("agent keychain: no item for aws", Side::Agent),
         ("agent keychain: no item for ssh", Side::Agent),
         ("agent keychain: no item for gh:github.com", Side::Agent),
-        ("as the agent: the core's credential store cannot be reached", Side::Agent),
+        (
+            "as the agent: the core's credential store cannot be reached",
+            Side::Agent,
+        ),
         (
             "as the agent: nothing in the tool prefix is writable",
             Side::Agent,
@@ -2951,9 +2958,11 @@ mod tests {
 
         let developer_checks = checks_run(&developer_run);
         let agent_checks = checks_run(&agent_run);
-        assert!(developer_checks
-            .iter()
-            .all(|check| !agent_checks.contains(check)));
+        assert!(
+            developer_checks
+                .iter()
+                .all(|check| !agent_checks.contains(check))
+        );
         assert_eq!(
             developer_checks.len().saturating_add(agent_checks.len()),
             CATALOGUE.len()
@@ -3096,18 +3105,22 @@ mod tests {
         )];
         let findings = assemble(Side::Developer, &stray);
         assert_eq!(findings.len(), CATALOGUE.len().saturating_add(1));
-        assert!(findings
-            .last()
-            .is_some_and(|finding| matches!(finding.status, Status::Unreachable { .. })));
+        assert!(
+            findings
+                .last()
+                .is_some_and(|finding| matches!(finding.status, Status::Unreachable { .. }))
+        );
     }
 
     #[test]
     fn unknown_identity_makes_every_check_unreachable() {
         let findings = unknown_mode_findings("id is not on PATH");
         assert_eq!(findings.len(), CATALOGUE.len());
-        assert!(findings
-            .iter()
-            .all(|finding| matches!(finding.status, Status::Unreachable { .. })));
+        assert!(
+            findings
+                .iter()
+                .all(|finding| matches!(finding.status, Status::Unreachable { .. }))
+        );
         assert_eq!(summarize(None, &findings), 1);
     }
 
@@ -3903,9 +3916,10 @@ mod tests {
             state: AgentHomeState::Missing,
         });
         assert_eq!(elsewhere.status, Status::Missing);
-        assert!(elsewhere.hint.is_some_and(|hint| hint
-            .contains("point NFSHomeDirectory at /Users/tycho-agent")
-            && !hint.contains("createhomedir")));
+        assert!(elsewhere.hint.is_some_and(|hint| {
+            hint.contains("point NFSHomeDirectory at /Users/tycho-agent")
+                && !hint.contains("createhomedir")
+        }));
         for path in [Some(AGENT_HOME.to_string()), None] {
             let at_agent_home = agent_home_finding(&AgentHome {
                 path,
@@ -3954,9 +3968,11 @@ mod tests {
             &finding.status,
             Status::Wrong { found, .. } if found == "ACL entry group:staff allow list,search"
         ));
-        assert!(finding
-            .hint
-            .is_some_and(|hint| hint.contains("chmod -a \"group:staff allow list,search\"")));
+        assert!(
+            finding
+                .hint
+                .is_some_and(|hint| hint.contains("chmod -a \"group:staff allow list,search\""))
+        );
         assert!(matches!(
             measure_agent_home(&record, listing("total 0\n")),
             AgentHomeState::Unrecognised(_)
@@ -4074,9 +4090,11 @@ mod tests {
             &format!("owner uid {uid}, group gid {gid}, mode 0755")
         );
         assert!(wanted.contains("mode 0700"));
-        assert!(finding
-            .hint
-            .is_some_and(|hint| hint.contains("move it aside by hand")));
+        assert!(
+            finding
+                .hint
+                .is_some_and(|hint| hint.contains("move it aside by hand"))
+        );
         fs::remove_dir(&home).expect("remove the home");
         fs::remove_dir(&base).expect("remove the base");
     }

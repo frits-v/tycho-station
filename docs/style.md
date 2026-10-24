@@ -9,7 +9,7 @@ check is not repeated in any instruction file. "review" means a reader rejects i
 |---|---|
 | Stability over performance over convenience; the trade-off is named when it comes up | review |
 | Security over convenience: where options differ in security, the most secure one that does the work is taken and the trade-off named | review |
-| No `unsafe` | `unsafe_code = "forbid"` |
+| No `unsafe`, except the two startup steps of the xtask that remove variables from its environment while it has one thread | `unsafe_code = "deny"`; each exception carries an `expect` with its reason |
 | Every `Result` handled; no `unwrap`, `expect`, `panic`, `todo`, `unimplemented` outside tests | clippy `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `let_underscore_must_use` |
 | No slice indexing; use `get` | clippy `indexing_slicing` |
 | No unchecked arithmetic | clippy `arithmetic_side_effects` |

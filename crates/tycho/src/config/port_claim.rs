@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use nix::errno::Errno;
 use nix::fcntl::{Flock, FlockArg, OFlag};
 
-use super::{user_home, CorePorts};
-use crate::config_store::{PortOffset, PORT_OFFSET_SLOTS};
+use super::{CorePorts, user_home};
+use crate::config_store::{PORT_OFFSET_SLOTS, PortOffset};
 use crate::private_dir;
 
 /// Under the user's home, so every worktree and suite of the user shares one set of slots.
@@ -161,7 +161,7 @@ fn claim_from(dir: &Path, home: &Path, start: u16, attempts: u16) -> Result<Port
                     ports: CorePorts::at(offset),
                     skipped: Vec::new(),
                     _lock: lock,
-                })
+                });
             }
             Err((_, Errno::EWOULDBLOCK)) => {}
             Err((_, errno)) => return Err(ClaimError::Lock(path, errno)),
@@ -233,9 +233,11 @@ mod tests {
         .unwrap();
         assert_eq!(claim.ports.offset.slot(), Some(6));
         assert_eq!(claim.skipped.len(), 1);
-        assert!(claim
-            .to_string()
-            .contains("skipped offset 1104: 127.0.0.1:44000"));
+        assert!(
+            claim
+                .to_string()
+                .contains("skipped offset 1104: 127.0.0.1:44000")
+        );
         drop(claim);
         assert!(matches!(
             claim_free(&dir, home, 5, &|_| Some("held".to_string())),

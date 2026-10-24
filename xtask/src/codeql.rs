@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::process::{run_bounded, Exit};
+use crate::process::{Exit, run_bounded};
 use crate::sarif::{self, Finding, Results};
 
 const PACK: &str = "codeql/actions-queries@0.6.37";

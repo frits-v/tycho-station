@@ -349,11 +349,7 @@ enum Step {
 }
 
 const fn step(passed: bool) -> Step {
-    if passed {
-        Step::Passed
-    } else {
-        Step::Failed
-    }
+    if passed { Step::Passed } else { Step::Failed }
 }
 
 /// The title check in ci: skipped, and named as skipped, when the run has no pull request.
@@ -464,21 +460,17 @@ fn tested() -> (bool, Option<test_step::Counts>) {
 /// hook starts inherits them; a test that runs `git init` or `git commit` would act on that
 /// repository. They are removed before any command runs, so no child of the xtask sees them.
 #[expect(
-    clippy::disallowed_methods,
-    reason = "runs first in main, while the process has one thread"
+    unsafe_code,
+    reason = "`remove_var` is sound only while no other thread reads the environment; this runs first in main, while the process has one thread"
 )]
 fn scrub_git_hook_environment() {
     for name in git_environment_removed() {
-        env::remove_var(name);
+        unsafe { env::remove_var(name) };
     }
 }
 
 const fn exit_code(passed: bool) -> i32 {
-    if passed {
-        0
-    } else {
-        1
-    }
+    if passed { 0 } else { 1 }
 }
 
 fn steps_in<'name>(steps: &[(&'name str, Step)], wanted: Step) -> Vec<&'name str> {
@@ -1162,9 +1154,11 @@ mod tests {
         let text = "let count = 1; // see issue 19\nlet url = \"https://host/#1\";\n";
         let defects = narration_defects(Path::new("a.rs"), text, true);
         assert_eq!(defects.len(), 1, "{defects:?}");
-        assert!(defects
-            .first()
-            .is_some_and(|defect| defect.to_string().starts_with("a.rs:1:16:")));
+        assert!(
+            defects
+                .first()
+                .is_some_and(|defect| defect.to_string().starts_with("a.rs:1:16:"))
+        );
     }
 
     #[test]

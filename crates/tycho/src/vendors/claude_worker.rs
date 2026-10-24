@@ -8,7 +8,7 @@ use tycho_types::session::Vendor;
 use tycho_types::task_packet::Effort;
 
 use crate::vendors::worker::{
-    vendor_word, Refusal, Stream, VendorEnd, VersionState, WorkerError, WorkerTask, WorkerVendor,
+    Refusal, Stream, VendorEnd, VersionState, WorkerError, WorkerTask, WorkerVendor, vendor_word,
 };
 
 pub const CLAUDE_PINNED_VERSION: &str = "2.1.280";

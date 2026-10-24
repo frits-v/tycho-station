@@ -19,8 +19,8 @@ mod bounds;
 mod port_offset;
 
 pub use port_offset::{
-    resolve_port_offset, PortOffset, PortOffsetError, MACOS_EPHEMERAL_PORT_FIRST, PORT_OFFSET_BASE,
-    PORT_OFFSET_ENV, PORT_OFFSET_MAX, PORT_OFFSET_SLOTS, PORT_OFFSET_STRIDE,
+    MACOS_EPHEMERAL_PORT_FIRST, PORT_OFFSET_BASE, PORT_OFFSET_ENV, PORT_OFFSET_MAX,
+    PORT_OFFSET_SLOTS, PORT_OFFSET_STRIDE, PortOffset, PortOffsetError, resolve_port_offset,
 };
 
 pub const CONFIG_DIR_ENV: &str = "TYCHO_CONFIG_DIR";

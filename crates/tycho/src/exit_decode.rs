@@ -7,7 +7,7 @@ use std::process::ExitStatus;
 
 use serde::Deserialize;
 use tycho_types::envelope::{
-    CommitSha, ProgressMarker, ShortText, StatusPayload, Usage, ENVELOPE_MAX_BYTES,
+    CommitSha, ENVELOPE_MAX_BYTES, ProgressMarker, ShortText, StatusPayload, Usage,
 };
 use tycho_types::exit::ExitState;
 use tycho_types::session::SessionName;

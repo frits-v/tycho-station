@@ -6,7 +6,7 @@ use std::fmt;
 
 use crate::session::{SessionName, SessionNameError};
 
-use crate::token::{check_opaque, checked_string, TokenError};
+use crate::token::{TokenError, check_opaque, checked_string};
 
 pub const ENV_AWAITABLE_ID: &str = "TYCHO_AWAITABLE_ID";
 pub const ENV_SESSION_SECRET: &str = "TYCHO_SESSION_SECRET";

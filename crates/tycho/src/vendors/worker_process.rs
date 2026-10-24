@@ -13,9 +13,9 @@ use std::process::{Child, Command, Stdio};
 
 use nix::sys::signal::Signal;
 use nix::unistd::{Uid, User};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tycho_types::envelope::{
-    CommitSha, Envelope, EscalationPayload, Payload, RecordId, ResultPayload, ENVELOPE_MAX_BYTES,
+    CommitSha, ENVELOPE_MAX_BYTES, Envelope, EscalationPayload, Payload, RecordId, ResultPayload,
 };
 use tycho_types::git_environment::git_environment_removed;
 use tycho_types::launcher::ENV_SESSION_NAME;
@@ -31,10 +31,10 @@ use crate::launch_spec::{
 };
 use crate::process::{now_unix_ms, send};
 use crate::vendors::claude_worker::ClaudeWorker;
-use crate::vendors::codex_worker::{CodexWorker, CODEX_OUTPUT_SCHEMA};
+use crate::vendors::codex_worker::{CODEX_OUTPUT_SCHEMA, CodexWorker};
 use crate::vendors::worker::{
-    outcome, state_word, CommandRefusal, Refusal, Stream, VersionState, WorkerArgs, WorkerError,
-    WorkerTask, WorkerVendor, EVENT_LINE_MAX_BYTES, WORD_VERSION_MISMATCH,
+    CommandRefusal, EVENT_LINE_MAX_BYTES, Refusal, Stream, VersionState, WORD_VERSION_MISMATCH,
+    WorkerArgs, WorkerError, WorkerTask, WorkerVendor, outcome, state_word,
 };
 
 /// Event lines one run may produce; the launcher's output cap usually ends it first.
@@ -440,10 +440,10 @@ fn check_version(vendor: &dyn WorkerVendor, run: &Prepared<'_>) -> Result<(), Re
 
 /// The state word and the envelope a completed run carries.
 fn conclude(run: &Prepared<'_>, stream: &Stream, end: ChildEnd) -> Conclusion {
-    if stream.refusal.is_none() {
-        if let Some(escalated) = escalated(run) {
-            return escalated;
-        }
+    if stream.refusal.is_none()
+        && let Some(escalated) = escalated(run)
+    {
+        return escalated;
     }
     let word = state_word(stream, end);
     if word != "completed" {
@@ -686,9 +686,11 @@ pub mod tests {
             "sk-ant-oat01-worker".to_string()
         )));
         assert!(pairs.contains(&(CODEX_HOME_ENV.to_string(), "/spool/codex-home".to_string())));
-        assert!(!pairs
-            .iter()
-            .any(|(name, _)| name == "TYCHO_CREDENTIAL_SOCKET"));
+        assert!(
+            !pairs
+                .iter()
+                .any(|(name, _)| name == "TYCHO_CREDENTIAL_SOCKET")
+        );
         assert_eq!(pairs.len(), 9 + AGENT_TELEMETRY_ENV.len());
         assert!(!format!("{environment:?}").contains("sk-ant-oat01-worker"));
     }
@@ -885,11 +887,13 @@ pub mod tests {
             "{text}"
         );
         assert!(worker_settings("[]", Path::new("/e")).is_err());
-        assert!(worker_settings(
-            r#"{"sandbox":{"filesystem":{"allowWrite":"x"}}}"#,
-            Path::new("/e")
-        )
-        .is_err());
+        assert!(
+            worker_settings(
+                r#"{"sandbox":{"filesystem":{"allowWrite":"x"}}}"#,
+                Path::new("/e")
+            )
+            .is_err()
+        );
     }
 
     #[test]

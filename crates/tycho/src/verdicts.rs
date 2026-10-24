@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 
 use nix::fcntl::OFlag;
 use tycho_types::envelope::ShortText;
-use tycho_types::service::{handler, Attempt, EpicId, WorkUnitId};
+use tycho_types::service::{Attempt, EpicId, WorkUnitId, handler};
 
 use crate::agent_files;
 use crate::config::CorePorts;
-use crate::epic_command::{self, OperatorAnswer, OPERATOR_SERVICE};
+use crate::epic_command::{self, OPERATOR_SERVICE, OperatorAnswer};
 use crate::http::Http;
 use crate::packets::{RATIONALE_MAX_BYTES, VERDICT_EXTENSION};
 use crate::services::operator::RuleUnitCall;
@@ -697,9 +697,11 @@ mod tests {
             "cf7a",
             "the epic is the directory's"
         );
-        assert!(seen[0]
-            .idempotency_key
-            .starts_with("verdict:cf7a:wu01-1.verdict:"));
+        assert!(
+            seen[0]
+                .idempotency_key
+                .starts_with("verdict:cf7a:wu01-1.verdict:")
+        );
         assert_eq!(seen[0].call.attempt, 1);
         assert_eq!(seen[0].call.ruling.verdict, RulingVerdict::Abandon);
         assert_eq!(seen[0].call.ruling.reason.as_str(), "the policy forbids it");

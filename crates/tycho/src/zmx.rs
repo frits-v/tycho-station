@@ -1296,9 +1296,11 @@ mod tests {
         let switched = Zmx::agent_as(Path::new("/p/zmx"), Path::new("/d"), "tycho-agent");
         assert_eq!(switched.working_dir(&["run", "s"]), Some(Path::new("/")));
         assert_eq!(switched.working_dir(&["list"]), None);
-        assert!(switched
-            .environment()
-            .contains(&("HOME", tycho_types::agent_switch::SWITCHED_HOME)));
+        assert!(
+            switched
+                .environment()
+                .contains(&("HOME", tycho_types::agent_switch::SWITCHED_HOME))
+        );
         let caller = Zmx::agent(Path::new("/p/zmx"), Path::new("/d"));
         assert_eq!(caller.working_dir(&["run", "s"]), None);
         assert!(!caller.environment().iter().any(|(name, _)| *name == "HOME"));

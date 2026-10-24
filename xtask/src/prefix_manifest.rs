@@ -357,9 +357,11 @@ mod tests {
         assert_eq!(read_manifest(&path).into_base(), Ok(Manifest::default()));
         fs::write(&path, record().render()).expect("write");
         assert_eq!(read_manifest(&path), ManifestRead::Present(record()));
-        assert!(ManifestRead::Unreadable("x".to_string())
-            .into_base()
-            .is_err());
+        assert!(
+            ManifestRead::Unreadable("x".to_string())
+                .into_base()
+                .is_err()
+        );
         fs::remove_dir_all(&dir).expect("clean up");
     }
 

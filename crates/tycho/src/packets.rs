@@ -9,8 +9,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use tycho_types::envelope::{
-    CommitSha, ContentRef, EscalationOption, EscalationPayload, QuestionType, Reversibility,
-    OPTIONS_MAX_ITEMS,
+    CommitSha, ContentRef, EscalationOption, EscalationPayload, OPTIONS_MAX_ITEMS, QuestionType,
+    Reversibility,
 };
 use tycho_types::service::{Attempt, EpicId, WorkUnitId};
 use tycho_types::session::Level;
@@ -599,7 +599,7 @@ mod tests {
 
     #[test]
     fn a_payload_at_every_bound_stays_under_the_packet_bound() {
-        use tycho_types::envelope::{RecordId, REFS_MAX_ITEMS, TEXT_MAX_BYTES};
+        use tycho_types::envelope::{REFS_MAX_ITEMS, RecordId, TEXT_MAX_BYTES};
         let long = text(&"t".repeat(TEXT_MAX_BYTES));
         let mut widest = payload();
         widest.give_up_reason = long.clone();

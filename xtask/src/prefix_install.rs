@@ -13,19 +13,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tycho_types::git_environment::git_command;
-use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use ureq::Agent;
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
 use crate::prefix_manifest::{
-    install_sha256, read_manifest, read_regular, sha256_hex, Manifest, StationRecord, ToolRecord,
-    BINARY_MAX_BYTES,
+    BINARY_MAX_BYTES, Manifest, StationRecord, ToolRecord, install_sha256, read_manifest,
+    read_regular, sha256_hex,
 };
 use crate::process::{self, Exit};
 use crate::provision;
 use crate::setup::{self, Identity};
 use crate::tool_prefix::{
-    self, AgentTool, Network, Prefix, StationBinary, ToolEnvironment, ToolState,
-    MISE_PINNED_VERSION, PREFIX_MODE,
+    self, AgentTool, MISE_PINNED_VERSION, Network, PREFIX_MODE, Prefix, StationBinary,
+    ToolEnvironment, ToolState,
 };
 
 /// The release assets of the pinned mise and their SHA-256, recorded when the pin was set.
@@ -258,11 +258,11 @@ pub fn install_mise(prefix: &Prefix) -> Result<(), String> {
         SumLine::Listed(published) => {
             return Err(format!(
                 "SHASUMS256.txt lists {published} for {asset}; the pinned digest is {pinned}"
-            ))
+            ));
         }
         SumLine::Absent => return Err(format!("SHASUMS256.txt does not list {asset}")),
         SumLine::Unrecognised(line) => {
-            return Err(format!("unrecognised SHASUMS256.txt line: {line:?}"))
+            return Err(format!("unrecognised SHASUMS256.txt line: {line:?}"));
         }
     }
     let binary = fetch(&agent, &format!("{release}/{asset}"), MISE_BINARY_MAX_BYTES)?;
@@ -319,7 +319,7 @@ pub fn install_agent_tools(prefix: &Prefix, developer: &Identity) -> Result<(), 
                     "mise which {} does not name {}: {other:?}",
                     tool.name(),
                     prefix.tool_binary(tool, &pin).display()
-                ))
+                ));
             }
         }
         let install_sha256 = install_sha256(&prefix.installs(tool, &pin))?;

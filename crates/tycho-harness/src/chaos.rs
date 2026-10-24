@@ -38,35 +38,30 @@ pub struct SliceZeroExitTest {
 pub const CHAOS_CATALOGUE: [ChaosTest; 4] = [
     ChaosTest {
         name: "terminal app killed",
-        pass_condition:
-            "the unit resumes from its last step with nothing lost and no second session spawned",
+        pass_condition: "the unit resumes from its last step with nothing lost and no second session spawned",
         readiness: Readiness::Runnable {
             test: "terminal_app_killed_leaves_the_session_core_and_unit_running",
         },
     },
     ChaosTest {
         name: "control session killed",
-        pass_condition:
-            "the control session's work resumes with no lost state and no duplicate session",
+        pass_condition: "the control session's work resumes with no lost state and no duplicate session",
         readiness: Readiness::NotYetRunnable {
             reason: "waits on the interactive control session adapter and a real vendor to kill",
         },
     },
     ChaosTest {
         name: "checkpoint corrupted",
-        pass_condition:
-            "the reconciler detects the corruption and replays from the last valid checkpoint",
+        pass_condition: "the reconciler detects the corruption and replays from the last valid checkpoint",
         readiness: Readiness::NotYetRunnable {
             reason: "waits on worker checkpoints, which a real vendor writes from slice one",
         },
     },
     ChaosTest {
         name: "budget exhausted",
-        pass_condition:
-            "the unit stops, reports the exhaustion, and raises nothing beyond its own budget",
+        pass_condition: "the unit stops, reports the exhaustion, and raises nothing beyond its own budget",
         readiness: Readiness::NotYetRunnable {
-            reason:
-                "waits on a real vendor whose usage can run out; the doubles report fixed usage",
+            reason: "waits on a real vendor whose usage can run out; the doubles report fixed usage",
         },
     },
 ];
@@ -235,9 +230,11 @@ mod tests {
             .iter()
             .find(|test| test.name == "attach tests (step 6)")
             .unwrap();
-        assert!(step_six
-            .pass_condition
-            .contains("zmx session and from a launchd agent"));
+        assert!(
+            step_six
+                .pass_condition
+                .contains("zmx session and from a launchd agent")
+        );
         assert!(step_six.pass_condition.contains("consent"));
     }
 

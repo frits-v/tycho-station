@@ -7,7 +7,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::claude_run::{self, Limits, RunOutcome};
 use super::findings::{self, Finding, Verdict};
@@ -16,9 +16,9 @@ use super::prompt_registry::{self, Template};
 use super::pull_request::Posted;
 use super::stream::{self, Transcript};
 use super::verdict::blocks;
-use super::{git_in, Context, Grants, Tally, EXCLUDED_PATHSPECS, VERIFIED_MAX};
+use super::{Context, EXCLUDED_PATHSPECS, Grants, Tally, VERIFIED_MAX, git_in};
 use crate::anthropic_token;
-use crate::process::{run_bounded, run_bounded_timed_lines, Exit};
+use crate::process::{Exit, run_bounded, run_bounded_timed_lines};
 
 const FIND_SCHEMA: &str = include_str!("../../../config/export/schema/review_findings.json");
 const VERDICT_SCHEMA: &str = include_str!("../../../config/export/schema/review_verdict.json");
@@ -262,7 +262,7 @@ fn launch(
         Err(reason) => {
             return Launched::before_start(RunOutcome::Unrecognised(format!(
                 "the token exchange: {reason}"
-            )))
+            )));
         }
     };
     let lifetime = token

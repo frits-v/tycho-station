@@ -1,13 +1,13 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["crates/tycho", "crates/tycho-types", "crates/tycho-harness", "xtask"]
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 license = "AGPL-3.0-only"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 missing_debug_implementations = "warn"
 unused_must_use = "deny"
 

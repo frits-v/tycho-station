@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 
-use crate::github_api::{github_message, Client, Method, Reply};
+use crate::github_api::{Client, Method, Reply, github_message};
 
 /// One GitHub App: where its credentials come from, and the grant its tokens are limited to.
 #[derive(Debug)]
@@ -443,7 +443,7 @@ fn mint_at(
                 repository.owner,
                 repository.name,
                 with_message(status, message.as_ref())
-            ))
+            ));
         }
         InstallationOutcome::Unrecognised(reason) => return Err(reason.to_string()),
     };
@@ -1067,10 +1067,12 @@ mod tests {
         let refused = bot_login_at(&client, &credentials, NOW).unwrap_err();
         assert!(refused.contains("HTTP 401"), "{refused}");
         let requests = seen.recv().unwrap();
-        assert!(requests
-            .first()
-            .unwrap()
-            .starts_with("GET /app HTTP/1.1\r\n"));
+        assert!(
+            requests
+                .first()
+                .unwrap()
+                .starts_with("GET /app HTTP/1.1\r\n")
+        );
     }
 
     #[test]
