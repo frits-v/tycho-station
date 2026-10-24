@@ -108,7 +108,6 @@ struct Context {
     github: Option<GitHub>,
     /// `owner/name#number` in Actions; Langfuse groups a pull request's runs by it.
     session: String,
-    fork: bool,
     posted: Vec<Posted>,
     user: Option<String>,
     langfuse: Option<Langfuse>,
@@ -212,7 +211,6 @@ fn review(
     let (event, reason) = verdict::decide(&verdict::Evidence {
         confirmed: &confirmed,
         unjudged_blocking: tally.unjudged_blocking,
-        fork: context.fork,
     });
     report::publish(
         context,

@@ -463,6 +463,10 @@ fn tested() -> (bool, Option<test_step::Counts>) {
 /// git hands its repository to a hook as `GIT_DIR` and its relatives, and every command the
 /// hook starts inherits them; a test that runs `git init` or `git commit` would act on that
 /// repository. They are removed before any command runs, so no child of the xtask sees them.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "runs first in main, while the process has one thread"
+)]
 fn scrub_git_hook_environment() {
     for name in git_environment_removed() {
         env::remove_var(name);
