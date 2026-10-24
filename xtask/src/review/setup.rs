@@ -10,12 +10,12 @@ use std::time::Duration;
 
 use super::passes::TOKEN_LIFETIME_MIN;
 use super::pull_request::CommitId;
-use super::{git_in, langfuse, pull_request, scrubbed, Context, GitHub, Grants, Mode};
+use super::{Context, GitHub, Grants, Mode, git_in, langfuse, pull_request, scrubbed};
 use crate::anthropic_token;
 use crate::app_token::{self, REVIEW};
 use crate::checkout;
 use crate::github_api::Client;
-use crate::process::{run_bounded, Exit};
+use crate::process::{Exit, run_bounded};
 
 const EVENT_MAX_BYTES: u64 = 1 << 20;
 const GIT_TIMEOUT: Duration = Duration::from_secs(120);

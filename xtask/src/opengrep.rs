@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::process::{run_bounded, Exit};
+use crate::process::{Exit, run_bounded};
 use crate::sarif::{self, Finding};
 
 const RULES_FILE: &str = "opengrep/rust.yml";
@@ -175,7 +175,7 @@ pub fn fixtures_pass(
         TestReport::Rules(rules) => rules,
         TestReport::BrokenConfig(reason) => return Err(format!("broken rule file: {reason}")),
         TestReport::Unrecognised(reason) => {
-            return Err(format!("unrecognised test report: {reason}"))
+            return Err(format!("unrecognised test report: {reason}"));
         }
     };
     let mut failures = Vec::new();

@@ -10,17 +10,17 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use nix::unistd::{Uid, User};
-use tycho_types::session::{SessionName, SOCKET_PATH_MAX_BYTES};
+use tycho_types::session::{SOCKET_PATH_MAX_BYTES, SessionName};
 
 mod port_claim;
 pub mod tool_prefix;
 
-pub use port_claim::{claim_in, ClaimError, PortClaim, PORT_SLOT_DIR};
-pub use tool_prefix::{ToolPrefix, MISE_PREFIX_ENV, TOOL_PREFIX_DEFAULT, TOOL_PREFIX_ENV};
+pub use port_claim::{ClaimError, PORT_SLOT_DIR, PortClaim, claim_in};
+pub use tool_prefix::{MISE_PREFIX_ENV, TOOL_PREFIX_DEFAULT, TOOL_PREFIX_ENV, ToolPrefix};
 
 use crate::command::{self, CommandError};
 use crate::config_store::{
-    resolve_port_offset, PortOffset, PortOffsetError, CONFIG_DIR_ENV, PORT_OFFSET_ENV,
+    CONFIG_DIR_ENV, PORT_OFFSET_ENV, PortOffset, PortOffsetError, resolve_port_offset,
 };
 
 pub const LOOPBACK: Ipv4Addr = Ipv4Addr::LOCALHOST;

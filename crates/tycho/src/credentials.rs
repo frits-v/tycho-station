@@ -660,11 +660,13 @@ pub mod tests {
             "{open}"
         );
         let other = status(&home, current_uid().wrapping_add(1), SystemTime::now());
-        assert!(other
-            .dir
-            .problem
-            .unwrap()
-            .contains("must be a Directory of uid"));
+        assert!(
+            other
+                .dir
+                .problem
+                .unwrap()
+                .contains("must be a Directory of uid")
+        );
         fs::remove_dir_all(&home).unwrap();
     }
 

@@ -6,13 +6,13 @@ use std::net::SocketAddr;
 use restate_sdk::prelude::{Endpoint, HttpServer};
 
 use crate::probe::Probe;
+use crate::services::Ports;
 use crate::services::epic::Epic;
 use crate::services::operator::Operator;
 use crate::services::reconciler::Reconciler;
 use crate::services::session::Session;
 use crate::services::work_unit::WorkUnit;
 use crate::services::worker_run::WorkerRun;
-use crate::services::Ports;
 
 /// The probe and the spine services, built from the given ports.
 #[must_use]
@@ -45,9 +45,9 @@ pub fn serve(address: SocketAddr, ports: &Ports) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::launch_probe::LAUNCH_PROBE_SERVICE;
+    use crate::services::Timing;
     use crate::services::merge_gate::NoGate;
     use crate::services::spawner::NoLauncher;
-    use crate::services::Timing;
     use crate::vendors::control::NoVendor;
     use std::sync::Arc;
 

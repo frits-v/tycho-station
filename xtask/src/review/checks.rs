@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::github_api::{github_message, Client, Method, Reply};
+use crate::github_api::{Client, Method, Reply, github_message};
 
 const PER_PAGE: usize = 100;
 const PAGES_MAX: usize = 5;
@@ -306,10 +306,12 @@ mod tests {
         assert!(requests.first().unwrap().starts_with(&format!(
             "GET /repos/o/r/commits/{sha}/check-runs?per_page=100&page=1 "
         )));
-        assert!(requests
-            .get(1)
-            .unwrap()
-            .starts_with(&format!("GET /repos/o/r/commits/{sha}/status ")));
+        assert!(
+            requests
+                .get(1)
+                .unwrap()
+                .starts_with(&format!("GET /repos/o/r/commits/{sha}/status "))
+        );
     }
 
     #[test]

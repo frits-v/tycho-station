@@ -28,23 +28,23 @@ use std::time::{Duration, Instant};
 use restate_sdk::prelude::{Endpoint, HttpServer};
 use tycho::agent_files::current_uid;
 use tycho::config::{
-    AgentDirs, CoreConfig, CorePorts, CoreRole, PortClaim, ToolPrefix, AGENT_USER_ENV, HOME_ENV,
-    MISE_NO_INSTALL, RESTATE_SERVER_ENV, ZMX_ENV,
+    AGENT_USER_ENV, AgentDirs, CoreConfig, CorePorts, CoreRole, HOME_ENV, MISE_NO_INSTALL,
+    PortClaim, RESTATE_SERVER_ENV, ToolPrefix, ZMX_ENV,
 };
-use tycho::credentials::{Credential, CredentialVendor, CLAUDE_TOKEN_ENV};
+use tycho::credentials::{CLAUDE_TOKEN_ENV, Credential, CredentialVendor};
 use tycho::health::{self, Health};
 use tycho::http::Http;
-use tycho::kill::{kill_session, KillRefusal, KillRequest, KillVerdict};
+use tycho::kill::{KillRefusal, KillRequest, KillVerdict, kill_session};
 use tycho::launch_probe::{LaunchProbe, REJECTED_PREFIX, RESOLVED_PREFIX};
+use tycho::launcher::{HEARTBEAT_INTERVAL, LEASE_FRESH_MS, SessionFiles, VendorRecord};
 use tycho::launcher::{HeartbeatTarget, VendorTerminal};
-use tycho::launcher::{SessionFiles, VendorRecord, HEARTBEAT_INTERVAL, LEASE_FRESH_MS};
 use tycho::process::now_unix_ms;
 use tycho::services::spawner::LeaseRead;
-use tycho::spawn::{read_lease, save_scrollback, spawn_session, SpawnOutcome, SpawnRequest};
+use tycho::spawn::{SpawnOutcome, SpawnRequest, read_lease, save_scrollback, spawn_session};
 use tycho::spool::ACKNOWLEDGED_SUFFIX;
-use tycho::zmx::{count_named, presence, Presence, Zmx};
+use tycho::zmx::{Presence, Zmx, count_named, presence};
 use tycho_harness::tool_prefix::link_scratch_prefix;
-use tycho_types::launcher::{LauncherEnv, ENV_AWAITABLE_ID, ENV_SESSION_NAME, ENV_SESSION_SECRET};
+use tycho_types::launcher::{ENV_AWAITABLE_ID, ENV_SESSION_NAME, ENV_SESSION_SECRET, LauncherEnv};
 use tycho_types::lease::{Freshness, RequeueReason};
 use tycho_types::session::SessionName;
 
@@ -529,7 +529,9 @@ fn assert_token_nowhere(harness: &Harness, name: &SessionName, launcher_pid: u32
     {
         assert!(!facts.command.contains(TEST_TOKEN));
     }
-    println!("evidence: the token is in none of {examined} agent-directory files, the scrollback, zmx list or the launcher's argv");
+    println!(
+        "evidence: the token is in none of {examined} agent-directory files, the scrollback, zmx list or the launcher's argv"
+    );
 }
 
 /// The saved scrollback, joined across wrapped lines, holds the typed command but no secret.

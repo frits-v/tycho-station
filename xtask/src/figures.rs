@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::process::{run_bounded, Exit};
+use crate::process::{Exit, run_bounded};
 
 const FIGURES_DIR: &str = "figures";
 const OUTPUT_DIR: &str = "docs/figures";

@@ -15,7 +15,7 @@ use crate::services::session::{
     InstructRequest, InstructionRecord, SessionClient, SpawnOutcome, SpawnRequest,
 };
 use crate::services::spawner::SpawnTerminal;
-use crate::services::{secret, CODE_BAD_REQUEST, CODE_CONFLICT, CODE_INTERNAL};
+use crate::services::{CODE_BAD_REQUEST, CODE_CONFLICT, CODE_INTERNAL, secret};
 use crate::spawn::CLAUDE_SANDBOX_SETTINGS;
 use crate::vendors::control::{ControlLaunch, PermissionMode, SessionVendor, VendorSessionId};
 

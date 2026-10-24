@@ -8,13 +8,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::command;
 use crate::config::{
-    CoreConfig, CorePorts, CoreRole, COMMAND_TIMEOUT, HEALTH_WAIT_POLLS_MAX, POLL_INTERVAL,
+    COMMAND_TIMEOUT, CoreConfig, CorePorts, CoreRole, HEALTH_WAIT_POLLS_MAX, POLL_INTERVAL,
     SESSION_WAIT_POLLS_MAX, STARTUP_GRACE_SECONDS,
 };
 use crate::health::{self, Health, Registration};
 use crate::http::Http;
 use crate::private_dir::{self, DirError};
-use crate::zmx::{presence, Presence, Zmx};
+use crate::zmx::{Presence, Zmx, presence};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {

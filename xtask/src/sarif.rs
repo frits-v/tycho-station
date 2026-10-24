@@ -6,7 +6,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub const SARIF_DIR: &str = "target/sarif";
 const SCHEMA: &str = "https://json.schemastore.org/sarif-2.1.0.json";

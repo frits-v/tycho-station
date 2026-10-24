@@ -6,8 +6,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use ureq::Agent;
+use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 
 const GITHUB_API: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
@@ -320,9 +320,10 @@ pub mod tests {
             "{raw}"
         );
         assert_eq!(raw.matches("the.jwt.value").count(), 1, "{raw}");
-        assert!(raw
-            .to_ascii_lowercase()
-            .contains("\r\nx-github-api-version: 2022-11-28\r\n"));
+        assert!(
+            raw.to_ascii_lowercase()
+                .contains("\r\nx-github-api-version: 2022-11-28\r\n")
+        );
     }
 
     #[test]
@@ -457,10 +458,12 @@ pub mod tests {
                 body: String::new()
             }
         );
-        assert!(server
-            .join()
-            .unwrap()
-            .starts_with("GET /start HTTP/1.1\r\n"));
+        assert!(
+            server
+                .join()
+                .unwrap()
+                .starts_with("GET /start HTTP/1.1\r\n")
+        );
         let followed = second.accept();
         assert!(
             matches!(&followed, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),

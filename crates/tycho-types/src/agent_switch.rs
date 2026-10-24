@@ -423,13 +423,12 @@ fn read_listing(stdout: &str, expected: &Expected<'_>) -> Listing {
         .copied()
         .filter(|line| !line.trim().is_empty())
         .collect();
-    if let [only] = meaningful.as_slice() {
-        if only.starts_with(PRIVILEGES_HEADER)
-            && only.contains(NOT_ALLOWED_MIDDLE)
-            && only.ends_with('.')
-        {
-            return Listing::NotAllowed;
-        }
+    if let [only] = meaningful.as_slice()
+        && only.starts_with(PRIVILEGES_HEADER)
+        && only.contains(NOT_ALLOWED_MIDDLE)
+        && only.ends_with('.')
+    {
+        return Listing::NotAllowed;
     }
     let mut section = Section::Start;
     let mut privileges_seen = false;
@@ -665,23 +664,33 @@ mod tests {
     fn every_other_way_to_run_without_a_password_is_named() {
         for (listing, other) in [
             (
-                format!("{MATCHING}{BOUND}User frits may run the following commands on h:\n    (tycho-agent) NOPASSWD: /Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx, /bin/sh\n"),
+                format!(
+                    "{MATCHING}{BOUND}User frits may run the following commands on h:\n    (tycho-agent) NOPASSWD: /Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx, /bin/sh\n"
+                ),
                 "(tycho-agent) NOPASSWD: /bin/sh",
             ),
             (
-                format!("{MATCHING}{BOUND}User frits may run the following commands on h:\n    (ALL) NOPASSWD: ALL\n    (tycho-agent) NOPASSWD: /Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx\n"),
+                format!(
+                    "{MATCHING}{BOUND}User frits may run the following commands on h:\n    (ALL) NOPASSWD: ALL\n    (tycho-agent) NOPASSWD: /Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx\n"
+                ),
                 "(ALL) NOPASSWD: ALL",
             ),
             (
-                format!("Matching Defaults entries for frits on h:\n    env_reset, !authenticate\n\n{BOUND}{PRIVILEGES}"),
+                format!(
+                    "Matching Defaults entries for frits on h:\n    env_reset, !authenticate\n\n{BOUND}{PRIVILEGES}"
+                ),
                 "Defaults !authenticate",
             ),
             (
-                format!("{MATCHING}Runas and Command-specific defaults for frits:\n    Defaults>tycho-agent !authenticate\n    Defaults!/Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx env_keep=\"HOME ZMX_DIR ZMX_DIR_MODE ZMX_LOG_MODE\", umask=0007, umask_override\n\n{PRIVILEGES}"),
+                format!(
+                    "{MATCHING}Runas and Command-specific defaults for frits:\n    Defaults>tycho-agent !authenticate\n    Defaults!/Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx env_keep=\"HOME ZMX_DIR ZMX_DIR_MODE ZMX_LOG_MODE\", umask=0007, umask_override\n\n{PRIVILEGES}"
+                ),
                 "Defaults>tycho-agent !authenticate",
             ),
             (
-                format!("{MATCHING}{BOUND}User frits may run the following commands on h:\n    (tycho-agent) CWD=/ NOPASSWD: SETENV: /usr/bin/env\n    (tycho-agent) NOPASSWD: /Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx\n"),
+                format!(
+                    "{MATCHING}{BOUND}User frits may run the following commands on h:\n    (tycho-agent) CWD=/ NOPASSWD: SETENV: /usr/bin/env\n    (tycho-agent) NOPASSWD: /Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx\n"
+                ),
                 "(tycho-agent) NOPASSWD: /usr/bin/env",
             ),
         ] {
@@ -772,8 +781,16 @@ mod tests {
             (Some(0), "garbage\n", ""),
             (Some(0), "    (ALL) ALL\n", ""),
             (Some(0), MATCHING, ""),
-            (Some(0), "User frits may run the following commands on h:\n    ALL\n", ""),
-            (Some(0), "Runas and Command-specific defaults for frits:\n    Something else\nUser frits may run the following commands on h:\n", ""),
+            (
+                Some(0),
+                "User frits may run the following commands on h:\n    ALL\n",
+                "",
+            ),
+            (
+                Some(0),
+                "Runas and Command-specific defaults for frits:\n    Something else\nUser frits may run the following commands on h:\n",
+                "",
+            ),
             (Some(0), PRIVILEGES, "sudo: warning\n"),
             (Some(0), long.as_str(), ""),
             (Some(1), "", "sudo: a password is required\nmore\n"),
@@ -782,7 +799,10 @@ mod tests {
             (None, "", ""),
         ] {
             assert!(
-                matches!(decode_listing(exit, stdout, stderr, &EXPECTED), Listing::Unrecognised(_)),
+                matches!(
+                    decode_listing(exit, stdout, stderr, &EXPECTED),
+                    Listing::Unrecognised(_)
+                ),
                 "{exit:?} {stdout:?} {stderr:?}"
             );
         }

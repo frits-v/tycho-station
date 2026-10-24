@@ -8,7 +8,7 @@ use std::io::{self, Read};
 use std::iter::Peekable;
 use std::str::Chars;
 
-use crate::{check_subject, explain, Verdict, HOOK_INPUT_MAX_BYTES};
+use crate::{HOOK_INPUT_MAX_BYTES, Verdict, check_subject, explain};
 
 const COMMAND_MAX_CHARS: usize = 256 * 1024;
 const WORDS_MAX: usize = 8192;
@@ -207,10 +207,10 @@ impl Lexer<'_> {
         if delimiter.is_empty() {
             return Err("a heredoc has no delimiter".to_string());
         }
-        if let Some(quote) = quote {
-            if self.chars.next() != Some(quote) {
-                return Err(format!("the heredoc delimiter {delimiter} is never closed"));
-            }
+        if let Some(quote) = quote
+            && self.chars.next() != Some(quote)
+        {
+            return Err(format!("the heredoc delimiter {delimiter} is never closed"));
         }
         Ok(delimiter)
     }
@@ -406,7 +406,7 @@ pub fn decide(command: &str) -> Decision {
     let commands = match commands(command) {
         Ok(commands) => commands,
         Err(reason) => {
-            return Decision::Deny(format!("xtask hook could not read the command: {reason}"))
+            return Decision::Deny(format!("xtask hook could not read the command: {reason}"));
         }
     };
     let mut variables: HashMap<String, String> = HashMap::new();
@@ -508,7 +508,7 @@ pub fn hook_pre_tool_use() -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{commands, decide, Decision, COMMAND_MAX_CHARS};
+    use super::{COMMAND_MAX_CHARS, Decision, commands, decide};
 
     fn texts(command: &str) -> Vec<Vec<String>> {
         commands(command)
@@ -646,7 +646,9 @@ mod tests {
         assert_eq!(
             texts(&body("a ) b", "--draft ")),
             vec![
-                vec!["gh", "pr", "create", "--draft", "--title", "fix: a b", "--body", "$(...)"],
+                vec![
+                    "gh", "pr", "create", "--draft", "--title", "fix: a b", "--body", "$(...)"
+                ],
                 vec!["gh", "pr", "view"],
             ]
         );
@@ -691,8 +693,10 @@ mod tests {
             decide("T=\"fix: keep it\"; gh pr create --draft --title \"$T\""),
             Decision::Allow
         );
-        assert!(denied("T='Fix: it'; gh pr create --draft --title \"${T}\"")
-            .contains("fails the commit subject check"));
+        assert!(
+            denied("T='Fix: it'; gh pr create --draft --title \"${T}\"")
+                .contains("fails the commit subject check")
+        );
         for command in [
             "gh pr create --draft --title \"$(git log -1 --format=%s)\"",
             "gh pr create --draft --title \"$UNSET\"",
@@ -727,10 +731,12 @@ mod tests {
 
     #[test]
     fn a_variable_reassigned_to_an_expansion_no_longer_resolves() {
-        assert!(denied(
-            "T='fix: ok'; T=\"$(git log -1 --format=%s)\"; gh pr create --draft --title \"$T\""
-        )
-        .contains("is not literal text"));
+        assert!(
+            denied(
+                "T='fix: ok'; T=\"$(git log -1 --format=%s)\"; gh pr create --draft --title \"$T\""
+            )
+            .contains("is not literal text")
+        );
     }
 
     #[test]

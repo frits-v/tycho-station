@@ -4,8 +4,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::service::{Attempt, EpicId, TaskId, WorkUnitId, ROOT_SEGMENT};
-use crate::token::{check_slug, checked_string, TokenError};
+use crate::service::{Attempt, EpicId, ROOT_SEGMENT, TaskId, WorkUnitId};
+use crate::token::{TokenError, check_slug, checked_string};
 
 /// `sun_path` is 104 bytes on macOS with its NUL; zmx names the socket after the session.
 pub const SOCKET_PATH_MAX_BYTES: usize = 103;

@@ -11,8 +11,8 @@ use restate_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use tycho_types::envelope::{Envelope, Outcome, Payload, ResultPayload, ShortText, Usage};
 use tycho_types::exit::{Disposition, ExitState};
-use tycho_types::rejection::{decode_rejection, Question};
-use tycho_types::service::{Attempt, EpicId, TaskId, WorkUnitId, RECONCILER_KEY};
+use tycho_types::rejection::{Question, decode_rejection};
+use tycho_types::service::{Attempt, EpicId, RECONCILER_KEY, TaskId, WorkUnitId};
 use tycho_types::session::{SessionKind, SessionName, Suffix, Vendor};
 use tycho_types::task_packet::{Effort, RoutingName};
 
@@ -27,11 +27,11 @@ use crate::services::session::{
 };
 use crate::services::spawner::SpawnTerminal;
 use crate::services::workers::{
-    worker_command, WorkerCommand, WorkerEvidence, WorkerPorts, WorkerTaskRequest,
+    WorkerCommand, WorkerEvidence, WorkerPorts, WorkerTaskRequest, worker_command,
 };
 use crate::services::{
-    blocking, refuse, secret, wall_clock_unix_ms, Ports, Timing, CODE_BAD_REQUEST, CODE_CANCELLED,
-    CODE_INTERNAL,
+    CODE_BAD_REQUEST, CODE_CANCELLED, CODE_INTERNAL, Ports, Timing, blocking, refuse, secret,
+    wall_clock_unix_ms,
 };
 use crate::vendors::worker::VendorSessionId;
 

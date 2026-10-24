@@ -40,17 +40,17 @@ use std::time::Duration;
 use tycho::agent_files::current_uid;
 use tycho::command::{self, CommandError};
 use tycho::config::{
-    ToolPrefix, AGENT_SOCKET_DIR_DEFAULT, AGENT_USER_DEFAULT, TOOL_PREFIX_DEFAULT,
+    AGENT_SOCKET_DIR_DEFAULT, AGENT_USER_DEFAULT, TOOL_PREFIX_DEFAULT, ToolPrefix,
 };
-use tycho::process::{process_facts, ProcessFacts};
-use tycho::repositories::{pin_ref, unit_branch, ProjectName, Repositories};
-use tycho::zmx::{prepare_shared_log, presence, Presence, Zmx, LOG_DIR, LOG_FILE};
+use tycho::process::{ProcessFacts, process_facts};
+use tycho::repositories::{ProjectName, Repositories, pin_ref, unit_branch};
+use tycho::zmx::{LOG_DIR, LOG_FILE, Presence, Zmx, prepare_shared_log, presence};
 use tycho_harness::content::content_ref;
-use tycho_harness::verify::{run_criteria_with, unit_passed, VerifyOptions};
-use tycho_harness::work_units::{load_default, PassCondition};
+use tycho_harness::verify::{VerifyOptions, run_criteria_with, unit_passed};
+use tycho_harness::work_units::{PassCondition, load_default};
 use tycho_types::agent_switch::{
-    decode_listing, decode_wider, listing_arguments, wider_probe_arguments, Expected, Listing,
-    WiderProbe,
+    Expected, Listing, WiderProbe, decode_listing, decode_wider, listing_arguments,
+    wider_probe_arguments,
 };
 use tycho_types::envelope::{BranchName, CommitSha};
 use tycho_types::git_environment::{git_command, hook_environment_refusal};
@@ -147,7 +147,9 @@ fn cut(text: &str) -> String {
 /// line of its own: a run without that line never reached the agent. The probe runs in a
 /// subshell, so its own `exit` ends only the probe.
 fn wrap(script: &str) -> String {
-    format!("(\n{script}\n)\nrc=$?\nprintf '\\n{MARKER} uid=%s exit=%s\\n' \"$(/usr/bin/id -u)\" \"$rc\"")
+    format!(
+        "(\n{script}\n)\nrc=$?\nprintf '\\n{MARKER} uid=%s exit=%s\\n' \"$(/usr/bin/id -u)\" \"$rc\""
+    )
 }
 
 /// Reads the marker, which counts only as the last non-empty line: the uid and exit status,
@@ -381,8 +383,7 @@ struct Boundary {
 const LIST: &str = "/bin/ls -1A \"$1\"";
 /// Opens the settings file for append and writes nothing, or creates and removes it, so the
 /// agent's settings are left as they were.
-const WRITE_SETTINGS: &str =
-    "if [ -e \"$1\" ]; then : >> \"$1\" && echo \"opened $1 for writing\"; \
+const WRITE_SETTINGS: &str = "if [ -e \"$1\" ]; then : >> \"$1\" && echo \"opened $1 for writing\"; \
      else : > \"$1\" && /bin/rm -f \"$1\" && echo \"created and removed $1\"; fi";
 const ADMIN_HEALTH: &str =
     "/usr/bin/curl -sS -m 5 -o /dev/null -w 'admin answered %{http_code}' \"http://$1/health\"";
@@ -661,12 +662,11 @@ fn listed_program(zmx: &Zmx, name: &str) -> ProcessFacts {
     let started = std::time::Instant::now();
     while started.elapsed() < SESSION_WAIT {
         seen = presence(&zmx.list().unwrap(), name);
-        if let Presence::Running { pid, .. } = seen {
-            if let ProcessFacts::Running(facts) = process_facts(pid) {
-                if facts.command.starts_with("/bin/sleep") {
-                    break;
-                }
-            }
+        if let Presence::Running { pid, .. } = seen
+            && let ProcessFacts::Running(facts) = process_facts(pid)
+            && facts.command.starts_with("/bin/sleep")
+        {
+            break;
         }
         std::thread::sleep(SESSION_POLL);
     }
@@ -1328,8 +1328,14 @@ mod decoders {
     #[test]
     fn a_refusal_is_decoded_and_named() {
         let samples = [
-            ("ls: /var/root: Permission denied\n", Refusal::PermissionDenied),
-            ("sh: /var/root/probe: Permission denied\n", Refusal::PermissionDenied),
+            (
+                "ls: /var/root: Permission denied\n",
+                Refusal::PermissionDenied,
+            ),
+            (
+                "sh: /var/root/probe: Permission denied\n",
+                Refusal::PermissionDenied,
+            ),
             (
                 "fatal: cannot change to '/var/root/x.git': Permission denied\n",
                 Refusal::PermissionDenied,
@@ -1346,7 +1352,10 @@ mod decoders {
                 "error: remote unpack failed: unable to create temporary object directory\n",
                 Refusal::GitWriteRefused,
             ),
-            ("touch: /etc/x: Operation not permitted\n", Refusal::NotPermitted),
+            (
+                "touch: /etc/x: Operation not permitted\n",
+                Refusal::NotPermitted,
+            ),
             (
                 "curl: (7) Failed to connect to 127.0.0.1 port 20126 after 0 ms: Couldn't connect to server\n",
                 Refusal::ConnectionRefused,

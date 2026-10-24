@@ -374,11 +374,13 @@ mod tests {
         let first = transcript.turns.first().unwrap();
         assert_eq!(first.tool_calls, [0]);
         assert_eq!(first.usage.cache_creation, 4694);
-        assert!(transcript
-            .result
-            .as_deref()
-            .unwrap()
-            .contains("\"structured_output\""));
+        assert!(
+            transcript
+                .result
+                .as_deref()
+                .unwrap()
+                .contains("\"structured_output\"")
+        );
         assert_eq!(
             transcript.unrecognised_count, 0,
             "{:?}",
@@ -409,10 +411,12 @@ mod tests {
         let first = transcript.tool_calls.first().unwrap();
         assert_eq!(first.input, "{\"file_path\":\"/tmp/review-files/main.rs\"}");
         let without_partials = read(SUCCESS, &[]);
-        assert!(without_partials
-            .turns
-            .iter()
-            .all(|turn| !turn.usage.output_final));
+        assert!(
+            without_partials
+                .turns
+                .iter()
+                .all(|turn| !turn.usage.output_final)
+        );
     }
 
     #[test]
@@ -425,10 +429,11 @@ mod tests {
             panic!("{:?}", turn.thinking);
         };
         assert!(summary.contains("Pell"), "{summary}");
-        assert!(turn
-            .usage
-            .thinking_estimate
-            .is_some_and(|tokens| tokens > 0));
+        assert!(
+            turn.usage
+                .thinking_estimate
+                .is_some_and(|tokens| tokens > 0)
+        );
         assert!(turn.first_seen < turn.last_seen);
         assert_eq!(
             transcript.unrecognised_count, 0,
@@ -442,11 +447,13 @@ mod tests {
         let transcript = read(MAX_TURNS, &[]);
         assert_eq!(transcript.tool_calls.len(), 1);
         assert!(transcript.tool_calls.first().unwrap().called.is_none());
-        assert!(transcript
-            .result
-            .as_deref()
-            .unwrap()
-            .contains("error_max_turns"));
+        assert!(
+            transcript
+                .result
+                .as_deref()
+                .unwrap()
+                .contains("error_max_turns")
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::process::{run_bounded, Exit};
+use crate::process::{Exit, run_bounded};
 use crate::sarif::{self, Finding, Rule};
 
 const CLIPPY_TIMEOUT: Duration = Duration::from_secs(60 * 60);

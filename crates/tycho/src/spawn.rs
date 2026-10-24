@@ -16,28 +16,28 @@ use nix::unistd::Uid;
 use tycho_types::envelope::ShortText;
 use tycho_types::launcher::{AwaitableDigest, LauncherEnv};
 use tycho_types::lease::{
-    spawn_decision, Lease, RequeueReason, SpawnDecision, LEASE_FILE_MAX_BYTES,
+    LEASE_FILE_MAX_BYTES, Lease, RequeueReason, SpawnDecision, spawn_decision,
 };
 use tycho_types::session::SessionName;
 
 use crate::agent_files::{read_checked, write_new, write_new_mode};
 use crate::config::{
-    AgentDirs, CorePorts, ToolPrefix, AGENT_DIR_ENV, AGENT_DIR_MODE, POLL_INTERVAL, SCROLLBACK_DIR,
-    SESSION_WAIT_POLLS_MAX, ZMX_ENV,
+    AGENT_DIR_ENV, AGENT_DIR_MODE, AgentDirs, CorePorts, POLL_INTERVAL, SCROLLBACK_DIR,
+    SESSION_WAIT_POLLS_MAX, ToolPrefix, ZMX_ENV,
 };
 use crate::config_store::PORT_OFFSET_ENV;
-use crate::credential_handoff::{socket_path, HandoffServer, CREDENTIAL_SOCKET_ENV};
+use crate::credential_handoff::{CREDENTIAL_SOCKET_ENV, HandoffServer, socket_path};
 use crate::credentials::Credential;
 use crate::launch_spec::CORE_UID_ENV;
 use crate::launcher::{
-    check_tier, check_vendor, HeartbeatTarget, LaunchSpec, VendorTerminal, AGENT_TELEMETRY_ENV,
-    HEARTBEAT_TARGET_ENV, LEASE_FRESH_MS, SPEC_SCHEMA_VERSION, TIER_FLAG, VENDOR_DIR_ENV,
-    VENDOR_SANDBOX_SETTINGS_ENV, VENDOR_TERMINAL_ENV,
+    AGENT_TELEMETRY_ENV, HEARTBEAT_TARGET_ENV, HeartbeatTarget, LEASE_FRESH_MS, LaunchSpec,
+    SPEC_SCHEMA_VERSION, TIER_FLAG, VENDOR_DIR_ENV, VENDOR_SANDBOX_SETTINGS_ENV,
+    VENDOR_TERMINAL_ENV, VendorTerminal, check_tier, check_vendor,
 };
 use crate::private_dir;
 use crate::process::now_unix_ms;
 use crate::services::spawner::{LeaseRead, SpawnerError};
-use crate::zmx::{prepare_shared_log, presence, Presence, Zmx};
+use crate::zmx::{Presence, Zmx, prepare_shared_log, presence};
 
 /// Enabled, no unsandboxed retry, fail if unavailable, no excluded commands, and a network
 /// allowlist that admits nothing until the adapter names the hosts a worker needs.
@@ -458,10 +458,9 @@ fn wait_for_pid(request: &SpawnRequest<'_>, name: &str) -> Result<Found, Spawner
         }
         if let LeaseRead::Present { lease } =
             read_lease(request.dirs, &request.env.session_name, request.agent_uid)
+            && *lease.awaitable_sha256() == AwaitableDigest::of(&request.env.awaitable_id)
         {
-            if *lease.awaitable_sha256() == AwaitableDigest::of(&request.env.awaitable_id) {
-                return Ok(Found::FromLease(lease.pid()));
-            }
+            return Ok(Found::FromLease(lease.pid()));
         }
         thread::sleep(POLL_INTERVAL);
     }
@@ -725,9 +724,11 @@ mod tests {
             ..request
         };
         let moved_words = typed_words(&moved, Path::new("/s")).unwrap();
-        assert!(moved_words
-            .iter()
-            .any(|word| word == "PATH=/tmp/prefix/bin:/usr/bin:/bin:/usr/sbin:/sbin"));
+        assert!(
+            moved_words
+                .iter()
+                .any(|word| word == "PATH=/tmp/prefix/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+        );
         assert_eq!(&words[words.len() - 2..], ["--tier", "t2"]);
         assert!(
             !words.iter().any(|word| word.contains(SECRET)),
@@ -913,7 +914,7 @@ mod tests {
     #[test]
     fn the_credential_travels_by_socket_never_by_spec_or_typed_line() {
         use crate::credentials::tests::CLAUDE_TOKEN;
-        use crate::credentials::{CredentialVendor, CLAUDE_TOKEN_ENV};
+        use crate::credentials::{CLAUDE_TOKEN_ENV, CredentialVendor};
         let dirs = AgentDirs::new(PathBuf::from("/Users/Shared/tycho-agent-zmx")).unwrap();
         let zmx = Zmx::agent(Path::new("/opt/zmx"), &dirs.socket_dir);
         let env = env();
@@ -948,8 +949,8 @@ mod tests {
 
     #[test]
     fn a_failed_zmx_run_closes_the_credential_socket() {
-        use crate::credentials::tests::CLAUDE_TOKEN;
         use crate::credentials::CredentialVendor;
+        use crate::credentials::tests::CLAUDE_TOKEN;
         let dirs =
             AgentDirs::new(PathBuf::from(format!("/tmp/tsc-{}", std::process::id()))).unwrap();
         if dirs.socket_dir.exists() {
@@ -996,8 +997,8 @@ mod tests {
     /// for the credential, then removes the spec as a launcher that read it would.
     fn spawn_with_launcher_here(tag: &str, listed_pid: u32) -> (Result<u32, SpawnerError>, bool) {
         use crate::credential_handoff::fetch;
-        use crate::credentials::tests::CLAUDE_TOKEN;
         use crate::credentials::CredentialVendor;
+        use crate::credentials::tests::CLAUDE_TOKEN;
         let dirs = AgentDirs::new(PathBuf::from(format!(
             "/tmp/tsb-{tag}-{}",
             std::process::id()

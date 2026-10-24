@@ -9,25 +9,25 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use tycho::config::{CorePorts, CoreRole, PortClaim, AGENT_USER_ENV};
+use tycho::config::{AGENT_USER_ENV, CorePorts, CoreRole, PortClaim};
 use tycho::health::{self, Health};
 use tycho::kill::{KillRefusal, KillVerdict};
 use tycho::launcher::HEARTBEAT_INTERVAL;
 use tycho::process::now_unix_ms;
-use tycho::process::{process_facts, ProcessFacts};
+use tycho::process::{ProcessFacts, process_facts};
 use tycho::services::doubles::FixedGate;
 use tycho::services::merge_gate::GateVerdict;
 use tycho::services::spawner::LeaseRead;
 use tycho::spawn::SpawnOutcome;
 use tycho::spool::ACKNOWLEDGED_SUFFIX;
 use tycho::zmx::SESSION_ENV;
-use tycho::zmx::{count_named, presence, Presence};
+use tycho::zmx::{Presence, count_named, presence};
 use tycho_types::envelope::CommitSha;
 
-use crate::launcher_spawner::{running_vendor, AgentGuard, LauncherSpawner, VendorPlan, VendorRun};
+use crate::launcher_spawner::{AgentGuard, LauncherSpawner, VendorPlan, VendorRun, running_vendor};
 use crate::support::{
-    attach, await_unit_end, dispatch, http, lifecycle_and_attempt, session_status, start_endpoint,
-    start_once, wait_until, worker_run_status, Core, DoublesEndpoint, TYCHO,
+    Core, DoublesEndpoint, TYCHO, attach, await_unit_end, dispatch, http, lifecycle_and_attempt,
+    session_status, start_endpoint, start_once, wait_until, worker_run_status,
 };
 use crate::support::{running_before_the_kill, test_claim};
 

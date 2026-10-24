@@ -18,7 +18,7 @@ use tycho::config::{
     self, CoreConfig, CorePorts, PROBE_TIMEOUT, VERDICT_INTERVAL, VERDICT_ITERATIONS_MAX,
     WATCHDOG_INTERVAL,
 };
-use tycho::config_store::{self, FactoryConfig, CONFIG_DIR_ENV};
+use tycho::config_store::{self, CONFIG_DIR_ENV, FactoryConfig};
 use tycho::credentials::{self, CredentialVendor};
 use tycho::epic_command::{self, OperatorAnswer};
 use tycho::http::Http;

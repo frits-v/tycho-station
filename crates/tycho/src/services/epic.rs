@@ -12,7 +12,7 @@ use tycho_types::service::{Attempt, TaskId, WorkUnitId};
 use crate::config::spine;
 use crate::config_store::SlotCounts;
 use crate::services::{
-    refuse, Ports, CODE_BAD_REQUEST, CODE_CONFLICT, CODE_INTERNAL, CODE_NOT_FOUND,
+    CODE_BAD_REQUEST, CODE_CONFLICT, CODE_INTERNAL, CODE_NOT_FOUND, Ports, refuse,
 };
 
 const STATE_KEY: &str = "epic";

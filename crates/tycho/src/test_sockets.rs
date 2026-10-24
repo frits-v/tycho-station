@@ -12,8 +12,8 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 
-use nix::fcntl::{fcntl, FcntlArg, FdFlag};
-use nix::sys::socket::{bind, socket, AddressFamily, SockFlag, SockType, UnixAddr};
+use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, socket};
 
 /// How long a fixture waits for a client's half-close, so a failed post never blocks it.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);

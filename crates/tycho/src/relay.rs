@@ -23,7 +23,7 @@ use tycho_types::session::SessionName;
 use crate::agent_files::{current_uid, write_new, write_new_mode};
 use crate::config::AgentDirs;
 use crate::vendors::claude_control::post;
-use crate::vendors::control::{bounded, Delivery};
+use crate::vendors::control::{Delivery, bounded};
 
 pub const RELAY_DIR: &str = "instructions";
 /// Group-writable for the launcher's markers, sticky so it cannot touch the core's files.
@@ -351,7 +351,7 @@ pub fn remove_relay_dir(dirs: &AgentDirs, session: &SessionName) -> Result<(), S
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(format!("{}: {error}", dir.display())),
         Ok(metadata) if !metadata.file_type().is_dir() || metadata.uid() != current_uid() => {
-            return Err(format!("{} is not a directory of this user", dir.display()))
+            return Err(format!("{} is not a directory of this user", dir.display()));
         }
         Ok(_) => {}
     }
@@ -462,9 +462,11 @@ mod tests {
         assert!(outcomes.iter().all(Delivery::written), "{outcomes:?}");
         assert_eq!(server.join().unwrap(), [line("first"), line("second")]);
         assert!(pending(&dir).unwrap().is_empty(), "both are marked posted");
-        assert!(relay_once(&dir, current_uid(), &session(), &socket)
-            .unwrap()
-            .is_empty());
+        assert!(
+            relay_once(&dir, current_uid(), &session(), &socket)
+                .unwrap()
+                .is_empty()
+        );
         fs::remove_file(&socket).unwrap();
         let key = ShortText::parse("k3").unwrap();
         let name = write_instruction(&dirs, &session(), &key, &line("third")).unwrap();

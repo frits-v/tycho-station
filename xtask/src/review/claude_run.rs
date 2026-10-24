@@ -322,9 +322,11 @@ mod tests {
             ]
         );
         let local = environment(Vec::new(), None, None);
-        assert!(!local
-            .iter()
-            .any(|(name, _)| name == AUTH_TOKEN_VARIABLE || name == "USER"));
+        assert!(
+            !local
+                .iter()
+                .any(|(name, _)| name == AUTH_TOKEN_VARIABLE || name == "USER")
+        );
     }
 
     #[test]

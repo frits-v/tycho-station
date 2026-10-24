@@ -19,20 +19,20 @@ use crate::code_graph::StepKey;
 use crate::config::spine;
 use crate::config_store::{FactoryConfig, UnitConfig};
 use crate::packets::{self, Blocker, PacketContext, PacketError};
-use crate::repositories::{pin_ref, unit_branch, RepositoryError, Worktree};
+use crate::repositories::{RepositoryError, Worktree, pin_ref, unit_branch};
 use crate::services::epic::EpicClient;
 use crate::services::merge_gate::{Claim, GateError, GateVerdict, MergeGate, VerifyRequest};
 use crate::services::session::{InstructionPath, InstructionRecord};
 use crate::services::worker_run::{
-    worker_key, WorkerRunClient, WorkerRunOutcome, WorkerRunRequest,
+    WorkerRunClient, WorkerRunOutcome, WorkerRunRequest, worker_key,
 };
 use crate::services::workers::{
-    graph_key, index, Checkpoint, IndexKind, IndexRecord, WorkerEvidence, WorkerPlacement,
-    WorkerPorts,
+    Checkpoint, IndexKind, IndexRecord, WorkerEvidence, WorkerPlacement, WorkerPorts, graph_key,
+    index,
 };
 use crate::services::{
-    blocking, refuse, secret, Ports, Timing, CODE_BAD_REQUEST, CODE_CANCELLED, CODE_CONFLICT,
-    CODE_FORBIDDEN, CODE_INTERNAL, CODE_NOT_FOUND,
+    CODE_BAD_REQUEST, CODE_CANCELLED, CODE_CONFLICT, CODE_FORBIDDEN, CODE_INTERNAL, CODE_NOT_FOUND,
+    Ports, Timing, blocking, refuse, secret,
 };
 use crate::vendors::control::SessionVendor;
 
@@ -716,11 +716,11 @@ impl WorkUnit {
         let cap = Attempt::new(unit.view.config.unit_attempt_cap)
             .map_err(|error| failure(CODE_INTERNAL, error.to_string()))?;
         let mut attempt = Attempt::FIRST;
-        if let Some(start) = &request.control {
-            if let Some(reason) = self.start_control(unit, unit_id, start).await? {
-                unit.view.reason = Some(reason);
-                return unit.step(Event::TerminalFailure);
-            }
+        if let Some(start) = &request.control
+            && let Some(reason) = self.start_control(unit, unit_id, start).await?
+        {
+            unit.view.reason = Some(reason);
+            return unit.step(Event::TerminalFailure);
         }
         unit.step(Event::ChildClaimsLease)?;
         unit.step(Event::FirstStatus)?;
@@ -1566,24 +1566,30 @@ mod tests {
             Blocker::Uncertified { reason } => reason,
             Blocker::Certified(_) => panic!("an uncertified outcome gave a certified blocker"),
         };
-        assert!(reason(WorkerRunOutcome::Escalated {
-            attempt: 1,
-            question: Question::Absent
-        })
-        .contains("without a certified question"));
-        assert!(reason(WorkerRunOutcome::Escalated {
-            attempt: 1,
-            question: Question::Malformed {
-                reason: "Syntax error".to_string()
-            }
-        })
-        .contains("did not decode: Syntax error"));
+        assert!(
+            reason(WorkerRunOutcome::Escalated {
+                attempt: 1,
+                question: Question::Absent
+            })
+            .contains("without a certified question")
+        );
+        assert!(
+            reason(WorkerRunOutcome::Escalated {
+                attempt: 1,
+                question: Question::Malformed {
+                    reason: "Syntax error".to_string()
+                }
+            })
+            .contains("did not decode: Syntax error")
+        );
         assert!(reason(WorkerRunOutcome::Replan { attempt: 1 }).contains("re-planning"));
-        assert!(reason(WorkerRunOutcome::Inbox {
-            attempt: 1,
-            state: "unrecognised:3:boo".to_string()
-        })
-        .contains("nobody enumerated"));
+        assert!(
+            reason(WorkerRunOutcome::Inbox {
+                attempt: 1,
+                state: "unrecognised:3:boo".to_string()
+            })
+            .contains("nobody enumerated")
+        );
     }
 
     #[test]

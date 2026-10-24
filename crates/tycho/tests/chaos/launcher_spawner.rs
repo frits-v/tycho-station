@@ -9,21 +9,21 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tycho::agent_files::current_uid;
 use tycho::config::{AgentDirs, CorePorts, ToolPrefix};
-use tycho::kill::{kill_session, reap, KillRequest, KillVerdict};
+use tycho::kill::{KillRequest, KillVerdict, kill_session, reap};
 use tycho::launcher::{HeartbeatTarget, VendorTerminal};
 use tycho::launcher::{SessionFiles, VendorRecord};
-use tycho::process::{process_facts, send, ProcessFacts};
+use tycho::process::{ProcessFacts, process_facts, send};
 use tycho::services::spawner::{LeaseRead, SpawnSpec, Spawner, SpawnerError};
 use tycho::spawn::{
-    read_lease, save_scrollback, spawn_session, split_tier, SpawnOutcome, SpawnRequest,
+    SpawnOutcome, SpawnRequest, read_lease, save_scrollback, spawn_session, split_tier,
 };
-use tycho::zmx::{count_named, presence, Zmx};
+use tycho::zmx::{Zmx, count_named, presence};
 use tycho_harness::tool_prefix::link_scratch_prefix;
 use tycho_types::envelope::ShortText;
 use tycho_types::launcher::LauncherEnv;
 use tycho_types::session::SessionName;
 
-use crate::support::{clear_sessions, mise_which, TYCHO};
+use crate::support::{TYCHO, clear_sessions, mise_which};
 
 const VENDOR_SCRIPT: &str = r#"#!/bin/sh
 # $1 seconds to run, $2 result file content or empty

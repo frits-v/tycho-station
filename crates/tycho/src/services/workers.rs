@@ -276,7 +276,7 @@ pub fn worker_command(
 mod tests {
     use super::*;
     use crate::code_graph::{Completeness, GraphCounts};
-    use crate::repositories::tests::{fixture, Scratch};
+    use crate::repositories::tests::{Scratch, fixture};
     use crate::repositories::unit_branch;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -514,22 +514,26 @@ mod tests {
             placement: None,
             ..task.clone()
         };
-        assert!(worker_command(
-            &ports,
-            &WorkerCommand {
-                task: &unplaced,
-                ..command.clone()
-            }
-        )
-        .is_err());
-        assert!(worker_command(
-            &ports,
-            &WorkerCommand {
-                vendor: Vendor::Amp,
-                ..command
-            }
-        )
-        .is_err());
+        assert!(
+            worker_command(
+                &ports,
+                &WorkerCommand {
+                    task: &unplaced,
+                    ..command.clone()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            worker_command(
+                &ports,
+                &WorkerCommand {
+                    vendor: Vendor::Amp,
+                    ..command
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -16,14 +16,14 @@ use tycho::services::doubles::{FixedGate, RecordingSpawner};
 use tycho::services::merge_gate::GateVerdict;
 use tycho::services::spawner::SpawnSpec;
 use tycho::spool::check_result_envelope;
-use tycho_harness::verify::{unit_passed, verify_unit, VerifyOptions};
+use tycho_harness::verify::{VerifyOptions, unit_passed, verify_unit};
 use tycho_types::envelope::CommitSha;
 use tycho_types::service::WorkUnitId;
 
 use crate::launcher_spawner::result_envelope;
 use crate::support::{
-    admin_query, attach, await_unit_end, client, dispatch, lifecycle_and_attempt, session_status,
-    start_core, wait_until, worker_run_status, DoublesEndpoint,
+    DoublesEndpoint, admin_query, attach, await_unit_end, client, dispatch, lifecycle_and_attempt,
+    session_status, start_core, wait_until, worker_run_status,
 };
 use crate::support::{running_before_the_kill, test_claim};
 

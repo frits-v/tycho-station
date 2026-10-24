@@ -12,7 +12,7 @@ use nix::unistd::{Uid, User};
 
 use crate::command::{self, CommandError};
 use crate::config::{
-    CoreConfig, COMMAND_TIMEOUT, HOME_ENV, LAUNCHD_LABEL, LAUNCHD_PATH, RESTATE_SERVER_ENV, ZMX_ENV,
+    COMMAND_TIMEOUT, CoreConfig, HOME_ENV, LAUNCHD_LABEL, LAUNCHD_PATH, RESTATE_SERVER_ENV, ZMX_ENV,
 };
 use crate::private_dir::{self, DirError};
 

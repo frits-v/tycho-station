@@ -12,7 +12,7 @@ use super::diff::DiffMap;
 use super::findings::{self, Finding};
 use super::pull_request::{self, PostOutcome};
 use super::verdict::Event;
-use super::{short, Context, Grants, Tally, VERIFIED_MAX};
+use super::{Context, Grants, Tally, VERIFIED_MAX, short};
 use crate::anthropic_token;
 use crate::app_token::InstallationToken;
 use crate::github_api::Client;

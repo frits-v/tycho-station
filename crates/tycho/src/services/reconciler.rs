@@ -17,7 +17,7 @@ use tycho_types::session::SessionName;
 use crate::config::spine;
 use crate::services::session::SessionClient;
 use crate::services::spawner::{LeaseRead, Spawner};
-use crate::services::{blocking, refuse, wall_clock_unix_ms, Ports, Timing, CODE_BAD_REQUEST};
+use crate::services::{CODE_BAD_REQUEST, Ports, Timing, blocking, refuse, wall_clock_unix_ms};
 
 const EXPECTED_KEY: &str = "expected";
 const GENERATION_KEY: &str = "generation";

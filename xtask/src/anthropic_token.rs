@@ -384,7 +384,7 @@ fn mint_at(
     let assertion = match decode_oidc(status, &body) {
         OidcOutcome::Issued(token) => token,
         OidcOutcome::Failed(status) => {
-            return Err(format!("the OIDC token request ended HTTP {status}"))
+            return Err(format!("the OIDC token request ended HTTP {status}"));
         }
         OidcOutcome::Unrecognised(reason) => return Err(reason.to_string()),
     };
@@ -580,9 +580,10 @@ mod tests {
             ),
             "{oidc}"
         );
-        assert!(oidc
-            .to_ascii_lowercase()
-            .contains("\r\nauthorization: bearer request-token\r\n"));
+        assert!(
+            oidc.to_ascii_lowercase()
+                .contains("\r\nauthorization: bearer request-token\r\n")
+        );
         let exchange = requests.get(1).unwrap();
         assert!(
             exchange.starts_with("POST /v1/oauth/token HTTP/1.1\r\n"),

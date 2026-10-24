@@ -10,15 +10,15 @@ use std::io::{self, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use nix::sys::signal::Signal;
-use nix::unistd::{tcsetpgrp, Pid};
+use nix::unistd::{Pid, tcsetpgrp};
 use serde::{Deserialize, Serialize};
-use tycho_types::agent_call::{HeartbeatCall, CONTEXT_TOKENS_MAX};
+use tycho_types::agent_call::{CONTEXT_TOKENS_MAX, HeartbeatCall};
 use tycho_types::exit::ExitState;
 use tycho_types::launcher::{AwaitableDigest, IdempotencyKey, SEQUENCE_MAX};
 use tycho_types::lease::Lease;
@@ -32,23 +32,23 @@ use crate::agent_tree::{self, Bounds, Owners};
 use crate::config::AgentDirs;
 use crate::credential_handoff::fetch;
 use crate::credentials::{
-    Credential, CredentialVendor, CLAUDE_TOKEN_ENV, CODEX_AUTH_FILE, CODEX_HOME_ENV,
+    CLAUDE_TOKEN_ENV, CODEX_AUTH_FILE, CODEX_HOME_ENV, Credential, CredentialVendor,
 };
 use crate::exit_decode::{
-    decode_exit, read_progress, read_result_file, status_payload, ChildEnd, Decoded, ResultFile,
-    ResultReport, Stop,
+    ChildEnd, Decoded, ResultFile, ResultReport, Stop, decode_exit, read_progress,
+    read_result_file, status_payload,
 };
 pub use crate::launch_spec::{
-    check_tier, check_vendor, core_uid_from_environment, take_spec, HeartbeatTarget, LaunchSpec,
-    LauncherSettings, SettingsError, VendorTerminal, AGENT_TELEMETRY_ENV, HEARTBEAT_TARGET_ENV,
-    SPEC_SCHEMA_VERSION, TIER_FLAG, VENDOR_DIR_ENV, VENDOR_SANDBOX_SETTINGS_ENV,
-    VENDOR_TERMINAL_ENV,
+    AGENT_TELEMETRY_ENV, HEARTBEAT_TARGET_ENV, HeartbeatTarget, LaunchSpec, LauncherSettings,
+    SPEC_SCHEMA_VERSION, SettingsError, TIER_FLAG, VENDOR_DIR_ENV, VENDOR_SANDBOX_SETTINGS_ENV,
+    VENDOR_TERMINAL_ENV, VendorTerminal, check_tier, check_vendor, core_uid_from_environment,
+    take_spec,
 };
 use crate::process::{now_unix_ms, send};
 use crate::relay::{relay_dir, relay_once};
 use crate::spool::{
-    spool_then_deliver, write_spool, Ack, Delivery, HeartbeatSend, Ingress, SpoolRecord,
-    SPOOL_FILE, SPOOL_SCHEMA_VERSION,
+    Ack, Delivery, HeartbeatSend, Ingress, SPOOL_FILE, SPOOL_SCHEMA_VERSION, SpoolRecord,
+    spool_then_deliver, write_spool,
 };
 use crate::vendors::claude_control::socket_of_pid;
 use crate::zmx::Zmx;
@@ -204,7 +204,7 @@ const LOG_LIMIT_MARKER: &str = "log limit reached\n";
 
 /// Sets the flag on SIGTERM or SIGHUP; registered on the caller's thread before it returns.
 pub fn watch_signals() -> io::Result<Arc<AtomicBool>> {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let flag = Arc::new(AtomicBool::new(false));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -471,10 +471,10 @@ impl<I: Ingress> Run<'_, I> {
             return;
         };
         let auth = home.join(CODEX_AUTH_FILE);
-        if let Err(error) = shred(&auth) {
-            if error.kind() != io::ErrorKind::NotFound {
-                self.log.line(&format!("{}: {error}", auth.display()));
-            }
+        if let Err(error) = shred(&auth)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            self.log.line(&format!("{}: {error}", auth.display()));
         }
         let owners = Owners {
             core: current_uid(),
@@ -809,8 +809,8 @@ mod tests {
     use super::*;
     use crate::credential_handoff::{HandoffOutcome, HandoffServer};
     use crate::credentials::tests::{CLAUDE_TOKEN, CODEX_AUTH};
-    use crate::launch_spec::tests::{environment, NAME, SECRET};
-    use crate::spool::{Resolution, ACKNOWLEDGED_SUFFIX};
+    use crate::launch_spec::tests::{NAME, SECRET, environment};
+    use crate::spool::{ACKNOWLEDGED_SUFFIX, Resolution};
     use std::cell::RefCell;
     use tycho_types::launcher::AwaitableId;
     use tycho_types::launcher::ENV_SESSION_NAME;
@@ -980,9 +980,11 @@ mod tests {
             lease.ended_unix_ms().is_some(),
             "an acknowledged launch ends its lease"
         );
-        assert!(!String::from_utf8(fs::read(&files.lease).unwrap())
-            .unwrap()
-            .contains("sign_1abc"));
+        assert!(
+            !String::from_utf8(fs::read(&files.lease).unwrap())
+                .unwrap()
+                .contains("sign_1abc")
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

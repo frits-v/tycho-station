@@ -20,8 +20,8 @@ use tycho_types::service::WorkUnitId;
 
 use crate::code_graph::{
     BuildReport, Callers, ChangeKind, ChangedEntity, Checkout, CodeGraph, Completeness,
-    Definitions, GraphCounts, GraphError, Impact, Location, QueryReport, RepoPath, Revision,
-    Revisions, StepKey, Symbol, GRAPH_RESULTS_MAX_ITEMS, IMPACT_ENTITIES_MAX_ITEMS,
+    Definitions, GRAPH_RESULTS_MAX_ITEMS, GraphCounts, GraphError, IMPACT_ENTITIES_MAX_ITEMS,
+    Impact, Location, QueryReport, RepoPath, Revision, Revisions, StepKey, Symbol,
 };
 use crate::command::{self, Captured, CommandError};
 use crate::config::{
@@ -161,7 +161,7 @@ pub fn decode_version(result: &Result<Captured, CommandError>) -> VersionState {
         Ok(captured) if captured.status.success() => captured,
         Ok(captured) => return VersionState::Unrecognised(excerpt(&captured.stderr)),
         Err(CommandError::Spawn(_, error)) if error.kind() == io::ErrorKind::NotFound => {
-            return VersionState::Absent
+            return VersionState::Absent;
         }
         Err(error) => return VersionState::Unrecognised(error.to_string()),
     };
@@ -570,14 +570,14 @@ impl EntireGraph {
             VersionState::Other(found) => {
                 return Err(GraphError::VersionRefused(format!(
                     "found {found}, pinned {ENTIRE_GRAPH_PINNED_VERSION}"
-                )))
+                )));
             }
             VersionState::Absent => {
                 return Err(GraphError::VersionRefused(format!(
                     "{} is absent; install with `entire plugin install graph --pin {}`",
                     binary.display(),
                     ENTIRE_GRAPH_PINNED_VERSION
-                )))
+                )));
             }
             VersionState::Unrecognised(reason) => return Err(GraphError::VersionRefused(reason)),
         }
@@ -595,7 +595,7 @@ impl EntireGraph {
         match decode_doctor(&doctor.stdout) {
             EgressState::NoEgress => {}
             EgressState::Egress(reason) | EgressState::Unrecognised(reason) => {
-                return Err(GraphError::EgressNotRuledOut(reason))
+                return Err(GraphError::EgressNotRuledOut(reason));
             }
         }
         Ok(Self {
@@ -672,11 +672,11 @@ impl EntireGraph {
             IndexOutcome::Built(summary) => summary,
             IndexOutcome::Empty => return Err(GraphError::EmptyIndex),
             IndexOutcome::NotARepository(message) => {
-                return Err(GraphError::NotARepository(message))
+                return Err(GraphError::NotARepository(message));
             }
             IndexOutcome::Failed(message) => return Err(GraphError::Failed("index", message)),
             IndexOutcome::Unrecognised(reason) => {
-                return Err(GraphError::Unrecognised("index", reason))
+                return Err(GraphError::Unrecognised("index", reason));
             }
         };
         Ok(BuildReport {

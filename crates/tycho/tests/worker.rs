@@ -28,17 +28,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use restate_sdk::prelude::HttpServer;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tycho::agent_files::current_uid;
 use tycho::config::{
-    self, AgentDirs, CoreConfig, CorePorts, PortClaim, ToolPrefix, HOME_ENV, MISE_NO_INSTALL,
-    RESTATE_SERVER_ENV, ZMX_ENV,
+    self, AgentDirs, CoreConfig, CorePorts, HOME_ENV, MISE_NO_INSTALL, PortClaim,
+    RESTATE_SERVER_ENV, ToolPrefix, ZMX_ENV,
 };
 use tycho::config_store::FactoryConfig;
 use tycho::credentials::{self, CredentialVendor};
 use tycho::endpoint;
 use tycho::entire_graph::EntireGraph;
-use tycho::launch_spec::{HeartbeatTarget, VendorTerminal, TIER_MAX_BYTES};
+use tycho::launch_spec::{HeartbeatTarget, TIER_MAX_BYTES, VendorTerminal};
 use tycho::launcher::SessionFiles;
 use tycho::repositories::{ProjectName, Repositories};
 use tycho::services::doubles::FixedGate;
@@ -47,13 +47,13 @@ use tycho::services::merge_gate::GateVerdict;
 use tycho::services::operator::read_secret_file;
 use tycho::services::workers::WorkerPorts;
 use tycho::services::{Ports, Timing};
-use tycho::spawn::{typed_words, SpawnRequest};
+use tycho::spawn::{SpawnRequest, typed_words};
 use tycho::spool::ACKNOWLEDGED_SUFFIX;
 use tycho::zmx::Zmx;
 use tycho_harness::tool_prefix::link_scratch_prefix;
 use tycho_types::envelope::CommitSha;
 use tycho_types::git_environment::git_command;
-use tycho_types::launcher::{LauncherEnv, ENV_AWAITABLE_ID, ENV_SESSION_NAME, ENV_SESSION_SECRET};
+use tycho_types::launcher::{ENV_AWAITABLE_ID, ENV_SESSION_NAME, ENV_SESSION_SECRET, LauncherEnv};
 use tycho_types::service::handler;
 use tycho_types::session::SessionName;
 use tycho_types::task_packet::RoutingName;
@@ -468,14 +468,16 @@ fn start(claim: PortClaim) -> (Core, TestEndpoint, Arc<WorkerPorts>) {
 
 /// Starts the epic, lists the unit, and dispatches one headless task with this brief.
 fn dispatch(core: &Core, brief: &str, max_turns: u16) -> String {
-    assert!(core
-        .tycho(&["epic", "start", "cf7a", "the synthetic epic"])
-        .status
-        .success());
-    assert!(core
-        .tycho(&["epic", "add-unit", "cf7a", UNIT])
-        .status
-        .success());
+    assert!(
+        core.tycho(&["epic", "start", "cf7a", "the synthetic epic"])
+            .status
+            .success()
+    );
+    assert!(
+        core.tycho(&["epic", "add-unit", "cf7a", UNIT])
+            .status
+            .success()
+    );
     let worker = json!({
         "epic": "cf7a", "work_unit": UNIT, "vendor": "claude", "argv": [],
         "routing": {"class": "probe", "tier": "light", "effort": "low", "binding": null,

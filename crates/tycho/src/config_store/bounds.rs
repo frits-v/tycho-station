@@ -1,7 +1,7 @@
 //! The bounds of `config/schema.cue`, checked again on decoded values: a file that matches its
 //! hash may still have been written by something other than `cue export`.
 
-use super::{RoutingTables, Thresholds, CLASSES_MAX_ITEMS, MODEL_MAX_BYTES, TIERS_MAX_ITEMS};
+use super::{CLASSES_MAX_ITEMS, MODEL_MAX_BYTES, RoutingTables, TIERS_MAX_ITEMS, Thresholds};
 
 pub const SECONDS_MAX: u64 = 86_400;
 pub const SLOTS_MAX: u64 = 64;

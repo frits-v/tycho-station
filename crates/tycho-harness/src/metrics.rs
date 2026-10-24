@@ -88,16 +88,14 @@ pub const METRIC_TABLE: [Metric; 14] = [
     },
     Metric {
         name: "Rollover fidelity",
-        definition:
-            "rollovers per unit, and sessions that repeat a dead end listed in the handoff note",
+        definition: "rollovers per unit, and sessions that repeat a dead end listed in the handoff note",
         measured_at: "session state, worker runs",
         target: "zero repeats, hard gate",
         measured_value: NOT_MEASURED_SLICE_ZERO,
     },
     Metric {
         name: "Rule citation ledger",
-        definition:
-            "per mandate article, case and mechanism: citations, firings, last cited, by whom",
+        definition: "per mandate article, case and mechanism: citations, firings, last cited, by whom",
         measured_at: "store",
         target: "no article unmeasured; dormant rules listed, each with a petition or a reason",
         measured_value: NOT_MEASURED_SLICE_ZERO,

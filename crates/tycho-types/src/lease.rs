@@ -160,10 +160,10 @@ impl Lease {
         if self.heartbeat_unix_ms < self.started_unix_ms {
             return Err(LeaseError::HeartbeatBeforeStart);
         }
-        if let Some(ended) = self.ended_unix_ms {
-            if ended < self.started_unix_ms {
-                return Err(LeaseError::EndBeforeStart);
-            }
+        if let Some(ended) = self.ended_unix_ms
+            && ended < self.started_unix_ms
+        {
+            return Err(LeaseError::EndBeforeStart);
         }
         Ok(())
     }

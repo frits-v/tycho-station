@@ -16,18 +16,18 @@ use std::net::Shutdown;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tycho_types::launcher::SessionSecret;
-use tycho_types::session::{SessionName, SOCKET_PATH_MAX_BYTES};
+use tycho_types::session::{SOCKET_PATH_MAX_BYTES, SessionName};
 
 use crate::config::AgentDirs;
-use crate::credentials::{wipe, Credential, CredentialVendor, CODEX_AUTH_MAX_BYTES};
+use crate::credentials::{CODEX_AUTH_MAX_BYTES, Credential, CredentialVendor, wipe};
 use crate::vendors::claude_control::peer_uid;
 
 /// The spec's name for the socket path; the launcher keeps it from the vendor.
@@ -708,14 +708,16 @@ mod tests {
             "{refused:?}"
         );
         let other = SessionName::parse("cf7a.wu04.wrk.claude.a1f3").unwrap();
-        assert!(fetch(
-            &path,
-            current_uid(),
-            &other,
-            &secret(),
-            CredentialVendor::Claude
-        )
-        .is_err());
+        assert!(
+            fetch(
+                &path,
+                current_uid(),
+                &other,
+                &secret(),
+                CredentialVendor::Claude
+            )
+            .is_err()
+        );
         let handed = fetch(
             &path,
             current_uid(),
@@ -734,14 +736,16 @@ mod tests {
         let other = current_uid().wrapping_add(1);
         let server = HandoffServer::start(&dirs, other, &session(), &secret(), claude()).unwrap();
         let path = server.path().to_path_buf();
-        assert!(fetch(
-            &path,
-            current_uid(),
-            &session(),
-            &secret(),
-            CredentialVendor::Claude
-        )
-        .is_err());
+        assert!(
+            fetch(
+                &path,
+                current_uid(),
+                &session(),
+                &secret(),
+                CredentialVendor::Claude
+            )
+            .is_err()
+        );
         assert!(matches!(
             server.finish(),
             HandoffOutcome::NotAsked { refused: 1 }
@@ -788,14 +792,16 @@ mod tests {
                 CredentialVendor::Claude,
             ));
         }
-        assert!(fetch(
-            &path,
-            current_uid(),
-            &session(),
-            &secret(),
-            CredentialVendor::Claude
-        )
-        .is_err());
+        assert!(
+            fetch(
+                &path,
+                current_uid(),
+                &session(),
+                &secret(),
+                CredentialVendor::Claude
+            )
+            .is_err()
+        );
         assert_eq!(server.finish(), HandoffOutcome::TooManyRefusals);
         fs::remove_dir_all(&dirs.socket_dir).unwrap();
     }
