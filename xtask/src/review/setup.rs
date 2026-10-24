@@ -208,7 +208,6 @@ fn dry_run_context() -> Result<Context, String> {
         claude: PathBuf::from("claude"),
         github: None,
         session,
-        fork: false,
         posted: Vec::new(),
         user: current_user(),
         langfuse,
@@ -386,8 +385,9 @@ fn post_context(grants: &Grants) -> Result<Context, String> {
     let request = read_request()?;
     let bot = app_token::bot_login(&request.credentials)?;
     let (pull_request, earlier) = read_pull_request(&request, token.expose(), &bot)?;
-    let (worktree, files) = prepare_trees(&request.root, &pull_request.head)?;
     let full_name = request.repository.full_name();
+    refuse_fork(&pull_request, &full_name)?;
+    let (worktree, files) = prepare_trees(&request.root, &pull_request.head)?;
     Ok(Context {
         tag: "post",
         checkout: worktree.dir.clone(),
@@ -396,7 +396,6 @@ fn post_context(grants: &Grants) -> Result<Context, String> {
         head: pull_request.head.clone(),
         claude: request.claude,
         session: format!("{full_name}#{}", pull_request.number),
-        fork: is_fork(&pull_request, &full_name),
         github: Some(GitHub {
             repository: full_name,
             pull_request,
@@ -408,9 +407,17 @@ fn post_context(grants: &Grants) -> Result<Context, String> {
     })
 }
 
-/// A pull request whose head lives in another repository; the App never approves one.
-fn is_fork(pull_request: &pull_request::PullRequest, repository: &str) -> bool {
-    pull_request.head_repository != repository
+/// A pull request whose head lives in another repository is refused before its head is
+/// fetched: the repository lets only collaborators open pull requests, and the review job,
+/// which holds the App's key, never reads a tree someone without write access wrote.
+fn refuse_fork(pull_request: &pull_request::PullRequest, repository: &str) -> Result<(), String> {
+    if pull_request.head_repository == repository {
+        return Ok(());
+    }
+    Err(format!(
+        "the head of #{} is in {}, not {repository}; a fork's pull request is not reviewed",
+        pull_request.number, pull_request.head_repository
+    ))
 }
 
 /// The runner's temporary directory in Actions, outside the workspace; the system's elsewhere.
@@ -469,7 +476,6 @@ pub mod tests {
                 },
             }),
             session: "o/r#1".to_string(),
-            fork: false,
             posted,
             user: None,
             langfuse: None,
@@ -553,16 +559,17 @@ pub mod tests {
     }
 
     #[test]
-    fn a_head_in_another_repository_is_a_fork() {
+    fn a_head_in_another_repository_is_refused() {
         let mut pull_request = PullRequest {
-            number: 1,
+            number: 7,
             base: CommitId::parse(&"b".repeat(40)).unwrap(),
             head: CommitId::parse(&"a".repeat(40)).unwrap(),
             head_repository: "o/r".to_string(),
         };
-        assert!(!is_fork(&pull_request, "o/r"));
+        assert_eq!(refuse_fork(&pull_request, "o/r"), Ok(()));
         pull_request.head_repository = "someone/r".to_string();
-        assert!(is_fork(&pull_request, "o/r"));
+        let refusal = refuse_fork(&pull_request, "o/r").unwrap_err();
+        assert!(refusal.contains("#7 is in someone/r"), "{refusal}");
     }
 
     /// Grants with an installation token of the given value and no Anthropic token.

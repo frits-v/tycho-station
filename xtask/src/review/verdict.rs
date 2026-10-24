@@ -36,7 +36,6 @@ pub struct Evidence<'a> {
     pub confirmed: &'a [Finding],
     /// High or medium candidates no verify pass judged: over the cap, or a pass that failed.
     pub unjudged_blocking: usize,
-    pub fork: bool,
 }
 
 pub const fn blocks(finding: &Finding) -> bool {
@@ -44,8 +43,7 @@ pub const fn blocks(finding: &Finding) -> bool {
 }
 
 /// A confirmed high or medium finding requests changes. Without one, a blocking candidate
-/// nobody judged, or a fork's pull request, gets a comment: the App approves only what it
-/// checked, on a branch of this repository.
+/// nobody judged gets a comment: the App approves only what it checked.
 pub fn decide(evidence: &Evidence<'_>) -> (Event, String) {
     let blocking = evidence
         .confirmed
@@ -65,12 +63,6 @@ pub fn decide(evidence: &Evidence<'_>) -> (Event, String) {
                 "{} high or medium candidates were not verified",
                 evidence.unjudged_blocking
             ),
-        );
-    }
-    if evidence.fork {
-        return (
-            Event::Comment,
-            "no confirmed high or medium findings; a fork's pull request is not approved".into(),
         );
     }
     (
@@ -95,11 +87,10 @@ mod tests {
         }
     }
 
-    fn decided(confirmed: &[Finding], unjudged_blocking: usize, fork: bool) -> Event {
+    fn decided(confirmed: &[Finding], unjudged_blocking: usize) -> Event {
         decide(&Evidence {
             confirmed,
             unjudged_blocking,
-            fork,
         })
         .0
     }
@@ -108,25 +99,24 @@ mod tests {
     fn a_confirmed_high_or_medium_finding_requests_changes_whatever_else_holds() {
         for severity in [Severity::High, Severity::Medium] {
             let confirmed = [finding(Severity::Low), finding(severity)];
-            assert_eq!(decided(&confirmed, 0, false), Event::RequestChanges);
-            assert_eq!(decided(&confirmed, 3, true), Event::RequestChanges);
+            assert_eq!(decided(&confirmed, 0), Event::RequestChanges);
+            assert_eq!(decided(&confirmed, 3), Event::RequestChanges);
         }
     }
 
     #[test]
     fn nothing_blocking_approves_and_low_findings_do_not_block() {
-        assert_eq!(decided(&[], 0, false), Event::Approve);
-        assert_eq!(decided(&[finding(Severity::Low)], 0, false), Event::Approve);
+        assert_eq!(decided(&[], 0), Event::Approve);
+        assert_eq!(decided(&[finding(Severity::Low)], 0), Event::Approve);
     }
 
     #[test]
-    fn an_unjudged_blocking_candidate_or_a_fork_never_approves() {
-        assert_eq!(decided(&[], 1, false), Event::Comment);
-        assert_eq!(decided(&[finding(Severity::Low)], 0, true), Event::Comment);
+    fn an_unjudged_blocking_candidate_never_approves() {
+        assert_eq!(decided(&[], 1), Event::Comment);
+        assert_eq!(decided(&[finding(Severity::Low)], 1), Event::Comment);
         let (_, reason) = decide(&Evidence {
             confirmed: &[],
             unjudged_blocking: 2,
-            fork: false,
         });
         assert!(reason.contains("2 high or medium candidates"), "{reason}");
     }

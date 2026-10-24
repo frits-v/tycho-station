@@ -628,11 +628,16 @@ check out, build and run it.
   unsigned, and the ruleset requires signed commits; the agent hook refuses it.
 - The `review` workflow starts on `pull_request_target` when a pull request whose author is
   an owner, member or collaborator is marked ready for review, and on `issue_comment` when a
-  comment on a pull request, any pull request a fork's included, mentions
-  `@frits-code-review` or `@claude` as a whole word, from an account of type `User` whose
-  association is `OWNER`, `MEMBER` or `COLLABORATOR`. Opening a pull request, pushing to it or
-  editing a comment starts nothing; the workflow's condition and the xtask's event decoder
-  both enforce this.
+  comment on a pull request mentions `@frits-code-review` or `@claude` as a whole word, from
+  an account of type `User` whose association is `OWNER`, `MEMBER` or `COLLABORATOR`. Opening
+  a pull request, pushing to it or editing a comment starts nothing; the workflow's condition
+  and the xtask's event decoder both enforce this.
+- A pull request whose head is in another repository is refused before its head is fetched,
+  so every head the review reads was pushed by someone with write access, and no stranger's
+  tree reaches the job that holds the App's key. The repository's pull request creation
+  policy is `collaborators_only`, so a stranger cannot open the pull request that refusal
+  would end. A head the station's own agents author is pushed by the core but written by a
+  model that read untrusted repositories; the review does not yet cover that case.
 - The review's own text mentions nobody and references nothing: model text is posted on one
   line, its code spans rewritten inside fences the review builds, the markdown characters
   outside them as entities, and a word joiner after `@` and between `#`, `/` or `-` and a
@@ -658,14 +663,13 @@ check out, build and run it.
 - The trusted `review` job runs the base branch's workflow and xtask. It checks the base
   branch out with its history, builds the base branch's xtask, and runs
   `xtask review --post`. The workflow checks out nothing of the pull request.
-- The xtask resolves the head commit (from the `ready_for_review` event, or from the pull
-  requests API for a comment), fetches exactly that commit from `origin` (a fork's head
-  included: GitHub serves it from the base repository) and checks it out as a detached
-  worktree under `RUNNER_TEMP`, with hooks off and Git LFS not smudging; it checks the
-  worktree is at that commit and posts the review on it. A push after the commit was resolved
-  changes nothing about what is reviewed; a push between a comment and the run is reviewed on
-  its own merits, since the commenter asks for a review and vouches for no code, and the
-  verdict is attached to the commit it judged.
+- The xtask resolves the head commit (from the `ready_for_review` event, or from the
+  pull requests API for a comment), fetches exactly that commit from `origin` and checks
+  it out as a detached worktree under `RUNNER_TEMP`, with hooks off and Git LFS not
+  smudging; it checks the worktree is at that commit and posts the review on it. A push
+  after the commit was resolved changes nothing about what is reviewed; a push between a
+  comment and the run is reviewed on its own merits, since the commenter asks for a
+  review and vouches for no code, and the verdict is attached to the commit it judged.
 - Nothing from the worktree is built or run: the xtask runs git in it with `--no-ext-diff
   --no-textconv`, runs the Claude binary `mise which claude` names from the base checkout (a
   mise shim run in the worktree would take the pull request's pin), and hands the model only
@@ -710,8 +714,8 @@ check out, build and run it.
 
 - A rule decides it from the confirmed findings, never the model: a confirmed high or medium
   finding requests changes; without one, a high or medium candidate nobody judged (over the
-  cap of 12, or a verify pass that ended without a verdict) gets `COMMENT`, as does a fork's
-  pull request; otherwise the App approves. Low findings never block. A finding posted before
+  cap of 12, or a verify pass that ended without a verdict) gets `COMMENT`; otherwise the
+  App approves. Low findings never block. A finding posted before
   that still holds counts again.
 - While the passes run, nothing about the other checks reaches the model. Afterwards the
   xtask reads the check runs and commit statuses on the head commit every 30 seconds, leaving
