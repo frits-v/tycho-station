@@ -1084,9 +1084,14 @@ mod tests {
         let dir = scratch("last-beat");
         let settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
         let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
-        let script = r#"sleep 0.3; printf '{"context_tokens":33390}' > "$TYCHO_PROGRESS_FILE"; printf '{"state":"failed","envelope":null}' > "$TYCHO_RESULT_FILE""#;
+        // The vendor ends only once the supervise loop's first heartbeat has taken its
+        // sequence number, so the beat after the exit is the second whatever the spawn costs.
+        let script = r#"i=0; while [ ! -f "$1" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; printf '{"context_tokens":33390}' > "$TYCHO_PROGRESS_FILE"; printf '{"state":"failed","envelope":null}' > "$TYCHO_RESULT_FILE""#;
         let recorder = recorder(&files);
-        let end = launch(&settings, &sh(script), &recorder).unwrap();
+        let mut vendor = sh(script);
+        vendor.push("vendor".to_string());
+        vendor.push(files.sequence.display().to_string());
+        let end = launch(&settings, &vendor, &recorder).unwrap();
         assert_eq!(end.state, "failed");
         let events = recorder.events.borrow();
         let beats = events
