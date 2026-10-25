@@ -35,8 +35,8 @@ pub const WORD_RESULT_PREFIX: &str = "vendor_result_";
 pub enum CommandRefusal {
     /// `codex exec` has no turn cap; a capped task would run uncapped.
     NoTurnCap,
-    /// `codex exec --sandbox workspace-write` leaves `.git` read-only, so the worker cannot
-    /// commit; the factory does not commit on its behalf.
+    /// No probe has shown a Codex worker commit in its worktree under the station's sandbox,
+    /// with Codex's own sandbox off; the factory does not commit on its behalf.
     CannotCommit,
     /// No headless adapter exists for the vendor.
     NoAdapter,
@@ -46,7 +46,7 @@ impl fmt::Display for CommandRefusal {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::NoTurnCap => "codex exec has no turn cap",
-            Self::CannotCommit => "codex exec cannot commit under its workspace-write sandbox",
+            Self::CannotCommit => "a codex exec commit under the station sandbox is not yet probed",
             Self::NoAdapter => "no headless adapter for this vendor",
         })
     }

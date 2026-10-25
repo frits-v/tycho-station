@@ -16,9 +16,9 @@ use crate::sarif::{self, Finding, Results};
 
 const WORKFLOW_DIR: &str = ".github/workflows";
 const POLICY: &str = ".github/workflow-policy.cue";
-const POLICY_TIMEOUT: Duration = Duration::from_secs(60);
+const POLICY_TIMEOUT: Duration = Duration::from_mins(1);
 const WORKFLOW_FILES_MAX: usize = 64;
-const AUDIT_TIMEOUT: Duration = Duration::from_secs(300);
+const AUDIT_TIMEOUT: Duration = Duration::from_mins(5);
 const REPORTED_FINDINGS_MAX: usize = 40;
 const TOKEN_VARIABLES: [&str; 2] = ["GH_TOKEN", "GITHUB_TOKEN"];
 

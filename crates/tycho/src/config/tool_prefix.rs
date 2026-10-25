@@ -144,6 +144,20 @@ impl ToolPrefix {
         self.tools.get(name).map(PathBuf::as_path)
     }
 
+    /// The install directory of a recorded tool, `mise/installs/<name>/<pin>`, which holds
+    /// its executable and everything that executable loads.
+    #[must_use]
+    pub fn install_dir(&self, name: &str) -> Option<PathBuf> {
+        let installs = self.root.join("mise/installs").join(name);
+        let pin = self
+            .tool(name)?
+            .strip_prefix(&installs)
+            .ok()?
+            .components()
+            .next()?;
+        Some(installs.join(pin))
+    }
+
     /// The prefix's binaries, each recorded tool's directory, then the system's; no shim
     /// directory is on it.
     #[must_use]
@@ -234,6 +248,24 @@ pub mod tests {
             ToolPrefix::new(PathBuf::from("/tmp/a prefix")),
             Err(ConfigError::UnsafePath(_))
         ));
+    }
+
+    #[test]
+    fn an_install_directory_is_the_pin_directory_above_the_executable() {
+        let prefix = production();
+        assert_eq!(
+            prefix.install_dir("codex"),
+            Some(PathBuf::from(
+                "/Users/Shared/tycho/mise/installs/codex/0.160.1"
+            ))
+        );
+        assert_eq!(
+            prefix.install_dir("claude"),
+            Some(PathBuf::from(
+                "/Users/Shared/tycho/mise/installs/claude/2.1.280"
+            ))
+        );
+        assert_eq!(prefix.install_dir("entire"), None);
     }
 
     #[test]

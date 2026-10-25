@@ -158,3 +158,36 @@ import (
 		}
 	}}
 }
+
+#Host:        string & =~"^([a-z0-9-]+\\.)+[a-z]{2,}$" & strings.MaxRunes(253)
+#SystemPath:  string & =~"^/[^\\x00]*$" & !~"/\\.\\.?(/|$)" & strings.MaxRunes(256)
+#AccessMode:  "read" | "write" | "read_write"
+#Platform:    "macos" | "linux"
+#Arch:        "aarch64" | "x86_64"
+
+// One system path the session sandbox grants on one platform. Every macOS entry is
+// required to exist when a session starts; `optional` is for the Linux list, which only the
+// ci runner uses, and lets an entry absent on that runner be skipped.
+#SystemGrant: {
+	path!:     #SystemPath
+	access!:   #AccessMode
+	platform!: #Platform
+	arch?:     #Arch
+	optional:  bool | *false
+	if platform == "macos" {
+		optional: false
+	}
+}
+
+#VendorNetwork: {
+	// The hosts the session proxy lets the vendor reach; anything else is refused and recorded.
+	allowed_hosts!: [...#Host] & list.MinItems(1) & list.MaxItems(16) & list.UniqueItems()
+}
+
+#Sandbox: {
+	system_paths!: [...#SystemGrant] & list.MinItems(1) & list.MaxItems(256)
+	vendors!: {
+		claude!: #VendorNetwork
+		codex!:  #VendorNetwork
+	}
+}

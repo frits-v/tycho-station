@@ -30,7 +30,10 @@ pub mod probe;
 pub mod process;
 pub mod relay;
 pub mod repositories;
+pub mod sandbox;
 pub mod services;
+pub mod session_proxy;
+pub mod session_sandbox;
 pub mod spawn;
 pub mod spool;
 #[cfg(test)]

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::process::{Exit, run_bounded_merged};
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const TEST_TIMEOUT: Duration = Duration::from_hours(1);
 const BINARIES_MAX: usize = 512;
 /// Cargo right-aligns its status verbs in twelve columns.
 const RUNNING_PREFIX: &str = "     Running ";

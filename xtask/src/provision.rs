@@ -33,7 +33,7 @@ use tycho_types::agent_switch::{self, DefaultsLine, Entry, Listing, SUDOERS_DROP
 
 const PROVISION_STEPS_MAX: usize = 16;
 /// Long enough for sudo's and sysadminctl's prompts to be answered at a terminal.
-const REMEDY_TIMEOUT: Duration = Duration::from_secs(600);
+const REMEDY_TIMEOUT: Duration = Duration::from_mins(10);
 const SUDO: &str = "/usr/bin/sudo";
 const DSEDITGROUP: &str = "/usr/sbin/dseditgroup";
 const SYSADMINCTL: &str = "/usr/sbin/sysadminctl";

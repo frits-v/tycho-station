@@ -25,9 +25,9 @@ pub const SPOOL_FILE: &str = "result.spool";
 pub const ACKNOWLEDGED_SUFFIX: &str = "acknowledged";
 pub const SPOOL_FILE_MAX_BYTES: usize = ENVELOPE_MAX_BYTES + 4096;
 pub const BACKOFF_FIRST: Duration = Duration::from_secs(10);
-pub const BACKOFF_CAP: Duration = Duration::from_secs(300);
+pub const BACKOFF_CAP: Duration = Duration::from_mins(5);
 pub const DELIVERY_ATTEMPTS_MAX: u32 = 32;
-pub const DELIVERY_DEADLINE: Duration = Duration::from_secs(3600);
+pub const DELIVERY_DEADLINE: Duration = Duration::from_hours(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

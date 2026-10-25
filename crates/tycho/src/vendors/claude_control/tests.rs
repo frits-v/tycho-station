@@ -16,7 +16,7 @@ use tycho_types::session::SessionName;
 use tycho_types::task_packet::AbsolutePath;
 
 use super::*;
-use crate::spawn::CLAUDE_SANDBOX_SETTINGS;
+use crate::spawn::CLAUDE_SANDBOX_OFF;
 use crate::test_sockets::{bound_without_listener, listener};
 use crate::vendors::control::AddressTarget;
 
@@ -28,7 +28,9 @@ const REGISTRY_NO_STATUS: &str = include_str!("../../fixtures/claude-registry-no
 // ids, model and usage, with its content cut to one word.
 const TRANSCRIPT_TAIL: &str = include_str!("../../fixtures/claude-transcript-tail.jsonl");
 const SESSION_ID: &str = "56736586-cf23-4aaa-955f-7ea9c1fb1e15";
-const SETTINGS: &str = r#"{"autoCompactWindow":1000000,"crossSessionInbound":"accept","sandbox":{"allowUnsandboxedCommands":false,"enabled":true,"excludedCommands":[],"failIfUnavailable":true,"network":{"allowAllUnixSockets":false,"allowLocalBinding":false,"allowedDomains":[]}}}"#;
+// serde_json keeps insertion order (`preserve_order`): the core's settings, then the adapter's.
+const SETTINGS: &str =
+    r#"{"sandbox":{"enabled":false},"crossSessionInbound":"accept","autoCompactWindow":1000000}"#;
 
 fn scratch(test: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tcc-{test}-{}", std::process::id()));
@@ -60,7 +62,7 @@ fn launch(resume: bool) -> ControlLaunch {
         model: "haiku".to_string(),
         effort: Effort::Low,
         permission: PermissionMode::DontAsk,
-        sandbox_settings: CLAUDE_SANDBOX_SETTINGS.to_string(),
+        sandbox_settings: CLAUDE_SANDBOX_OFF.to_string(),
         working_dir: AbsolutePath::parse("/Users/agent/control/cf7a-wu03").unwrap(),
         resume,
     }
@@ -248,7 +250,7 @@ fn the_instruction_line_is_one_json_user_message() {
     let text = ShortText::parse("Task packet sha256:ab: \"plan\" it").unwrap();
     assert_eq!(
         instruction_line(&text),
-        "{\"message\":{\"content\":\"Task packet sha256:ab: \\\"plan\\\" it\",\"role\":\"user\"},\"type\":\"user\"}\n"
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"Task packet sha256:ab: \\\"plan\\\" it\"}}\n"
     );
 }
 

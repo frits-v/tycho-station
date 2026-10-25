@@ -395,7 +395,7 @@ fn describe(command: &Command) -> String {
 mod tests {
     use super::*;
 
-    const QUICK_TIMEOUT: Duration = Duration::from_secs(120);
+    const QUICK_TIMEOUT: Duration = Duration::from_mins(2);
 
     #[test]
     fn described_commands_never_show_the_token() {

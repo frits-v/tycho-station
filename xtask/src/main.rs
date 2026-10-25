@@ -46,7 +46,7 @@ const TYPES: [&str; 11] = [
     "feat", "fix", "docs", "chore", "refactor", "test", "build", "ci", "perf", "style", "revert",
 ];
 const SUBJECT_MAX: usize = 72;
-const FMT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const FMT_TIMEOUT: Duration = Duration::from_mins(5);
 const HOOK_INPUT_MAX_BYTES: u64 = 1 << 20;
 const HOOK_REPORT_MAX_LINES: usize = 40;
 const WALK_MAX_FILES: usize = 4096;
@@ -1029,8 +1029,17 @@ mod tests {
     use super::*;
     use tycho_types::git_environment::{git_environment_in, scrub_git_environment};
 
+    /// The xtask builds alone in some workflows and with the workspace in ci, where nono turns
+    /// on `serde_json`'s `preserve_order`; the xtask names the feature itself so both builds
+    /// order a JSON object's keys as they were inserted.
+    #[test]
+    fn a_json_object_keeps_its_keys_in_insertion_order() {
+        let value = serde_json::json!({"zeta": 1, "alpha": 2});
+        assert_eq!(value.to_string(), r#"{"zeta":1,"alpha":2}"#);
+    }
+
     const INHERITED_CHILD: &str = "tests::git_children_under_an_inherited_hook_environment";
-    const ENV_TIMEOUT: Duration = Duration::from_secs(60);
+    const ENV_TIMEOUT: Duration = Duration::from_mins(1);
 
     fn env_listing(command: &mut Command) -> String {
         let captured = process::run_bounded(command, ENV_TIMEOUT);

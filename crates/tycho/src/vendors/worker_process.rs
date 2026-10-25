@@ -30,11 +30,12 @@ use crate::launch_spec::{
     AGENT_TELEMETRY_ENV, PROGRESS_FILE_ENV, RESULT_FILE_ENV, VENDOR_SANDBOX_SETTINGS_ENV,
 };
 use crate::process::{now_unix_ms, send};
+use crate::session_proxy::CHILD_ENVIRONMENT_NAMES;
 use crate::vendors::claude_worker::ClaudeWorker;
 use crate::vendors::codex_worker::{CODEX_OUTPUT_SCHEMA, CodexWorker};
 use crate::vendors::worker::{
-    CommandRefusal, EVENT_LINE_MAX_BYTES, Refusal, Stream, VersionState, WORD_VERSION_MISMATCH,
-    WorkerArgs, WorkerError, WorkerTask, WorkerVendor, outcome, state_word,
+    CommandRefusal, EVENT_LINE_MAX_BYTES, Stream, VersionState, WORD_VERSION_MISMATCH, WorkerArgs,
+    WorkerError, WorkerTask, WorkerVendor, outcome, state_word,
 };
 
 /// Event lines one run may produce; the launcher's output cap usually ends it first.
@@ -90,11 +91,13 @@ impl WorkerEnvironment {
     pub fn from_map(environment: &BTreeMap<String, String>) -> Result<Self, WorkerError> {
         let session = SessionName::parse(&required(environment, ENV_SESSION_NAME)?)
             .map_err(|error| WorkerError::Argument(error.to_string()))?;
-        // The credential pair the launcher added: Claude's token, or the Codex home.
+        // The credential pair the launcher added (Claude's token, or the Codex home) and the
+        // session proxy's variables, without which the vendor's sandbox refuses its traffic.
         let inherited_names = ["HOME", "PATH", CLAUDE_TOKEN_ENV, CODEX_HOME_ENV]
             .into_iter()
             .chain(MISE_PREFIX_ENV)
-            .chain(AGENT_TELEMETRY_ENV.iter().map(|(name, _)| *name));
+            .chain(AGENT_TELEMETRY_ENV.iter().map(|(name, _)| *name))
+            .chain(CHILD_ENVIRONMENT_NAMES);
         let inherited = inherited_names
             .filter_map(|name| {
                 environment
@@ -421,7 +424,9 @@ struct Prepared<'a> {
     vendor_environment: Vec<(String, String)>,
 }
 
-fn check_version(vendor: &dyn WorkerVendor, run: &Prepared<'_>) -> Result<(), Refusal> {
+/// The binary's banner at the pin, or what it said instead: its banner, or why `--version`
+/// did not answer.
+fn check_version(vendor: &dyn WorkerVendor, run: &Prepared<'_>) -> Result<(), String> {
     let pairs: Vec<(&str, &str)> = run
         .vendor_environment
         .iter()
@@ -429,11 +434,11 @@ fn check_version(vendor: &dyn WorkerVendor, run: &Prepared<'_>) -> Result<(), Re
         .collect();
     let banner = run_captured(&run.args.binary, &["--version"], &pairs, COMMAND_TIMEOUT)
         .map(|captured| captured.stdout)
-        .unwrap_or_default();
+        .map_err(|error| format!("--version did not answer: {error}"))?;
     match vendor.version(&banner) {
         VersionState::Pinned => Ok(()),
         VersionState::Other(found) | VersionState::Unrecognised(found) => {
-            Err(Refusal::VersionMismatch(found))
+            Err(format!("the banner reads {found:?}"))
         }
     }
 }
@@ -510,6 +515,14 @@ pub fn run(
             return Err(error.to_string());
         }
     };
+    // The worker and everything it starts run in the worktree, inside the session's
+    // sandbox: a vendor started from a directory the sandbox does not grant cannot read its
+    // own working directory, and the pinned Claude CLI then fails even `--version`.
+    if let Err(error) = std::env::set_current_dir(&args.worktree) {
+        let detail = format!("{}: {error}", args.worktree.display());
+        write_conclusion(&environment.result, &Conclusion::failed("failed", &detail))?;
+        return Err(detail);
+    }
     let prepared = Prepared {
         args: &args,
         environment: &environment,
@@ -518,8 +531,11 @@ pub fn run(
             &current_user().map_err(|error| error.to_string())?,
         ),
     };
-    if check_version(vendor.as_ref(), &prepared).is_err() {
-        write_result(&environment.result, WORD_VERSION_MISMATCH, None)?;
+    if let Err(detail) = check_version(vendor.as_ref(), &prepared) {
+        write_conclusion(
+            &environment.result,
+            &Conclusion::failed(WORD_VERSION_MISMATCH, &detail),
+        )?;
         return Ok(EXIT_NOT_COMPLETED);
     }
     let command = prepare_command(vendor.as_ref(), &prepared)?;
@@ -540,31 +556,45 @@ pub fn run(
     })
 }
 
-/// The sandbox settings the launcher handed over, with the escalation directory added to the
-/// sandbox's writable paths and to the session's directories; nothing else of the spool is.
+/// Bash for every command, allowed by rule.
+///
+/// Claude's own sandbox, when on, runs each sandboxed Bash command without a prompt, and a
+/// headless worker has nobody to answer one. The station's sandbox bounds the whole process
+/// tree, so the allow rule stands where that auto-allow stood.
+pub const WORKER_ALLOWED_TOOLS: [&str; 1] = ["Bash"];
+
+/// Appends `value` to the list at `permissions.<key>`, making the object and list as needed.
+fn push_permission(settings: &mut Value, key: &str, value: Value) -> Result<(), String> {
+    settings
+        .as_object_mut()
+        .ok_or_else(|| "sandbox settings: not an object".to_string())?
+        .entry("permissions")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(|| "sandbox settings: permissions is not an object".to_string())?
+        .entry(key)
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or_else(|| format!("sandbox settings: {key} is not a list"))?
+        .push(value);
+    Ok(())
+}
+
+/// The settings the launcher handed over, with the worker's permissions added.
+///
+/// The escalation directory joins the session's directories, so the vendor's permission
+/// rules let it write the question there, and nothing else of the spool does; the station's
+/// sandbox already grants that directory. Bash is allowed (`WORKER_ALLOWED_TOOLS`).
 pub fn worker_settings(base: &str, escalation_dir: &Path) -> Result<String, String> {
     let mut settings: Value =
         serde_json::from_str(base).map_err(|error| format!("sandbox settings: {error}"))?;
-    let dir = Value::String(escalation_dir.display().to_string());
-    for (section, key) in [
-        (["sandbox", "filesystem"], "allowWrite"),
-        (["permissions", ""], "additionalDirectories"),
-    ] {
-        let mut node = &mut settings;
-        for part in section.iter().filter(|part| !part.is_empty()) {
-            node = node
-                .as_object_mut()
-                .ok_or_else(|| format!("sandbox settings: {part} is not an object"))?
-                .entry(*part)
-                .or_insert_with(|| json!({}));
-        }
-        node.as_object_mut()
-            .ok_or_else(|| format!("sandbox settings: {key}'s parent is not an object"))?
-            .entry(key)
-            .or_insert_with(|| json!([]))
-            .as_array_mut()
-            .ok_or_else(|| format!("sandbox settings: {key} is not a list"))?
-            .push(dir.clone());
+    push_permission(
+        &mut settings,
+        "additionalDirectories",
+        Value::String(escalation_dir.display().to_string()),
+    )?;
+    for tool in WORKER_ALLOWED_TOOLS {
+        push_permission(&mut settings, "allow", Value::String(tool.to_string()))?;
     }
     serde_json::to_string(&settings).map_err(|error| error.to_string())
 }
@@ -696,6 +726,91 @@ pub mod tests {
     }
 
     #[test]
+    fn the_proxy_variables_reach_the_vendor_and_the_sandbox_plan_does_not() {
+        let mut launcher = launcher_environment();
+        for name in CHILD_ENVIRONMENT_NAMES {
+            launcher.insert(name.to_string(), format!("{name}-value"));
+        }
+        launcher.insert(crate::sandbox::PLAN_ENV.to_string(), "{}".to_string());
+        let environment = WorkerEnvironment::from_map(&launcher).unwrap();
+        let pairs = vendor_environment(&environment, "agent");
+        for name in CHILD_ENVIRONMENT_NAMES {
+            assert!(
+                pairs.contains(&(name.to_string(), format!("{name}-value"))),
+                "{name}"
+            );
+        }
+        assert!(
+            !pairs
+                .iter()
+                .any(|(name, _)| name == crate::sandbox::PLAN_ENV)
+        );
+        assert_eq!(
+            pairs.len(),
+            7 + AGENT_TELEMETRY_ENV.len() + CHILD_ENVIRONMENT_NAMES.len()
+        );
+    }
+
+    /// The worker changes to its worktree before anything else runs: one it cannot enter
+    /// fails the run, naming the worktree, before the version check starts the vendor.
+    #[test]
+    fn a_worker_runs_in_its_worktree_and_fails_on_one_it_cannot_enter() {
+        let dir = std::env::temp_dir().join(format!("tycho-worker-cwd-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut launcher = launcher_environment();
+        let result = dir.join("result.json");
+        launcher.insert(RESULT_FILE_ENV.to_string(), result.display().to_string());
+        let missing = dir.join("no-worktree");
+        let words = WorkerArgs {
+            worktree: missing.clone(),
+            binary: PathBuf::from("/nonexistent/claude"),
+            ..args()
+        }
+        .to_argv(Path::new("/opt/tycho"));
+        let error = run(&words[2..], &launcher, &mut std::io::sink()).unwrap_err();
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+        let written: Value = serde_json::from_slice(&std::fs::read(&result).unwrap()).unwrap();
+        assert_eq!(written["state"], json!("failed"));
+        assert!(
+            written["detail"]
+                .as_str()
+                .unwrap()
+                .contains(&missing.display().to_string()),
+            "the version check ran before the worktree was entered: {written}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A version check that could not run says why, so a refusal of the binary under the
+    /// sandbox is not read as a wrong pin.
+    #[test]
+    fn a_version_check_that_cannot_run_names_why() {
+        let environment = WorkerEnvironment::from_map(&launcher_environment()).unwrap();
+        let missing = WorkerArgs {
+            binary: PathBuf::from("/nonexistent/claude"),
+            ..args()
+        };
+        let prepared = Prepared {
+            args: &missing,
+            environment: &environment,
+            vendor_environment: Vec::new(),
+        };
+        let detail = check_version(&ClaudeWorker, &prepared).unwrap_err();
+        assert!(detail.starts_with("--version did not answer: "), "{detail}");
+        let wrong = Prepared {
+            args: &WorkerArgs {
+                binary: PathBuf::from("/bin/echo"),
+                ..args()
+            },
+            environment: &environment,
+            vendor_environment: Vec::new(),
+        };
+        let detail = check_version(&ClaudeWorker, &wrong).unwrap_err();
+        assert!(detail.starts_with("the banner reads "), "{detail}");
+    }
+
+    #[test]
     fn the_worker_environment_is_required() {
         for name in [
             ENV_SESSION_NAME,
@@ -725,7 +840,10 @@ pub mod tests {
     fn a_refused_stream_stops_at_the_init_event() {
         let mut copied = Vec::new();
         let stream = fold_stream(&ClaudeWorker, BARE.as_bytes(), &mut copied, &mut |_| {});
-        assert_eq!(stream.refusal, Some(Refusal::BareMode));
+        assert_eq!(
+            stream.refusal,
+            Some(crate::vendors::worker::Refusal::BareMode)
+        );
         assert_eq!(stream.end, None);
         assert_eq!(stream.events, 2);
     }
@@ -863,24 +981,17 @@ pub mod tests {
     }
 
     #[test]
-    fn only_the_escalation_directory_is_added_to_the_sandbox() {
-        let base = crate::spawn::CLAUDE_SANDBOX_SETTINGS;
+    fn the_worker_gets_bash_and_its_escalation_directory_and_the_vendor_sandbox_stays_off() {
+        let base = crate::spawn::CLAUDE_SANDBOX_OFF;
         let settings: Value =
             serde_json::from_str(&worker_settings(base, Path::new("/spool/escalation")).unwrap())
                 .unwrap();
         assert_eq!(
-            settings["sandbox"]["filesystem"]["allowWrite"],
-            json!(["/spool/escalation"])
-        );
-        assert_eq!(
             settings["permissions"]["additionalDirectories"],
             json!(["/spool/escalation"])
         );
-        assert_eq!(settings["sandbox"]["enabled"], json!(true));
-        assert_eq!(
-            settings["sandbox"]["allowUnsandboxedCommands"],
-            json!(false)
-        );
+        assert_eq!(settings["permissions"]["allow"], json!(["Bash"]));
+        assert_eq!(settings["sandbox"], json!({"enabled": false}));
         let text = settings.to_string();
         assert!(
             !text.contains("result.json") && !text.contains("progress.json"),
@@ -889,7 +1000,7 @@ pub mod tests {
         assert!(worker_settings("[]", Path::new("/e")).is_err());
         assert!(
             worker_settings(
-                r#"{"sandbox":{"filesystem":{"allowWrite":"x"}}}"#,
+                r#"{"permissions":{"additionalDirectories":"x"}}"#,
                 Path::new("/e")
             )
             .is_err()

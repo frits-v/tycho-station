@@ -17,7 +17,7 @@ const FIXTURE_DIR: &str = "opengrep";
 const FIXTURE_FILE: &str = "opengrep/rust.rs";
 const SCANNED_DIRS: [&str; 2] = ["crates", "xtask"];
 const EXCLUDED: [&str; 2] = ["target", ".worktrees"];
-const OPENGREP_TIMEOUT: Duration = Duration::from_secs(300);
+const OPENGREP_TIMEOUT: Duration = Duration::from_mins(5);
 const RULES_MAX: usize = 256;
 const REPORTED_FINDINGS_MAX: usize = 40;
 

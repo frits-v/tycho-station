@@ -24,6 +24,7 @@ use tycho::epic_command::{self, OperatorAnswer};
 use tycho::http::Http;
 use tycho::launchd::Agent;
 use tycho::launcher;
+use tycho::process::{Leadership, TrampolineError};
 use tycho::services::merge_gate::NoGate;
 use tycho::services::operator::read_secret_file;
 use tycho::services::spawner::NoLauncher;
@@ -52,7 +53,8 @@ const USAGE: &str = "usage: tycho <command>
   launch --spec <spec file> [--tier <tier>]   run a vendor session: lease, heartbeat, spool, resolve
   launch --replay <spool file>    deliver a spooled result that was never acknowledged
   worker --vendor <vendor> ...    run one headless worker inside a launcher session
-  session-leader -- <program> ... run a program as the leader of a new session";
+  session-leader -- <program> ... run a program sandboxed, as the leader of a new session
+  group-leader -- <program> ...   run a program sandboxed, in the launcher's process group";
 
 fn main() {
     let arguments: Vec<String> = env::args().skip(1).collect();
@@ -100,7 +102,7 @@ fn main() {
         ["launch", "--replay", spool] => replay(spool),
         ["launch", "--spec", spec] => launch(spec, None),
         ["launch", "--spec", spec, "--tier", tier] => launch(spec, Some(tier)),
-        ["worker" | "session-leader", ..] => worker(&arguments),
+        ["worker" | "session-leader" | "group-leader", ..] => worker(&arguments),
         ["graph", "build", checkout, unit] => report_result(graph::build(checkout, unit)),
         ["graph", "query", checkout, kind, argument] => {
             report_result(graph::query(checkout, kind, argument))
@@ -213,11 +215,10 @@ fn launch(spec: &str, tier: Option<&str>) -> i32 {
 /// and the session trampoline the launcher runs every vendor through.
 fn worker(arguments: &[String]) -> i32 {
     let words = arguments.get(1..).unwrap_or_default();
-    if arguments
-        .first()
-        .is_some_and(|command| command == "session-leader")
-    {
-        return session_leader(words);
+    match arguments.first().map(String::as_str) {
+        Some("session-leader") => return session_leader(words, Leadership::Session),
+        Some("group-leader") => return session_leader(words, Leadership::Group),
+        _ => {}
     }
     let environment = env::vars().collect();
     let mut stdout = std::io::stdout();
@@ -230,11 +231,15 @@ fn worker(arguments: &[String]) -> i32 {
     }
 }
 
-/// Never returns on success: the process becomes the vendor in a session of its own.
-fn session_leader(words: &[String]) -> i32 {
-    let error = tycho::process::exec_session_leader(words);
+/// Never returns on success: the process becomes the sandboxed vendor, in a session of its
+/// own or in the launcher's group.
+fn session_leader(words: &[String], leadership: Leadership) -> i32 {
+    let error = tycho::process::exec_session_leader(words, leadership);
     eprintln!("tycho: session-leader: {error}");
-    launcher::EXIT_REFUSED_TO_START
+    match error {
+        TrampolineError::Sandbox(_) => tycho::sandbox::EXIT_SANDBOX_REFUSED,
+        TrampolineError::Usage(_) | TrampolineError::Exec(_) => launcher::EXIT_REFUSED_TO_START,
+    }
 }
 
 fn replay(spool: &str) -> i32 {

@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::process::{Exit, run_bounded};
 use crate::sarif::{self, Finding, Rule};
 
-const CLIPPY_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const CLIPPY_TIMEOUT: Duration = Duration::from_hours(1);
 const FINDINGS_MAX: usize = 2000;
 const RENDERED_MAX: usize = 40;
 

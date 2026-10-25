@@ -46,6 +46,9 @@ pub use crate::launch_spec::{
 };
 use crate::process::{now_unix_ms, send};
 use crate::relay::{relay_dir, relay_once};
+use crate::sandbox::{EXIT_SANDBOX_REFUSED, PLAN_ENV, SANDBOX_REFUSED, SandboxVendor};
+use crate::session_proxy::SessionProxy;
+use crate::session_sandbox::{self, SessionPaths};
 use crate::spool::{
     Ack, Delivery, HeartbeatSend, Ingress, SPOOL_FILE, SPOOL_SCHEMA_VERSION, SpoolRecord,
     spool_then_deliver, write_spool,
@@ -70,6 +73,8 @@ pub const EXIT_REFUSED_TO_START: i32 = 2;
 pub const CREDENTIAL_UNAVAILABLE: &str = "vendor_credential_unavailable";
 /// The per-session Codex home under the session's private spool directory.
 pub const CODEX_HOME_DIR: &str = "codex-home";
+/// The session's directory the vendor may write, under its spool directory.
+pub const VENDOR_FILES_DIR: &str = "vendor";
 /// What removing a Codex home may walk: Codex keeps logs and session files beside `auth.json`.
 const CODEX_HOME_BOUNDS: Bounds = Bounds {
     depth: 8,
@@ -82,6 +87,9 @@ pub struct SessionFiles {
     pub lease: PathBuf,
     pub sequence: PathBuf,
     pub spool_dir: PathBuf,
+    /// The one directory of the session the vendor's sandbox may write: its result and
+    /// progress, and what the worker keeps beside them.
+    pub vendor_files: PathBuf,
     pub spool: PathBuf,
     pub result: PathBuf,
     pub progress: PathBuf,
@@ -95,12 +103,14 @@ impl SessionFiles {
     #[must_use]
     pub fn new(dirs: &AgentDirs, session: &SessionName) -> Self {
         let spool_dir = dirs.spool_dir(session);
+        let vendor_files = spool_dir.join(VENDOR_FILES_DIR);
         Self {
             lease: dirs.lease_path(session),
             sequence: dirs.sequence_path(session),
             spool: spool_dir.join(SPOOL_FILE),
-            result: spool_dir.join("result.json"),
-            progress: spool_dir.join("progress.json"),
+            result: vendor_files.join("result.json"),
+            progress: vendor_files.join("progress.json"),
+            vendor_files,
             stdout: spool_dir.join("stdout.log"),
             stderr: spool_dir.join("stderr.log"),
             log: spool_dir.join("launcher.log"),
@@ -264,23 +274,38 @@ impl fmt::Display for LaunchEnd {
     }
 }
 
-/// The vendor as the leader of its own session through `tycho session-leader`, or, without
-/// the trampoline, in its own process group; either way its group id is its pid.
-fn vendor_command(session_leader: Option<&Path>, program: &str, arguments: &[String]) -> Command {
-    session_leader.map_or_else(
-        || {
+/// The vendor through the sandboxing trampoline: as the leader of its own session for a
+/// headless vendor (`tycho session-leader`), or in its own process group for an interactive
+/// one, which keeps the pty (`tycho group-leader`). Without the trampoline, in tests only,
+/// it runs unsandboxed in its own process group. Its group id is its pid in every case.
+fn vendor_command(
+    session_leader: Option<&Path>,
+    terminal: VendorTerminal,
+    program: &str,
+    arguments: &[String],
+) -> Command {
+    match (session_leader, terminal) {
+        (None, _) => {
             let mut command = Command::new(program);
             command.args(arguments).process_group(0);
             command
-        },
-        |tycho| {
+        }
+        (Some(tycho), VendorTerminal::Files) => {
             let mut command = Command::new(tycho);
             command
                 .args(["session-leader", "--", program])
                 .args(arguments);
             command
-        },
-    )
+        }
+        (Some(tycho), VendorTerminal::Inherit) => {
+            let mut command = Command::new(tycho);
+            command
+                .args(["group-leader", "--", program])
+                .args(arguments)
+                .process_group(0);
+            command
+        }
+    }
 }
 
 /// The running launcher: its settings, files, lease and the ingress it reports to.
@@ -296,6 +321,8 @@ struct Run<'a, I: Ingress> {
     credential: Option<Result<Credential, String>>,
     /// The Codex home made for this session, removed when the vendor stops.
     codex_home: Option<PathBuf>,
+    /// The session's proxy, stopped when the vendor stops.
+    proxy: Option<SessionProxy>,
 }
 
 /// Asks the core for the session's credential when the spec names a hand-off socket.
@@ -363,7 +390,8 @@ pub fn launch_with_stop(
     // The core keeps the hand-off open until the lease appears, so the request comes first.
     let credential = fetch_credential(settings);
     let lease = write_first_lease(settings, &files)?;
-    let spool_ready = ensure_private_dir(&files.spool_dir);
+    let spool_ready =
+        ensure_private_dir(&files.spool_dir).and_then(|()| ensure_private_dir(&files.vendor_files));
     let mut run = Run {
         settings,
         log: LaunchLog::open(&files.log),
@@ -373,6 +401,7 @@ pub fn launch_with_stop(
         spooled: false,
         credential,
         codex_home: None,
+        proxy: None,
     };
     let decoded = match spool_ready
         .map_err(|error| error.to_string())
@@ -410,13 +439,32 @@ impl<I: Ingress> Run<'_, I> {
                 };
             }
         };
-        let (end, stop) = match self.start_vendor(vendor, credential) {
+        let sandbox = match self.prepare_sandbox() {
+            Ok(sandbox) => sandbox,
+            Err(reason) => {
+                self.remove_codex_home();
+                self.log
+                    .line(&format!("sandbox refused, vendor not started: {reason}"));
+                return Decoded {
+                    state: ExitState::from_wire(SANDBOX_REFUSED),
+                    envelope: None,
+                };
+            }
+        };
+        let (end, stop) = match self.start_vendor(vendor, credential, sandbox) {
             Ok(mut child) => self.supervise(&mut child, stop_flag),
             Err(error) => {
                 self.log.line(&format!("vendor did not start: {error}"));
                 (ChildEnd::NotStarted, Stop::None)
             }
         };
+        if end == ChildEnd::Exited(EXIT_SANDBOX_REFUSED) {
+            self.log.line(&format!(
+                "the session leader exited {EXIT_SANDBOX_REFUSED}: it could not apply the \
+                 sandbox, and its reason is in stderr.log"
+            ));
+        }
+        self.stop_proxy();
         self.remove_codex_home();
         self.log
             .line(&format!("vendor ended: {end:?}, stop: {stop:?}"));
@@ -465,6 +513,48 @@ impl<I: Ingress> Run<'_, I> {
         }
     }
 
+    /// Starts the session's proxy and writes the leader's plan, when the vendor runs through
+    /// the trampoline; `None` without one, in tests only. The proxy variables and the plan
+    /// carry the proxy's session token and are never logged.
+    fn prepare_sandbox(&mut self) -> Result<Option<Vec<(String, String)>>, String> {
+        if self.settings.session_leader.is_none() {
+            return Ok(None);
+        }
+        let session = &self.settings.env.session_name;
+        let vendor = SandboxVendor::for_session(session.vendor())
+            .ok_or_else(|| format!("no sandbox for a {} session", session.vendor().as_str()))?;
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set".to_string())?;
+        let paths = SessionPaths {
+            vendor,
+            home: &home,
+            vendor_files: &self.files.vendor_files,
+            codex_home: self.codex_home.as_deref(),
+            spec_grants: &self.settings.grants,
+            ports: self.settings.ports,
+            uid: current_uid(),
+        };
+        let prepared = session_sandbox::prepare(&paths).map_err(|error| error.to_string())?;
+        let mut environment = prepared.proxy.child_environment();
+        environment.push((PLAN_ENV.to_string(), prepared.plan));
+        self.log.line(&format!(
+            "proxy on 127.0.0.1:{}, vendor environment adds {}",
+            prepared.proxy.port(),
+            prepared.proxy.child_environment_names().join(" ")
+        ));
+        self.proxy = Some(prepared.proxy);
+        Ok(Some(environment))
+    }
+
+    /// Stops the proxy and logs what it allowed and refused.
+    fn stop_proxy(&mut self) {
+        if let Some(proxy) = self.proxy.take() {
+            let record = proxy.stop();
+            self.log.line(&format!("proxy: {record}"));
+        }
+    }
+
     /// Zeroes and removes the session's `auth.json`, then the Codex home, never through a link.
     fn remove_codex_home(&mut self) {
         let Some(home) = self.codex_home.take() else {
@@ -501,6 +591,7 @@ impl<I: Ingress> Run<'_, I> {
         &mut self,
         vendor: &[String],
         credential: Vec<(String, String)>,
+        sandbox: Option<Vec<(String, String)>>,
     ) -> io::Result<Child> {
         let (program, arguments) = vendor
             .split_first()
@@ -509,13 +600,13 @@ impl<I: Ingress> Run<'_, I> {
             .settings
             .vendor_environment(&self.files.progress, &self.files.result);
         environment.extend(credential);
-        // An interactive vendor keeps the pty as its controlling terminal, which a new
-        // session would drop, so it runs in its own process group instead.
-        let leader = match self.settings.terminal {
-            VendorTerminal::Files => self.settings.session_leader.as_deref(),
-            VendorTerminal::Inherit => None,
-        };
-        let mut command = vendor_command(leader, program, arguments);
+        environment.extend(sandbox.into_iter().flatten());
+        let mut command = vendor_command(
+            self.settings.session_leader.as_deref(),
+            self.settings.terminal,
+            program,
+            arguments,
+        );
         command.env_clear().envs(environment);
         if let Some(dir) = &self.settings.vendor_dir {
             command.current_dir(dir);
@@ -874,7 +965,7 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(keys, vec!["context_tokens", "secret", "sequence", "status"]);
+        assert_eq!(keys, vec!["secret", "sequence", "status", "context_tokens"]);
         assert!(!format!("{body:?}").contains(SECRET));
         let back: HeartbeatCall = serde_json::from_value(value).unwrap();
         assert_eq!(back, body);
@@ -993,9 +1084,14 @@ mod tests {
         let dir = scratch("last-beat");
         let settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
         let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
-        let script = r#"sleep 0.3; printf '{"context_tokens":33390}' > "$TYCHO_PROGRESS_FILE"; printf '{"state":"failed","envelope":null}' > "$TYCHO_RESULT_FILE""#;
+        // The vendor ends only once the supervise loop's first heartbeat has taken its
+        // sequence number, so the beat after the exit is the second whatever the spawn costs.
+        let script = r#"i=0; while [ ! -f "$1" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; printf '{"context_tokens":33390}' > "$TYCHO_PROGRESS_FILE"; printf '{"state":"failed","envelope":null}' > "$TYCHO_RESULT_FILE""#;
         let recorder = recorder(&files);
-        let end = launch(&settings, &sh(script), &recorder).unwrap();
+        let mut vendor = sh(script);
+        vendor.push("vendor".to_string());
+        vendor.push(files.sequence.display().to_string());
+        let end = launch(&settings, &vendor, &recorder).unwrap();
         assert_eq!(end.state, "failed");
         let events = recorder.events.borrow();
         let beats = events
@@ -1031,7 +1127,7 @@ mod tests {
     }
 
     #[test]
-    fn the_vendor_runs_through_the_session_trampoline() {
+    fn every_vendor_runs_through_a_sandboxing_trampoline_in_its_terminal_mode() {
         let words = |command: &Command| {
             std::iter::once(command.get_program())
                 .chain(command.get_args())
@@ -1040,13 +1136,24 @@ mod tests {
                 .join(" ")
         };
         let arguments = ["-c".to_string(), "true".to_string()];
-        let through = vendor_command(Some(Path::new("/opt/tycho")), "/bin/sh", &arguments);
+        let tycho = Some(Path::new("/opt/tycho"));
+        let headless = vendor_command(tycho, VendorTerminal::Files, "/bin/sh", &arguments);
         assert_eq!(
-            words(&through),
+            words(&headless),
             "/opt/tycho session-leader -- /bin/sh -c true"
         );
+        let interactive = vendor_command(tycho, VendorTerminal::Inherit, "/bin/sh", &arguments);
         assert_eq!(
-            words(&vendor_command(None, "/bin/sh", &arguments)),
+            words(&interactive),
+            "/opt/tycho group-leader -- /bin/sh -c true"
+        );
+        assert_eq!(
+            words(&vendor_command(
+                None,
+                VendorTerminal::Files,
+                "/bin/sh",
+                &arguments
+            )),
             "/bin/sh -c true"
         );
     }
@@ -1147,6 +1254,28 @@ mod tests {
             recorder.events.borrow().last().map(String::as_str),
             Some("deliver sign_1abc failed spooled=true")
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The trampoline's refusal reaches the core as the inbox state, not as a failure to retry.
+    #[test]
+    fn a_trampoline_that_refused_its_sandbox_rejects_with_the_inbox_state() {
+        let dir = scratch("sandbox-refused");
+        let settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
+        let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
+        let recorder = recorder(&files);
+        let vendor = sh(&format!("exit {EXIT_SANDBOX_REFUSED}"));
+        let end = launch(&settings, &vendor, &recorder).unwrap();
+        let state = ExitState::from_wire(&end.state);
+        assert_eq!(
+            state,
+            ExitState::from_wire(SANDBOX_REFUSED),
+            "{}",
+            end.state
+        );
+        assert_eq!(state.disposition(), tycho_types::exit::Disposition::Inbox);
+        let log = fs::read_to_string(&files.log).unwrap();
+        assert!(log.contains("could not apply the sandbox"), "{log}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

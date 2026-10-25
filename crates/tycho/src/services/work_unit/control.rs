@@ -16,7 +16,7 @@ use crate::services::session::{
 };
 use crate::services::spawner::SpawnTerminal;
 use crate::services::{CODE_BAD_REQUEST, CODE_CONFLICT, CODE_INTERNAL, secret};
-use crate::spawn::CLAUDE_SANDBOX_SETTINGS;
+use crate::spawn::CLAUDE_SANDBOX_OFF;
 use crate::vendors::control::{ControlLaunch, PermissionMode, SessionVendor, VendorSessionId};
 
 /// How the unit's control session runs; it is instructed with the packet before dispatch.
@@ -94,7 +94,7 @@ async fn spawn_request(
         model: start.model.to_string(),
         effort: start.effort,
         permission: start.permission,
-        sandbox_settings: CLAUDE_SANDBOX_SETTINGS.to_string(),
+        sandbox_settings: CLAUDE_SANDBOX_OFF.to_string(),
         working_dir: start.working_dir.clone(),
         resume: false,
     };
@@ -166,7 +166,7 @@ mod tests {
             model: "haiku".to_string(),
             effort: Effort::Low,
             permission: PermissionMode::DontAsk,
-            sandbox_settings: CLAUDE_SANDBOX_SETTINGS.to_string(),
+            sandbox_settings: CLAUDE_SANDBOX_OFF.to_string(),
             working_dir: AbsolutePath::parse("/Users/agent/control/cf7a-wu03").unwrap(),
             resume: false,
         }

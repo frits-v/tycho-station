@@ -17,6 +17,7 @@ use crate::config::{AGENT_DIR_ENV, AgentDirs, CorePorts, MISE_PREFIX_ENV, ZMX_EN
 use crate::config_store::{PORT_OFFSET_ENV, PortOffset, PortOffsetError};
 use crate::credential_handoff::CREDENTIAL_SOCKET_ENV;
 use crate::launch_probe::LAUNCH_PROBE_SERVICE;
+use crate::sandbox::{Grant, PLAN_GRANTS_MAX};
 
 pub const HEARTBEAT_TARGET_ENV: &str = "TYCHO_HEARTBEAT_TARGET";
 pub const CORE_UID_ENV: &str = "TYCHO_CORE_UID";
@@ -29,14 +30,20 @@ pub const VENDOR_ARGS_MAX: usize = 64;
 pub const VENDOR_ARG_MAX_BYTES: usize = 4096;
 pub const SPEC_FILE_MAX_BYTES: usize = 65_536;
 pub const SPEC_ENV_MAX: usize = 64;
-pub const SPEC_SCHEMA_VERSION: u32 = 1;
-pub const WALL_CLOCK_MAX: Duration = Duration::from_secs(86_400);
+pub const SPEC_SCHEMA_VERSION: u32 = 2;
+pub const WALL_CLOCK_MAX: Duration = Duration::from_hours(24);
 pub const OUTPUT_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
-/// Telemetry off in every agent environment. Claude Code documents the first three; the two
-/// entire variables are names found in the pinned entire binary.
-pub const AGENT_TELEMETRY_ENV: [(&str, &str); 5] = [
+/// Telemetry, error reporting and update checks off in every agent environment.
+///
+/// Claude Code documents the first six; the two entire variables are names found in the
+/// pinned entire binary. Whatever still tries a host off the vendor's allowlist is refused at
+/// the proxy.
+pub const AGENT_TELEMETRY_ENV: [(&str, &str); 8] = [
     ("DISABLE_TELEMETRY", "1"),
+    ("DISABLE_ERROR_REPORTING", "1"),
+    ("DISABLE_AUTOUPDATER", "1"),
     ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+    ("CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL", "1"),
     ("DO_NOT_TRACK", "1"),
     ("ENTIRE_TELEMETRY_OPTOUT", "1"),
     ("ENTIRE_NO_AUTO_UPDATE", "1"),
@@ -185,6 +192,9 @@ pub struct LauncherSettings {
     pub session_leader: Option<PathBuf>,
     /// The core's hand-off socket for this session's vendor credential, from the spec.
     pub credential_socket: Option<PathBuf>,
+    /// The session's own paths in the vendor's sandbox (worktree, tool installs, brief), from
+    /// the spec; the launcher adds its session files, the vendor's state and the proxy.
+    pub grants: Vec<Grant>,
 }
 
 /// A tier is 1 to 32 bytes of letters, digits, `.`, `_` and `-`.
@@ -273,6 +283,7 @@ impl LauncherSettings {
             output_max_bytes: OUTPUT_FILE_MAX_BYTES,
             session_leader: None,
             credential_socket,
+            grants: Vec::new(),
         })
     }
 
@@ -323,6 +334,7 @@ pub struct LaunchSpec {
     pub schema_version: u32,
     pub environment: BTreeMap<String, String>,
     pub vendor: Vec<String>,
+    pub grants: Vec<Grant>,
 }
 
 impl fmt::Debug for LaunchSpec {
@@ -331,6 +343,7 @@ impl fmt::Debug for LaunchSpec {
             .debug_struct("LaunchSpec")
             .field("environment", &self.environment.keys().collect::<Vec<_>>())
             .field("vendor", &self.vendor)
+            .field("grants", &self.grants)
             .finish_non_exhaustive()
     }
 }
@@ -358,7 +371,25 @@ impl LaunchSpec {
             )));
         }
         check_vendor(&self.vendor)?;
-        LauncherSettings::from_map(&self.environment)
+        if self.grants.len() > PLAN_GRANTS_MAX {
+            return Err(SettingsError::Spec(format!(
+                "{} sandbox grants; maximum is {PLAN_GRANTS_MAX}",
+                self.grants.len()
+            )));
+        }
+        if let Some(grant) = self
+            .grants
+            .iter()
+            .find(|grant| crate::sandbox::check_path(&grant.path).is_err())
+        {
+            return Err(SettingsError::Spec(format!(
+                "sandbox grant {} is not a plain absolute path",
+                grant.path.display()
+            )));
+        }
+        let mut settings = LauncherSettings::from_map(&self.environment)?;
+        settings.grants.clone_from(&self.grants);
+        Ok(settings)
     }
 }
 
@@ -472,6 +503,10 @@ pub mod tests {
             schema_version: SPEC_SCHEMA_VERSION,
             environment: environment(dir),
             vendor: vec!["/bin/true".to_string()],
+            grants: vec![Grant {
+                path: dir.to_path_buf(),
+                access: crate::sandbox::Access::ReadWrite,
+            }],
         }
     }
 
@@ -566,6 +601,9 @@ pub mod tests {
         names.sort_unstable();
         let mut expected = vec![
             "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+            "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL",
+            "DISABLE_AUTOUPDATER",
+            "DISABLE_ERROR_REPORTING",
             "DISABLE_TELEMETRY",
             "DO_NOT_TRACK",
             "ENTIRE_NO_AUTO_UPDATE",
@@ -652,8 +690,9 @@ pub mod tests {
             Err(SettingsError::Spec(_))
         ));
         fs::write(&path, serde_json::to_vec(&spec(&dir)).unwrap()).unwrap();
-        let (_, vendor) = take_spec(&path, current_uid()).unwrap();
+        let (settings, vendor) = take_spec(&path, current_uid()).unwrap();
         assert_eq!(vendor, spec(&dir).vendor);
+        assert_eq!(settings.grants, spec(&dir).grants);
         assert!(!path.exists(), "the spec outlived its read");
         assert!(!format!("{:?}", spec(&dir)).contains(SECRET));
         let mut wide = spec(&dir);
@@ -662,10 +701,23 @@ pub mod tests {
                 .insert(format!("EXTRA_{index}"), "x".to_string());
         }
         let mut versioned = spec(&dir);
-        versioned.schema_version = 2;
+        versioned.schema_version = SPEC_SCHEMA_VERSION + 1;
+        let mut older = spec(&dir);
+        older.schema_version = SPEC_SCHEMA_VERSION - 1;
         let mut no_vendor = spec(&dir);
         no_vendor.vendor.clear();
-        for refused in [wide, versioned, no_vendor] {
+        let mut many_grants = spec(&dir);
+        many_grants.grants = vec![many_grants.grants[0].clone(); PLAN_GRANTS_MAX + 1];
+        let mut relative_grant = spec(&dir);
+        relative_grant.grants[0].path = PathBuf::from("worktree");
+        for refused in [
+            wide,
+            versioned,
+            older,
+            no_vendor,
+            many_grants,
+            relative_grant,
+        ] {
             fs::write(&path, serde_json::to_vec(&refused).unwrap()).unwrap();
             assert!(take_spec(&path, current_uid()).is_err());
             assert!(!path.exists(), "a refused spec is zeroed and removed");

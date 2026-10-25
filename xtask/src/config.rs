@@ -17,7 +17,14 @@ const EXPORT_DIR: &str = "config/export";
 const SCHEMA_EXPORT_SUBDIR: &str = "schema";
 const SCHEMAS_DIR: &str = "schemas";
 const CHECK_DIR: &str = "target/check-config";
-const VALUES: [&str; 5] = ["adapters", "mandate", "petitions", "routing", "thresholds"];
+const VALUES: [&str; 6] = [
+    "adapters",
+    "mandate",
+    "petitions",
+    "routing",
+    "sandbox",
+    "thresholds",
+];
 const SCHEMAS: [(&str, &str); 6] = [
     ("envelope", "#Envelope"),
     ("task_packet", "#TaskPacketPayload"),
@@ -26,7 +33,7 @@ const SCHEMAS: [(&str, &str); 6] = [
     ("review_findings", "#ReviewFindings"),
     ("review_verdict", "#ReviewVerdict"),
 ];
-const CUE_TIMEOUT: Duration = Duration::from_secs(120);
+const CUE_TIMEOUT: Duration = Duration::from_mins(2);
 const EXPORT_DIR_MAX_FILES: usize = 256;
 const EXPORT_DIR_MAX_DEPTH: usize = 4;
 const SCHEMA_SOURCES_MAX: usize = 64;

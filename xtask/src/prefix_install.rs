@@ -50,12 +50,12 @@ const REDIRECTS_MAX: usize = 3;
 const MISE_BINARY_MAX_BYTES: u64 = 256 << 20;
 const SUMS_MAX_BYTES: u64 = 64 << 10;
 const SUMS_LINES_MAX: usize = 256;
-const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 const USER_AGENT: &str = "tycho-xtask";
 /// A mise install downloads every agent tool; claude and codex are about 100 MB each.
-const INSTALL_TIMEOUT: Duration = Duration::from_secs(1800);
+const INSTALL_TIMEOUT: Duration = Duration::from_mins(30);
 /// A cold release build of the workspace.
-const BUILD_TIMEOUT: Duration = Duration::from_secs(3600);
+const BUILD_TIMEOUT: Duration = Duration::from_hours(1);
 const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONFIG_MODE: u32 = 0o644;
 const BINARY_MODE: u32 = 0o755;
