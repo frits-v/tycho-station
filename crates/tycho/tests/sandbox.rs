@@ -219,8 +219,8 @@ fn a_state_file_and_its_siblings_are_writable_and_nothing_else_beside_them() {
     let script = r#"
 cd "$1" || exit 9
 w() { if (echo x > "$1") 2>/dev/null; then echo "$1=written"; else echo "$1=refused"; fi; }
-w .claude.json.tmp
-if mv .claude.json.tmp .claude.json 2>/dev/null; then echo rename=done; else echo rename=refused; fi
+w .claude.json.saving
+if mv .claude.json.saving .claude.json 2>/dev/null; then echo rename=done; else echo rename=refused; fi
 w .claude.jsonx
 w .claude.json.d/inner
 w other.json
@@ -231,7 +231,7 @@ w other.json
     assert_eq!(
         stdout.lines().collect::<Vec<_>>(),
         [
-            ".claude.json.tmp=written",
+            ".claude.json.saving=written",
             "rename=done",
             ".claude.jsonx=refused",
             ".claude.json.d/inner=refused",
