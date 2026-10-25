@@ -296,7 +296,7 @@ pub fn launch_spec(request: &SpawnRequest<'_>) -> Result<LaunchSpec, SpawnerErro
         schema_version: SPEC_SCHEMA_VERSION,
         environment,
         vendor: request.vendor.to_vec(),
-        grants: sandbox_grants(request),
+        grants: sandbox_grants(request)?,
     };
     spec.settings()
         .map_err(|error| SpawnerError::Refused(error.to_string()))?;
@@ -328,12 +328,33 @@ fn executable_grants(executable: &Path, install_dir: Option<&Path>) -> Vec<Grant
         .collect()
 }
 
+/// The arguments of a worker command: a vendor command that runs the prefix's `tycho` or
+/// names the worker command is one, and arguments that do not parse are a refusal, never a
+/// session without its worktree; any other command is not a worker's.
+fn worker_args(request: &SpawnRequest<'_>) -> Result<Option<WorkerArgs>, SpawnerError> {
+    let Some((program, rest)) = request.vendor.split_first() else {
+        return Ok(None);
+    };
+    let command = rest.first().map(String::as_str);
+    let runs_tycho = Path::new(program) == request.tool_prefix.tycho();
+    if !runs_tycho && command != Some(WORKER_COMMAND) {
+        return Ok(None);
+    }
+    if command != Some(WORKER_COMMAND) {
+        return Err(SpawnerError::Refused(format!(
+            "{program} runs as a vendor only as {WORKER_COMMAND}, not {command:?}"
+        )));
+    }
+    WorkerArgs::parse(rest.get(1..).unwrap_or_default())
+        .map(Some)
+        .map_err(|error| SpawnerError::Refused(format!("the worker's arguments: {error}")))
+}
+
 /// The session's own paths in the vendor's sandbox; the launcher adds the rest.
 ///
 /// The prefix's `tycho` and the session vendor's install to read, a worker's brief and
 /// binary to read, and its worktree or the vendor's working directory to read and write.
-#[must_use]
-pub fn sandbox_grants(request: &SpawnRequest<'_>) -> Vec<Grant> {
+pub fn sandbox_grants(request: &SpawnRequest<'_>) -> Result<Vec<Grant>, SpawnerError> {
     let prefix = request.tool_prefix;
     let mut grants = vec![grant(&prefix.tycho(), Access::Read)];
     grants.extend(link_target_grant(&prefix.tycho()));
@@ -347,12 +368,7 @@ pub fn sandbox_grants(request: &SpawnRequest<'_>) -> Vec<Grant> {
     if let Some(dir) = request.vendor_dir {
         grants.push(grant(dir, Access::ReadWrite));
     }
-    let worker = request
-        .vendor
-        .split_first()
-        .filter(|(_, rest)| rest.first().map(String::as_str) == Some(WORKER_COMMAND))
-        .and_then(|(_, rest)| WorkerArgs::parse(rest.get(1..).unwrap_or_default()).ok());
-    if let Some(args) = worker {
+    if let Some(args) = worker_args(request)? {
         grants.push(grant(&args.worktree, Access::ReadWrite));
         grants.push(grant(&args.brief, Access::Read));
         grants.extend(executable_grants(&args.binary, None));
@@ -365,7 +381,7 @@ pub fn sandbox_grants(request: &SpawnRequest<'_>) -> Vec<Grant> {
         }
         fresh
     });
-    grants
+    Ok(grants)
 }
 
 /// The words zmx types: `exec env -i HOME PATH MISE_* <tycho> launch --spec <file>`, bounded.
@@ -733,6 +749,158 @@ mod tests {
             ports: CorePorts::PRODUCTION,
             tool_prefix: &PRODUCTION_PREFIX,
             credential: None,
+        }
+    }
+
+    const WORKTREE: &str = "/Users/Shared/tycho-agent-zmx/worktrees/cf7a/wu03/a1";
+    const BRIEF: &str = "/Users/Shared/tycho-agent-zmx/worktrees/cf7a/wu03.brief.md";
+    const CLAUDE_INSTALL: &str = "/Users/Shared/tycho/mise/installs/claude/2.1.280";
+    const PREFIX_TYCHO: &str = "/Users/Shared/tycho/bin/tycho";
+
+    fn read(path: &str) -> Grant {
+        grant(Path::new(path), Access::Read)
+    }
+
+    fn read_write(path: &str) -> Grant {
+        grant(Path::new(path), Access::ReadWrite)
+    }
+
+    /// The worker command the run builds for the prefix's Claude, as `WorkerArgs::to_argv`
+    /// writes it.
+    fn worker_argv() -> Vec<String> {
+        crate::vendors::worker::WorkerArgs {
+            vendor: tycho_types::session::Vendor::Claude,
+            binary: PRODUCTION_PREFIX.tool("claude").unwrap().to_path_buf(),
+            brief: PathBuf::from(BRIEF),
+            worktree: PathBuf::from(WORKTREE),
+            model: crate::vendors::worker::ModelName::parse("haiku").unwrap(),
+            effort: tycho_types::task_packet::Effort::Low,
+            max_turns: None,
+            session_id: crate::vendors::worker::VendorSessionId::parse(
+                "3f0c6c1e-6b1a-4a51-9a0e-2a8c5d0c1a10",
+            )
+            .unwrap(),
+            to: SessionName::parse("cf7a.wu03.ctl.claude").unwrap(),
+            branch: tycho_types::envelope::BranchName::parse("wu03/a1").unwrap(),
+            base: tycho_types::envelope::CommitSha::parse(
+                "0123456789abcdef0123456789abcdef01234567",
+            )
+            .unwrap(),
+        }
+        .to_argv(Path::new(PREFIX_TYCHO))
+    }
+
+    /// A worker gets the prefix's `tycho` and its vendor's install to read, its worktree to
+    /// read and write, and its brief to read; nothing else, and each once.
+    #[test]
+    fn a_worker_s_grants_are_its_tycho_install_worktree_and_brief_with_their_modes() {
+        let dirs = AgentDirs::new(PathBuf::from("/Users/Shared/tycho-agent-zmx")).unwrap();
+        let zmx = Zmx::agent(Path::new("/opt/zmx"), &dirs.socket_dir);
+        let env = env();
+        let vendor = worker_argv();
+        let request = shared_request(&dirs, &zmx, &env, &vendor);
+        assert_eq!(
+            sandbox_grants(&request).unwrap(),
+            [
+                read(PREFIX_TYCHO),
+                read(CLAUDE_INSTALL),
+                read_write(WORKTREE),
+                read(BRIEF),
+            ]
+        );
+        assert_eq!(launch_spec(&request).unwrap().grants.len(), 4);
+    }
+
+    /// A control session gets the prefix's `tycho` and its vendor's install to read and its
+    /// working directory to read and write.
+    #[test]
+    fn a_control_session_s_grants_are_its_tycho_install_and_working_directory() {
+        let dirs = AgentDirs::new(PathBuf::from("/Users/Shared/tycho-agent-zmx")).unwrap();
+        let zmx = Zmx::agent(Path::new("/opt/zmx"), &dirs.socket_dir);
+        let env = env();
+        let claude = PRODUCTION_PREFIX
+            .tool("claude")
+            .unwrap()
+            .display()
+            .to_string();
+        let vendor = [claude, "--model".to_string(), "haiku".to_string()];
+        let working = Path::new("/Users/tycho-agent/control/cf7a-wu03");
+        let request = SpawnRequest {
+            vendor_dir: Some(working),
+            terminal: VendorTerminal::Inherit,
+            ..shared_request(&dirs, &zmx, &env, &vendor)
+        };
+        assert_eq!(
+            sandbox_grants(&request).unwrap(),
+            [
+                read(PREFIX_TYCHO),
+                read(CLAUDE_INSTALL),
+                read_write("/Users/tycho-agent/control/cf7a-wu03"),
+            ]
+        );
+    }
+
+    /// A vendor's whole install is granted, not only its executable's directory: Codex keeps
+    /// its executable in `bin` and loads what lies beside that directory.
+    #[test]
+    fn a_codex_session_reads_its_whole_install_not_only_its_bin() {
+        let dirs = AgentDirs::new(PathBuf::from("/Users/Shared/tycho-agent-zmx")).unwrap();
+        let zmx = Zmx::agent(Path::new("/opt/zmx"), &dirs.socket_dir);
+        let env = LauncherEnv::from_map(&BTreeMap::from([
+            (ENV_AWAITABLE_ID.to_string(), "sign_1abc".to_string()),
+            (ENV_SESSION_SECRET.to_string(), SECRET.to_string()),
+            (
+                ENV_SESSION_NAME.to_string(),
+                "cf7a.wu03.wrk.codex.a1f3".to_string(),
+            ),
+        ]))
+        .unwrap();
+        let codex = PRODUCTION_PREFIX
+            .tool("codex")
+            .unwrap()
+            .display()
+            .to_string();
+        let vendor = [codex, "exec".to_string()];
+        let request = shared_request(&dirs, &zmx, &env, &vendor);
+        assert_eq!(
+            sandbox_grants(&request).unwrap(),
+            [
+                read(PREFIX_TYCHO),
+                read("/Users/Shared/tycho/mise/installs/codex/0.160.1"),
+            ]
+        );
+    }
+
+    /// The station binary as a vendor runs only as a worker with arguments that parse; any
+    /// other use is refused, never granted a set without the worktree.
+    #[test]
+    fn a_station_vendor_that_is_not_a_well_formed_worker_is_refused() {
+        let dirs = AgentDirs::new(PathBuf::from("/Users/Shared/tycho-agent-zmx")).unwrap();
+        let zmx = Zmx::agent(Path::new("/opt/zmx"), &dirs.socket_dir);
+        let env = env();
+        let mut missing_worktree = worker_argv();
+        let at = missing_worktree
+            .iter()
+            .position(|word| word == "--worktree")
+            .unwrap();
+        missing_worktree.drain(at..=at + 1);
+        let refused: [Vec<String>; 4] = [
+            vec![PREFIX_TYCHO.to_string(), "session-leader".to_string()],
+            vec![PREFIX_TYCHO.to_string()],
+            missing_worktree,
+            vec![
+                "/opt/elsewhere/tycho".to_string(),
+                WORKER_COMMAND.to_string(),
+                "--vendor".to_string(),
+            ],
+        ];
+        for vendor in &refused {
+            let request = shared_request(&dirs, &zmx, &env, vendor);
+            assert!(
+                matches!(sandbox_grants(&request), Err(SpawnerError::Refused(_))),
+                "{vendor:?}"
+            );
+            assert!(launch_spec(&request).is_err(), "{vendor:?}");
         }
     }
 

@@ -199,6 +199,110 @@ mod tests {
     use super::*;
     use crate::agent_files::current_uid;
 
+    fn scratch(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tycho-plan-{test}-{}", std::process::id()));
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+        for level in ["home", "vendor", "codex-home"] {
+            std::fs::create_dir_all(dir.join(level)).unwrap();
+        }
+        dir
+    }
+
+    fn codex_paths<'a>(
+        codex_home: &'a Path,
+        home: &'a Path,
+        vendor_files: &'a Path,
+    ) -> SessionPaths<'a> {
+        SessionPaths {
+            vendor: SandboxVendor::Codex,
+            home,
+            vendor_files,
+            codex_home: Some(codex_home),
+            spec_grants: &[],
+            ports: CorePorts::PRODUCTION,
+            uid: current_uid(),
+        }
+    }
+
+    /// The session's vendor directory is the one directory of the spool the vendor writes,
+    /// and the git files of a home that has none are stat-able absences, never grants.
+    #[test]
+    fn a_plan_grants_the_vendor_directory_and_names_each_absent_git_file() {
+        let dir = scratch("absent");
+        let (home, vendor_files) = (dir.join("home"), dir.join("vendor"));
+        let codex_home = dir.join("codex-home");
+        let plan = session_plan(&codex_paths(&codex_home, &home, &vendor_files), 40_000).unwrap();
+        assert!(plan.grants.contains(&Grant {
+            path: vendor_files.clone(),
+            access: Access::ReadWrite,
+        }));
+        let absent: Vec<PathBuf> = GIT_CONFIG_FILES
+            .iter()
+            .map(|name| home.join(name))
+            .collect();
+        assert_eq!(plan.absent_paths, absent);
+        assert!(
+            plan.grants
+                .iter()
+                .all(|grant| !grant.path.starts_with(&home)),
+            "{:?}",
+            plan.grants
+        );
+        assert_eq!(plan.proxy_port, 40_000);
+        assert_eq!(plan.core_ports, core_ports(CorePorts::PRODUCTION));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A git file the home has is granted to read and drops out of the absences.
+    #[test]
+    fn a_present_git_file_is_granted_to_read_and_is_no_absence() {
+        let dir = scratch("present");
+        let (home, vendor_files) = (dir.join("home"), dir.join("vendor"));
+        let codex_home = dir.join("codex-home");
+        std::fs::write(home.join(".gitconfig"), "[user]\n").unwrap();
+        let plan = session_plan(&codex_paths(&codex_home, &home, &vendor_files), 40_000).unwrap();
+        assert!(plan.grants.contains(&Grant {
+            path: home.join(".gitconfig"),
+            access: Access::Read,
+        }));
+        assert!(!plan.absent_paths.contains(&home.join(".gitconfig")));
+        assert_eq!(plan.absent_paths.len(), GIT_CONFIG_FILES.len() - 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A Codex session gets its Codex home to read and write and nothing of Claude's: no
+    /// `~/.claude`, cache, state file or inbox socket directory, and none of them is made.
+    #[test]
+    fn a_codex_plan_grants_its_codex_home_and_nothing_of_claude_s() {
+        let dir = scratch("codex");
+        let (home, vendor_files) = (dir.join("home"), dir.join("vendor"));
+        let codex_home = dir.join("codex-home");
+        let plan = session_plan(&codex_paths(&codex_home, &home, &vendor_files), 40_000).unwrap();
+        assert_eq!(
+            plan.grants,
+            [
+                Grant {
+                    path: vendor_files.clone(),
+                    access: Access::ReadWrite,
+                },
+                Grant {
+                    path: codex_home.clone(),
+                    access: Access::ReadWrite,
+                },
+            ]
+        );
+        assert!(plan.state_files.is_empty() && plan.socket_dirs.is_empty());
+        for name in [CLAUDE_CONFIG_DIR_NAME, CLAUDE_CACHE_DIR, CLAUDE_STATE_FILE] {
+            assert!(
+                !home.join(name).exists(),
+                "{name} was made for a Codex session"
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_home_without_its_cache_levels_gets_each_made_and_a_link_among_them_is_refused() {
         let home = std::env::temp_dir().join(format!("tycho-state-{}", std::process::id()));
