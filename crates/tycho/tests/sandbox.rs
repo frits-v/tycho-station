@@ -72,10 +72,6 @@ fn plan(proxy_port: u16, core_port: u16, granted: &Path) -> SandboxPlan {
     }
 }
 
-fn run(plan: Option<&SandboxPlan>, words: &[&str]) -> Output {
-    run_through("session-leader", plan, words)
-}
-
 /// Runs the words through one of the two trampolines the launcher uses.
 fn run_through(trampoline: &str, plan: Option<&SandboxPlan>, words: &[&str]) -> Output {
     let mut command = Command::new(TYCHO);
@@ -226,7 +222,11 @@ w .claude.json.d/inner
 w other.json
 "#;
     let outside = scratch.outside.display().to_string();
-    let output = run(Some(&state), &[BASH, "-c", script, "state", &outside]);
+    let output = run_through(
+        "session-leader",
+        Some(&state),
+        &[BASH, "-c", script, "state", &outside],
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         stdout.lines().collect::<Vec<_>>(),
@@ -261,7 +261,8 @@ fn no_name_resolves_inside_the_sandbox() {
         resolved(&outside),
         "the positive control resolved nothing, so this host cannot tell a refusal"
     );
-    let inside = run(
+    let inside = run_through(
+        "session-leader",
         Some(&plan(40_000, 19_070, &scratch.granted)),
         &[BASH, "-c", lookup],
     );
