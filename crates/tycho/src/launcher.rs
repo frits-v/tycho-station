@@ -645,13 +645,15 @@ impl<I: Ingress> Run<'_, I> {
         Ok(Some(environment))
     }
 
-    /// Stops the proxy, writes its decisions to the session's audit file for the core, and
-    /// logs what it allowed and refused.
+    /// Writes the proxy's decisions to the session's audit file for the core, logs what it
+    /// allowed and refused, then stops it; the file comes first, since at a stop zmx kills
+    /// the launcher half a second after its hangup. Once stopped, the proxy admits nothing, so
+    /// the file holds every decision of the session.
     fn stop_proxy(&mut self) {
         let Some(proxy) = self.proxy.take() else {
             return;
         };
-        let events = proxy.stop_with_events();
+        let events = proxy.drain_events();
         let path = proxy_audit::audit_path(&self.settings.dirs, &self.settings.env.session_name);
         match proxy_audit::write(&path, &events) {
             Ok(lines) => self.log.line(&format!(
@@ -667,6 +669,7 @@ impl<I: Ingress> Run<'_, I> {
             "proxy: {}",
             crate::session_proxy::ProxyRecord::of(&events)
         ));
+        drop(proxy.stop_with_events());
     }
 
     /// Zeroes and removes the session's `auth.json`, then the Codex home, never through a link.
@@ -821,10 +824,12 @@ impl<I: Ingress> Run<'_, I> {
                 }
             }
             if stop_flag.load(Ordering::SeqCst) {
-                // zmx sends SIGKILL half a second after SIGHUP: spool and remove the Codex
-                // home before stopping the vendor, which may take longer than that.
+                // zmx sends SIGKILL half a second after SIGHUP: spool, remove the Codex home
+                // and write the proxy's audit before stopping the vendor, which may take
+                // longer than that.
                 self.spool_early(ExitState::Cancelled);
                 self.remove_codex_home();
+                self.stop_proxy();
                 return (self.terminate(child), Stop::Cancelled);
             }
             if self.output_too_large() {
@@ -1783,6 +1788,39 @@ mod tests {
             dir.join("gone-at-term").exists(),
             "the Codex home was there at SIGTERM"
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// At a stop the proxy's audit is on disk before the vendor is signalled, since zmx kills
+    /// the launcher half a second after its hangup.
+    #[test]
+    fn a_cancelled_session_writes_its_proxy_audit_before_the_vendor_is_stopped() {
+        let dir = scratch("audit-cancel");
+        let settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
+        let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
+        let audit = proxy_audit::audit_path(&settings.dirs, &settings.env.session_name);
+        let script = format!(
+            r#"trap 'test -f "{}" && echo written > "{}"; exit 0' TERM; sleep 30 & wait"#,
+            audit.display(),
+            dir.join("audit-at-term").display()
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&stop);
+        let timer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(700));
+            setter.store(true, Ordering::SeqCst);
+        });
+        let end = launch_with_stop(&settings, &sh(&script), &recorder(&files), Some(stop)).unwrap();
+        timer.join().unwrap();
+        assert_eq!(end.state, "cancelled");
+        assert!(
+            dir.join("audit-at-term").exists(),
+            "the proxy audit was not on disk at SIGTERM"
+        );
+        assert!(matches!(
+            proxy_audit::read(&settings.dirs, &settings.env.session_name, current_uid()),
+            proxy_audit::AuditRead::Read(_)
+        ));
         fs::remove_dir_all(&dir).unwrap();
     }
 
