@@ -140,6 +140,7 @@ pub fn session_plan(
         }
     }
     let mut socket_dirs = Vec::new();
+    let mut state_files = Vec::new();
     match paths.vendor {
         SandboxVendor::Claude => {
             let config = paths.home.join(CLAUDE_CONFIG_DIR_NAME);
@@ -149,10 +150,7 @@ pub fn session_plan(
             }
             grants.push(read_write(config));
             grants.push(read_write(cache));
-            let state = paths.home.join(CLAUDE_STATE_FILE);
-            if state.is_file() {
-                grants.push(read_write(state));
-            }
+            state_files.push(nono::try_canonicalize(paths.home).join(CLAUDE_STATE_FILE));
             socket_dirs = claude_socket_dirs(paths.uid)?;
         }
         SandboxVendor::Codex => {
@@ -167,6 +165,7 @@ pub fn session_plan(
         grants,
         socket_dirs,
         absent_paths,
+        state_files,
     })
 }
 

@@ -37,6 +37,7 @@ fn plan(dir: &Path, proxy_port: u16, ports: CorePorts) -> SandboxPlan {
         ],
         socket_dirs: vec![dir.join("sockets")],
         absent_paths: vec![dir.join("absent/.gitconfig")],
+        state_files: vec![dir.join("home/.claude.json")],
     }
 }
 
@@ -258,16 +259,35 @@ fn a_plan_round_trips_and_one_out_of_bounds_or_with_an_unplain_path_is_refused()
 
 #[cfg(target_os = "macos")]
 #[test]
-fn an_absent_path_becomes_one_metadata_rule_and_nothing_wider() {
+fn an_absent_path_and_a_state_file_become_one_rule_each_and_nothing_wider() {
     let dir = scratch("absent");
     let plan = plan(&dir, 40_000, CorePorts::PRODUCTION);
     let set = capability_set(&plan, &config()).unwrap();
+    let state = dir.join("home/.claude.json").display().to_string();
+    let escaped = state.replace('.', "[.]");
     assert_eq!(
         set.platform_rules(),
-        [format!(
-            "(allow file-read-metadata (literal \"{}\"))",
-            dir.join("absent/.gitconfig").display()
-        )]
+        [
+            format!(
+                "(allow file-read-metadata (literal \"{}\"))",
+                dir.join("absent/.gitconfig").display()
+            ),
+            format!("(allow file-read* file-write* (regex \"^{escaped}([.][^/]+)?$\"))"),
+        ]
     );
     fs::remove_dir_all(&dir).unwrap();
+}
+
+/// The sibling pattern of a state file matches what an atomic save writes and renames, and
+/// nothing beside the file or below it.
+#[test]
+fn a_state_file_rule_covers_its_siblings_and_nothing_else() {
+    let rule = state_file_rule(Path::new("/Users/agent/.claude.json"));
+    assert_eq!(
+        rule,
+        "(allow file-read* file-write* (regex \"^/Users/agent/[.]claude[.]json([.][^/]+)?$\"))"
+    );
+    let mut bracketed = plan(Path::new("/x"), 40_000, CorePorts::PRODUCTION);
+    bracketed.state_files = vec![PathBuf::from("/Users/a[b]/.claude.json")];
+    assert!(matches!(bracketed.to_json(), Err(SandboxError::Path(_))));
 }

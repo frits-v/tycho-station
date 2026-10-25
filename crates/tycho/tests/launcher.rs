@@ -39,7 +39,9 @@ use tycho::launch_probe::{LaunchProbe, REJECTED_PREFIX, RESOLVED_PREFIX};
 use tycho::launcher::{HEARTBEAT_INTERVAL, LEASE_FRESH_MS, SessionFiles, VendorRecord};
 use tycho::launcher::{HeartbeatTarget, VendorTerminal};
 use tycho::process::now_unix_ms;
+use tycho::sandbox::PLAN_ENV;
 use tycho::services::spawner::LeaseRead;
+use tycho::session_proxy::CHILD_ENVIRONMENT_NAMES;
 use tycho::spawn::{SpawnOutcome, SpawnRequest, read_lease, save_scrollback, spawn_session};
 use tycho::spool::ACKNOWLEDGED_SUFFIX;
 use tycho::zmx::{Presence, Zmx, count_named, presence};
@@ -53,10 +55,19 @@ const SECRET: &str = "launcher-test-secret-0123456789abcdef";
 /// The shape of a long-lived Claude token; every session here gets it through the hand-off.
 const TEST_TOKEN: &str = "sk-ant-oat01-launcher-suite-test-credential-0123456789";
 const WAIT_LIMIT: Duration = Duration::from_mins(2);
+/// The fake vendor's directory under the test home: its script, its markers, its working
+/// directory.
+const FIXTURE_DIR: &str = "vendor-fixture";
 const VENDOR_SCRIPT: &str = r#"#!/bin/sh
-# $1 lease path, $2 seconds to run, $3 result file content or empty, $4 marker prefix
-if test -f "$1"; then echo seen > "$4.lease-seen"; fi
+# $1 lease path, $2 seconds to run, $3 result file content or empty, $4 marker prefix,
+# $5 the core's admin port
+# The launcher's lease is outside the vendor's sandbox: the vendor finds it hidden.
+if test -f "$1"; then echo seen > "$4.lease-seen"; else echo hidden > "$4.lease-seen"; fi
 printf '%s' "$TYCHO_TIER" > "$4.tier"
+# The sandbox lets the vendor reach its proxy and none of the core's ports.
+proxy_port="${HTTPS_PROXY##*:}"
+/bin/bash -c 'if (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; then echo open; else echo refused; fi' admin "$5" > "$4.admin"
+/bin/bash -c 'if (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; then echo open; else echo refused; fi' proxy "$proxy_port" > "$4.proxy"
 /usr/bin/env > "$4.env"
 # Under the zmx pty a background group that sets terminal modes is stopped by SIGTTOU.
 if (: < /dev/tty) 2>/dev/null; then stty -ixon < /dev/tty; echo attached > "$4.tty"; else echo detached > "$4.tty"; fi
@@ -137,7 +148,7 @@ impl Harness {
             zmx: Zmx::agent(prefix.tool("zmx").unwrap(), &agent),
             launcher: prefix.tycho(),
             prefix,
-            fixture: home.join("vendor.sh"),
+            fixture: home.join(FIXTURE_DIR).join("vendor.sh"),
             config,
             dirs,
             names: Vec::new(),
@@ -145,6 +156,7 @@ impl Harness {
         };
         assert!(harness.tycho(&["core", "start"]).status.success());
         harness.probe_endpoint = Some(start_probe_endpoint(harness.config.ports));
+        fs::create_dir(home.join(FIXTURE_DIR)).unwrap();
         fs::write(&harness.fixture, VENDOR_SCRIPT).unwrap();
         harness
     }
@@ -176,9 +188,14 @@ impl Harness {
         name
     }
 
-    /// Where the fake vendor leaves its markers, in the test home rather than the spool.
+    /// Where the fake vendor leaves its markers: its working directory, the one directory of
+    /// the test home its sandbox grants, rather than the spool.
     fn marker(&self, name: &SessionName, suffix: &str) -> PathBuf {
-        self.config.home.join(format!("{name}{suffix}"))
+        self.fixture_dir().join(format!("{name}{suffix}"))
+    }
+
+    fn fixture_dir(&self) -> PathBuf {
+        self.config.home.join(FIXTURE_DIR)
     }
 
     fn files(&self, name: &SessionName) -> SessionFiles {
@@ -205,8 +222,10 @@ impl Harness {
             seconds.to_string(),
             result.to_string(),
             self.marker(name, "").display().to_string(),
+            self.config.ports.admin().port().to_string(),
         ];
         let home = PathBuf::from(env::var_os("HOME").unwrap());
+        let fixture_dir = self.fixture_dir();
         let outcome = spawn_session(&SpawnRequest {
             zmx: &self.zmx,
             dirs: &self.dirs,
@@ -218,7 +237,7 @@ impl Harness {
             agent_uid: current_uid(),
             tier: Some("t1"),
             terminal: VendorTerminal::Files,
-            vendor_dir: None,
+            vendor_dir: Some(&fixture_dir),
             ports: self.config.ports,
             tool_prefix: &self.prefix,
             credential: Some(&self.credential),
@@ -484,6 +503,31 @@ fn assert_vendor_saw_only_its_allowlist(harness: &Harness, name: &SessionName, a
     );
     assert!(!vendor_env.contains("TYCHO_CREDENTIAL_SOCKET"));
     println!("evidence: the vendor's environment holds {CLAUDE_TOKEN_ENV} from the hand-off");
+    for name in CHILD_ENVIRONMENT_NAMES {
+        assert!(
+            vendor_env
+                .lines()
+                .any(|line| line.starts_with(&format!("{name}="))),
+            "the vendor has no {name}"
+        );
+    }
+    assert!(
+        !vendor_env.contains(&format!("{PLAN_ENV}=")),
+        "the sandbox plan reached the vendor"
+    );
+    let admin = fs::read_to_string(harness.marker(name, ".admin")).unwrap();
+    let proxy = fs::read_to_string(harness.marker(name, ".proxy")).unwrap();
+    println!(
+        "evidence: from inside the session the core's admin port is {}, the proxy {}",
+        admin.trim(),
+        proxy.trim()
+    );
+    assert_eq!(
+        admin.trim(),
+        "refused",
+        "the vendor reached the core's admin port"
+    );
+    assert_eq!(proxy.trim(), "open", "the vendor could not reach its proxy");
 }
 
 /// The test token is in no file under the agent directory, the saved scrollback, `zmx list`
@@ -581,9 +625,15 @@ fn launch_spools_resolves_and_ends_its_session() {
         "the launcher did not start from the prefix: {}",
         launcher.command
     );
-    wait_until("vendor saw the lease before it ran", WAIT_LIMIT, || {
-        harness.marker(&name, ".lease-seen").exists().then_some(())
+    let lease_seen = wait_until("the vendor looked for the lease", WAIT_LIMIT, || {
+        fs::read_to_string(harness.marker(&name, ".lease-seen")).ok()
     });
+    assert_eq!(
+        lease_seen.trim(),
+        "hidden",
+        "the vendor's sandbox let it see the launcher's lease"
+    );
+    assert_lease_before_vendor(&harness, &name);
     assert_vendor_saw_only_its_allowlist(&harness, &name, &awaitable);
     assert_token_nowhere(&harness, &name, pid);
     let terminal = fs::read_to_string(harness.marker(&name, ".tty")).unwrap();
@@ -617,6 +667,22 @@ fn launch_spools_resolves_and_ends_its_session() {
         "{again:?}"
     );
     assert_eq!(harness.sessions_named(&name), 0);
+}
+
+/// The lease was written before the vendor started: its start time precedes the vendor
+/// record's, both taken by the launcher.
+fn assert_lease_before_vendor(harness: &Harness, name: &SessionName) {
+    let LeaseRead::Present { lease } = read_lease(&harness.dirs, name, current_uid()) else {
+        panic!("no lease");
+    };
+    let record: VendorRecord =
+        serde_json::from_slice(&fs::read(&harness.files(name).vendor).unwrap()).unwrap();
+    println!(
+        "evidence: lease started {} ms, vendor started {} ms",
+        lease.started_unix_ms(),
+        record.started_unix_ms
+    );
+    assert!(lease.started_unix_ms() <= record.started_unix_ms);
 }
 
 /// A heartbeat interval later the lease has not moved and is stale against that interval.

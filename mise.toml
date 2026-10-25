@@ -102,6 +102,10 @@ run = "cargo test -p tycho --test worker -- --ignored --test-threads=1 --nocaptu
 description = "Spawn real interactive claude control sessions under zmx through the launcher, instruct them over the inbox socket from a handler step, then stall, kill and resume them; run it alone, never beside the worker suite, since both use the vendor seat (macOS, uses the developer's claude login)"
 run = "cargo test -p tycho --test control -- --ignored --test-threads=1 --nocapture"
 
+[tasks.vendor-sandbox-tests]
+description = "Probe the pinned claude under the station's sandbox, proxy and trampoline: which settings layer decides Claude's own sandbox, and whether it saves its configuration; uses the core's Claude token and the vendor seat, so never beside the worker or control suite (macOS)"
+run = "cargo test -p tycho --test vendor_sandbox -- --ignored --test-threads=1 --nocapture"
+
 [tasks.chaos-tests]
 description = "Run a work unit through the operator while the terminal app, the restate server, the endpoint and the launcher are killed; record the slice zero baselines (macOS)"
 run = "cargo test -p tycho --test chaos -- --ignored --test-threads=1 --nocapture"

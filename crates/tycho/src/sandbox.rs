@@ -261,6 +261,9 @@ pub struct SandboxPlan {
     /// Absent paths the vendor may stat and find absent; without this a denied `stat` answers
     /// `EPERM`, which git treats as fatal for its configuration files.
     pub absent_paths: Vec<PathBuf>,
+    /// Files the vendor replaces by writing a sibling `<file>.<suffix>` and renaming it over
+    /// the file, granted with those siblings: a grant of the file alone refuses the save.
+    pub state_files: Vec<PathBuf>,
 }
 
 impl SandboxPlan {
@@ -287,6 +290,7 @@ impl SandboxPlan {
             ("grants", self.grants.len()),
             ("socket directories", self.socket_dirs.len()),
             ("absent paths", self.absent_paths.len()),
+            ("state files", self.state_files.len()),
         ];
         if let Some((what, count)) = counts.iter().find(|(_, count)| *count > PLAN_GRANTS_MAX) {
             return Err(SandboxError::Plan(format!(
@@ -298,9 +302,17 @@ impl SandboxPlan {
             .iter()
             .map(|grant| grant.path.as_path())
             .chain(self.socket_dirs.iter().map(PathBuf::as_path))
-            .chain(self.absent_paths.iter().map(PathBuf::as_path));
+            .chain(self.absent_paths.iter().map(PathBuf::as_path))
+            .chain(self.state_files.iter().map(PathBuf::as_path));
         for path in paths {
             check_path(path)?;
+        }
+        if let Some(path) = self
+            .state_files
+            .iter()
+            .find(|path| path.to_str().is_some_and(|text| text.contains(['[', ']'])))
+        {
+            return Err(SandboxError::Path(path.clone()));
         }
         Ok(())
     }
@@ -396,12 +408,41 @@ fn grant_path(
     granted.map_err(|error| refused(error.to_string()))
 }
 
-/// The metadata rule for one absent path, the only platform rule a station set carries.
+/// The metadata rule for one absent path.
 fn absent_path_rule(path: &Path) -> String {
     format!(
         "(allow file-read-metadata (literal \"{}\"))",
         path.display()
     )
+}
+
+/// The read and write rule for one state file and its `<file>.<suffix>` siblings. Each regex
+/// metacharacter of the path becomes a one-character class; `[`, `]`, `"` and `\` never
+/// reach here.
+fn state_file_rule(path: &Path) -> String {
+    let mut pattern = String::new();
+    for character in path.display().to_string().chars() {
+        if ".+*?(){}|^$".contains(character) {
+            pattern.push('[');
+            pattern.push(character);
+            pattern.push(']');
+        } else {
+            pattern.push(character);
+        }
+    }
+    format!("(allow file-read* file-write* (regex \"^{pattern}([.][^/]+)?$\"))")
+}
+
+/// The platform rules a set built from `plan` carries, in order: none on Linux.
+fn platform_rules(plan: &SandboxPlan, platform: Platform) -> Vec<String> {
+    if platform != Platform::Macos {
+        return Vec::new();
+    }
+    plan.absent_paths
+        .iter()
+        .map(|path| absent_path_rule(path))
+        .chain(plan.state_files.iter().map(|path| state_file_rule(path)))
+        .collect()
 }
 
 /// The set for one session on the host platform: proxy-only network, the system list, the
@@ -434,14 +475,16 @@ pub fn capability_set(
                 reason: error.to_string(),
             })?;
     }
-    if platform == Platform::Macos {
-        for path in &plan.absent_paths {
-            set =
-                set.platform_rule(absent_path_rule(path))
-                    .map_err(|error| SandboxError::Grant {
-                        path: path.clone(),
-                        reason: error.to_string(),
-                    })?;
+    for rule in platform_rules(plan, platform) {
+        set = set
+            .platform_rule(rule)
+            .map_err(|error| SandboxError::Plan(error.to_string()))?;
+    }
+    // Landlock has no pattern rule, so on Linux a state file present is granted alone and
+    // its save is refused; the ci runner runs no vendor.
+    if platform == Platform::Linux {
+        for path in plan.state_files.iter().filter(|path| path.is_file()) {
+            set = grant_path(set, path, Access::ReadWrite)?;
         }
     }
     check_proxy_only(&set, plan)?;
@@ -449,7 +492,8 @@ pub fn capability_set(
 }
 
 /// The property every station set holds: outbound TCP only to the proxy's port, which is
-/// none of the core's, no other TCP grant, and no platform rule but the absent-path ones.
+/// none of the core's, no other TCP grant, and no platform rule but the plan's absent-path
+/// and state-file rules.
 pub fn check_proxy_only(set: &CapabilitySet, plan: &SandboxPlan) -> Result<(), SandboxError> {
     let refuse = |reason: String| Err(SandboxError::NotProxyOnly(reason));
     match set.network_mode() {
@@ -473,11 +517,7 @@ pub fn check_proxy_only(set: &CapabilitySet, plan: &SandboxPlan) -> Result<(), S
     {
         return refuse("a TCP port beyond the proxy's is granted".to_string());
     }
-    let expected: Vec<String> = plan
-        .absent_paths
-        .iter()
-        .map(|path| absent_path_rule(path))
-        .collect();
+    let expected = host().map_or_else(Vec::new, |(platform, _)| platform_rules(plan, platform));
     if let Some(rule) = set
         .platform_rules()
         .iter()
