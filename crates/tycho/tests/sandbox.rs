@@ -137,13 +137,31 @@ fn probe_through(trampoline: &str) {
     assert!(!scratch.outside.join("outside").exists());
 }
 
-/// No plan, a plan whose proxy port is one of the core's, or a grant that does not exist:
-/// the trampoline refuses with its own exit code and runs nothing.
+/// What a refusal case hands the trampoline in `TYCHO_SANDBOX_PLAN`.
+enum PlanInput {
+    Absent,
+    Text(String),
+}
+
+fn run_with_input(trampoline: &str, input: &PlanInput, words: &[&str]) -> Output {
+    let mut command = Command::new(TYCHO);
+    command.arg(trampoline).arg("--").args(words);
+    command.env_remove(PLAN_ENV);
+    if let PlanInput::Text(text) = input {
+        command.env(PLAN_ENV, text);
+    }
+    command.output().unwrap()
+}
+
+/// No plan, a plan that does not decode, one with a field the plan does not have, one whose
+/// proxy port is one of the core's, or one with a grant that does not exist: either
+/// trampoline refuses with its own exit code and runs nothing.
 #[test]
 fn a_missing_or_unsound_plan_runs_nothing() {
     let scratch = Scratch::new("refusals");
     let marker = scratch.granted.join("ran");
-    let words = [BASH, "-c", "echo ran > \"$1\"", "refusal", ""];
+    let marker_text = marker.display().to_string();
+    let words = [BASH, "-c", "echo ran > \"$1\"", "refusal", &marker_text];
     let mut on_core = plan(19_070, 19_070, &scratch.granted);
     on_core.core_ports.push(18_080);
     let mut missing = plan(40_000, 19_070, &scratch.granted);
@@ -151,24 +169,105 @@ fn a_missing_or_unsound_plan_runs_nothing() {
         path: scratch.granted.join("never-made"),
         access: Access::Read,
     });
-    for (name, plan) in [
-        ("none", None),
-        ("core port", Some(&on_core)),
-        ("missing", Some(&missing)),
-    ] {
-        let marker_text = marker.display().to_string();
-        let mut words = words;
-        words[4] = &marker_text;
-        let output = run(plan, &words);
-        assert_eq!(
-            output.status.code(),
-            Some(EXIT_SANDBOX_REFUSED),
-            "{name}: {output:?}"
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("sandbox refused"),
-            "{name}: {output:?}"
-        );
-        assert!(!marker.exists(), "{name}: the program ran");
+    let sound = plan(40_000, 19_070, &scratch.granted).to_json().unwrap();
+    // A plan built by hand: `to_json` refuses the unsound ones before they leave the launcher.
+    let encode = |plan: &SandboxPlan| serde_json::to_string(plan).unwrap();
+    let cases = [
+        ("none", PlanInput::Absent),
+        (
+            "not json",
+            PlanInput::Text("{\"proxy_port\":40000,".to_string()),
+        ),
+        (
+            "unknown field",
+            PlanInput::Text(sound.replacen('{', "{\"extra\":true,", 1)),
+        ),
+        ("core port", PlanInput::Text(encode(&on_core))),
+        ("missing grant", PlanInput::Text(encode(&missing))),
+    ];
+    let mut examined = 0_usize;
+    for trampoline in ["session-leader", "group-leader"] {
+        for (name, input) in &cases {
+            let output = run_with_input(trampoline, input, &words);
+            assert_eq!(
+                output.status.code(),
+                Some(EXIT_SANDBOX_REFUSED),
+                "{trampoline}, {name}: {output:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("sandbox refused"),
+                "{trampoline}, {name}: {output:?}"
+            );
+            assert!(!marker.exists(), "{trampoline}, {name}: the program ran");
+            examined += 1;
+        }
     }
+    assert_eq!(examined, 10);
+}
+
+/// A state file is writable with its `<file>.<suffix>` siblings, and nothing else beside it
+/// or below a sibling; what the kernel refuses, not what the rule's text says.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_state_file_and_its_siblings_are_writable_and_nothing_else_beside_them() {
+    let scratch = Scratch::new("state");
+    let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let mut state = plan(proxy.local_addr().unwrap().port(), 19_070, &scratch.granted);
+    let file = scratch.outside.join(".claude.json");
+    fs::create_dir(scratch.outside.join(".claude.json.d")).unwrap();
+    state.state_files = vec![file.clone()];
+    let script = r#"
+cd "$1" || exit 9
+w() { if (echo x > "$1") 2>/dev/null; then echo "$1=written"; else echo "$1=refused"; fi; }
+w .claude.json.tmp
+if mv .claude.json.tmp .claude.json 2>/dev/null; then echo rename=done; else echo rename=refused; fi
+w .claude.jsonx
+w .claude.json.d/inner
+w other.json
+"#;
+    let outside = scratch.outside.display().to_string();
+    let output = run(Some(&state), &[BASH, "-c", script, "state", &outside]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            ".claude.json.tmp=written",
+            "rename=done",
+            ".claude.jsonx=refused",
+            ".claude.json.d/inner=refused",
+            "other.json=refused"
+        ],
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), "x\n");
+}
+
+/// No name resolves through the system resolver inside the sandbox; the same lookup outside
+/// it, the positive control, resolves, so a refusal is the sandbox's and not a host without
+/// a network.
+#[cfg(target_os = "macos")]
+#[test]
+fn no_name_resolves_inside_the_sandbox() {
+    let scratch = Scratch::new("dns");
+    let lookup = "dscacheutil -q host -a name api.anthropic.com";
+    let resolved = |output: &Output| {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.starts_with("ip_address:") || line.starts_with("ipv6_address:"))
+    };
+    let outside = Command::new(BASH).args(["-c", lookup]).output().unwrap();
+    assert!(
+        resolved(&outside),
+        "the positive control resolved nothing, so this host cannot tell a refusal"
+    );
+    let inside = run(
+        Some(&plan(40_000, 19_070, &scratch.granted)),
+        &[BASH, "-c", lookup],
+    );
+    assert!(
+        !resolved(&inside),
+        "a name resolved inside the sandbox: {}",
+        String::from_utf8_lossy(&inside.stdout)
+    );
 }

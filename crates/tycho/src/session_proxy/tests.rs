@@ -148,8 +148,26 @@ fn a_record_counts_every_decision_and_names_each_refused_target_once_within_its_
         events.push(event("deny", format!("h{index}.example.com")));
     }
     let record = ProxyRecord::of(&events);
+    assert!(!record.at_cap);
     assert_eq!(record.allowed, 1);
     assert_eq!(record.denied, 2 * (DENIED_TARGETS_MAX + 5));
     assert_eq!(record.denied_targets.len(), DENIED_TARGETS_MAX);
     assert_eq!(record.denied_targets[0], "h0.example.com:443");
+}
+
+#[test]
+fn a_record_at_the_proxy_s_cap_says_later_events_were_dropped() {
+    let event: NetworkAuditEvent = serde_json::from_value(serde_json::json!({
+        "timestamp_unix_ms": 1, "mode": "connect", "decision": "allow",
+        "target": "api.anthropic.com", "port": 443
+    }))
+    .unwrap();
+    let record = ProxyRecord::of(&vec![event; AUDIT_EVENTS_MAX]);
+    assert!(record.at_cap);
+    assert!(
+        record
+            .to_string()
+            .contains("cap of 4096 events was reached"),
+        "{record}"
+    );
 }

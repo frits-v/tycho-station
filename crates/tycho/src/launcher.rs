@@ -461,7 +461,7 @@ impl<I: Ingress> Run<'_, I> {
         if end == ChildEnd::Exited(EXIT_SANDBOX_REFUSED) {
             self.log.line(&format!(
                 "the session leader exited {EXIT_SANDBOX_REFUSED}: it could not apply the \
-                 sandbox, or the vendor exited with that code"
+                 sandbox, and its reason is in stderr.log"
             ));
         }
         self.stop_proxy();
@@ -1249,6 +1249,28 @@ mod tests {
             recorder.events.borrow().last().map(String::as_str),
             Some("deliver sign_1abc failed spooled=true")
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The trampoline's refusal reaches the core as the inbox state, not as a failure to retry.
+    #[test]
+    fn a_trampoline_that_refused_its_sandbox_rejects_with_the_inbox_state() {
+        let dir = scratch("sandbox-refused");
+        let settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
+        let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
+        let recorder = recorder(&files);
+        let vendor = sh(&format!("exit {EXIT_SANDBOX_REFUSED}"));
+        let end = launch(&settings, &vendor, &recorder).unwrap();
+        let state = ExitState::from_wire(&end.state);
+        assert_eq!(
+            state,
+            ExitState::from_wire(SANDBOX_REFUSED),
+            "{}",
+            end.state
+        );
+        assert_eq!(state.disposition(), tycho_types::exit::Disposition::Inbox);
+        let log = fs::read_to_string(&files.log).unwrap();
+        assert!(log.contains("could not apply the sandbox"), "{log}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -307,11 +307,10 @@ impl SandboxPlan {
         for path in paths {
             check_path(path)?;
         }
-        if let Some(path) = self
-            .state_files
-            .iter()
-            .find(|path| path.to_str().is_some_and(|text| text.contains(['[', ']'])))
-        {
+        if let Some(path) = self.state_files.iter().find(|path| {
+            path.to_str()
+                .is_some_and(|text| text.contains(STATE_FILE_REFUSED_CHARACTERS))
+        }) {
             return Err(SandboxError::Path(path.clone()));
         }
         Ok(())
@@ -417,12 +416,12 @@ fn absent_path_rule(path: &Path) -> String {
 }
 
 /// The read and write rule for one state file and its `<file>.<suffix>` siblings. Each regex
-/// metacharacter of the path becomes a one-character class; `[`, `]`, `"` and `\` never
-/// reach here.
+/// metacharacter of the path becomes a one-character class; the characters a class cannot
+/// hold literally (`STATE_FILE_REFUSED_CHARACTERS`, `"` and `\`) never reach here.
 fn state_file_rule(path: &Path) -> String {
     let mut pattern = String::new();
     for character in path.display().to_string().chars() {
-        if ".+*?(){}|^$".contains(character) {
+        if ".+*?(){}|$".contains(character) {
             pattern.push('[');
             pattern.push(character);
             pattern.push(']');
@@ -432,6 +431,10 @@ fn state_file_rule(path: &Path) -> String {
     }
     format!("(allow file-read* file-write* (regex \"^{pattern}([.][^/]+)?$\"))")
 }
+
+/// What a state file's path may not hold: `[` and `]` end or open a class, and `^` first in
+/// one negates it, so `[^]` would match every character but the one meant.
+pub const STATE_FILE_REFUSED_CHARACTERS: [char; 3] = ['[', ']', '^'];
 
 /// The platform rules a set built from `plan` carries, in order: none on Linux.
 fn platform_rules(plan: &SandboxPlan, platform: Platform) -> Vec<String> {
@@ -454,9 +457,12 @@ pub fn capability_set(
     let (platform, arch) = host().ok_or(SandboxError::UnsupportedPlatform)?;
     plan.check()?;
     // Isolated still lets the vendor signal its own tool children, which share its sandbox;
-    // nono's same-sandbox mode needs Landlock ABI 6 on Linux and fails closed below it.
+    // nono's same-sandbox mode needs Landlock ABI 6 on Linux and fails closed below it. No
+    // name resolves inside the sandbox on macOS: the proxy resolves the hosts it admits, and
+    // the resolver's socket would otherwise carry data out in queries.
     let mut set = CapabilitySet::new()
         .proxy_only(plan.proxy_port)
+        .block_dns()
         .set_signal_mode(SignalMode::Isolated);
     for grant in config.system_paths_for(platform, arch) {
         if grant.optional && fs::symlink_metadata(&grant.path).is_err() {
@@ -491,9 +497,10 @@ pub fn capability_set(
     Ok(set)
 }
 
-/// The property every station set holds: outbound TCP only to the proxy's port, which is
-/// none of the core's, no other TCP grant, and no platform rule but the plan's absent-path
-/// and state-file rules.
+/// The property every station set holds, or the reason it does not.
+///
+/// Outbound TCP only to the proxy's port, which is none of the core's; no other TCP grant; no
+/// resolver; and no platform rule but the plan's absent-path and state-file rules.
 pub fn check_proxy_only(set: &CapabilitySet, plan: &SandboxPlan) -> Result<(), SandboxError> {
     let refuse = |reason: String| Err(SandboxError::NotProxyOnly(reason));
     match set.network_mode() {
@@ -509,6 +516,9 @@ pub fn check_proxy_only(set: &CapabilitySet, plan: &SandboxPlan) -> Result<(), S
             }
         }
         other => return refuse(format!("network mode {other}")),
+    }
+    if set.dns_enabled() {
+        return refuse("the system resolver is reachable".to_string());
     }
     if !set.localhost_ports().is_empty()
         || !set.localhost_port_ranges().is_empty()

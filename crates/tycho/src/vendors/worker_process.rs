@@ -751,6 +751,37 @@ pub mod tests {
         );
     }
 
+    /// The worker changes to its worktree before anything else runs: one it cannot enter
+    /// fails the run, naming the worktree, before the version check starts the vendor.
+    #[test]
+    fn a_worker_runs_in_its_worktree_and_fails_on_one_it_cannot_enter() {
+        let dir = std::env::temp_dir().join(format!("tycho-worker-cwd-{}", std::process::id()));
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut launcher = launcher_environment();
+        let result = dir.join("result.json");
+        launcher.insert(RESULT_FILE_ENV.to_string(), result.display().to_string());
+        let missing = dir.join("no-worktree");
+        let words = WorkerArgs {
+            worktree: missing.clone(),
+            binary: PathBuf::from("/nonexistent/claude"),
+            ..args()
+        }
+        .to_argv(Path::new("/opt/tycho"));
+        let error = run(&words[2..], &launcher, &mut std::io::sink()).unwrap_err();
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+        let written: Value = serde_json::from_slice(&std::fs::read(&result).unwrap()).unwrap();
+        assert_eq!(written["state"], json!("failed"));
+        assert!(
+            written["detail"]
+                .as_str()
+                .unwrap()
+                .contains(&missing.display().to_string()),
+            "the version check ran before the worktree was entered: {written}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A version check that could not run says why, so a refusal of the binary under the
     /// sandbox is not read as a wrong pin.
     #[test]

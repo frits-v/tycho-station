@@ -118,15 +118,39 @@ fn a_bad_host_or_an_optional_macos_entry_is_refused() {
     }
 }
 
-/// The property of every set the station builds, swept over every test core slot's ports
-/// and the production ports: a set exists only in proxy-only mode on the plan's port, and
-/// never when that port is one of the core's.
+/// Proxy-only on the plan's port, which is none of the core's, with no other TCP grant, no
+/// network platform rule and no resolver.
+fn assert_holds_the_property(set: &CapabilitySet, proxy_port: u16, ports: CorePorts) {
+    assert_eq!(
+        set.network_mode(),
+        &NetworkMode::ProxyOnly {
+            port: proxy_port,
+            bind_ports: Vec::new()
+        }
+    );
+    assert!(!core_ports(ports).contains(&proxy_port));
+    assert_ne!(proxy_port, 0);
+    assert!(set.localhost_ports().is_empty());
+    assert!(set.localhost_port_ranges().is_empty());
+    assert!(set.tcp_connect_ports().is_empty());
+    assert!(set.tcp_bind_ports().is_empty());
+    assert!(
+        set.platform_rules()
+            .iter()
+            .all(|rule| !rule.contains("network"))
+    );
+    assert!(!set.dns_enabled());
+}
+
+/// The property of every set the station builds, swept over the ports of every one of the
+/// 1800 test core slots and the production ports: a set exists only in proxy-only mode on the
+/// plan's port, with no resolver, and never when that port is one of the core's.
 #[test]
 fn no_set_the_station_builds_leaves_proxy_only_or_reaches_a_core_port() {
     let dir = scratch("property");
     let config = config();
     let mut offsets = vec![CorePorts::PRODUCTION];
-    for slot in (0..PORT_OFFSET_SLOTS).step_by(97) {
+    for slot in 0..PORT_OFFSET_SLOTS {
         let value = u32::from(PORT_OFFSET_BASE) + u32::from(slot) * u32::from(PORT_OFFSET_STRIDE);
         offsets.push(CorePorts::at(PortOffset::new(value).unwrap()));
     }
@@ -139,24 +163,7 @@ fn no_set_the_station_builds_leaves_proxy_only_or_reaches_a_core_port() {
             match capability_set(&plan, &config) {
                 Ok(set) => {
                     built += 1;
-                    assert_eq!(
-                        set.network_mode(),
-                        &NetworkMode::ProxyOnly {
-                            port: proxy_port,
-                            bind_ports: Vec::new()
-                        }
-                    );
-                    assert!(!core_ports(ports).contains(&proxy_port));
-                    assert_ne!(proxy_port, 0);
-                    assert!(set.localhost_ports().is_empty());
-                    assert!(set.localhost_port_ranges().is_empty());
-                    assert!(set.tcp_connect_ports().is_empty());
-                    assert!(set.tcp_bind_ports().is_empty());
-                    assert!(
-                        set.platform_rules()
-                            .iter()
-                            .all(|rule| !rule.contains("network"))
-                    );
+                    assert_holds_the_property(&set, proxy_port, ports);
                 }
                 Err(SandboxError::NotProxyOnly(_)) => {
                     refused += 1;
@@ -287,7 +294,17 @@ fn a_state_file_rule_covers_its_siblings_and_nothing_else() {
         rule,
         "(allow file-read* file-write* (regex \"^/Users/agent/[.]claude[.]json([.][^/]+)?$\"))"
     );
-    let mut bracketed = plan(Path::new("/x"), 40_000, CorePorts::PRODUCTION);
-    bracketed.state_files = vec![PathBuf::from("/Users/a[b]/.claude.json")];
-    assert!(matches!(bracketed.to_json(), Err(SandboxError::Path(_))));
+    for crafted in [
+        "/Users/a[b]/.claude.json",
+        "/Users/a^b/.claude.json",
+        "/Users/^/.claude.json",
+        "/Users/a]/.claude.json",
+    ] {
+        let mut refused = plan(Path::new("/x"), 40_000, CorePorts::PRODUCTION);
+        refused.state_files = vec![PathBuf::from(crafted)];
+        assert!(
+            matches!(refused.to_json(), Err(SandboxError::Path(_))),
+            "{crafted}"
+        );
+    }
 }

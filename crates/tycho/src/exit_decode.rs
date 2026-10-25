@@ -13,6 +13,7 @@ use tycho_types::exit::ExitState;
 use tycho_types::session::SessionName;
 
 use crate::agent_files::{current_uid, read_checked, read_checked_modified};
+use crate::sandbox::{EXIT_SANDBOX_REFUSED, SANDBOX_REFUSED};
 use crate::spool::{check_result_envelope, escalation_rejection};
 
 pub const PROGRESS_FILE_MAX_BYTES: usize = 4096;
@@ -202,6 +203,8 @@ pub fn decode_exit(
         ResultFile::Invalid(_) => Decoded::failure(ExitState::from_wire(RAW_RESULT_FILE_INVALID)),
         ResultFile::Report(report) => decode_report(report, end, session),
         ResultFile::Absent => Decoded::failure(match end {
+            // The trampoline's own refusal: no vendor ran, and a retry would be refused alike.
+            ChildEnd::Exited(EXIT_SANDBOX_REFUSED) => ExitState::from_wire(SANDBOX_REFUSED),
             ChildEnd::Exited(_) | ChildEnd::NotStarted => ExitState::Failed,
             ChildEnd::Signalled(_) => ExitState::Killed,
             ChildEnd::Unknown => ExitState::from_wire(RAW_EXIT_STATUS_UNKNOWN),
@@ -390,6 +393,25 @@ pub mod tests {
             ),
             unrecognised(RAW_RESULT_FILE_INVALID)
         );
+    }
+
+    /// A sandbox the trampoline could not apply goes to the inbox, never back to the queue,
+    /// where every attempt would be refused the same way.
+    #[test]
+    fn a_trampoline_refusal_without_a_result_goes_to_the_inbox() {
+        let refused = decode(
+            Stop::None,
+            ChildEnd::Exited(EXIT_SANDBOX_REFUSED),
+            ResultFile::Absent,
+        );
+        assert_eq!(refused, unrecognised(SANDBOX_REFUSED));
+        assert_eq!(refused.disposition(), Disposition::Inbox);
+        let reported = decode(
+            Stop::None,
+            ChildEnd::Exited(EXIT_SANDBOX_REFUSED),
+            report("failed", None),
+        );
+        assert_eq!(reported, ExitState::Failed);
     }
 
     #[test]

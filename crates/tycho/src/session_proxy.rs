@@ -40,7 +40,13 @@ pub struct ProxyRecord {
     pub other: usize,
     /// Each refused destination once, in the order first refused.
     pub denied_targets: Vec<String>,
+    /// The proxy held `AUDIT_EVENTS_MAX` events, so it dropped every later one.
+    pub at_cap: bool,
 }
+
+/// nono-proxy 0.80.0 keeps at most this many audit events between drains and drops the rest,
+/// so the counts of a longer session are a lower bound.
+pub const AUDIT_EVENTS_MAX: usize = 4096;
 
 /// Every name `child_environment` may set.
 ///
@@ -59,13 +65,16 @@ pub const CHILD_ENVIRONMENT_NAMES: [&str; 9] = [
     "NODE_USE_ENV_PROXY",
 ];
 
-/// Refused destinations a record names; the counts still cover every event.
+/// Refused destinations a record names; the counts cover every event the proxy kept.
 pub const DENIED_TARGETS_MAX: usize = 32;
 
 impl ProxyRecord {
     #[must_use]
     pub fn of(events: &[NetworkAuditEvent]) -> Self {
-        let mut record = Self::default();
+        let mut record = Self {
+            at_cap: events.len() >= AUDIT_EVENTS_MAX,
+            ..Self::default()
+        };
         for event in events {
             match event.decision {
                 NetworkAuditDecision::Allow => record.allowed = record.allowed.saturating_add(1),
@@ -94,7 +103,15 @@ impl fmt::Display for ProxyRecord {
             self.denied,
             self.other,
             self.denied_targets.join(", ")
-        )
+        )?;
+        if self.at_cap {
+            write!(
+                formatter,
+                "; the proxy's cap of {AUDIT_EVENTS_MAX} events was reached and later events \
+                 were dropped"
+            )?;
+        }
+        Ok(())
     }
 }
 
