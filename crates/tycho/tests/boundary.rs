@@ -777,6 +777,7 @@ fn minimal_plan() -> String {
         grants: Vec::new(),
         socket_dirs: Vec::new(),
         absent_paths: Vec::new(),
+        state_files: Vec::new(),
     }
     .to_json()
     .unwrap()

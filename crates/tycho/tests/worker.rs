@@ -503,7 +503,12 @@ fn dump_spool(core: &Core) {
         .flatten()
         .filter_map(Result::ok)
     {
-        for file in ["launcher.log", "progress.json", "stderr.log", "result.json"] {
+        for file in [
+            "launcher.log",
+            "vendor/progress.json",
+            "stderr.log",
+            "vendor/result.json",
+        ] {
             let text = fs::read_to_string(entry.path().join(file)).unwrap_or_default();
             println!("evidence: {}/{file}: {text}", entry.path().display());
         }
@@ -570,6 +575,11 @@ fn spool_record(core: &Core, session: &str) -> Value {
         acknowledged.display(),
         record["state"]
     );
+    // The session's proxy line: what the sandboxed vendor reached and what it was refused.
+    let log = fs::read_to_string(&files.log).unwrap_or_default();
+    for line in log.lines().filter(|line| line.contains(" proxy")) {
+        println!("evidence: {session} {line}");
+    }
     record
 }
 

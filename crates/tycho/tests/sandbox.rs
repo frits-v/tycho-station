@@ -68,6 +68,7 @@ fn plan(proxy_port: u16, core_port: u16, granted: &Path) -> SandboxPlan {
         }],
         socket_dirs: Vec::new(),
         absent_paths: Vec::new(),
+        state_files: Vec::new(),
     }
 }
 
