@@ -59,7 +59,7 @@ use tycho_types::session::SessionName;
 use tycho_types::task_packet::RoutingName;
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
-const WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+const WAIT_TIMEOUT: Duration = Duration::from_mins(5);
 const PROJECT: &str = "widget";
 const UNIT: &str = "wu01";
 const TASK: &str = "wu01-t1";

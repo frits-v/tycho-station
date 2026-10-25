@@ -565,6 +565,10 @@ pub mod tests {
     }
 
     fn trace() -> Trace {
+        #[expect(
+            clippy::duration_suboptimal_units,
+            reason = "a Unix timestamp reads in seconds"
+        )]
         let started = UNIX_EPOCH
             .checked_add(Duration::from_secs(1_800_000_000))
             .unwrap();
@@ -583,7 +587,7 @@ pub mod tests {
                 name: "find".to_string(),
                 model: "opus",
                 started,
-                ended: started.checked_add(Duration::from_secs(60)).unwrap(),
+                ended: started.checked_add(Duration::from_mins(1)).unwrap(),
                 launched: started.checked_add(Duration::from_secs(2)),
                 input: r#"{"head":"h"}"#.to_string(),
                 output: r#"{"findings":[]}"#.to_string(),

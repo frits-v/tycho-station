@@ -52,8 +52,8 @@ use tycho::services::session::{
 use tycho::services::spawner::{LeaseRead, SpawnSpec, SpawnTerminal, Spawner, SpawnerError};
 use tycho::services::{Ports, Timing};
 use tycho::spawn::{
-    CLAUDE_SANDBOX_SETTINGS, SpawnOutcome as LaunchOutcome, SpawnRequest, read_lease,
-    save_scrollback, send_line, spawn_session,
+    CLAUDE_SANDBOX_OFF, SpawnOutcome as LaunchOutcome, SpawnRequest, read_lease, save_scrollback,
+    send_line, spawn_session,
 };
 use tycho::vendors::claude_control::{ClaudeControl, RelayMode};
 use tycho::vendors::control::{
@@ -68,7 +68,7 @@ use tycho_types::session::{SessionName, Vendor};
 use tycho_types::task_packet::{AbsolutePath, Effort};
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
-const WAIT_LIMIT: Duration = Duration::from_secs(120);
+const WAIT_LIMIT: Duration = Duration::from_mins(2);
 const TURN_LIMIT: Duration = Duration::from_secs(150);
 const MODEL: &str = "haiku";
 const TRUST_DIALOG: &str = "Quick safety check";
@@ -485,7 +485,7 @@ impl Harness {
                 model: MODEL.to_string(),
                 effort: Effort::Low,
                 permission,
-                sandbox_settings: CLAUDE_SANDBOX_SETTINGS.to_string(),
+                sandbox_settings: CLAUDE_SANDBOX_OFF.to_string(),
                 working_dir: AbsolutePath::parse(&self.work.display().to_string()).unwrap(),
                 resume,
             })
@@ -670,7 +670,7 @@ fn ingress_json(core_ports: CorePorts, path: &str, body: &str) -> Option<String>
         .post(core_ports.ingress_url(path))
         .header("content-type", "application/json")
         .body(body.to_string())
-        .timeout(Duration::from_secs(60))
+        .timeout(Duration::from_mins(1))
         .send()
         .ok()?;
     let status = response.status();

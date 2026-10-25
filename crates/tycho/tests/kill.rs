@@ -34,7 +34,7 @@ use tycho::launchd::{Agent, AgentState, THROTTLE_SECONDS};
 use tycho::zmx::{Presence, Zmx, count_named, presence};
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
-const ATTACH_TIMEOUT: Duration = Duration::from_secs(120);
+const ATTACH_TIMEOUT: Duration = Duration::from_mins(2);
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(90);
 
 struct Core {

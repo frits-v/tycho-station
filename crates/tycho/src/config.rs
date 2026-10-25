@@ -90,9 +90,9 @@ pub const GRAPH_INDEX_DIR: &str = "graph";
 /// The graph plugin version the adapter accepts; its command names changed between releases.
 pub const ENTIRE_GRAPH_PINNED_VERSION: &str = "v0.4.0";
 /// A cold build of a 1,573-file repository took 42 seconds when the plugin was probed.
-pub const GRAPH_BUILD_TIMEOUT: Duration = Duration::from_secs(900);
+pub const GRAPH_BUILD_TIMEOUT: Duration = Duration::from_mins(15);
 /// Covers a query that finds no cached index and builds one first.
-pub const GRAPH_QUERY_TIMEOUT: Duration = Duration::from_secs(300);
+pub const GRAPH_QUERY_TIMEOUT: Duration = Duration::from_mins(5);
 pub const GRAPH_DIFF_BUDGET_SECONDS: u64 = 120;
 pub const GRAPH_OUTPUT_MAX_BYTES: usize = 4 * 1024 * 1024;
 

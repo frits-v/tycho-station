@@ -92,26 +92,68 @@ pub const fn start_matches(process_start_unix_seconds: u64, recorded_unix_ms: u6
         && recorded.saturating_sub(process_start_unix_seconds) <= START_LEAD_MAX_SECONDS
 }
 
-/// `tycho session-leader -- <program> <arguments>`: becomes the leader of a new session with
-/// no controlling terminal, then execs the program; returns only the reason it could not.
+/// How the trampoline leaves the vendor in relation to the launcher's terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leadership {
+    /// `tycho session-leader`: a new session with no controlling terminal, for a headless
+    /// vendor. Under zmx the pty is the launcher's controlling terminal, and a vendor in a
+    /// background group there is stopped with `SIGTTOU` by any tool that sets terminal
+    /// modes, such as `stty` in a login shell's startup file.
+    Session,
+    /// `tycho group-leader`: the process group the launcher already made, which keeps the
+    /// pty for an interactive vendor.
+    Group,
+}
+
+/// Why the trampoline did not exec the vendor.
+#[derive(Debug)]
+pub enum TrampolineError {
+    /// The words were not `-- <program> [arguments]`.
+    Usage(String),
+    /// The sandbox could not be built or applied; nothing ran.
+    Sandbox(String),
+    /// `exec` itself failed after the sandbox was applied.
+    Exec(String),
+}
+
+impl std::fmt::Display for TrampolineError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Usage(reason) | Self::Exec(reason) => write!(formatter, "{reason}"),
+            Self::Sandbox(reason) => write!(formatter, "sandbox refused: {reason}"),
+        }
+    }
+}
+
+/// `tycho session-leader|group-leader -- <program> <arguments>`; returns only why it failed.
 ///
-/// Under zmx the pty is the launcher's controlling terminal, and a vendor in a background
-/// group there is stopped with `SIGTTOU` by any tool that sets terminal modes, such as `stty`
-/// in a login shell's startup file. The new session's group id is the vendor's pid, so the
-/// launcher's group signal reaches it and everything it starts.
+/// It leads a new session (or stays in the launcher's group), applies the session sandbox
+/// from `TYCHO_SANDBOX_PLAN` to itself and so to everything the vendor starts, removes the
+/// plan from the environment and execs the program. The vendor keeps this pid, so its group
+/// id is its pid and the launcher's group signal reaches it and everything it starts.
 #[must_use]
-pub fn exec_session_leader(words: &[String]) -> String {
+pub fn exec_session_leader(words: &[String], leadership: Leadership) -> TrampolineError {
     let Some(([separator, program], arguments)) = words.split_first_chunk::<2>() else {
-        return "expected -- <program> [arguments]".to_string();
+        return TrampolineError::Usage("expected -- <program> [arguments]".to_string());
     };
     if separator != "--" {
-        return format!("expected -- before the program, found {separator:?}");
+        return TrampolineError::Usage(format!(
+            "expected -- before the program, found {separator:?}"
+        ));
     }
-    if let Err(error) = nix::unistd::setsid() {
-        return format!("setsid: {error}");
+    if leadership == Leadership::Session
+        && let Err(error) = nix::unistd::setsid()
+    {
+        return TrampolineError::Usage(format!("setsid: {error}"));
     }
-    let error = std::process::Command::new(program).args(arguments).exec();
-    format!("{program}: {error}")
+    if let Err(error) = crate::sandbox::apply_from_environment() {
+        return TrampolineError::Sandbox(error.to_string());
+    }
+    let error = std::process::Command::new(program)
+        .args(arguments)
+        .env_remove(crate::sandbox::PLAN_ENV)
+        .exec();
+    TrampolineError::Exec(format!("{program}: {error}"))
 }
 
 #[must_use]

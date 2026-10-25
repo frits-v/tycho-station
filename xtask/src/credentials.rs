@@ -68,7 +68,7 @@ const RULES: [Rule<'static>; 2] = [
 ];
 const LISTED_FILES_MAX: usize = 4096;
 const SCANNED_FILE_MAX_BYTES: u64 = 4 << 20;
-const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+const GIT_TIMEOUT: Duration = Duration::from_mins(1);
 
 /// Every file git tracks or would track under `base` (ignored files excluded), relative to
 /// `base`. A listing over the bound or a git that cannot run is an error, never an empty scan.

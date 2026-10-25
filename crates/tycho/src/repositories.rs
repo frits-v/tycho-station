@@ -33,7 +33,7 @@ pub const STAGING_DIR: &str = "staging";
 pub const PIN_REF_PREFIX: &str = "refs/factory/checkpoints";
 pub const PROJECT_NAME_MAX_BYTES: usize = 64;
 /// A clone or fetch of a large repository over the local file system.
-pub const GIT_TIMEOUT: Duration = Duration::from_secs(300);
+pub const GIT_TIMEOUT: Duration = Duration::from_mins(5);
 /// The identity of commits made in a worktree; the worktree never signs.
 pub const WORKER_NAME: &str = "Tycho Worker";
 pub const WORKER_EMAIL: &str = "worker@tycho.invalid";

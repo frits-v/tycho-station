@@ -36,12 +36,18 @@ use crate::launcher::{
 };
 use crate::private_dir;
 use crate::process::now_unix_ms;
+use crate::sandbox::{Access, Grant};
 use crate::services::spawner::{LeaseRead, SpawnerError};
+use crate::vendors::worker::{WORKER_COMMAND, WorkerArgs};
 use crate::zmx::{Presence, Zmx, prepare_shared_log, presence};
 
-/// Enabled, no unsandboxed retry, fail if unavailable, no excluded commands, and a network
-/// allowlist that admits nothing until the adapter names the hosts a worker needs.
-pub const CLAUDE_SANDBOX_SETTINGS: &str = r#"{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false,"excludedCommands":[],"network":{"allowedDomains":[],"allowLocalBinding":false,"allowAllUnixSockets":false}}}"#;
+/// Claude's own sandbox off, passed with `--settings`.
+///
+/// The station's sandbox, which the session leader applies to the vendor's whole process
+/// tree, is the only layer. A vendor sandbox nested inside it cannot apply its profile, and
+/// Claude then reruns the refused command outside its sandbox. `--settings` wins over the
+/// worktree's `.claude/settings.json`.
+pub const CLAUDE_SANDBOX_OFF: &str = r#"{"sandbox":{"enabled":false}}"#;
 pub const SCROLLBACK_MAX_BYTES: usize = 4 * 1024 * 1024;
 const OTHER_BITS: u32 = 0o007;
 const GROUP_WRITE_BIT: u32 = 0o020;
@@ -258,10 +264,7 @@ pub fn launch_spec(request: &SpawnRequest<'_>) -> Result<LaunchSpec, SpawnerErro
             HEARTBEAT_TARGET_ENV,
             request.heartbeat.as_wire().to_string(),
         ),
-        (
-            VENDOR_SANDBOX_SETTINGS_ENV,
-            CLAUDE_SANDBOX_SETTINGS.to_string(),
-        ),
+        (VENDOR_SANDBOX_SETTINGS_ENV, CLAUDE_SANDBOX_OFF.to_string()),
     ];
     let telemetry = AGENT_TELEMETRY_ENV.map(|(name, value)| (name, value.to_string()));
     for (name, value) in fixed.into_iter().chain(telemetry) {
@@ -293,10 +296,76 @@ pub fn launch_spec(request: &SpawnRequest<'_>) -> Result<LaunchSpec, SpawnerErro
         schema_version: SPEC_SCHEMA_VERSION,
         environment,
         vendor: request.vendor.to_vec(),
+        grants: sandbox_grants(request),
     };
     spec.settings()
         .map_err(|error| SpawnerError::Refused(error.to_string()))?;
     Ok(spec)
+}
+
+fn grant(path: &Path, access: Access) -> Grant {
+    Grant {
+        path: path.to_path_buf(),
+        access,
+    }
+}
+
+/// Read on the directory a linked executable points into, as a scratch prefix links the
+/// developer's installs; `None` for a file that is not a link.
+fn link_target_grant(executable: &Path) -> Option<Grant> {
+    let target = fs::read_link(executable).ok()?;
+    let dir = target.parent().filter(|dir| dir.is_absolute())?;
+    Some(grant(dir, Access::Read))
+}
+
+/// Read on an executable's install directory (or its own directory) and on its link's.
+fn executable_grants(executable: &Path, install_dir: Option<&Path>) -> Vec<Grant> {
+    install_dir
+        .or_else(|| executable.parent())
+        .map(|dir| grant(dir, Access::Read))
+        .into_iter()
+        .chain(link_target_grant(executable))
+        .collect()
+}
+
+/// The session's own paths in the vendor's sandbox; the launcher adds the rest.
+///
+/// The prefix's `tycho` and the session vendor's install to read, a worker's brief and
+/// binary to read, and its worktree or the vendor's working directory to read and write.
+#[must_use]
+pub fn sandbox_grants(request: &SpawnRequest<'_>) -> Vec<Grant> {
+    let prefix = request.tool_prefix;
+    let mut grants = vec![grant(&prefix.tycho(), Access::Read)];
+    grants.extend(link_target_grant(&prefix.tycho()));
+    let vendor = request.env.session_name.vendor().as_str();
+    if let Some(executable) = prefix.tool(vendor) {
+        grants.extend(executable_grants(
+            executable,
+            prefix.install_dir(vendor).as_deref(),
+        ));
+    }
+    if let Some(dir) = request.vendor_dir {
+        grants.push(grant(dir, Access::ReadWrite));
+    }
+    let worker = request
+        .vendor
+        .split_first()
+        .filter(|(_, rest)| rest.first().map(String::as_str) == Some(WORKER_COMMAND))
+        .and_then(|(_, rest)| WorkerArgs::parse(rest.get(1..).unwrap_or_default()).ok());
+    if let Some(args) = worker {
+        grants.push(grant(&args.worktree, Access::ReadWrite));
+        grants.push(grant(&args.brief, Access::Read));
+        grants.extend(executable_grants(&args.binary, None));
+    }
+    let mut seen = Vec::new();
+    grants.retain(|entry| {
+        let fresh = !seen.contains(entry);
+        if fresh {
+            seen.push(entry.clone());
+        }
+        fresh
+    });
+    grants
 }
 
 /// The words zmx types: `exec env -i HOME PATH MISE_* <tycho> launch --spec <file>`, bounded.
@@ -691,9 +760,12 @@ mod tests {
         }
         assert!(spec.environment.contains_key("TYCHO_SESSION_SECRET"));
         assert_eq!(spec.vendor, vendor);
-        let settings: serde_json::Value = serde_json::from_str(CLAUDE_SANDBOX_SETTINGS).unwrap();
-        assert_eq!(settings["sandbox"]["allowUnsandboxedCommands"], false);
-        assert_eq!(settings["sandbox"]["failIfUnavailable"], true);
+        assert_eq!(
+            spec.environment
+                .get("TYCHO_VENDOR_SANDBOX_SETTINGS")
+                .map(String::as_str),
+            Some(r#"{"sandbox":{"enabled":false}}"#)
+        );
         let empty: [String; 0] = [];
         let refused = SpawnRequest {
             vendor: &empty,

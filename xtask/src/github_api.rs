@@ -12,7 +12,7 @@ use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 const GITHUB_API: &str = "https://api.github.com";
 const API_VERSION: &str = "2022-11-28";
 const USER_AGENT: &str = "tycho-xtask";
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
 const RESPONSE_MAX_BYTES: u64 = 256 * 1024;
 const GITHUB_HEADERS: [(&str, &str); 2] = [
     ("Accept", "application/vnd.github+json"),

@@ -12,11 +12,11 @@ use crate::process::{Captured, Exit, run_bounded};
 use std::time::Duration;
 use tycho_types::git_environment::git_command;
 
-const RELEASE_PLZ_TIMEOUT: Duration = Duration::from_secs(600);
-const DIST_TIMEOUT: Duration = Duration::from_secs(1800);
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(600);
-const GIT_TIMEOUT: Duration = Duration::from_secs(120);
-const RUSTUP_TIMEOUT: Duration = Duration::from_secs(600);
+const RELEASE_PLZ_TIMEOUT: Duration = Duration::from_mins(10);
+const DIST_TIMEOUT: Duration = Duration::from_mins(30);
+const UPLOAD_TIMEOUT: Duration = Duration::from_mins(10);
+const GIT_TIMEOUT: Duration = Duration::from_mins(2);
+const RUSTUP_TIMEOUT: Duration = Duration::from_mins(10);
 const REPORT_MAX_LINES: usize = 80;
 const ARTIFACTS_MAX: usize = 32;
 const TAG_MAX_CHARS: usize = 32;

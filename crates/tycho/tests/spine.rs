@@ -52,7 +52,7 @@ use tycho_types::session::Level;
 use tycho_types::session::SessionName;
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
-const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const WAIT_TIMEOUT: Duration = Duration::from_mins(1);
 
 struct Core {
     config: CoreConfig,
@@ -211,7 +211,7 @@ fn mise_which(tool: &str) -> PathBuf {
 
 fn client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(120))
+        .timeout(Duration::from_mins(2))
         .no_proxy()
         .build()
         .unwrap()

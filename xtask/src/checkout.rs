@@ -9,7 +9,7 @@ use tycho_types::git_environment::git_command;
 
 use crate::process::{Exit, run_bounded};
 
-const GIT_TIMEOUT: Duration = Duration::from_secs(60);
+const GIT_TIMEOUT: Duration = Duration::from_mins(1);
 /// SHA-1 and SHA-256 object names.
 const COMMIT_LENGTHS: [usize; 2] = [40, 64];
 

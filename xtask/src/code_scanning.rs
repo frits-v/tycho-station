@@ -20,7 +20,7 @@ use crate::sarif::{SARIF_DIR, SARIF_FILES_MAX};
 /// bound is refused here before compression.
 pub const SARIF_MAX_BYTES: u64 = 10 << 20;
 const BODY_DIR: &str = "target/sarif-upload";
-const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const UPLOAD_TIMEOUT: Duration = Duration::from_mins(2);
 const NOT_ENABLED_MARKERS: [&str; 2] = [
     "code scanning is not enabled",
     "advanced security must be enabled",

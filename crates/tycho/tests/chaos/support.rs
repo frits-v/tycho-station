@@ -22,7 +22,7 @@ use tycho::vendors::control::NoVendor;
 use tycho::zmx::Zmx;
 
 pub const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
-pub const WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+pub const WAIT_TIMEOUT: Duration = Duration::from_mins(2);
 const POLL: Duration = Duration::from_millis(250);
 /// Evidence bodies longer than this are cut, so a large view cannot flood the report.
 const EVIDENCE_MAX_CHARS: usize = 600;

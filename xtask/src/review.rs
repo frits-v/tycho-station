@@ -41,7 +41,7 @@ const EXCLUDED_PATHSPECS: [&str; 3] = [
 const VERIFIED_MAX: usize = 12;
 /// How long after the review starts the other checks are waited for; the App's token lasts
 /// an hour from the start.
-const CHECKS_WAIT: Duration = Duration::from_secs(45 * 60);
+const CHECKS_WAIT: Duration = Duration::from_mins(45);
 const SHORT_COMMIT_CHARS: usize = 12;
 /// What a review run holds that no child it starts may see: the App key, the Langfuse secret
 /// key, the Actions OIDC request and runtime tokens and a job token. The Claude CLI gets an

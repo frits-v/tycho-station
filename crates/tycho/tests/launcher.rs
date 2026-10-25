@@ -52,7 +52,7 @@ const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
 const SECRET: &str = "launcher-test-secret-0123456789abcdef";
 /// The shape of a long-lived Claude token; every session here gets it through the hand-off.
 const TEST_TOKEN: &str = "sk-ant-oat01-launcher-suite-test-credential-0123456789";
-const WAIT_LIMIT: Duration = Duration::from_secs(120);
+const WAIT_LIMIT: Duration = Duration::from_mins(2);
 const VENDOR_SCRIPT: &str = r#"#!/bin/sh
 # $1 lease path, $2 seconds to run, $3 result file content or empty, $4 marker prefix
 if test -f "$1"; then echo seen > "$4.lease-seen"; fi

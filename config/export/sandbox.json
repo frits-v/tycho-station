@@ -1,0 +1,724 @@
+{
+    "system_paths": [
+        {
+            "path": "/bin",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/sbin",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/usr/bin",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/usr/sbin",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/usr/local/bin",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/usr/lib",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/usr/share",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/System/Library",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/Library",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/Library/Frameworks",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/dev",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/var/db",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/private/etc/ssl",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/etc/ssl",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/etc",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/private/etc",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/usr/share/zoneinfo",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/usr/share/locale",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/var/db/timezone",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/usr/share/terminfo",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/var",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/private/var",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/private",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/tmp",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/System/Volumes",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/System/Cryptexes",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/Applications",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/cores",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/opt",
+            "access": "read",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/private/tmp",
+            "access": "write",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/tmp",
+            "access": "write",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/private/var/folders",
+            "access": "write",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/var/folders",
+            "access": "write",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/dev",
+            "access": "write",
+            "platform": "macos",
+            "optional": false
+        },
+        {
+            "path": "/bin",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/sbin",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/usr/bin",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/usr/sbin",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/usr/lib",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/usr/share",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/etc/hosts",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/etc/nsswitch.conf",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/etc/group",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/etc/passwd",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/etc/ssl",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/etc/ld.so.cache",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/etc/ld.so.conf",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/etc/ld.so.conf.d",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/etc/localtime",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/etc/alternatives",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/etc/os-release",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/etc/services",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/null",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/zero",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/random",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/urandom",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/full",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/stdin",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/stdout",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/stderr",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/fd",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/pts",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/proc/self",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/proc/cpuinfo",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/proc/meminfo",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/proc/stat",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/proc/loadavg",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/proc/version",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/proc/filesystems",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/run",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/var/run",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/sys",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/tmp",
+            "access": "read",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/lib",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/lib64",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/usr/local/bin",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/usr/lib64",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/usr/local/lib",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/usr/local/lib64",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/etc/resolv.conf",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/run/systemd/resolve",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/etc/gai.conf",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/etc/pki",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/etc/ca-certificates",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/etc/crypto-policies",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/etc/fonts",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/etc/timezone",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/etc/locale.conf",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/etc/locale.gen",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/etc/mime.types",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/etc/manpath.config",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/etc/man_db.conf",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/var/cache/man",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/run/systemd/userdb",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/usr/share/locale",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/usr/share/locale-langpack",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/usr/share/zoneinfo",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/usr/share/terminfo",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/usr/share/ca-certificates",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/lib/terminfo",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/etc/terminfo",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/dev/tty",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/dev/console",
+            "access": "read",
+            "platform": "linux",
+            "optional": true
+        },
+        {
+            "path": "/lib/x86_64-linux-gnu",
+            "access": "read",
+            "platform": "linux",
+            "arch": "x86_64",
+            "optional": true
+        },
+        {
+            "path": "/usr/lib/x86_64-linux-gnu",
+            "access": "read",
+            "platform": "linux",
+            "arch": "x86_64",
+            "optional": true
+        },
+        {
+            "path": "/lib/aarch64-linux-gnu",
+            "access": "read",
+            "platform": "linux",
+            "arch": "aarch64",
+            "optional": true
+        },
+        {
+            "path": "/usr/lib/aarch64-linux-gnu",
+            "access": "read",
+            "platform": "linux",
+            "arch": "aarch64",
+            "optional": true
+        },
+        {
+            "path": "/tmp",
+            "access": "write",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/null",
+            "access": "write",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/zero",
+            "access": "write",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/full",
+            "access": "write",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/stdout",
+            "access": "write",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/stderr",
+            "access": "write",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/fd",
+            "access": "write",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/pts",
+            "access": "write",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/proc/self/fd",
+            "access": "write",
+            "platform": "linux",
+            "optional": false
+        },
+        {
+            "path": "/dev/tty",
+            "access": "write",
+            "platform": "linux",
+            "optional": true
+        }
+    ],
+    "vendors": {
+        "claude": {
+            "allowed_hosts": [
+                "api.anthropic.com"
+            ]
+        },
+        "codex": {
+            "allowed_hosts": [
+                "chatgpt.com",
+                "api.openai.com",
+                "auth.openai.com"
+            ]
+        }
+    }
+}

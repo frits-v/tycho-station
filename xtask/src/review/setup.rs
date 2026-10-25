@@ -18,10 +18,10 @@ use crate::github_api::Client;
 use crate::process::{Exit, run_bounded};
 
 const EVENT_MAX_BYTES: u64 = 1 << 20;
-const GIT_TIMEOUT: Duration = Duration::from_secs(120);
-const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
-const MISE_TIMEOUT: Duration = Duration::from_secs(60);
-const RUN_TIME_MAX: Duration = Duration::from_secs(30 * 60);
+const GIT_TIMEOUT: Duration = Duration::from_mins(2);
+const FETCH_TIMEOUT: Duration = Duration::from_mins(5);
+const MISE_TIMEOUT: Duration = Duration::from_mins(1);
+const RUN_TIME_MAX: Duration = Duration::from_mins(30);
 const DRY_RUN_BASE: &str = "origin/main";
 /// The diff, the earlier findings and one instructions file per pass.
 const FILES_MAX: usize = 64;

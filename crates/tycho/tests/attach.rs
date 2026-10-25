@@ -64,13 +64,13 @@ const UMASK_EXEC: &str = "umask 007; exec \"$0\" \"$@\"";
 /// Exits 0 once `zmx list` shows a client attached to the session `$1` names as a pattern.
 const CLIENT_PROBE: &str = "umask 007; \"$0\" list | /usr/bin/grep -Eq \"$1\"";
 /// Covers the operator typing the password at the first prompt.
-const SUDO_TIMEOUT: Duration = Duration::from_secs(120);
+const SUDO_TIMEOUT: Duration = Duration::from_mins(2);
 const OUTPUT_MAX_BYTES: usize = 65_536;
 const OUTPUT_FILE_MAX_BYTES: u64 = 65_536;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 /// An Automation consent dialog holds osascript until it is answered; past this the path
 /// reads as unanswered.
-const ANSWER_WAIT_MAX: Duration = Duration::from_secs(180);
+const ANSWER_WAIT_MAX: Duration = Duration::from_mins(3);
 const MARKER_WAIT_MAX: Duration = Duration::from_secs(30);
 /// How long a client gets to show as attached in `zmx list` before a line is typed.
 const ATTACH_WAIT_MAX: Duration = Duration::from_secs(10);
@@ -2037,7 +2037,7 @@ mod decoders {
             Err(std::io::Error::from_raw_os_error(1)),
             4242,
             "S 4242 4242",
-            Duration::from_secs(120),
+            Duration::from_mins(2),
             || panic!("a refused kill is not waited for"),
         );
         assert!(

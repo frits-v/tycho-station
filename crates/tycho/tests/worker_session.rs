@@ -9,7 +9,23 @@
 
 use std::process::Command;
 
+use tycho::sandbox::{PLAN_ENV, SandboxPlan};
+
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
+
+/// The smallest plan the trampoline accepts: the system paths and a proxy port nothing
+/// listens on, which no probe here uses.
+fn plan() -> String {
+    SandboxPlan {
+        proxy_port: 40_000,
+        core_ports: vec![19_070],
+        grants: Vec::new(),
+        socket_dirs: Vec::new(),
+        absent_paths: Vec::new(),
+    }
+    .to_json()
+    .unwrap()
+}
 const PROBE: &str = "if (: < /dev/tty) 2>/dev/null; then echo attached; else echo detached; fi";
 
 /// Runs the words under a fresh pseudo-terminal through `script`, which gives them a
@@ -19,6 +35,7 @@ fn under_a_terminal(words: &[&str]) -> String {
         Command::new("script")
             .args(["-q", "/dev/null"])
             .args(words)
+            .env(PLAN_ENV, plan())
             .output()
     } else {
         let line = words
@@ -28,6 +45,7 @@ fn under_a_terminal(words: &[&str]) -> String {
             .join(" ");
         Command::new("script")
             .args(["-qec", &line, "/dev/null"])
+            .env(PLAN_ENV, plan())
             .output()
     }
     .unwrap();

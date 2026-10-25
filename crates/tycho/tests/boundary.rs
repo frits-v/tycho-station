@@ -58,7 +58,7 @@ use tycho_types::service::{Attempt, WorkUnitId};
 
 const SUDO: &str = "/usr/bin/sudo";
 /// Covers the operator typing the password at the first probe's prompt.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
+const PROBE_TIMEOUT: Duration = Duration::from_mins(2);
 const PROBE_OUTPUT_MAX_BYTES: usize = 65_536;
 /// The agent-side shell's last line: who it ran as and what the probe exited with.
 const MARKER: &str = "tycho-probe";
@@ -760,18 +760,39 @@ fn a_session_started_through_the_rule_runs_as_the_agent() {
     );
 }
 
-/// Starts `tycho session-leader -- /bin/sleep <seconds>` as a background child of a shell and
-/// prints the child's pid, as `$!` names it. The shell zmx starts is the leader of the pty's
-/// session already, and `setsid` refuses a session leader, so a program typed with `exec`
-/// in place of the shell cannot lead a session of its own; a child can.
-const GROUP_LEADER_SCRIPT: &str =
-    "\"$0\" session-leader -- /bin/sleep \"$1\" & printf 'reap-leader %s\\n' \"$!\"; wait";
+/// Starts `tycho session-leader -- /bin/sleep <seconds>` as a background child of a shell,
+/// sandboxed by the plan in `$2` as a vendor is, and prints the child's pid, as `$!` names it.
+/// The shell zmx starts is the leader of the pty's session already, and `setsid` refuses a
+/// session leader, so a program typed with `exec` in place of the shell cannot lead a session
+/// of its own; a child can.
+const GROUP_LEADER_SCRIPT: &str = "TYCHO_SANDBOX_PLAN=\"$2\" \"$0\" session-leader -- /bin/sleep \"$1\" & printf 'reap-leader %s\\n' \"$!\"; wait";
 const LEADER_MARKER: &str = "reap-leader ";
 
+/// The smallest plan the trampoline accepts: the system paths and a proxy port nothing
+/// listens on, which `sleep` never uses.
+fn minimal_plan() -> String {
+    tycho::sandbox::SandboxPlan {
+        proxy_port: 40_000,
+        core_ports: tycho::sandbox::core_ports(tycho::config::CorePorts::PRODUCTION),
+        grants: Vec::new(),
+        socket_dirs: Vec::new(),
+        absent_paths: Vec::new(),
+    }
+    .to_json()
+    .unwrap()
+}
+
 fn group_leader_words(tycho: &str, seconds: &str) -> Vec<String> {
-    ["/bin/sh", "-c", GROUP_LEADER_SCRIPT, tycho, seconds]
-        .map(str::to_string)
-        .to_vec()
+    [
+        "/bin/sh",
+        "-c",
+        GROUP_LEADER_SCRIPT,
+        tycho,
+        seconds,
+        &minimal_plan(),
+    ]
+    .map(str::to_string)
+    .to_vec()
 }
 
 /// The pid a line of output names as the group leader; the echoed command line, whose marker
@@ -1249,41 +1270,70 @@ mod group_leader {
 
     const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
 
+    /// Runs the words under a fresh pseudo-terminal through `script`, whose shell leads the
+    /// pty's session the way the shell zmx starts does.
+    fn under_a_terminal(words: &[String]) -> Command {
+        if cfg!(target_os = "macos") {
+            let mut command = Command::new("script");
+            command.args(["-q", "/dev/null"]).args(words);
+            command
+        } else {
+            let line = words
+                .iter()
+                .map(|word| format!("'{}'", word.replace('\'', r"'\''")))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut command = Command::new("script");
+            command.args(["-qec", &line, "/dev/null"]);
+            command
+        }
+    }
+
     #[test]
     fn a_program_typed_with_exec_in_a_session_leader_cannot_lead_a_session() {
-        let status = Command::new(TYCHO)
-            .args([
-                "session-leader",
-                "--",
-                "/bin/sh",
-                "-c",
-                "exec \"$0\" session-leader -- /bin/sleep 1",
-                TYCHO,
-            ])
+        let words = [
+            "/bin/sh",
+            "-c",
+            "TYCHO_SANDBOX_PLAN=\"$1\" exec \"$0\" session-leader -- /bin/sleep 1",
+            TYCHO,
+            &minimal_plan(),
+        ]
+        .map(str::to_string);
+        let output = under_a_terminal(&words)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .output()
             .unwrap();
-        assert!(!status.success(), "setsid succeeded in a session leader");
+        let shown = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            shown.contains("setsid"),
+            "the trampoline did not fail at setsid: {output:?}"
+        );
     }
 
     #[test]
     fn a_child_of_a_session_leader_leads_its_own_group_and_names_its_pid() {
-        let mut shell = Command::new(TYCHO)
-            .arg("session-leader")
-            .arg("--")
-            .args(group_leader_words(TYCHO, "30"))
+        let mut shell = under_a_terminal(&group_leader_words(TYCHO, "30"))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let mut line = String::new();
-        BufReader::new(shell.stdout.take().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let leader = leader_pid(&line).unwrap_or_else(|| panic!("no leader in {line:?}"));
+        let mut reader = BufReader::new(shell.stdout.take().unwrap());
+        let mut leader = None;
+        for _ in 0..LEADER_LINES_MAX {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            // `script` echoes the end of its input as `^D` and two backspaces first.
+            leader = line
+                .find(LEADER_MARKER)
+                .and_then(|at| leader_pid(&line[at..]));
+            if leader.is_some() {
+                break;
+            }
+        }
+        let leader = leader.unwrap_or_else(|| panic!("no leader line"));
         let facts = once_leading(leader);
         let killed = tycho::process::send(leader, true, nix::sys::signal::Signal::SIGKILL);
         let ended = shell.wait();
@@ -1297,6 +1347,9 @@ mod group_leader {
         assert!(killed.is_ok(), "{killed:?}");
         assert!(ended.is_ok());
     }
+
+    /// Lines `script` may print before the shell's own, its echo of the command included.
+    const LEADER_LINES_MAX: usize = 16;
 
     #[test]
     fn only_a_marker_followed_by_digits_names_the_leader() {

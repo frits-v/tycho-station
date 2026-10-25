@@ -27,7 +27,7 @@ const VERIFY_INSTRUCTIONS: &str = include_str!("../../prompts/review-verify.md")
 const DIFF_MAX_BYTES: usize = 512 * 1024;
 /// The event stream of one pass, an 80-turn find pass with its tool results included.
 const STREAM_MAX_BYTES: u64 = 64 << 20;
-const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+const GIT_TIMEOUT: Duration = Duration::from_mins(2);
 const FIND_LIMITS: Limits = Limits {
     max_turns: 80,
     max_budget_usd: 10,
@@ -37,9 +37,9 @@ const VERIFY_LIMITS: Limits = Limits {
     max_budget_usd: 2,
 };
 const VERIFY_PARALLEL: usize = 4;
-const ONE_RUN_MIN: Duration = Duration::from_secs(60);
+const ONE_RUN_MIN: Duration = Duration::from_mins(1);
 /// Left unused at the end of a pass's token, so no request goes out on a token about to lapse.
-const TOKEN_MARGIN: Duration = Duration::from_secs(60);
+const TOKEN_MARGIN: Duration = Duration::from_mins(1);
 /// The longest a pass's exchange can take: the OIDC token and the exchange, each one request.
 const MINT_TIME_MAX: Duration =
     Duration::from_secs(2 * crate::github_api::REQUEST_TIMEOUT.as_secs());
@@ -550,19 +550,19 @@ mod tests {
     #[test]
     fn a_pass_ends_at_the_run_deadline_or_before_its_token_lapses() {
         let now = Instant::now();
-        let run = now.checked_add(Duration::from_secs(1800)).unwrap();
+        let run = now.checked_add(Duration::from_mins(30)).unwrap();
         assert_eq!(
             pass_time(run, now, now, None),
-            Some(Duration::from_secs(1800))
+            Some(Duration::from_mins(30))
         );
         assert_eq!(
             pass_time(run, now, now, Some(Duration::from_secs(598))),
             Some(Duration::from_secs(538))
         );
-        let soon = now.checked_add(Duration::from_secs(120)).unwrap();
+        let soon = now.checked_add(Duration::from_mins(2)).unwrap();
         assert_eq!(
             pass_time(soon, now, now, Some(Duration::from_secs(598))),
-            Some(Duration::from_secs(120))
+            Some(Duration::from_mins(2))
         );
         assert_eq!(pass_time(soon, now, soon, None), None);
     }
@@ -570,7 +570,7 @@ mod tests {
     #[test]
     fn the_shortest_accepted_token_leaves_a_minute_after_the_slowest_exchange() {
         let started = Instant::now();
-        let run = started.checked_add(Duration::from_secs(1800)).unwrap();
+        let run = started.checked_add(Duration::from_mins(30)).unwrap();
         let minted = started.checked_add(MINT_TIME_MAX).unwrap();
         assert_eq!(
             pass_time(run, started, minted, Some(TOKEN_LIFETIME_MIN)),

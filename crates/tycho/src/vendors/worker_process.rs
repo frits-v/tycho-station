@@ -30,6 +30,7 @@ use crate::launch_spec::{
     AGENT_TELEMETRY_ENV, PROGRESS_FILE_ENV, RESULT_FILE_ENV, VENDOR_SANDBOX_SETTINGS_ENV,
 };
 use crate::process::{now_unix_ms, send};
+use crate::session_proxy::CHILD_ENVIRONMENT_NAMES;
 use crate::vendors::claude_worker::ClaudeWorker;
 use crate::vendors::codex_worker::{CODEX_OUTPUT_SCHEMA, CodexWorker};
 use crate::vendors::worker::{
@@ -90,11 +91,13 @@ impl WorkerEnvironment {
     pub fn from_map(environment: &BTreeMap<String, String>) -> Result<Self, WorkerError> {
         let session = SessionName::parse(&required(environment, ENV_SESSION_NAME)?)
             .map_err(|error| WorkerError::Argument(error.to_string()))?;
-        // The credential pair the launcher added: Claude's token, or the Codex home.
+        // The credential pair the launcher added (Claude's token, or the Codex home) and the
+        // session proxy's variables, without which the vendor's sandbox refuses its traffic.
         let inherited_names = ["HOME", "PATH", CLAUDE_TOKEN_ENV, CODEX_HOME_ENV]
             .into_iter()
             .chain(MISE_PREFIX_ENV)
-            .chain(AGENT_TELEMETRY_ENV.iter().map(|(name, _)| *name));
+            .chain(AGENT_TELEMETRY_ENV.iter().map(|(name, _)| *name))
+            .chain(CHILD_ENVIRONMENT_NAMES);
         let inherited = inherited_names
             .filter_map(|name| {
                 environment
@@ -540,16 +543,15 @@ pub fn run(
     })
 }
 
-/// The sandbox settings the launcher handed over, with the escalation directory added to the
-/// sandbox's writable paths and to the session's directories; nothing else of the spool is.
+/// The settings the launcher handed over, with the escalation directory added.
+///
+/// It joins the session's directories, so the vendor's permission rules let it write the
+/// question there; nothing else of the spool is. The station's sandbox already grants it.
 pub fn worker_settings(base: &str, escalation_dir: &Path) -> Result<String, String> {
     let mut settings: Value =
         serde_json::from_str(base).map_err(|error| format!("sandbox settings: {error}"))?;
     let dir = Value::String(escalation_dir.display().to_string());
-    for (section, key) in [
-        (["sandbox", "filesystem"], "allowWrite"),
-        (["permissions", ""], "additionalDirectories"),
-    ] {
+    for (section, key) in [(["permissions", ""], "additionalDirectories")] {
         let mut node = &mut settings;
         for part in section.iter().filter(|part| !part.is_empty()) {
             node = node
@@ -693,6 +695,32 @@ pub mod tests {
         );
         assert_eq!(pairs.len(), 9 + AGENT_TELEMETRY_ENV.len());
         assert!(!format!("{environment:?}").contains("sk-ant-oat01-worker"));
+    }
+
+    #[test]
+    fn the_proxy_variables_reach_the_vendor_and_the_sandbox_plan_does_not() {
+        let mut launcher = launcher_environment();
+        for name in CHILD_ENVIRONMENT_NAMES {
+            launcher.insert(name.to_string(), format!("{name}-value"));
+        }
+        launcher.insert(crate::sandbox::PLAN_ENV.to_string(), "{}".to_string());
+        let environment = WorkerEnvironment::from_map(&launcher).unwrap();
+        let pairs = vendor_environment(&environment, "agent");
+        for name in CHILD_ENVIRONMENT_NAMES {
+            assert!(
+                pairs.contains(&(name.to_string(), format!("{name}-value"))),
+                "{name}"
+            );
+        }
+        assert!(
+            !pairs
+                .iter()
+                .any(|(name, _)| name == crate::sandbox::PLAN_ENV)
+        );
+        assert_eq!(
+            pairs.len(),
+            7 + AGENT_TELEMETRY_ENV.len() + CHILD_ENVIRONMENT_NAMES.len()
+        );
     }
 
     #[test]
@@ -863,24 +891,16 @@ pub mod tests {
     }
 
     #[test]
-    fn only_the_escalation_directory_is_added_to_the_sandbox() {
-        let base = crate::spawn::CLAUDE_SANDBOX_SETTINGS;
+    fn only_the_escalation_directory_is_added_and_the_vendor_sandbox_stays_off() {
+        let base = crate::spawn::CLAUDE_SANDBOX_OFF;
         let settings: Value =
             serde_json::from_str(&worker_settings(base, Path::new("/spool/escalation")).unwrap())
                 .unwrap();
         assert_eq!(
-            settings["sandbox"]["filesystem"]["allowWrite"],
-            json!(["/spool/escalation"])
-        );
-        assert_eq!(
             settings["permissions"]["additionalDirectories"],
             json!(["/spool/escalation"])
         );
-        assert_eq!(settings["sandbox"]["enabled"], json!(true));
-        assert_eq!(
-            settings["sandbox"]["allowUnsandboxedCommands"],
-            json!(false)
-        );
+        assert_eq!(settings["sandbox"], json!({"enabled": false}));
         let text = settings.to_string();
         assert!(
             !text.contains("result.json") && !text.contains("progress.json"),
@@ -889,7 +909,7 @@ pub mod tests {
         assert!(worker_settings("[]", Path::new("/e")).is_err());
         assert!(
             worker_settings(
-                r#"{"sandbox":{"filesystem":{"allowWrite":"x"}}}"#,
+                r#"{"permissions":{"additionalDirectories":"x"}}"#,
                 Path::new("/e")
             )
             .is_err()
