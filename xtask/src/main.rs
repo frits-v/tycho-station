@@ -1030,7 +1030,7 @@ mod tests {
     use tycho_types::git_environment::{git_environment_in, scrub_git_environment};
 
     /// The xtask builds alone in some workflows and with the workspace in ci, where nono turns
-    /// on serde_json's `preserve_order`; the xtask names the feature itself so both builds
+    /// on `serde_json`'s `preserve_order`; the xtask names the feature itself so both builds
     /// order a JSON object's keys as they were inserted.
     #[test]
     fn a_json_object_keeps_its_keys_in_insertion_order() {

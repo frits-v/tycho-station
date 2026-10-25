@@ -38,7 +38,7 @@ use tycho_types::git_environment::{git_command, hook_environment_refusal};
 use tycho_types::task_packet::Effort;
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
-const RUN_LIMIT: Duration = Duration::from_secs(180);
+const RUN_LIMIT: Duration = Duration::from_mins(3);
 const PROBE_COMMAND: &str = "echo probe-$((6*7))";
 const PROBE_OUTPUT: &str = "probe-42";
 /// Claude's own sandbox as the station passed it before the station's sandbox existed.
@@ -135,10 +135,9 @@ fn decode_bash(stream: &str) -> BashOutcome {
     if results.iter().any(|text| text.contains(PROBE_OUTPUT)) {
         return BashOutcome::Ran;
     }
-    match results.first() {
-        None => BashOutcome::NoToolResult,
-        Some(text) => BashOutcome::Unrecognised(text.chars().take(300).collect()),
-    }
+    results.first().map_or(BashOutcome::NoToolResult, |text| {
+        BashOutcome::Unrecognised(text.chars().take(300).collect())
+    })
 }
 
 struct Run {
@@ -161,9 +160,10 @@ enum Mode {
     Unsandboxed,
 }
 
-fn run_claude_as(scratch: &Scratch, settings: &str, prompt: &str, mode: Mode) -> Run {
-    let claude = mise_which("claude");
-    let mut spec_grants = vec![
+/// The grants the core would put in the spec: the worktree, and the vendor's install and
+/// the directory its link points into.
+fn spec_grants(scratch: &Scratch, claude: &Path) -> Vec<Grant> {
+    let mut grants = vec![
         Grant {
             path: scratch.worktree(),
             access: Access::ReadWrite,
@@ -173,12 +173,35 @@ fn run_claude_as(scratch: &Scratch, settings: &str, prompt: &str, mode: Mode) ->
             access: Access::Read,
         },
     ];
-    if let Ok(target) = fs::read_link(&claude) {
-        spec_grants.push(Grant {
+    if let Ok(target) = fs::read_link(claude) {
+        grants.push(Grant {
             path: target.parent().unwrap().to_path_buf(),
             access: Access::Read,
         });
     }
+    grants
+}
+
+/// The worker's command line for `claude`, with Bash available to the probe's prompt.
+fn worker_words(claude: &Path, scratch: &Scratch, settings: &str) -> Vec<String> {
+    let task = WorkerTask {
+        worktree: scratch.worktree(),
+        model: ModelName::parse("haiku").unwrap(),
+        effort: Effort::Low,
+        max_turns: NonZeroU16::new(4),
+        requires_commit: false,
+        session_id: VendorSessionId::parse(&uuid_like()).unwrap(),
+        settings: settings.to_string(),
+        output_schema: scratch.root.join("vendor/schema.json"),
+    };
+    let mut words = ClaudeWorker.command(claude, &task).unwrap();
+    words.extend(["--allowedTools".to_string(), "Bash".to_string()]);
+    words
+}
+
+fn run_claude_as(scratch: &Scratch, settings: &str, prompt: &str, mode: Mode) -> Run {
+    let claude = mise_which("claude");
+    let spec_grants = spec_grants(scratch, &claude);
     let home = scratch.home();
     let vendor_files = scratch.root.join("vendor");
     let paths = SessionPaths {
@@ -191,18 +214,7 @@ fn run_claude_as(scratch: &Scratch, settings: &str, prompt: &str, mode: Mode) ->
         uid: current_uid(),
     };
     let prepared = session_sandbox::prepare(&paths).unwrap();
-    let task = WorkerTask {
-        worktree: scratch.worktree(),
-        model: ModelName::parse("haiku").unwrap(),
-        effort: Effort::Low,
-        max_turns: NonZeroU16::new(4),
-        requires_commit: false,
-        session_id: VendorSessionId::parse(&uuid_like()).unwrap(),
-        settings: settings.to_string(),
-        output_schema: vendor_files.join("schema.json"),
-    };
-    let mut words = ClaudeWorker.command(&claude, &task).unwrap();
-    words.extend(["--allowedTools".to_string(), "Bash".to_string()]);
+    let words = worker_words(&claude, scratch, settings);
     let token = credentials::load(&config::core_home().unwrap(), CredentialVendor::Claude)
         .unwrap_or_else(|error| panic!("no Claude token in the core's store: {error}"));
     let user = tycho::launch_spec::current_user_name().unwrap();
@@ -228,16 +240,27 @@ fn run_claude_as(scratch: &Scratch, settings: &str, prompt: &str, mode: Mode) ->
         .env(CLAUDE_TOKEN_ENV, token.expose())
         .envs(AGENT_TELEMETRY_ENV)
         .envs(prepared.proxy.child_environment())
-        .current_dir(scratch.worktree())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .current_dir(scratch.worktree());
     if mode == Mode::Sandboxed {
         command.env(PLAN_ENV, &prepared.plan);
     }
+    let output = run_with_prompt(command, prompt);
+    let record = prepared.proxy.stop();
+    Run {
+        stream: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        proxy: record.to_string(),
+    }
+}
+
+/// Runs the command with the prompt on stdin, as the worker hands the brief.
+fn run_with_prompt(mut command: Command, prompt: &str) -> std::process::Output {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let started = Instant::now();
     let mut child = command.spawn().unwrap();
-    // The worker hands the brief on stdin the same way.
     let mut stdin = child.stdin.take().unwrap();
     std::io::Write::write_all(&mut stdin, prompt.as_bytes()).unwrap();
     drop(stdin);
@@ -246,12 +269,7 @@ fn run_claude_as(scratch: &Scratch, settings: &str, prompt: &str, mode: Mode) ->
         started.elapsed() < RUN_LIMIT,
         "the probe outlasted {RUN_LIMIT:?}"
     );
-    let record = prepared.proxy.stop();
-    Run {
-        stream: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        proxy: record.to_string(),
-    }
+    output
 }
 
 fn uuid_like() -> String {

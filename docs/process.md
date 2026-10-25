@@ -95,6 +95,7 @@ The suites that start real processes are ignored tests, run by their mise tasks 
 | `kill-tests`, `spine-tests`, `launcher-tests`, `chaos-tests` | the mise tools; they run at the same time, each test core on its own port slot |
 | `worker-tests` | a Claude token in the core's store (`tycho credentials set claude`), which the suite copies into its test core and hands its worker, and `graph-plugin`; never beside `control-tests` |
 | `control-tests` | a Claude token in the core's store, which the suite copies into its test core and hands each control session; never beside `worker-tests` |
+| `vendor-sandbox-tests` | a Claude token in the core's store; five short `claude -p` turns through the session proxy and the trampoline; never beside `worker-tests` or `control-tests` |
 | `graph-tests` | `mise run graph-plugin` |
 | `boundary-tests` | a terminal, the provisioned agent user and the sudoers rule: sudo asks for the developer's password on the terminal to run each probe as `tycho-agent` |
 | `attach-tests` | a Ghostty terminal and the agent user: sudo once, again at teardown past its five-minute cache; up to two Automation dialogs (the suite's terminal, `osascript`) |
@@ -176,6 +177,33 @@ state, process group and foreground group for sudo (`T` is stopped reading the t
 a background group, `S` is waiting), and a refused kill is named and not waited for. The
 agent's scripts send zmx's output to a file of their own, so a session daemon that inherits
 a descriptor cannot hold the run open.
+
+## The session sandbox
+
+Every vendor session runs inside the station's own sandbox (design section 7, the session
+sandbox): a nono capability set the session leader applies, and a session proxy in the
+launcher that admits only the vendor's allowed hosts. What it grants is decided in two
+places, both re-proved when something under them moves.
+
+- The system-path list in `config/sandbox.cue`, ported from nono-cli's `data/policy.json`
+  at the pinned release. `sandbox::tests::every_system_path_of_this_host_exists` requires
+  every entry for this host to exist; a missing macOS entry fails every session start, so
+  the test is the warning. It runs in `ci` on the Linux runner and on every developer run of
+  the tests on macOS.
+- The vendors' own behaviour under it: which hosts they reach, whether a nested vendor
+  sandbox starts, which settings layer decides it, and whether Claude's configuration saves
+  land. `mise run vendor-sandbox-tests` measures the last three; `mise run worker-tests`
+  prints each session's proxy line with what it refused.
+
+A bump of the `nono` or `nono-proxy` pin, of the `claude` or `codex` pin, or a macOS update
+re-runs, before it merges: `mise run vendor-sandbox-tests`, `mise run launcher-tests`,
+`mise run worker-tests` and `mise run control-tests`, the probes recorded on
+[the nono issue](https://github.com/frits-v/tycho-station/issues/124) that the change
+touches (Codex's destinations and the kill path among them), and the system-path test
+above. A nono bump also diffs the release's `data/policy.json` groups against
+`config/sandbox.cue` and records what changed. A host the vendor newly tries goes into
+`docs/vendor-surfaces.md` (Evidence) and onto the allowlist only by a ruling; until then it
+stays refused.
 
 ## Reporting
 

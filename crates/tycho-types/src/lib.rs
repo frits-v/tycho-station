@@ -21,7 +21,7 @@ pub mod token;
 
 #[cfg(test)]
 mod tests {
-    /// nono turns on serde_json's `preserve_order`, and cargo turns a feature on for every
+    /// nono turns on `serde_json`'s `preserve_order`, and cargo turns a feature on for every
     /// crate of a build, so this crate names it itself: a build of one crate and of the whole
     /// workspace then order a JSON object's keys the same way, as they were inserted.
     #[test]

@@ -165,8 +165,9 @@ impl WorkerVendor for CodexWorker {
             "--json",
             "--output-schema",
             &task.output_schema.display().to_string(),
+            // Codex's own sandbox off: the station's sandbox bounds the whole process tree.
             "--sandbox",
-            "workspace-write",
+            "danger-full-access",
             "--cd",
             &task.worktree.display().to_string(),
             "--model",
@@ -262,7 +263,7 @@ mod tests {
         assert_eq!(
             words.join(" "),
             "/opt/codex/bin/codex exec --json --output-schema /spool/output-schema.json \
-             --sandbox workspace-write --cd /agent/worktrees/cf7a/wu03/a1 \
+             --sandbox danger-full-access --cd /agent/worktrees/cf7a/wu03/a1 \
              --model gpt-5-codex-mini -c model_reasoning_effort=\"xhigh\" -"
         );
     }

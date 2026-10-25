@@ -556,10 +556,11 @@ pub fn run(
     })
 }
 
-/// Bash for every command: Claude's own sandbox, when it was on, ran each Bash command
-/// without a prompt because its sandbox bounded it, and a headless worker has nobody to
-/// answer one. The station's sandbox now bounds the whole process tree, so the allow rule
-/// stands where Claude's auto-allow stood.
+/// Bash for every command, allowed by rule.
+///
+/// Claude's own sandbox, when on, runs each sandboxed Bash command without a prompt, and a
+/// headless worker has nobody to answer one. The station's sandbox bounds the whole process
+/// tree, so the allow rule stands where that auto-allow stood.
 pub const WORKER_ALLOWED_TOOLS: [&str; 1] = ["Bash"];
 
 /// Appends `value` to the list at `permissions.<key>`, making the object and list as needed.

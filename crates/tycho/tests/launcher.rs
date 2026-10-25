@@ -625,15 +625,7 @@ fn launch_spools_resolves_and_ends_its_session() {
         "the launcher did not start from the prefix: {}",
         launcher.command
     );
-    let lease_seen = wait_until("the vendor looked for the lease", WAIT_LIMIT, || {
-        fs::read_to_string(harness.marker(&name, ".lease-seen")).ok()
-    });
-    assert_eq!(
-        lease_seen.trim(),
-        "hidden",
-        "the vendor's sandbox let it see the launcher's lease"
-    );
-    assert_lease_before_vendor(&harness, &name);
+    assert_lease_hidden_and_written_first(&harness, &name);
     assert_vendor_saw_only_its_allowlist(&harness, &name, &awaitable);
     assert_token_nowhere(&harness, &name, pid);
     let terminal = fs::read_to_string(harness.marker(&name, ".tty")).unwrap();
@@ -669,9 +661,17 @@ fn launch_spools_resolves_and_ends_its_session() {
     assert_eq!(harness.sessions_named(&name), 0);
 }
 
-/// The lease was written before the vendor started: its start time precedes the vendor
-/// record's, both taken by the launcher.
-fn assert_lease_before_vendor(harness: &Harness, name: &SessionName) {
+/// The vendor's sandbox hides the launcher's lease, which was written before the vendor
+/// started: its start time precedes the vendor record's, both taken by the launcher.
+fn assert_lease_hidden_and_written_first(harness: &Harness, name: &SessionName) {
+    let lease_seen = wait_until("the vendor looked for the lease", WAIT_LIMIT, || {
+        fs::read_to_string(harness.marker(name, ".lease-seen")).ok()
+    });
+    assert_eq!(
+        lease_seen.trim(),
+        "hidden",
+        "the vendor's sandbox let it see the launcher's lease"
+    );
     let LeaseRead::Present { lease } = read_lease(&harness.dirs, name, current_uid()) else {
         panic!("no lease");
     };
