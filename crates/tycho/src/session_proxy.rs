@@ -203,9 +203,10 @@ impl CredentialCaptureBackend for InMemoryCredential {
     }
 }
 
-/// The `anthropic` route: requests to `ANTHROPIC_BASE_URL` reach `api.anthropic.com` with
-/// `Authorization: Bearer <handed token>` in place of the phantom the vendor sent, which is
-/// the proxy's session token in `CLAUDE_CODE_OAUTH_TOKEN`.
+/// The `anthropic` route, from `ANTHROPIC_BASE_URL` to `api.anthropic.com`.
+///
+/// A request carries `Authorization: Bearer <handed token>` upstream in place of the phantom
+/// the vendor sent, which is the proxy's session token in `CLAUDE_CODE_OAUTH_TOKEN`.
 #[must_use]
 pub fn anthropic_route() -> RouteConfig {
     RouteConfig {

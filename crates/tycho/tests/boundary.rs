@@ -42,8 +42,13 @@ use tycho::command::{self, CommandError};
 use tycho::config::{
     AGENT_SOCKET_DIR_DEFAULT, AGENT_USER_DEFAULT, TOOL_PREFIX_DEFAULT, ToolPrefix,
 };
+use tycho::config::{AgentDirs, CorePorts};
+use tycho::credentials::{Credential, CredentialVendor};
+use tycho::launch_spec::{HeartbeatTarget, VendorTerminal};
 use tycho::process::{ProcessFacts, process_facts};
+use tycho::proxy_audit::{self, AuditRead};
 use tycho::repositories::{ProjectName, Repositories, pin_ref, unit_branch};
+use tycho::spawn::{SpawnOutcome, SpawnRequest, spawn_session};
 use tycho::zmx::{LOG_DIR, LOG_FILE, Presence, Zmx, prepare_shared_log, presence};
 use tycho_harness::content::content_ref;
 use tycho_harness::verify::{VerifyOptions, run_criteria_with, unit_passed};
@@ -54,7 +59,9 @@ use tycho_types::agent_switch::{
 };
 use tycho_types::envelope::{BranchName, CommitSha};
 use tycho_types::git_environment::{git_command, hook_environment_refusal};
+use tycho_types::launcher::{ENV_AWAITABLE_ID, ENV_SESSION_NAME, ENV_SESSION_SECRET, LauncherEnv};
 use tycho_types::service::{Attempt, WorkUnitId};
+use tycho_types::session::SessionName;
 
 const SUDO: &str = "/usr/bin/sudo";
 /// Covers the operator typing the password at the first probe's prompt.
@@ -885,6 +892,260 @@ fn a_group_of_the_agent_is_killed_through_the_rule() {
         Some(tycho::kill::KillVerdict::SignalledThroughRule)
     );
 }
+
+/// The fake vendor of a session launched as the agent: from inside the session sandbox it
+/// probes the core's admin port, a host off the allowlist through the proxy and the model
+/// endpoint through the route, dumps its environment, and marks the end.
+const SESSION_VENDOR_SCRIPT: &str = r#"#!/bin/sh
+# $1 marker prefix, $2 the core's admin port
+/bin/bash -c 'if (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; then echo open; else echo refused; fi' admin "$2" > "$1.admin"
+/usr/bin/env > "$1.env"
+/usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 10 https://github.com/ > "$1.github" 2>/dev/null
+/usr/bin/curl -s -o "$1.model-body" -w '%{http_code}' --max-time 20 -H "Authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" -H 'anthropic-version: 2023-06-01' "$ANTHROPIC_BASE_URL/v1/models" > "$1.model" 2>/dev/null
+echo done > "$1.done"
+"#;
+/// The shape of a long-lived Claude token; Anthropic refuses it, which shows the route
+/// reached Anthropic with the token the proxy holds.
+const SESSION_TEST_TOKEN: &str = "sk-ant-oat01-boundary-suite-test-credential-0123456789";
+const SHARED_GROUP: &str = "tycho-zmx";
+
+/// The fake vendor's directory: the developer's, in the shared group at 2770, so the agent
+/// reads the script and writes its markers and the developer reads them back.
+struct SessionFixture {
+    dir: PathBuf,
+}
+
+impl SessionFixture {
+    fn new() -> Self {
+        let dir = PathBuf::from(format!(
+            "/Users/Shared/tycho-boundary-session-{}",
+            std::process::id()
+        ));
+        if dir.exists() {
+            fs::remove_dir_all(&dir).unwrap();
+        }
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        let group = nix::unistd::Group::from_name(SHARED_GROUP)
+            .unwrap()
+            .unwrap_or_else(|| panic!("boundary: no group {SHARED_GROUP}"));
+        nix::unistd::chown(&dir, None, Some(group.gid)).unwrap();
+        fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o2770)).unwrap();
+        fs::write(dir.join("vendor.sh"), SESSION_VENDOR_SCRIPT).unwrap();
+        Self { dir }
+    }
+
+    fn marker(&self, suffix: &str) -> PathBuf {
+        self.dir.join(format!("marker{suffix}"))
+    }
+
+    fn read(&self, suffix: &str) -> String {
+        fs::read_to_string(self.marker(suffix)).unwrap_or_default()
+    }
+}
+
+impl Drop for SessionFixture {
+    fn drop(&mut self) {
+        drop(fs::remove_dir_all(&self.dir));
+    }
+}
+
+/// A session launched as the agent, as the spawner launches a vendor, is held at its
+/// boundaries from inside: the core's admin port refused while it answers the developer, a host
+/// off the allowlist refused at the proxy and recorded as a firing in the session's audit, the
+/// model endpoint reached through the route, and the handed token in no variable of the
+/// vendor's. The bare probes of `the_agent_user_is_refused_at_every_boundary` run outside any
+/// session sandbox and stay measurements of the agent user alone.
+#[test]
+#[ignore = "launches a session as the agent through the sudoers rule against a test core; run with mise run boundary-tests"]
+fn a_session_launched_as_the_agent_is_held_at_its_boundaries() {
+    require_the_narrow_rule();
+    let agent = nix::unistd::User::from_name(AGENT_USER_DEFAULT)
+        .unwrap()
+        .unwrap_or_else(|| panic!("boundary: no user {AGENT_USER_DEFAULT}"));
+    let agent_uid = agent.uid.as_raw();
+    let claim = support::claim_ports(&test_home("session"));
+    let core = support::Core::new(claim);
+    support::start_once(&core, |core| {
+        core.tycho(&["core", "start"])
+            .status
+            .success()
+            .then_some(())
+    });
+    let ports = core.config.ports;
+    let answered = support::client()
+        .get(ports.admin_url("/health"))
+        .send()
+        .unwrap()
+        .status();
+    println!("evidence: the admin port answers the developer with {answered}");
+    assert!(answered.is_success(), "the probe needs a live admin port");
+    let shared = Path::new(AGENT_SOCKET_DIR_DEFAULT);
+    let dirs = AgentDirs::new(shared.to_path_buf()).unwrap();
+    let zmx = Zmx::agent_as(&prefix_zmx(), shared, AGENT_USER_DEFAULT);
+    let prefix = ToolPrefix::load(PathBuf::from(TOOL_PREFIX_DEFAULT)).unwrap();
+    let fixture = SessionFixture::new();
+    let name = SessionName::parse(&format!("b{}.wu01.wrk.claude.bs", std::process::id())).unwrap();
+    let outcome = launch_as_agent(&Launch {
+        zmx: &zmx,
+        dirs: &dirs,
+        prefix: &prefix,
+        fixture: &fixture,
+        name: &name,
+        agent: &agent,
+        ports,
+    });
+    println!("evidence: spawn_session({name}) as the agent -> {outcome:?}");
+    let ended = within_the_launched_wait(|| fixture.marker(".done").exists());
+    let audit =
+        first_within_the_launched_wait(|| match proxy_audit::read(&dirs, &name, agent_uid) {
+            AuditRead::Absent => None,
+            read => Some(read),
+        });
+    drop(zmx.kill(&name.to_string()));
+    assert!(
+        matches!(outcome, Ok(SpawnOutcome::Spawned { .. })),
+        "{outcome:?}"
+    );
+    assert_held_from_inside(&fixture, ended, audit);
+}
+
+/// What a launch as the agent needs: the agent's zmx and directories, the prefix it starts
+/// from, the fake vendor and the test core's ports.
+struct Launch<'a> {
+    zmx: &'a Zmx,
+    dirs: &'a AgentDirs,
+    prefix: &'a ToolPrefix,
+    fixture: &'a SessionFixture,
+    name: &'a SessionName,
+    agent: &'a nix::unistd::User,
+    ports: CorePorts,
+}
+
+/// Spawns the fake vendor as the spawner spawns one, through the rule as the agent, with a test
+/// token the hand-off delivers.
+fn launch_as_agent(
+    launch: &Launch<'_>,
+) -> Result<SpawnOutcome, tycho::services::spawner::SpawnerError> {
+    let (fixture, name, ports) = (launch.fixture, launch.name, launch.ports);
+    let env = LauncherEnv::from_map(&std::collections::BTreeMap::from([
+        (
+            ENV_AWAITABLE_ID.to_string(),
+            format!("boundary-awaitable-{}", std::process::id()),
+        ),
+        (ENV_SESSION_SECRET.to_string(), "s".repeat(40)),
+        (ENV_SESSION_NAME.to_string(), name.to_string()),
+    ]))
+    .unwrap();
+    let vendor = [
+        "/bin/sh".to_string(),
+        fixture.dir.join("vendor.sh").display().to_string(),
+        fixture.marker("").display().to_string(),
+        ports.admin().port().to_string(),
+    ];
+    let credential =
+        Credential::parse(CredentialVendor::Claude, SESSION_TEST_TOKEN.as_bytes()).unwrap();
+    let outcome = spawn_session(&SpawnRequest {
+        zmx: launch.zmx,
+        dirs: launch.dirs,
+        tycho: &launch.prefix.tycho(),
+        home: &launch.agent.dir,
+        env: &env,
+        heartbeat: HeartbeatTarget::LaunchProbe,
+        vendor: &vendor,
+        agent_uid: launch.agent.uid.as_raw(),
+        tier: None,
+        terminal: VendorTerminal::Files,
+        vendor_dir: Some(&fixture.dir),
+        ports,
+        tool_prefix: launch.prefix,
+        credential: Some(&credential),
+    });
+    println!("evidence: spawn_session({name}) as the agent -> {outcome:?}");
+    outcome
+}
+
+/// From inside the session: the admin port refused, github.com refused at the proxy and in
+/// the audit, the model endpoint answered by Anthropic, and only the phantom in the vendor's
+/// environment.
+fn assert_held_from_inside(fixture: &SessionFixture, ended: bool, audit: Option<AuditRead>) {
+    let environment = fixture.read(".env");
+    let names: Vec<&str> = environment
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+        .collect();
+    let value = |wanted: &str| {
+        environment
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{wanted}=")))
+    };
+    let body: String = fixture
+        .read(".model-body")
+        .chars()
+        .take(EVIDENCE_MAX_CHARS)
+        .collect();
+    println!(
+        "evidence: from inside the agent's session: vendor ended {ended}; admin port {}; \
+         github.com through the proxy {}; the model endpoint through the route {} {body}; the \
+         vendor's environment names {names:?}; the proxy audit {audit:?}",
+        fixture.read(".admin").trim(),
+        fixture.read(".github").trim(),
+        fixture.read(".model").trim(),
+    );
+    assert!(ended, "the vendor did not finish its probes");
+    assert_eq!(
+        fixture.read(".admin").trim(),
+        "refused",
+        "the vendor reached the admin port"
+    );
+    assert_eq!(
+        fixture.read(".github").trim(),
+        "403",
+        "the proxy did not refuse github.com"
+    );
+    assert_eq!(fixture.read(".model").trim(), "401", "{body}");
+    assert!(
+        body.contains("\"authentication_error\""),
+        "the route did not reach Anthropic: {body}"
+    );
+    assert!(
+        !environment.contains(SESSION_TEST_TOKEN),
+        "the vendor's environment holds the handed token"
+    );
+    assert!(
+        value("CLAUDE_CODE_OAUTH_TOKEN").is_some()
+            && value("CLAUDE_CODE_OAUTH_TOKEN") == value("NONO_PROXY_TOKEN"),
+        "the vendor's token is not the phantom"
+    );
+    let Some(AuditRead::Read(audit)) = audit else {
+        panic!("the session's proxy audit did not read: {audit:?}");
+    };
+    assert!(
+        audit
+            .firings
+            .iter()
+            .any(|firing| firing.subject == "github.com:443"),
+        "{audit}"
+    );
+}
+
+/// Polls a condition for the session wait of a launched session, twice the wait of a bare one,
+/// since the vendor's model probe goes to the network.
+fn within_the_launched_wait(mut condition: impl FnMut() -> bool) -> bool {
+    first_within_the_launched_wait(|| condition().then_some(())).is_some()
+}
+
+fn first_within_the_launched_wait<T>(mut condition: impl FnMut() -> Option<T>) -> Option<T> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < LAUNCHED_SESSION_WAIT {
+        if let Some(value) = condition() {
+            return Some(value);
+        }
+        std::thread::sleep(SESSION_POLL);
+    }
+    None
+}
+
+const LAUNCHED_SESSION_WAIT: Duration = Duration::from_mins(1);
 
 /// The gate's throwaway directories, removed when the test ends.
 struct GateScratch {

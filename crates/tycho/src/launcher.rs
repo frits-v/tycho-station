@@ -632,6 +632,7 @@ impl<I: Ingress> Run<'_, I> {
         let prepared = session_sandbox::prepare(&paths, self.token.take(), leader)
             .map_err(|error| error.to_string())?;
         let mut environment = prepared.proxy.child_environment();
+        environment.extend(session_sandbox::trust_environment(vendor));
         if let Some(plan) = prepared.plan {
             environment.push((PLAN_ENV.to_string(), plan));
         }
@@ -1734,6 +1735,17 @@ mod tests {
         let env = fs::read_to_string(dir.join("env")).unwrap();
         assert!(
             env.contains(&format!("{CODEX_HOME_ENV}={}", home.display())),
+            "{env}"
+        );
+        // Codex verifies TLS against the system bundle: its system roots go through the
+        // security daemon the sandbox denies.
+        assert!(
+            env.lines().any(|line| line
+                == format!(
+                    "{}={}",
+                    session_sandbox::CODEX_TRUST_ENV,
+                    session_sandbox::SYSTEM_TRUST_BUNDLE
+                )),
             "{env}"
         );
         assert!(!home.exists(), "the Codex home outlived the session");

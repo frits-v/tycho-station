@@ -20,6 +20,7 @@ use crate::credentials::CODEX_HOME_ENV;
 use crate::launch_probe::LAUNCH_PROBE_SERVICE;
 use crate::sandbox::{Grant, PLAN_ENV, PLAN_GRANTS_MAX};
 use crate::session_proxy::{CHILD_ENVIRONMENT_NAMES, ROUTE_ENVIRONMENT_NAMES};
+use crate::session_sandbox::CODEX_TRUST_ENV;
 
 pub const HEARTBEAT_TARGET_ENV: &str = "TYCHO_HEARTBEAT_TARGET";
 pub const CORE_UID_ENV: &str = "TYCHO_CORE_UID";
@@ -344,7 +345,7 @@ impl LauncherSettings {
 }
 
 /// Every name the launcher may add to a vendor's environment for its session.
-pub const SESSION_ENVIRONMENT_NAMES: [&str; 13] = [
+pub const SESSION_ENVIRONMENT_NAMES: [&str; 14] = [
     CHILD_ENVIRONMENT_NAMES[0],
     CHILD_ENVIRONMENT_NAMES[1],
     CHILD_ENVIRONMENT_NAMES[2],
@@ -357,6 +358,7 @@ pub const SESSION_ENVIRONMENT_NAMES: [&str; 13] = [
     ROUTE_ENVIRONMENT_NAMES[0],
     ROUTE_ENVIRONMENT_NAMES[1],
     CODEX_HOME_ENV,
+    CODEX_TRUST_ENV,
     PLAN_ENV,
 ];
 
@@ -630,6 +632,39 @@ pub mod tests {
         assert!(check_vendor(&vec!["x".to_string(); VENDOR_ARGS_MAX + 1]).is_err());
     }
 
+    /// A Claude session's vendor environment beyond the mise variables: the spec's pairs, the
+    /// launcher's, the proxy's and the route's.
+    const CLAUDE_SESSION_VENDOR_NAMES: [&str; 28] = [
+        "ANTHROPIC_BASE_URL",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+        "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "DISABLE_AUTOUPDATER",
+        "DISABLE_ERROR_REPORTING",
+        "DISABLE_TELEMETRY",
+        "DO_NOT_TRACK",
+        "ENTIRE_NO_AUTO_UPDATE",
+        "ENTIRE_TELEMETRY_OPTOUT",
+        "HOME",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "LOGNAME",
+        "NODE_USE_ENV_PROXY",
+        "NONO_NO_PROXY",
+        "NONO_PROXY_TOKEN",
+        "NO_PROXY",
+        "PATH",
+        "TYCHO_PROGRESS_FILE",
+        "TYCHO_RESULT_FILE",
+        "TYCHO_SESSION_NAME",
+        "TYCHO_TIER",
+        "TYCHO_VENDOR_SANDBOX_SETTINGS",
+        "USER",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    ];
+
     #[test]
     fn the_vendor_environment_is_exactly_the_allowlist() {
         let mut spec_environment = environment(Path::new("/agent"));
@@ -651,36 +686,7 @@ pub mod tests {
             .unwrap();
         let mut names: Vec<&str> = pairs.iter().map(|(name, _)| name.as_str()).collect();
         names.sort_unstable();
-        let mut expected = vec![
-            "ANTHROPIC_BASE_URL",
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-            "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "DISABLE_AUTOUPDATER",
-            "DISABLE_ERROR_REPORTING",
-            "DISABLE_TELEMETRY",
-            "DO_NOT_TRACK",
-            "ENTIRE_NO_AUTO_UPDATE",
-            "ENTIRE_TELEMETRY_OPTOUT",
-            "HOME",
-            "HTTPS_PROXY",
-            "HTTP_PROXY",
-            "LOGNAME",
-            "NODE_USE_ENV_PROXY",
-            "NONO_NO_PROXY",
-            "NONO_PROXY_TOKEN",
-            "NO_PROXY",
-            "PATH",
-            "TYCHO_PROGRESS_FILE",
-            "TYCHO_RESULT_FILE",
-            "TYCHO_SESSION_NAME",
-            "TYCHO_TIER",
-            "TYCHO_VENDOR_SANDBOX_SETTINGS",
-            "USER",
-            "http_proxy",
-            "https_proxy",
-            "no_proxy",
-        ];
+        let mut expected = CLAUDE_SESSION_VENDOR_NAMES.to_vec();
         // The mise variables pass from the launcher's environment when it has them.
         expected.extend(
             MISE_PREFIX_ENV
@@ -709,7 +715,30 @@ pub mod tests {
                 .any(|(_, value)| value == SECRET || value == "sign_1abc")
         );
         drop(proxy.stop());
+        assert_eq!(
+            settings.credential_socket,
+            Some(PathBuf::from("/agent/specs/0123456789abcdef.cred"))
+        );
+        let mut relative = spec_environment;
+        relative.insert(CREDENTIAL_SOCKET_ENV.to_string(), "x.cred".to_string());
+        assert!(matches!(
+            LauncherSettings::from_map(&relative),
+            Err(SettingsError::NotAbsolute(CREDENTIAL_SOCKET_ENV))
+        ));
+    }
+
+    /// A session pair the launcher never sets, or a name given twice, is refused rather than
+    /// passed to the vendor.
+    #[test]
+    fn a_session_pair_outside_the_names_or_repeated_is_refused() {
+        let settings = LauncherSettings::from_map(&environment(Path::new("/agent"))).unwrap();
         let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+        let codex_home = vec![pair(CODEX_HOME_ENV, "/a")];
+        assert!(
+            settings
+                .vendor_environment(Path::new("/p"), Path::new("/r"), codex_home)
+                .is_ok()
+        );
         for refused in [
             vec![pair("TYCHO_SESSION_SECRET", "x")],
             vec![pair("HOME", "/elsewhere")],
@@ -723,16 +752,6 @@ pub mod tests {
                 "{refused:?}"
             );
         }
-        assert_eq!(
-            settings.credential_socket,
-            Some(PathBuf::from("/agent/specs/0123456789abcdef.cred"))
-        );
-        let mut relative = spec_environment;
-        relative.insert(CREDENTIAL_SOCKET_ENV.to_string(), "x.cred".to_string());
-        assert!(matches!(
-            LauncherSettings::from_map(&relative),
-            Err(SettingsError::NotAbsolute(CREDENTIAL_SOCKET_ENV))
-        ));
     }
 
     #[test]

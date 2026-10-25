@@ -35,6 +35,30 @@ pub const CLAUDE_CACHE_DIR: &str = "Library/Caches/claude-cli-nodejs";
 #[cfg(not(target_os = "macos"))]
 pub const CLAUDE_CACHE_DIR: &str = ".cache/claude-cli-nodejs";
 
+/// The variable that makes Codex verify TLS with rustls against a bundle file.
+///
+/// With system roots Codex asks `com.apple.SecurityServer`, which the sandbox denies with the
+/// keychain, so every request fails though the proxy admits each tunnel.
+pub const CODEX_TRUST_ENV: &str = "CODEX_CA_CERTIFICATE";
+/// The operating system's own bundle of trusted roots, which the system-path list lets a
+/// session read.
+#[cfg(target_os = "macos")]
+pub const SYSTEM_TRUST_BUNDLE: &str = "/etc/ssl/cert.pem";
+#[cfg(not(target_os = "macos"))]
+pub const SYSTEM_TRUST_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+
+/// What a vendor's environment needs for TLS inside the sandbox: Codex's bundle variable, and
+/// nothing for Claude, which carries its own roots.
+#[must_use]
+pub fn trust_environment(vendor: SandboxVendor) -> Vec<(String, String)> {
+    match vendor {
+        SandboxVendor::Codex => {
+            vec![(CODEX_TRUST_ENV.to_string(), SYSTEM_TRUST_BUNDLE.to_string())]
+        }
+        SandboxVendor::Claude => Vec::new(),
+    }
+}
+
 #[derive(Debug)]
 pub enum PrepareError {
     Vendor(String),

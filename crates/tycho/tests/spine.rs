@@ -734,6 +734,23 @@ fn assert_proxy_audit_recorded(core_ports: CorePorts, session: &str) {
 
 const PROXY_AUDIT_POLLS_MAX: u32 = 50;
 
+/// An audit with two admissions and one refusal, as a launcher leaves it.
+fn one_firing() -> AuditRead {
+    AuditRead::Read(SessionAudit {
+        examinations: 2,
+        firing_count: 1,
+        firings: vec![Firing {
+            mechanism: proxy_audit::MECHANISM.to_string(),
+            session: SessionName::parse("cf7a.wu01.wrk.claude.a1").unwrap(),
+            subject: "github.com:443".to_string(),
+            unix_ms: 1,
+            reason: None,
+        }],
+        unrecognised: 0,
+        at_cap: false,
+    })
+}
+
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
@@ -746,19 +763,7 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     let gate = FixedGate::new(GateVerdict::Merged {
         default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
     });
-    spawner.set_default_proxy_audit(AuditRead::Read(SessionAudit {
-        examinations: 2,
-        firing_count: 1,
-        firings: vec![Firing {
-            mechanism: proxy_audit::MECHANISM.to_string(),
-            session: SessionName::parse("cf7a.wu01.wrk.claude.a1").unwrap(),
-            subject: "github.com:443".to_string(),
-            unix_ms: 1,
-            reason: None,
-        }],
-        unrecognised: 0,
-        at_cap: false,
-    }));
+    spawner.set_default_proxy_audit(one_firing());
     let (core, _doubles, ports) =
         start_core_with(claim, &spawner, Arc::new(gate.clone()), test_timing());
     assert_unit_handlers_private(core_ports);

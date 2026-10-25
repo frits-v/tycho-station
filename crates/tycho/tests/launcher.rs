@@ -544,8 +544,9 @@ fn assert_vendor_saw_only_its_allowlist(harness: &Harness, name: &SessionName, a
     );
     // The vendor holds the phantom, which is the proxy's session token, and never the token
     // the hand-off delivered.
-    let phantom = value(CLAUDE_TOKEN_ENV).expect("the vendor has no phantom");
-    assert_eq!(Some(phantom.clone()), value("NONO_PROXY_TOKEN"));
+    let phantom = value(CLAUDE_TOKEN_ENV);
+    assert!(phantom.is_some(), "the vendor has no phantom");
+    assert_eq!(phantom, value("NONO_PROXY_TOKEN"));
     assert!(
         !vendor_env.contains(TEST_TOKEN),
         "the vendor's environment holds the handed token"

@@ -3,6 +3,10 @@ use crate::agent_files::current_uid;
 use crate::launch_spec::tests::NAME;
 use std::os::unix::fs::PermissionsExt;
 
+fn newlines(bytes: &[u8]) -> usize {
+    std::str::from_utf8(bytes).unwrap().matches('\n').count()
+}
+
 fn session() -> SessionName {
     SessionName::parse(NAME).unwrap()
 }
@@ -92,10 +96,7 @@ fn no_file_reads_absent_and_an_empty_one_examined_nothing() {
 fn a_proxy_at_its_cap_writes_its_events_and_the_cap_line() {
     let events = vec![event("deny", "connect", "github.com"); AUDIT_EVENTS_MAX];
     let bytes = encode(&events).unwrap();
-    assert_eq!(
-        bytes.iter().filter(|byte| **byte == b'\n').count(),
-        AUDIT_LINES_MAX
-    );
+    assert_eq!(newlines(&bytes), AUDIT_LINES_MAX);
     assert!(bytes.len() <= AUDIT_FILE_MAX_BYTES);
     let audit = decode(&session(), &bytes);
     assert!(audit.at_cap);
@@ -201,6 +202,6 @@ fn a_target_and_reason_are_cut_to_their_bounds_without_control_characters() {
     let reason = line.reason.unwrap();
     assert!(reason.len() <= REASON_MAX_BYTES && !reason.contains('\n'));
     let bytes = encode(&[forged]).unwrap();
-    assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+    assert_eq!(newlines(&bytes), 1);
     assert!(bytes.len() <= AUDIT_LINE_MAX_BYTES + 1);
 }

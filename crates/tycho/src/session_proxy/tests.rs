@@ -6,6 +6,7 @@ use std::sync::mpsc;
 use crate::credentials::tests::CLAUDE_TOKEN;
 
 const RESPONSE_MAX_BYTES: u64 = 4096;
+const HEAD_MAX_BYTES: usize = 4096;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn hosts(names: &[&str]) -> Vec<String> {
@@ -246,7 +247,7 @@ fn upstream() -> (u16, mpsc::Receiver<String>) {
         stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
         let mut head = Vec::new();
         let mut byte = [0_u8; 1];
-        while head.len() < RESPONSE_MAX_BYTES as usize && !head.ends_with(b"\r\n\r\n") {
+        while head.len() < HEAD_MAX_BYTES && !head.ends_with(b"\r\n\r\n") {
             match stream.read(&mut byte) {
                 Ok(1) => head.push(byte[0]),
                 _ => break,
@@ -263,12 +264,16 @@ fn upstream() -> (u16, mpsc::Receiver<String>) {
 
 fn route_request(bearer: &str) -> String {
     format!(
-        "GET /{ANTHROPIC_ROUTE}/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n\r\n"
+        "GET /{ANTHROPIC_ROUTE}/v1/models HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {bearer}\r\nx-api-key: {OTHER_KEY}\r\nConnection: close\r\n\r\n"
     )
 }
 
-/// The route swaps the phantom for the handed token on its way upstream, and forwards
-/// nothing for a bearer that is not the phantom.
+/// Another account's key a vendor might add beside the phantom.
+const OTHER_KEY: &str = "sk-ant-api03-another-account";
+
+/// The route swaps the phantom for the handed token on its way upstream, drops any other
+/// credential header the vendor added, and forwards nothing for a bearer that is not the
+/// phantom.
 #[test]
 fn the_route_sends_the_handed_token_upstream_in_place_of_the_phantom() {
     let (port, heads) = upstream();

@@ -499,8 +499,9 @@ pub fn capability_set(
 
 /// The property every station set holds, or the reason it does not.
 ///
-/// Outbound TCP only to the proxy's port, which is none of the core's; no other TCP grant; no
-/// resolver; and no platform rule but the plan's absent-path and state-file rules.
+/// Outbound TCP only to the proxy's port, which is none of the core's; no other TCP grant; the
+/// resolver blocked, which Seatbelt enforces on macOS and Landlock, which leaves UDP open, does
+/// not on Linux; and no platform rule but the plan's absent-path and state-file rules.
 pub fn check_proxy_only(set: &CapabilitySet, plan: &SandboxPlan) -> Result<(), SandboxError> {
     let refuse = |reason: String| Err(SandboxError::NotProxyOnly(reason));
     match set.network_mode() {
@@ -552,20 +553,30 @@ pub fn apply(set: &CapabilitySet) -> Result<(), SandboxError> {
     }
     #[cfg(target_os = "linux")]
     {
-        use nono::sandbox::SeccompNetFallback;
-        match nono::Sandbox::apply_auto(set) {
-            Ok(SeccompNetFallback::None) => Ok(()),
-            Ok(fallback) => Err(SandboxError::Apply(format!(
-                "Landlock cannot filter TCP on this kernel and nono asks for a seccomp \
-                 supervisor ({fallback:?}); the network would not be enforced"
-            ))),
-            Err(error) => Err(SandboxError::Apply(error.to_string())),
-        }
+        landlock_applied(nono::Sandbox::apply_auto(set))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = set;
         Err(SandboxError::UnsupportedPlatform)
+    }
+}
+
+/// What Landlock's answer means: only no fallback is an applied set. A fallback is nono asking
+/// for a seccomp supervisor the station does not run, so the network would not be enforced,
+/// and an error is a set that could not be applied; both are refusals, never a pass.
+#[cfg(target_os = "linux")]
+fn landlock_applied<E: fmt::Display>(
+    applied: Result<nono::sandbox::SeccompNetFallback, E>,
+) -> Result<(), SandboxError> {
+    use nono::sandbox::SeccompNetFallback;
+    match applied {
+        Ok(SeccompNetFallback::None) => Ok(()),
+        Ok(fallback) => Err(SandboxError::Apply(format!(
+            "Landlock cannot filter TCP on this kernel and nono asks for a seccomp \
+             supervisor ({fallback:?}); the network would not be enforced"
+        ))),
+        Err(error) => Err(SandboxError::Apply(error.to_string())),
     }
 }
 

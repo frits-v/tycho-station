@@ -31,6 +31,7 @@ use crate::launch_spec::{
 };
 use crate::process::{now_unix_ms, send};
 use crate::session_proxy::{CHILD_ENVIRONMENT_NAMES, ROUTE_ENVIRONMENT_NAMES};
+use crate::session_sandbox::CODEX_TRUST_ENV;
 use crate::vendors::claude_worker::ClaudeWorker;
 use crate::vendors::codex_worker::{CODEX_OUTPUT_SCHEMA, CodexWorker};
 use crate::vendors::worker::{
@@ -94,7 +95,7 @@ impl WorkerEnvironment {
         // What the launcher added for the session: the route's phantom and base URL for
         // Claude, the Codex home, and the session proxy's variables, without which the
         // vendor's sandbox refuses its traffic.
-        let inherited_names = ["HOME", "PATH", CODEX_HOME_ENV]
+        let inherited_names = ["HOME", "PATH", CODEX_HOME_ENV, CODEX_TRUST_ENV]
             .into_iter()
             .chain(ROUTE_ENVIRONMENT_NAMES)
             .chain(MISE_PREFIX_ENV)
@@ -723,6 +724,7 @@ pub mod tests {
             "http://127.0.0.1:41000/anthropic".to_string(),
         );
         launcher.insert(CODEX_HOME_ENV.to_string(), "/spool/codex-home".to_string());
+        launcher.insert(CODEX_TRUST_ENV.to_string(), "/etc/ssl/cert.pem".to_string());
         launcher.insert(
             "TYCHO_CREDENTIAL_SOCKET".to_string(),
             "/a/specs/x.cred".to_string(),
@@ -738,12 +740,13 @@ pub mod tests {
             "http://127.0.0.1:41000/anthropic".to_string()
         )));
         assert!(pairs.contains(&(CODEX_HOME_ENV.to_string(), "/spool/codex-home".to_string())));
+        assert!(pairs.contains(&(CODEX_TRUST_ENV.to_string(), "/etc/ssl/cert.pem".to_string())));
         assert!(
             !pairs
                 .iter()
                 .any(|(name, _)| name == "TYCHO_CREDENTIAL_SOCKET")
         );
-        assert_eq!(pairs.len(), 10 + AGENT_TELEMETRY_ENV.len());
+        assert_eq!(pairs.len(), 11 + AGENT_TELEMETRY_ENV.len());
         assert!(!format!("{environment:?}").contains("phantom-session-token"));
     }
 

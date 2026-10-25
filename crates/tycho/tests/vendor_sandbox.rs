@@ -20,6 +20,7 @@
 
 use std::fs;
 use std::num::NonZeroU16;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -30,10 +31,11 @@ use tycho::config::{self, CorePorts, MISE_NO_INSTALL};
 use tycho::credentials::{self, CredentialVendor};
 use tycho::launch_spec::AGENT_TELEMETRY_ENV;
 use tycho::sandbox::{Access, Grant, PLAN_ENV, SandboxVendor};
-use tycho::session_proxy::HandedToken;
+use tycho::session_proxy::{HandedToken, ProxyRecord};
 use tycho::session_sandbox::{self, SessionPaths};
 use tycho::spawn::CLAUDE_SANDBOX_OFF;
 use tycho::vendors::claude_worker::{ClaudeWorker, SETTING_SOURCES_NONE};
+use tycho::vendors::codex_worker::CodexWorker;
 use tycho::vendors::worker::{ModelName, VendorSessionId, WorkerTask, WorkerVendor};
 use tycho::vendors::worker_process::worker_settings;
 use tycho_types::git_environment::{git_command, hook_environment_refusal};
@@ -41,6 +43,9 @@ use tycho_types::task_packet::Effort;
 
 const TYCHO: &str = env!("CARGO_BIN_EXE_tycho");
 const RUN_LIMIT: Duration = Duration::from_mins(3);
+/// A model in the pinned Codex's bundled catalog that a `ChatGPT` login may use; the routing
+/// table's `gpt-5-codex` and `gpt-5-codex-mini` are refused with `model_not_found`.
+const CODEX_PROBE_MODEL: &str = "gpt-6-luna";
 const PROBE_COMMAND: &str = "echo probe-$((6*7))";
 const PROBE_OUTPUT: &str = "probe-42";
 /// Claude's own sandbox as the station passed it before the station's sandbox existed.
@@ -160,7 +165,28 @@ fn decode_bash(stream: &str) -> BashOutcome {
 struct Run {
     stream: String,
     stderr: String,
-    proxy: String,
+    proxy: ProxyRecord,
+}
+
+/// Claude's model traffic takes the route: requests to the base URL, which the proxy answers
+/// with the handed token, and never a tunnel to `api.anthropic.com`, which the proxy refuses
+/// and could only intercept with a CA of its own. The proxy's record counts the paths.
+fn assert_model_traffic_took_the_route(run: &Run) {
+    let reverse = run.proxy.modes.get("reverse").copied().unwrap_or(0);
+    assert!(reverse >= 1, "no request took the route: {}", run.proxy);
+    assert!(
+        !run.proxy.modes.contains_key("connect_intercept"),
+        "{}",
+        run.proxy
+    );
+    assert!(
+        run.proxy
+            .denied_targets
+            .iter()
+            .all(|target| !target.starts_with("api.anthropic.com")),
+        "a tunnel to the model API was tried: {}",
+        run.proxy
+    );
 }
 
 /// One `claude -p` turn as a worker runs it, through the station's proxy, plan and
@@ -277,7 +303,7 @@ fn run_claude_as(scratch: &Scratch, settings: &str, prompt: &str, mode: Mode) ->
     Run {
         stream: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        proxy: record.to_string(),
+        proxy: record,
     }
 }
 
@@ -384,6 +410,7 @@ fn assert_settings_cells(cells: &[(&str, &Run); 4]) {
                 tools.is_some() && has_result(&run.stream),
                 "{name}: the run did not complete"
             );
+            assert_model_traffic_took_the_route(run);
             if !matches!(outcome, BashOutcome::Ran | BashOutcome::VendorSandboxFailed) {
                 println!(
                     "stderr: {}",
@@ -523,6 +550,7 @@ fn claude_saves_its_configuration_under_the_sandbox() {
         "stderr: {}",
         sandboxed.stderr.chars().take(2000).collect::<String>()
     );
+    assert_model_traffic_took_the_route(&sandboxed);
     drop(unsandboxed);
     assert_ne!(
         control_state,
@@ -534,4 +562,171 @@ fn claude_saves_its_configuration_under_the_sandbox() {
         keys(&control_state),
         "Claude's save under the sandbox did not land as it does without it"
     );
+}
+
+/// What one `codex exec` turn showed: whether it completed, the proxy's record, and the start
+/// of its stream and standard error.
+struct CodexRun {
+    completed: bool,
+    proxy: ProxyRecord,
+    output: String,
+}
+
+const CODEX_PROBE_SCHEMA: &str = r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"#;
+
+/// The session's Codex home, 0700, holding the core's `auth.json` at 0600 as the launcher
+/// leaves it.
+fn codex_home_with_auth(scratch: &Scratch) -> PathBuf {
+    let codex_home = scratch.root.join("vendor-codex-home");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&codex_home)
+        .unwrap();
+    let auth = credentials::load(&config::core_home().unwrap(), CredentialVendor::Codex)
+        .unwrap_or_else(|error| panic!("no Codex credential in the core's store: {error}"));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(codex_home.join(tycho::credentials::CODEX_AUTH_FILE))
+        .and_then(|mut file| std::io::Write::write_all(&mut file, auth.expose().as_bytes()))
+        .unwrap();
+    codex_home
+}
+
+/// Whether a `codex exec --json` stream completed its turn.
+fn turn_completed(stream: &str) -> bool {
+    stream
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|event| event["type"] == "turn.completed")
+}
+
+/// One `codex exec` turn as a worker runs it, through the station's proxy, with its Codex home
+/// in the session's directory holding the core's `auth.json`; under the trampoline when
+/// `mode` says so.
+/// The proxy and plan for a Codex session: the worktree and Codex's install in the spec, and
+/// the Codex home the launcher adds.
+fn codex_prepared(scratch: &Scratch, codex: &Path, codex_home: &Path) -> session_sandbox::Prepared {
+    let install = codex.parent().and_then(Path::parent).unwrap().to_path_buf();
+    let spec_grants = [
+        Grant {
+            path: scratch.worktree(),
+            access: Access::ReadWrite,
+        },
+        Grant {
+            path: install,
+            access: Access::Read,
+        },
+    ];
+    let home = scratch.home();
+    let vendor_files = scratch.root.join("vendor");
+    let paths = SessionPaths {
+        vendor: SandboxVendor::Codex,
+        home: &home,
+        vendor_files: &vendor_files,
+        codex_home: Some(codex_home),
+        spec_grants: &spec_grants,
+        ports: CorePorts::PRODUCTION,
+        uid: current_uid(),
+    };
+    session_sandbox::prepare(&paths, None, true).unwrap()
+}
+
+/// The worker's command line for `codex exec`, with a model a `ChatGPT` login may use.
+fn codex_words(scratch: &Scratch, codex: &Path, schema: PathBuf) -> Vec<String> {
+    let task = WorkerTask {
+        worktree: scratch.worktree(),
+        model: ModelName::parse(CODEX_PROBE_MODEL).unwrap(),
+        effort: Effort::Low,
+        max_turns: None,
+        requires_commit: false,
+        session_id: VendorSessionId::parse(&uuid_like()).unwrap(),
+        settings: String::new(),
+        output_schema: schema,
+    };
+    CodexWorker.command(codex, &task).unwrap()
+}
+
+fn run_codex(scratch: &Scratch, mode: Mode) -> CodexRun {
+    let codex = mise_which("codex");
+    let codex_home = codex_home_with_auth(scratch);
+    let schema = scratch.root.join("vendor/schema.json");
+    fs::write(&schema, CODEX_PROBE_SCHEMA).unwrap();
+    let home = scratch.home();
+    let prepared = codex_prepared(scratch, &codex, &codex_home);
+    let words = codex_words(scratch, &codex, schema);
+    let user = tycho::launch_spec::current_user_name().unwrap();
+    let mut command = if mode == Mode::Sandboxed {
+        let mut command = Command::new(TYCHO);
+        command.arg("session-leader").arg("--").args(&words);
+        command
+    } else {
+        let mut command = Command::new(&words[0]);
+        command.args(&words[1..]);
+        command
+    };
+    command
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .env("USER", &user)
+        .env("LOGNAME", &user)
+        .env(tycho::credentials::CODEX_HOME_ENV, &codex_home)
+        .envs(session_sandbox::trust_environment(SandboxVendor::Codex))
+        .envs(AGENT_TELEMETRY_ENV)
+        .envs(prepared.proxy.child_environment())
+        .current_dir(scratch.worktree());
+    if mode == Mode::Sandboxed {
+        command.env(PLAN_ENV, prepared.plan.as_deref().unwrap());
+    }
+    let output = run_with_prompt(command, "Answer with the word ready in the answer field.");
+    let proxy = prepared.proxy.stop();
+    let stream = String::from_utf8_lossy(&output.stdout).into_owned();
+    let completed = turn_completed(&stream);
+    assert!(
+        codex_home
+            .join(tycho::credentials::CODEX_AUTH_FILE)
+            .is_file(),
+        "the Codex credential is a file in the session's Codex home"
+    );
+    CodexRun {
+        completed,
+        proxy,
+        output: format!(
+            "{}\n{}",
+            stream.chars().take(1000).collect::<String>(),
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(6000)
+                .collect::<String>()
+        ),
+    }
+}
+
+/// A `codex exec` turn completes under the station's sandbox with its Codex home in the
+/// session's directory. The core's `auth.json` stays a file in the sandbox's reach: Codex's
+/// bearer has no route. No name resolves inside the sandbox, so the turn shows Codex works
+/// through the proxy alone. The unsandboxed run through the same proxy is the positive
+/// control: a turn it cannot complete says nothing about the sandbox.
+#[test]
+#[ignore = "spends two codex turns; run with mise run vendor-sandbox-tests"]
+fn codex_runs_a_turn_under_the_sandbox_with_its_home_in_the_session() {
+    let control = run_codex(&Scratch::new("codex-control"), Mode::Unsandboxed);
+    println!(
+        "evidence: codex through the proxy, unsandboxed: turn completed {}; proxy {}",
+        control.completed, control.proxy
+    );
+    assert!(
+        control.completed,
+        "the positive control failed: {}",
+        control.output
+    );
+    let sandboxed = run_codex(&Scratch::new("codex"), Mode::Sandboxed);
+    println!(
+        "evidence: codex under the sandbox: turn completed {}; proxy {}",
+        sandboxed.completed, sandboxed.proxy
+    );
+    assert!(sandboxed.completed, "{}", sandboxed.output);
+    assert!(sandboxed.proxy.allowed >= 1, "{}", sandboxed.proxy);
 }
