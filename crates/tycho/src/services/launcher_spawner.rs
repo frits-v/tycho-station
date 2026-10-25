@@ -17,6 +17,7 @@ use crate::kill::{KillReport, KillRequest, kill_by_name, kill_session};
 use crate::launch_spec::{HeartbeatTarget, VendorTerminal};
 use crate::private_dir;
 use crate::process::now_unix_ms;
+use crate::proxy_audit::{self, AuditRead};
 use crate::services::spawner::{LeaseRead, SpawnSpec, SpawnTerminal, Spawner, SpawnerError};
 use crate::spawn::{
     SpawnOutcome, SpawnRequest, read_lease, save_scrollback, send_line, spawn_session, split_tier,
@@ -204,6 +205,10 @@ impl Spawner for LauncherSpawner {
 
     fn read_lease(&self, session: &SessionName) -> LeaseRead {
         read_lease(&self.dirs, session, self.agent_uid)
+    }
+
+    fn read_proxy_audit(&self, session: &SessionName) -> AuditRead {
+        proxy_audit::read(&self.dirs, session, self.agent_uid)
     }
 }
 

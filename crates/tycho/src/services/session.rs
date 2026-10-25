@@ -16,6 +16,7 @@ use tycho_types::session::{SessionName, Vendor};
 use tycho_types::task_packet::AbsolutePath;
 
 use crate::config::spine;
+use crate::proxy_audit::AuditRead;
 use crate::services::reconciler::{ExpectRequest, ReconcilerClient, fingerprint};
 use crate::services::spawner::{LeaseRead, SpawnSpec, SpawnTerminal, Spawner};
 use crate::services::{
@@ -65,6 +66,10 @@ pub struct SessionState {
     /// Why the vendor port could not remove what it kept for the session once it ended.
     #[serde(default)]
     pub release_error: Option<String>,
+    /// The session proxy's decisions as firings and examinations, read once the session
+    /// was killed or reaped.
+    #[serde(default)]
+    pub proxy_audit: Option<AuditRead>,
 }
 
 /// Which way an instruction reached the session.
@@ -176,6 +181,8 @@ pub struct SessionView {
     pub last_instruction: Option<InstructionRecord>,
     #[serde(default)]
     pub release_error: Option<String>,
+    #[serde(default)]
+    pub proxy_audit: Option<AuditRead>,
 }
 
 impl From<&SessionState> for SessionView {
@@ -196,6 +203,7 @@ impl From<&SessionState> for SessionView {
             awaiting_reap: state.awaiting_reap,
             last_instruction: state.instructions.last().cloned(),
             release_error: state.release_error.clone(),
+            proxy_audit: state.proxy_audit.clone(),
         }
     }
 }
@@ -606,6 +614,9 @@ impl Session {
             .name("kill")
             .retry_policy(self.timing.port_retry())
             .await?;
+        if state.proxy_audit.is_none() {
+            state.proxy_audit = Some(self.read_proxy_audit(&object_context, &name).await?);
+        }
         state.release_error = self.release(&object_context, &name).await?;
         state.phase = SessionPhase::Killed;
         state.scrollback.clone_from(&scrollback);
@@ -615,6 +626,23 @@ impl Session {
             .forget(Json(name))
             .send();
         Ok(Json(KillOutcome::Killed { scrollback }))
+    }
+
+    /// The session's awaitable completed, so its launcher has written the proxy's decisions:
+    /// reads them once, as the firings and examinations of the session proxy.
+    #[handler(ingress_private)]
+    async fn record_proxy_audit(&self, object_context: ObjectContext<'_>) -> HandlerResult<bool> {
+        let name = parse_key(object_context.key()).map_err(|error| terminal(&error))?;
+        let Some(state) = object_context.get::<Json<SessionState>>(STATE_KEY).await? else {
+            return Ok(false);
+        };
+        let mut state = state.into_inner();
+        if state.proxy_audit.is_some() {
+            return Ok(false);
+        }
+        state.proxy_audit = Some(self.read_proxy_audit(&object_context, &name).await?);
+        object_context.set(STATE_KEY, Json(state));
+        Ok(true)
     }
 
     /// The reconciler's verdict: rejects the awaitable with the exit state, trusts no pid after.
@@ -658,6 +686,9 @@ impl Session {
             .name("reap")
             .retry_policy(self.timing.port_retry())
             .await?;
+        if next.proxy_audit.is_none() {
+            next.proxy_audit = Some(self.read_proxy_audit(&object_context, &name).await?);
+        }
         next.release_error = self.release(&object_context, &name).await?;
         object_context.set(STATE_KEY, Json(next));
         Ok(true)
@@ -777,6 +808,23 @@ impl Session {
         Ok(released.into_inner())
     }
 
+    /// Reads the proxy's decisions the launcher left; a file that cannot be read is kept as
+    /// unreadable, never as no decisions.
+    async fn read_proxy_audit(
+        &self,
+        object_context: &ObjectContext<'_>,
+        name: &SessionName,
+    ) -> Result<AuditRead, HandlerError> {
+        let spawner = Arc::clone(&self.spawner);
+        let target = name.clone();
+        let audit = object_context
+            .run(|| blocking(move || Ok(Json(spawner.read_proxy_audit(&target)))))
+            .name("proxy audit")
+            .retry_policy(self.timing.port_retry())
+            .await?;
+        Ok(audit.into_inner())
+    }
+
     async fn save_scrollback(
         &self,
         object_context: &ObjectContext<'_>,
@@ -827,6 +875,7 @@ pub fn spawn_record(
         awaiting_reap: false,
         instructions: Vec::new(),
         release_error: None,
+        proxy_audit: None,
     };
     let expectation = ExpectRequest {
         session: name.clone(),
@@ -905,6 +954,7 @@ mod tests {
             awaiting_reap: false,
             instructions: Vec::new(),
             release_error: None,
+            proxy_audit: None,
         }
     }
 

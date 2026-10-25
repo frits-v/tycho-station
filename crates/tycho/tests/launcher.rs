@@ -29,19 +29,21 @@ use restate_sdk::prelude::{Endpoint, HttpServer};
 use tycho::agent_files::current_uid;
 use tycho::config::{
     AGENT_USER_ENV, AgentDirs, CoreConfig, CorePorts, CoreRole, HOME_ENV, MISE_NO_INSTALL,
-    PortClaim, RESTATE_SERVER_ENV, ToolPrefix, ZMX_ENV,
+    MISE_PREFIX_ENV, PortClaim, RESTATE_SERVER_ENV, ToolPrefix, ZMX_ENV,
 };
 use tycho::credentials::{CLAUDE_TOKEN_ENV, Credential, CredentialVendor};
 use tycho::health::{self, Health};
 use tycho::http::Http;
 use tycho::kill::{KillRefusal, KillRequest, KillVerdict, kill_session};
 use tycho::launch_probe::{LaunchProbe, REJECTED_PREFIX, RESOLVED_PREFIX};
+use tycho::launch_spec::AGENT_TELEMETRY_ENV;
 use tycho::launcher::{HEARTBEAT_INTERVAL, LEASE_FRESH_MS, SessionFiles, VendorRecord};
 use tycho::launcher::{HeartbeatTarget, VendorTerminal};
 use tycho::process::now_unix_ms;
+use tycho::proxy_audit::{self, AuditRead};
 use tycho::sandbox::PLAN_ENV;
 use tycho::services::spawner::LeaseRead;
-use tycho::session_proxy::CHILD_ENVIRONMENT_NAMES;
+use tycho::session_proxy::{CHILD_ENVIRONMENT_NAMES, ROUTE_ENVIRONMENT_NAMES};
 use tycho::spawn::{SpawnOutcome, SpawnRequest, read_lease, save_scrollback, spawn_session};
 use tycho::spool::ACKNOWLEDGED_SUFFIX;
 use tycho::zmx::{Presence, Zmx, count_named, presence};
@@ -55,6 +57,23 @@ const SECRET: &str = "launcher-test-secret-0123456789abcdef";
 /// The shape of a long-lived Claude token; every session here gets it through the hand-off.
 const TEST_TOKEN: &str = "sk-ant-oat01-launcher-suite-test-credential-0123456789";
 const WAIT_LIMIT: Duration = Duration::from_mins(2);
+/// The rest of the fake vendor's environment: the launcher's own, what `sh` adds (`PWD`,
+/// `SHLVL`, `_`), and the text encoding macOS sets for a process started without one.
+const VENDOR_NAMES: [&str; 13] = [
+    "HOME",
+    "LOGNAME",
+    "PATH",
+    "TYCHO_PROGRESS_FILE",
+    "TYCHO_RESULT_FILE",
+    "TYCHO_SESSION_NAME",
+    "TYCHO_TIER",
+    "TYCHO_VENDOR_SANDBOX_SETTINGS",
+    "USER",
+    "PWD",
+    "SHLVL",
+    "_",
+    "__CF_USER_TEXT_ENCODING",
+];
 /// The fake vendor's directory under the test home: its script, its markers, its working
 /// directory.
 const FIXTURE_DIR: &str = "vendor-fixture";
@@ -69,6 +88,12 @@ proxy_port="${HTTPS_PROXY##*:}"
 /bin/bash -c 'if (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; then echo open; else echo refused; fi' admin "$5" > "$4.admin"
 /bin/bash -c 'if (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; then echo open; else echo refused; fi' proxy "$proxy_port" > "$4.proxy"
 /usr/bin/env > "$4.env"
+# With the probe marker: a host off the allowlist through the proxy, and the model endpoint
+# through the route with the phantom the vendor holds.
+if test -f "$4.probe-network"; then
+  /usr/bin/curl -s -o /dev/null -w '%{http_connect}' --max-time 10 https://github.com/ > "$4.github" 2>/dev/null
+  /usr/bin/curl -s -o "$4.model-body" -w '%{http_code}' --max-time 20 -H "Authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" -H 'anthropic-version: 2023-06-01' "$ANTHROPIC_BASE_URL/v1/models" > "$4.model" 2>/dev/null
+fi
 # Under the zmx pty a background group that sets terminal modes is stopped by SIGTTOU.
 if (: < /dev/tty) 2>/dev/null; then stty -ixon < /dev/tty; echo attached > "$4.tty"; else echo detached > "$4.tty"; fi
 sleep "$2"
@@ -494,23 +519,42 @@ fn assert_vendor_saw_only_its_allowlist(harness: &Harness, name: &SessionName, a
     assert_eq!(tier, "t1", "the vendor did not receive the tier");
     let vendor_env = fs::read_to_string(harness.marker(name, ".env")).unwrap();
     assert!(!vendor_env.contains(SECRET) && !vendor_env.contains(awaitable));
-    assert!(!vendor_env.contains("ZMX_DIR=") && !vendor_env.contains("TYCHO_AGENT_DIR="));
-    assert!(
+    let value = |wanted: &str| {
         vendor_env
             .lines()
-            .any(|line| line == format!("{CLAUDE_TOKEN_ENV}={TEST_TOKEN}")),
-        "the vendor did not receive the handed-over token"
+            .find_map(|line| line.strip_prefix(&format!("{wanted}=")))
+            .map(str::to_string)
+    };
+    let mut names: Vec<&str> = vendor_env
+        .lines()
+        .filter_map(|line| line.split_once('=').map(|(name, _)| name))
+        .collect();
+    names.sort_unstable();
+    let mut expected: Vec<&str> = VENDOR_NAMES
+        .into_iter()
+        .chain(CHILD_ENVIRONMENT_NAMES)
+        .chain(ROUTE_ENVIRONMENT_NAMES)
+        .chain(AGENT_TELEMETRY_ENV.iter().map(|(name, _)| *name))
+        .chain(MISE_PREFIX_ENV)
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(
+        names, expected,
+        "the vendor's environment is not its allowlist"
     );
-    assert!(!vendor_env.contains("TYCHO_CREDENTIAL_SOCKET"));
-    println!("evidence: the vendor's environment holds {CLAUDE_TOKEN_ENV} from the hand-off");
-    for name in CHILD_ENVIRONMENT_NAMES {
-        assert!(
-            vendor_env
-                .lines()
-                .any(|line| line.starts_with(&format!("{name}="))),
-            "the vendor has no {name}"
-        );
-    }
+    // The vendor holds the phantom, which is the proxy's session token, and never the token
+    // the hand-off delivered.
+    let phantom = value(CLAUDE_TOKEN_ENV).expect("the vendor has no phantom");
+    assert_eq!(Some(phantom.clone()), value("NONO_PROXY_TOKEN"));
+    assert!(
+        !vendor_env.contains(TEST_TOKEN),
+        "the vendor's environment holds the handed token"
+    );
+    println!(
+        "evidence: the vendor's environment holds {} names, the phantom in {CLAUDE_TOKEN_ENV} and \
+         not the handed token",
+        names.len()
+    );
     assert!(
         !vendor_env.contains(&format!("{PLAN_ENV}=")),
         "the sandbox plan reached the vendor"
@@ -610,6 +654,7 @@ fn launch_spools_resolves_and_ends_its_session() {
     let key = format!("{name}.await");
     let awaitable = start_wait(core_ports, &key);
     let files = harness.files(&name);
+    fs::write(harness.marker(&name, ".probe-network"), "").unwrap();
     let outcome_spawn = harness.spawn(&name, &awaitable, "12", &result_json(&name));
     let SpawnOutcome::Spawned { pid } = outcome_spawn else {
         panic!("expected a spawn, got {outcome_spawn:?}");
@@ -650,6 +695,7 @@ fn launch_spools_resolves_and_ends_its_session() {
     assert!(resolved.starts_with(RESOLVED_PREFIX), "{resolved}");
     assert!(resolved.contains(&name.to_string()));
     assert!(files.spool.with_extension(ACKNOWLEDGED_SUFFIX).exists());
+    assert_network_from_inside(&harness, &name);
     wait_until("zmx session gone", WAIT_LIMIT, || {
         (harness.sessions_named(&name) == 0).then_some(())
     });
@@ -659,6 +705,44 @@ fn launch_spools_resolves_and_ends_its_session() {
         "{again:?}"
     );
     assert_eq!(harness.sessions_named(&name), 0);
+}
+
+/// From inside the session a host off the allowlist is refused at the proxy and recorded in
+/// the session's audit as a firing, and the model endpoint answers through the route: the
+/// handed test token reaches Anthropic in place of the phantom, which refuses it with its own
+/// authentication error, never the proxy's.
+fn assert_network_from_inside(harness: &Harness, name: &SessionName) {
+    let github = fs::read_to_string(harness.marker(name, ".github")).unwrap();
+    let model = fs::read_to_string(harness.marker(name, ".model")).unwrap();
+    let body = fs::read_to_string(harness.marker(name, ".model-body")).unwrap_or_default();
+    let body: String = body.chars().take(300).collect();
+    println!(
+        "evidence: from inside the session github.com through the proxy answers {}, the model \
+         endpoint through the route {} {body}",
+        github.trim(),
+        model.trim()
+    );
+    assert_eq!(github.trim(), "403", "the proxy did not refuse github.com");
+    assert_eq!(model.trim(), "401", "{body}");
+    assert!(
+        body.contains("\"authentication_error\""),
+        "the 401 did not come from Anthropic: {body}"
+    );
+    assert!(!body.contains(TEST_TOKEN));
+    let audit = proxy_audit::read(&harness.dirs, name, current_uid());
+    println!("evidence: the session's proxy audit reads {audit:?}");
+    let AuditRead::Read(audit) = audit else {
+        panic!("the session's proxy audit did not read: {audit:?}");
+    };
+    assert!(
+        audit
+            .firings
+            .iter()
+            .any(|firing| firing.subject == "github.com:443"),
+        "{audit}"
+    );
+    assert!(audit.examinations >= 1, "{audit}");
+    assert_eq!(audit.unrecognised, 0, "{audit}");
 }
 
 /// The vendor's sandbox hides the launcher's lease, which was written before the vendor

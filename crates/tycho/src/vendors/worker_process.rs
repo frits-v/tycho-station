@@ -24,13 +24,13 @@ use tycho_types::session::{SessionName, Vendor};
 use crate::agent_files::{current_uid, ensure_private_dir, read_checked, write_durable};
 use crate::command::{run_captured, run_captured_without};
 use crate::config::{COMMAND_TIMEOUT, MISE_PREFIX_ENV};
-use crate::credentials::{CLAUDE_TOKEN_ENV, CODEX_HOME_ENV};
+use crate::credentials::CODEX_HOME_ENV;
 use crate::exit_decode::ChildEnd;
 use crate::launch_spec::{
     AGENT_TELEMETRY_ENV, PROGRESS_FILE_ENV, RESULT_FILE_ENV, VENDOR_SANDBOX_SETTINGS_ENV,
 };
 use crate::process::{now_unix_ms, send};
-use crate::session_proxy::CHILD_ENVIRONMENT_NAMES;
+use crate::session_proxy::{CHILD_ENVIRONMENT_NAMES, ROUTE_ENVIRONMENT_NAMES};
 use crate::vendors::claude_worker::ClaudeWorker;
 use crate::vendors::codex_worker::{CODEX_OUTPUT_SCHEMA, CodexWorker};
 use crate::vendors::worker::{
@@ -91,10 +91,12 @@ impl WorkerEnvironment {
     pub fn from_map(environment: &BTreeMap<String, String>) -> Result<Self, WorkerError> {
         let session = SessionName::parse(&required(environment, ENV_SESSION_NAME)?)
             .map_err(|error| WorkerError::Argument(error.to_string()))?;
-        // The credential pair the launcher added (Claude's token, or the Codex home) and the
-        // session proxy's variables, without which the vendor's sandbox refuses its traffic.
-        let inherited_names = ["HOME", "PATH", CLAUDE_TOKEN_ENV, CODEX_HOME_ENV]
+        // What the launcher added for the session: the route's phantom and base URL for
+        // Claude, the Codex home, and the session proxy's variables, without which the
+        // vendor's sandbox refuses its traffic.
+        let inherited_names = ["HOME", "PATH", CODEX_HOME_ENV]
             .into_iter()
+            .chain(ROUTE_ENVIRONMENT_NAMES)
             .chain(MISE_PREFIX_ENV)
             .chain(AGENT_TELEMETRY_ENV.iter().map(|(name, _)| *name))
             .chain(CHILD_ENVIRONMENT_NAMES);
@@ -124,8 +126,8 @@ impl WorkerEnvironment {
     }
 }
 
-/// HOME, PATH, telemetry and the credential pair from the launcher, the escalation path,
-/// USER and LOGNAME.
+/// HOME, PATH, telemetry, the proxy's variables and the route's phantom and base URL from the
+/// launcher, the escalation path, USER and LOGNAME.
 #[must_use]
 pub fn vendor_environment(environment: &WorkerEnvironment, user: &str) -> Vec<(String, String)> {
     // The pinned Claude CLI finds its subscription login in the keychain under USER.
@@ -642,6 +644,8 @@ fn prepare_command(vendor: &dyn WorkerVendor, run: &Prepared<'_>) -> Result<Vec<
 )]
 pub mod tests {
     use super::*;
+    use crate::credentials::CLAUDE_TOKEN_ENV;
+    use crate::session_proxy::ANTHROPIC_BASE_URL_ENV;
     use crate::vendors::worker::{ModelName, VendorEnd, VendorSessionId};
     use std::num::NonZeroU16;
     use tycho_types::envelope::{BranchName, Outcome, Usage};
@@ -705,12 +709,18 @@ pub mod tests {
         assert_eq!(names.len(), 7 + AGENT_TELEMETRY_ENV.len());
     }
 
+    /// The route's phantom and base URL, and the Codex home, pass to the vendor; the hand-off
+    /// socket and anything else of the launcher's do not.
     #[test]
-    fn the_credential_pair_reaches_the_vendor_and_nothing_else_of_the_launchers_does() {
+    fn the_route_pair_and_the_codex_home_reach_the_vendor_and_nothing_else_of_the_launchers_does() {
         let mut launcher = launcher_environment();
         launcher.insert(
             CLAUDE_TOKEN_ENV.to_string(),
-            "sk-ant-oat01-worker".to_string(),
+            "phantom-session-token".to_string(),
+        );
+        launcher.insert(
+            ANTHROPIC_BASE_URL_ENV.to_string(),
+            "http://127.0.0.1:41000/anthropic".to_string(),
         );
         launcher.insert(CODEX_HOME_ENV.to_string(), "/spool/codex-home".to_string());
         launcher.insert(
@@ -721,7 +731,11 @@ pub mod tests {
         let pairs = vendor_environment(&environment, "agent");
         assert!(pairs.contains(&(
             CLAUDE_TOKEN_ENV.to_string(),
-            "sk-ant-oat01-worker".to_string()
+            "phantom-session-token".to_string()
+        )));
+        assert!(pairs.contains(&(
+            ANTHROPIC_BASE_URL_ENV.to_string(),
+            "http://127.0.0.1:41000/anthropic".to_string()
         )));
         assert!(pairs.contains(&(CODEX_HOME_ENV.to_string(), "/spool/codex-home".to_string())));
         assert!(
@@ -729,8 +743,8 @@ pub mod tests {
                 .iter()
                 .any(|(name, _)| name == "TYCHO_CREDENTIAL_SOCKET")
         );
-        assert_eq!(pairs.len(), 9 + AGENT_TELEMETRY_ENV.len());
-        assert!(!format!("{environment:?}").contains("sk-ant-oat01-worker"));
+        assert_eq!(pairs.len(), 10 + AGENT_TELEMETRY_ENV.len());
+        assert!(!format!("{environment:?}").contains("phantom-session-token"));
     }
 
     #[test]

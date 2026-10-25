@@ -9,6 +9,8 @@ use tycho_types::lease::Lease;
 use tycho_types::session::SessionName;
 use tycho_types::task_packet::AbsolutePath;
 
+use crate::proxy_audit::AuditRead;
+
 /// Whether the vendor writes bounded files or owns the session's pty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +75,9 @@ pub trait Spawner: Send + Sync + 'static {
     fn send(&self, session: &SessionName, text: &ShortText) -> Result<(), SpawnerError>;
     /// Reads the lease file the launcher keeps for this session name.
     fn read_lease(&self, session: &SessionName) -> LeaseRead;
+    /// Reads the decisions the session's proxy made, which its launcher leaves when the vendor
+    /// ends.
+    fn read_proxy_audit(&self, session: &SessionName) -> AuditRead;
 }
 
 /// The production stand-in until a launcher is installed: every call is refused.
@@ -108,6 +113,12 @@ impl Spawner for NoLauncher {
 
     fn read_lease(&self, _session: &SessionName) -> LeaseRead {
         LeaseRead::Unreadable {
+            reason: NO_LAUNCHER.to_string(),
+        }
+    }
+
+    fn read_proxy_audit(&self, _session: &SessionName) -> AuditRead {
+        AuditRead::Unreadable {
             reason: NO_LAUNCHER.to_string(),
         }
     }

@@ -227,6 +227,10 @@ impl Spawner for LauncherSpawner {
     fn read_lease(&self, session: &SessionName) -> LeaseRead {
         read_lease(&self.dirs, session, current_uid())
     }
+
+    fn read_proxy_audit(&self, session: &SessionName) -> tycho::proxy_audit::AuditRead {
+        tycho::proxy_audit::read(&self.dirs, session, current_uid())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

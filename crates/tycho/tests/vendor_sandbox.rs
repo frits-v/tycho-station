@@ -27,9 +27,10 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tycho::agent_files::current_uid;
 use tycho::config::{self, CorePorts, MISE_NO_INSTALL};
-use tycho::credentials::{self, CLAUDE_TOKEN_ENV, CredentialVendor};
+use tycho::credentials::{self, CredentialVendor};
 use tycho::launch_spec::AGENT_TELEMETRY_ENV;
 use tycho::sandbox::{Access, Grant, PLAN_ENV, SandboxVendor};
+use tycho::session_proxy::HandedToken;
 use tycho::session_sandbox::{self, SessionPaths};
 use tycho::spawn::CLAUDE_SANDBOX_OFF;
 use tycho::vendors::claude_worker::{ClaudeWorker, SETTING_SOURCES_NONE};
@@ -232,7 +233,9 @@ fn run_claude_as(scratch: &Scratch, settings: &str, prompt: &str, mode: Mode) ->
         ports: CorePorts::PRODUCTION,
         uid: current_uid(),
     };
-    let prepared = session_sandbox::prepare(&paths).unwrap();
+    let token = credentials::load(&config::core_home().unwrap(), CredentialVendor::Claude)
+        .unwrap_or_else(|error| panic!("no Claude token in the core's store: {error}"));
+    let prepared = session_sandbox::prepare(&paths, HandedToken::of(&token), true).unwrap();
     println!("evidence: claude binary {}", claude.display());
     let mut words = worker_words(&claude, scratch, settings);
     if mode == Mode::SandboxedReadingSettingFiles {
@@ -243,8 +246,6 @@ fn run_claude_as(scratch: &Scratch, settings: &str, prompt: &str, mode: Mode) ->
         assert_eq!(flags, 1, "the worker passes the flag once");
         words.retain(|word| word != SETTING_SOURCES_NONE);
     }
-    let token = credentials::load(&config::core_home().unwrap(), CredentialVendor::Claude)
-        .unwrap_or_else(|error| panic!("no Claude token in the core's store: {error}"));
     let user = tycho::launch_spec::current_user_name().unwrap();
     let path = format!("{}:/usr/bin:/bin", claude.parent().unwrap().display());
     let mut command = match mode {
@@ -265,12 +266,11 @@ fn run_claude_as(scratch: &Scratch, settings: &str, prompt: &str, mode: Mode) ->
         .env("PATH", path)
         .env("USER", &user)
         .env("LOGNAME", &user)
-        .env(CLAUDE_TOKEN_ENV, token.expose())
         .envs(AGENT_TELEMETRY_ENV)
         .envs(prepared.proxy.child_environment())
         .current_dir(scratch.worktree());
     if mode != Mode::Unsandboxed {
-        command.env(PLAN_ENV, &prepared.plan);
+        command.env(PLAN_ENV, prepared.plan.as_deref().unwrap());
     }
     let output = run_with_prompt(command, prompt);
     let record = prepared.proxy.stop();

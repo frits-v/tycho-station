@@ -35,6 +35,7 @@ use tycho::config::{
 };
 use tycho::config_store::FactoryConfig;
 use tycho::endpoint;
+use tycho::proxy_audit::{self, AuditRead, Firing, SessionAudit};
 use tycho::services::doubles::{DOUBLE_SOCKET, FixedGate, RecordingSpawner, RecordingVendor};
 use tycho::services::merge_gate::{GateVerdict, MergeGate, NoGate};
 use tycho::services::operator::read_secret_file;
@@ -456,6 +457,7 @@ fn session_and_reconciler_refuse_agents_outside_their_scope() {
         handler::SESSION_NUDGE,
         handler::SESSION_EXPIRE,
         handler::SESSION_REAP,
+        handler::SESSION_RECORD_PROXY_AUDIT,
     ];
     assert_private(core_ports, Service::Session, &session_handlers, name);
     let reconciler_handlers = [
@@ -709,6 +711,29 @@ fn assert_unit_handlers_private(core_ports: CorePorts) {
     );
 }
 
+/// Once a session's awaitable completes, the session reads its proxy's decisions through the
+/// port and keeps them as firings and examinations on its view.
+fn assert_proxy_audit_recorded(core_ports: CorePorts, session: &str) {
+    let path = format!("/Session/{session}/status");
+    let mut view = serde_json::Value::Null;
+    for _ in 0..PROXY_AUDIT_POLLS_MAX {
+        let (_, body) = call(core_ports, &path, "", None);
+        view = serde_json::from_str(&body).unwrap();
+        if !view["proxy_audit"].is_null() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let audit = &view["proxy_audit"];
+    assert_eq!(audit["state"], "read", "{view}");
+    assert_eq!(audit["examinations"], 2, "{view}");
+    assert_eq!(audit["firing_count"], 1, "{view}");
+    assert_eq!(audit["firings"][0]["mechanism"], "session_proxy", "{view}");
+    assert_eq!(audit["firings"][0]["subject"], "github.com:443", "{view}");
+}
+
+const PROXY_AUDIT_POLLS_MAX: u32 = 50;
+
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
@@ -721,6 +746,19 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     let gate = FixedGate::new(GateVerdict::Merged {
         default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
     });
+    spawner.set_default_proxy_audit(AuditRead::Read(SessionAudit {
+        examinations: 2,
+        firing_count: 1,
+        firings: vec![Firing {
+            mechanism: proxy_audit::MECHANISM.to_string(),
+            session: SessionName::parse("cf7a.wu01.wrk.claude.a1").unwrap(),
+            subject: "github.com:443".to_string(),
+            unix_ms: 1,
+            reason: None,
+        }],
+        unrecognised: 0,
+        at_cap: false,
+    }));
     let (core, _doubles, ports) =
         start_core_with(claim, &spawner, Arc::new(gate.clone()), test_timing());
     assert_unit_handlers_private(core_ports);
@@ -762,6 +800,7 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     for hidden in ["sign_", "secret", "awaitable"] {
         assert!(!session_view.contains(hidden), "{hidden} in {session_view}");
     }
+    assert_proxy_audit_recorded(core_ports, session);
     let state = epic_status(core_ports);
     assert_eq!(state["reservations"], serde_json::json!({}));
     assert_eq!(

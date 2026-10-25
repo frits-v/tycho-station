@@ -31,9 +31,7 @@ use crate::agent_files::{
 use crate::agent_tree::{self, Bounds, Owners};
 use crate::config::AgentDirs;
 use crate::credential_handoff::fetch;
-use crate::credentials::{
-    CLAUDE_TOKEN_ENV, CODEX_AUTH_FILE, CODEX_HOME_ENV, Credential, CredentialVendor,
-};
+use crate::credentials::{CODEX_AUTH_FILE, CODEX_HOME_ENV, Credential, CredentialVendor};
 use crate::exit_decode::{
     ChildEnd, Decoded, ResultFile, ResultReport, Stop, decode_exit, read_progress,
     read_result_file, status_payload,
@@ -45,9 +43,10 @@ pub use crate::launch_spec::{
     take_spec,
 };
 use crate::process::{now_unix_ms, send};
+use crate::proxy_audit;
 use crate::relay::{relay_dir, relay_once};
 use crate::sandbox::{EXIT_SANDBOX_REFUSED, PLAN_ENV, SANDBOX_REFUSED, SandboxVendor};
-use crate::session_proxy::SessionProxy;
+use crate::session_proxy::{HandedToken, SessionProxy};
 use crate::session_sandbox::{self, SessionPaths};
 use crate::spool::{
     Ack, BeatState, Delivery, FinalBeat, HeartbeatCompletion, HeartbeatSend, Ingress, SPOOL_FILE,
@@ -396,6 +395,8 @@ struct Run<'a, I: Ingress> {
     /// The beat after the vendor exited and the context size it carried, reported with the
     /// launch's end and in the result's resolution.
     last_beat: Option<(LastBeat, Option<u64>)>,
+    /// Claude's handed token, held until the proxy takes it as its route's credential.
+    token: Option<HandedToken>,
 }
 
 /// Asks the core for the session's credential when the spec names a hand-off socket.
@@ -476,6 +477,7 @@ pub fn launch_with_stop(
         codex_home: None,
         proxy: None,
         last_beat: None,
+        token: None,
     };
     let decoded = match spool_ready
         .map_err(|error| error.to_string())
@@ -570,8 +572,8 @@ impl<I: Ingress> Run<'_, I> {
         decode_exit(stop, end, result, &session)
     }
 
-    /// The vendor's credential pair: Claude's token itself, or the Codex home holding the
-    /// core's `auth.json`; empty when the spec named no hand-off.
+    /// The vendor's credential pair: none for Claude, whose token the proxy takes, or the
+    /// Codex home holding the core's `auth.json`; empty when the spec named no hand-off.
     fn credential_environment(&mut self) -> Result<Vec<(String, String)>, String> {
         let credential = match self.credential.take() {
             None => return Ok(Vec::new()),
@@ -579,10 +581,10 @@ impl<I: Ingress> Run<'_, I> {
             Some(Ok(credential)) => credential,
         };
         match credential.vendor() {
-            CredentialVendor::Claude => Ok(vec![(
-                CLAUDE_TOKEN_ENV.to_string(),
-                credential.expose().to_string(),
-            )]),
+            CredentialVendor::Claude => {
+                self.token = HandedToken::of(&credential);
+                Ok(Vec::new())
+            }
             CredentialVendor::Codex => {
                 let home = self.files.spool_dir.join(CODEX_HOME_DIR);
                 ensure_private_dir(&home)
@@ -599,16 +601,22 @@ impl<I: Ingress> Run<'_, I> {
         }
     }
 
-    /// Starts the session's proxy and writes the leader's plan, when the vendor runs through
-    /// the trampoline; `None` without one, in tests only. The proxy variables and the plan
-    /// carry the proxy's session token and are never logged.
+    /// Starts the session's proxy, with Claude's handed token as its route's credential, and
+    /// writes the leader's plan when the vendor runs through the trampoline. A vendor with no
+    /// sandbox gets neither, in tests only, where it also runs without the trampoline. The
+    /// proxy variables and the plan carry the proxy's session token and are never logged.
     fn prepare_sandbox(&mut self) -> Result<Option<Vec<(String, String)>>, String> {
-        if self.settings.session_leader.is_none() {
-            return Ok(None);
-        }
         let session = &self.settings.env.session_name;
-        let vendor = SandboxVendor::for_session(session.vendor())
-            .ok_or_else(|| format!("no sandbox for a {} session", session.vendor().as_str()))?;
+        let leader = self.settings.session_leader.is_some();
+        let Some(vendor) = SandboxVendor::for_session(session.vendor()) else {
+            if leader {
+                return Err(format!(
+                    "no sandbox for a {} session",
+                    session.vendor().as_str()
+                ));
+            }
+            return Ok(None);
+        };
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| "HOME is not set".to_string())?;
@@ -621,9 +629,12 @@ impl<I: Ingress> Run<'_, I> {
             ports: self.settings.ports,
             uid: current_uid(),
         };
-        let prepared = session_sandbox::prepare(&paths).map_err(|error| error.to_string())?;
+        let prepared = session_sandbox::prepare(&paths, self.token.take(), leader)
+            .map_err(|error| error.to_string())?;
         let mut environment = prepared.proxy.child_environment();
-        environment.push((PLAN_ENV.to_string(), prepared.plan));
+        if let Some(plan) = prepared.plan {
+            environment.push((PLAN_ENV.to_string(), plan));
+        }
         self.log.line(&format!(
             "proxy on 127.0.0.1:{}, vendor environment adds {}",
             prepared.proxy.port(),
@@ -633,12 +644,28 @@ impl<I: Ingress> Run<'_, I> {
         Ok(Some(environment))
     }
 
-    /// Stops the proxy and logs what it allowed and refused.
+    /// Stops the proxy, writes its decisions to the session's audit file for the core, and
+    /// logs what it allowed and refused.
     fn stop_proxy(&mut self) {
-        if let Some(proxy) = self.proxy.take() {
-            let record = proxy.stop();
-            self.log.line(&format!("proxy: {record}"));
+        let Some(proxy) = self.proxy.take() else {
+            return;
+        };
+        let events = proxy.stop_with_events();
+        let path = proxy_audit::audit_path(&self.settings.dirs, &self.settings.env.session_name);
+        match proxy_audit::write(&path, &events) {
+            Ok(lines) => self.log.line(&format!(
+                "proxy audit: {lines} events in {}",
+                path.display()
+            )),
+            Err(error) => self.log.line(&format!(
+                "proxy audit not written: {}: {error}",
+                path.display()
+            )),
         }
+        self.log.line(&format!(
+            "proxy: {}",
+            crate::session_proxy::ProxyRecord::of(&events)
+        ));
     }
 
     /// Zeroes and removes the session's `auth.json`, then the Codex home, never through a link.
@@ -682,11 +709,12 @@ impl<I: Ingress> Run<'_, I> {
         let (program, arguments) = vendor
             .split_first()
             .ok_or_else(|| io::Error::other("empty vendor command"))?;
-        let mut environment = self
+        let mut session = credential;
+        session.extend(sandbox.into_iter().flatten());
+        let environment = self
             .settings
-            .vendor_environment(&self.files.progress, &self.files.result);
-        environment.extend(credential);
-        environment.extend(sandbox.into_iter().flatten());
+            .vendor_environment(&self.files.progress, &self.files.result, session)
+            .map_err(io::Error::other)?;
         let mut command = vendor_command(
             self.settings.session_leader.as_deref(),
             self.settings.terminal,
@@ -1032,6 +1060,7 @@ impl<I: Ingress> Run<'_, I> {
 mod tests {
     use super::*;
     use crate::credential_handoff::{HandoffOutcome, HandoffServer};
+    use crate::credentials::CLAUDE_TOKEN_ENV;
     use crate::credentials::tests::{CLAUDE_TOKEN, CODEX_AUTH};
     use crate::launch_spec::tests::{NAME, SECRET, environment};
     use crate::spool::{ACKNOWLEDGED_SUFFIX, Resolution};
@@ -1605,7 +1634,7 @@ mod tests {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
                     stack.push(path);
-                } else if path.file_name().is_some_and(|name| name != "env") {
+                } else {
                     examined = examined.saturating_add(1);
                     let bytes = fs::read(&path).unwrap();
                     assert!(
@@ -1619,8 +1648,11 @@ mod tests {
         assert!(examined >= 4, "only {examined} files examined");
     }
 
+    /// The handed token stays in the launcher's proxy: the vendor's real environment holds the
+    /// phantom, which is the proxy's session token, and the route's base URL, and no variable,
+    /// file or report holds the token.
     #[test]
-    fn a_handed_claude_token_reaches_the_vendor_environment_and_no_file() {
+    fn a_handed_claude_token_stays_in_the_proxy_and_the_vendor_gets_the_phantom() {
         let dir = scratch("claude-token");
         let mut settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
         let credential =
@@ -1633,12 +1665,31 @@ mod tests {
         assert_eq!(end.state, "failed");
         assert_eq!(server.finish(), HandoffOutcome::Answered);
         let env = fs::read_to_string(dir.join("env")).unwrap();
-        assert!(
+        let value = |name: &str| {
             env.lines()
-                .any(|line| line == format!("{CLAUDE_TOKEN_ENV}={CLAUDE_TOKEN}")),
+                .find_map(|line| line.strip_prefix(&format!("{name}=")))
+                .map(str::to_string)
+        };
+        let phantom = value(CLAUDE_TOKEN_ENV).unwrap_or_else(|| panic!("no phantom: {env}"));
+        assert_eq!(Some(phantom.clone()), value("NONO_PROXY_TOKEN"), "{env}");
+        assert_ne!(phantom, CLAUDE_TOKEN);
+        assert!(
+            value(crate::session_proxy::ANTHROPIC_BASE_URL_ENV)
+                .is_some_and(|url| url.starts_with("http://127.0.0.1:")),
             "{env}"
         );
+        assert!(
+            !env.contains(CLAUDE_TOKEN),
+            "the vendor's environment holds the token"
+        );
         assert!(!env.contains("TYCHO_CREDENTIAL_SOCKET"), "{env}");
+        assert!(
+            matches!(
+                proxy_audit::read(&settings.dirs, &settings.env.session_name, current_uid()),
+                proxy_audit::AuditRead::Read(_)
+            ),
+            "the launcher left no proxy audit"
+        );
         assert_nowhere(&dir, &end, CLAUDE_TOKEN);
         fs::remove_dir_all(&dir).unwrap();
     }

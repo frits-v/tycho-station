@@ -14,7 +14,7 @@ use crate::sandbox::{
     Access, Grant, SandboxConfig, SandboxError, SandboxPlan, SandboxVendor, capability_set,
     core_ports,
 };
-use crate::session_proxy::{ProxyError, SessionProxy};
+use crate::session_proxy::{HandedToken, ProxyError, SessionProxy};
 use crate::vendors::claude_control::sockets_dirs;
 
 const PRIVATE_DIR_MODE: u32 = 0o700;
@@ -71,12 +71,13 @@ pub struct SessionPaths<'a> {
     pub uid: u32,
 }
 
-/// A started proxy and the plan for the leader, already built once against the
-/// configuration so a refusal happens here, before any vendor process exists.
+/// A started proxy and, for a vendor under the trampoline, the plan for the leader, already
+/// built once against the configuration so a refusal happens here, before any vendor process
+/// exists.
 #[derive(Debug)]
 pub struct Prepared {
     pub proxy: SessionProxy,
-    pub plan: String,
+    pub plan: Option<String>,
 }
 
 /// Creates a directory of the vendor's own state 0700 when it is missing; an existing one
@@ -177,17 +178,33 @@ pub fn session_plan(
     })
 }
 
-/// Starts the proxy on the vendor's allowlist, writes the plan and builds its set once.
-pub fn prepare(paths: &SessionPaths<'_>) -> Result<Prepared, PrepareError> {
+/// Starts the proxy on the vendor's allowlist and, with `with_plan`, writes the leader's plan
+/// and builds its set once.
+///
+/// A Claude session's handed token becomes the `anthropic` route's credential. The route is
+/// never intercepted: Claude sends its model traffic to the route's base URL, and the proxy
+/// refuses a CONNECT to `api.anthropic.com`, so the phantom is the only token the vendor
+/// holds and the route is the only way it is exchanged.
+pub fn prepare(
+    paths: &SessionPaths<'_>,
+    token: Option<HandedToken>,
+    with_plan: bool,
+) -> Result<Prepared, PrepareError> {
     let config = SandboxConfig::embedded()
         .map_err(|error| PrepareError::Sandbox(SandboxError::Config(error)))?
         .value;
-    let proxy =
-        SessionProxy::start(config.allowed_hosts(paths.vendor)).map_err(PrepareError::Proxy)?;
+    let proxy = SessionProxy::start(config.allowed_hosts(paths.vendor), token)
+        .map_err(PrepareError::Proxy)?;
+    if !with_plan {
+        return Ok(Prepared { proxy, plan: None });
+    }
     let plan = session_plan(paths, proxy.port())?;
     capability_set(&plan, &config).map_err(PrepareError::Sandbox)?;
     let plan = plan.to_json().map_err(PrepareError::Sandbox)?;
-    Ok(Prepared { proxy, plan })
+    Ok(Prepared {
+        proxy,
+        plan: Some(plan),
+    })
 }
 
 #[cfg(test)]
