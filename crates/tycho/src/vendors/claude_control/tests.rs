@@ -88,7 +88,7 @@ fn go(control: &ClaudeControl) -> Delivery {
 }
 
 #[test]
-fn the_command_line_is_exact_and_resume_re_passes_the_settings() {
+fn the_command_line_is_exact_and_resume_re_passes_the_settings_and_no_setting_sources() {
     let command = adapter(Path::new("/c"))
         .control_command(&launch(false))
         .unwrap();
@@ -106,6 +106,7 @@ fn the_command_line_is_exact_and_resume_re_passes_the_settings() {
         SESSION_ID,
         "--settings",
         SETTINGS,
+        "--setting-sources=",
     ];
     assert_eq!(command.argv, expected);
     assert_eq!(command.terminal, VendorTerminal::Inherit);
@@ -119,12 +120,14 @@ fn the_command_line_is_exact_and_resume_re_passes_the_settings() {
     let mut expected_resume = expected.map(str::to_string).to_vec();
     expected_resume[9] = "--resume".to_string();
     assert_eq!(resumed.argv, expected_resume);
-    assert!(
-        command
-            .argv
+    for argv in [&command.argv, &resumed.argv] {
+        assert!(argv.iter().all(|word| ShortText::parse(word).is_ok()));
+        let sources: Vec<&String> = argv
             .iter()
-            .all(|word| ShortText::parse(word).is_ok())
-    );
+            .filter(|word| word.starts_with("--setting-sources"))
+            .collect();
+        assert_eq!(sources, ["--setting-sources="], "{argv:?}");
+    }
 }
 
 #[test]

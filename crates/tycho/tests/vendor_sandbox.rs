@@ -32,7 +32,7 @@ use tycho::launch_spec::AGENT_TELEMETRY_ENV;
 use tycho::sandbox::{Access, Grant, PLAN_ENV, SandboxVendor};
 use tycho::session_sandbox::{self, SessionPaths};
 use tycho::spawn::CLAUDE_SANDBOX_OFF;
-use tycho::vendors::claude_worker::ClaudeWorker;
+use tycho::vendors::claude_worker::{ClaudeWorker, SETTING_SOURCES_NONE};
 use tycho::vendors::worker::{ModelName, VendorSessionId, WorkerTask, WorkerVendor};
 use tycho::vendors::worker_process::worker_settings;
 use tycho_types::git_environment::{git_command, hook_environment_refusal};
@@ -45,6 +45,10 @@ const PROBE_OUTPUT: &str = "probe-42";
 /// Claude's own sandbox as the station passed it before the station's sandbox existed.
 const VENDOR_SANDBOX_ON: &str =
     r#"{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false}}"#;
+/// A settings file that turns Claude's sandbox on and denies Bash. A deny rule from any layer
+/// that is read wins over the launcher's allow rule, so a Bash call that runs shows the file
+/// was not read at all, not only outranked.
+const FILE_SANDBOX_ON_BASH_DENIED: &str = r#"{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false},"permissions":{"deny":["Bash"]}}"#;
 
 fn mise_which(tool: &str) -> PathBuf {
     let output = Command::new("mise")
@@ -107,7 +111,9 @@ enum BashOutcome {
     /// Claude's own sandbox could not start inside the station's, which refuses the socket
     /// it listens on and the profile it applies, so the call was refused.
     VendorSandboxFailed,
-    /// No Bash call came back.
+    /// A permission rule refused the call, or took Bash out of the session.
+    Denied,
+    /// No Bash call came back; a tool a deny rule names is not offered to the model.
     NoToolResult,
     Unrecognised(String),
 }
@@ -136,6 +142,15 @@ fn decode_bash(stream: &str) -> BashOutcome {
     if results.iter().any(|text| text.contains(PROBE_OUTPUT)) {
         return BashOutcome::Ran;
     }
+    // A deny rule naming the whole tool takes it out of the session; the model's call then
+    // gets the vendor's "no such tool" error.
+    let denied = |text: &String| {
+        text.contains("No such tool available: Bash")
+            || (text.contains("Permission to use Bash") && text.contains("denied"))
+    };
+    if results.iter().any(denied) {
+        return BashOutcome::Denied;
+    }
     results.first().map_or(BashOutcome::NoToolResult, |text| {
         BashOutcome::Unrecognised(text.chars().take(300).collect())
     })
@@ -158,6 +173,9 @@ fn run_claude(scratch: &Scratch, settings: &str, prompt: &str) -> Run {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Sandboxed,
+    /// Sandboxed, with the worker's words less `--setting-sources=`: the positive control
+    /// that a planted settings file is read when the flag is absent.
+    SandboxedReadingSettingFiles,
     Unsandboxed,
 }
 
@@ -215,13 +233,22 @@ fn run_claude_as(scratch: &Scratch, settings: &str, prompt: &str, mode: Mode) ->
         uid: current_uid(),
     };
     let prepared = session_sandbox::prepare(&paths).unwrap();
-    let words = worker_words(&claude, scratch, settings);
+    println!("evidence: claude binary {}", claude.display());
+    let mut words = worker_words(&claude, scratch, settings);
+    if mode == Mode::SandboxedReadingSettingFiles {
+        let flags = words
+            .iter()
+            .filter(|word| *word == SETTING_SOURCES_NONE)
+            .count();
+        assert_eq!(flags, 1, "the worker passes the flag once");
+        words.retain(|word| word != SETTING_SOURCES_NONE);
+    }
     let token = credentials::load(&config::core_home().unwrap(), CredentialVendor::Claude)
         .unwrap_or_else(|error| panic!("no Claude token in the core's store: {error}"));
     let user = tycho::launch_spec::current_user_name().unwrap();
     let path = format!("{}:/usr/bin:/bin", claude.parent().unwrap().display());
     let mut command = match mode {
-        Mode::Sandboxed => {
+        Mode::Sandboxed | Mode::SandboxedReadingSettingFiles => {
             let mut command = Command::new(TYCHO);
             command.arg("session-leader").arg("--").args(&words);
             command
@@ -242,7 +269,7 @@ fn run_claude_as(scratch: &Scratch, settings: &str, prompt: &str, mode: Mode) ->
         .envs(AGENT_TELEMETRY_ENV)
         .envs(prepared.proxy.child_environment())
         .current_dir(scratch.worktree());
-    if mode == Mode::Sandboxed {
+    if mode != Mode::Unsandboxed {
         command.env(PLAN_ENV, &prepared.plan);
     }
     let output = run_with_prompt(command, prompt);
@@ -293,23 +320,44 @@ fn bash_prompt() -> String {
     format!("Use the Bash tool to run exactly `{PROBE_COMMAND}`, then reply with only its output.")
 }
 
-/// A worktree's `.claude/settings.json` that turns Claude's sandbox on does not win over the
-/// settings the launcher passes. The third cell is the observable that tells the two apart:
-/// with Claude's sandbox on, it cannot start inside the station's and refuses the call.
+/// Only the launcher's settings decide Claude's sandbox: the worker starts Claude with
+/// `--setting-sources=`, so the worktree's and the user's settings files are not read. The
+/// third cell is the observable that tells the layers apart: with Claude's sandbox on, it
+/// cannot start inside the station's and refuses the call.
 #[test]
-#[ignore = "spends three claude turns; run with mise run vendor-sandbox-tests"]
+#[ignore = "spends four claude turns; run with mise run vendor-sandbox-tests"]
 fn a_worktree_cannot_turn_claude_s_sandbox_back_on_under_the_launcher_s_settings() {
     let scratch = Scratch::new("settings");
     let baseline = run_claude(&scratch, CLAUDE_SANDBOX_OFF, &bash_prompt());
     let worktree_settings = scratch.worktree().join(".claude");
-    fs::create_dir_all(&worktree_settings).unwrap();
-    fs::write(worktree_settings.join("settings.json"), VENDOR_SANDBOX_ON).unwrap();
-    let worktree_on = run_claude(&scratch, CLAUDE_SANDBOX_OFF, &bash_prompt());
-    fs::remove_file(worktree_settings.join("settings.json")).unwrap();
+    let user_settings = scratch.home().join(".claude");
+    let planted = [
+        worktree_settings.join("settings.json"),
+        worktree_settings.join("settings.local.json"),
+        user_settings.join("settings.json"),
+    ];
+    for file in &planted {
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, FILE_SANDBOX_ON_BASH_DENIED).unwrap();
+    }
+    let files_on = run_claude(&scratch, CLAUDE_SANDBOX_OFF, &bash_prompt());
+    let files_read = run_claude_as(
+        &scratch,
+        CLAUDE_SANDBOX_OFF,
+        &bash_prompt(),
+        Mode::SandboxedReadingSettingFiles,
+    );
+    for file in &planted {
+        fs::remove_file(file).unwrap();
+    }
     let launcher_on = run_claude(&scratch, VENDOR_SANDBOX_ON, &bash_prompt());
     let cells = [
-        ("launcher off, no worktree setting", &baseline),
-        ("launcher off, worktree on", &worktree_on),
+        ("launcher off, no settings file", &baseline),
+        (
+            "launcher off, worktree and user files on with Bash denied",
+            &files_on,
+        ),
+        ("the same files, read without the flag", &files_read),
         ("launcher on", &launcher_on),
     ];
     let outcomes: Vec<BashOutcome> = cells
@@ -327,12 +375,17 @@ fn a_worktree_cannot_turn_claude_s_sandbox_back_on_under_the_launcher_s_settings
         })
         .collect();
     assert_eq!(
-        outcomes,
+        [&outcomes[0], &outcomes[1], &outcomes[3]],
         [
-            BashOutcome::Ran,
-            BashOutcome::Ran,
-            BashOutcome::VendorSandboxFailed
+            &BashOutcome::Ran,
+            &BashOutcome::Ran,
+            &BashOutcome::VendorSandboxFailed
         ]
+    );
+    assert!(
+        matches!(outcomes[2], BashOutcome::Denied | BashOutcome::NoToolResult),
+        "the planted files were not read without the flag, so the second cell shows nothing: {:?}",
+        outcomes[2]
     );
 }
 

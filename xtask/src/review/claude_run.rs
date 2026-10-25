@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn the_command_line_has_exact_text() {
         let command = command(
-            Path::new("/opt/claude/2.1.280/claude"),
+            Path::new("/opt/claude/2.1.295/claude"),
             Path::new("/t/tycho-review-7/find.md"),
             Path::new("/t/tycho-review-7"),
             "{}",
@@ -252,7 +252,7 @@ mod tests {
         assert_eq!(
             words,
             [
-                "/opt/claude/2.1.280/claude",
+                "/opt/claude/2.1.295/claude",
                 "-p",
                 "--output-format",
                 "stream-json",

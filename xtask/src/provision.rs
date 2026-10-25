@@ -2690,7 +2690,7 @@ mod tests {
     #[test]
     fn the_operator_commands_run_the_pinned_installs_by_path_with_the_whole_environment() {
         let commands = operator_commands(&Prefix::production()).expect("the pins decode");
-        let environment = "PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise";
+        let environment = "PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.295:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise";
         let as_agent = "sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent";
         assert_eq!(
             commands,
@@ -2718,7 +2718,7 @@ mod tests {
         assert_eq!(
             commands,
             [
-                "/Users/Shared/tycho/mise/installs/claude/2.1.280/claude setup-token".to_string(),
+                "/Users/Shared/tycho/mise/installs/claude/2.1.295/claude setup-token".to_string(),
                 "/Users/Shared/tycho/bin/tycho credentials set claude".to_string(),
                 "/Users/Shared/tycho/mise/installs/codex/0.160.1/bin/codex login -c 'cli_auth_credentials_store=\"file\"'".to_string(),
                 "/Users/Shared/tycho/bin/tycho credentials set codex < ~/.codex/auth.json".to_string(),

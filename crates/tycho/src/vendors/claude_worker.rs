@@ -11,13 +11,19 @@ use crate::vendors::worker::{
     Refusal, Stream, VendorEnd, VersionState, WorkerError, WorkerTask, WorkerVendor, vendor_word,
 };
 
-pub const CLAUDE_PINNED_VERSION: &str = "2.1.280";
+pub const CLAUDE_PINNED_VERSION: &str = "2.1.295";
+/// No settings file applies, so the launcher's `--settings` object is the only layer.
+///
+/// Not the user's, the project's or the local one, and with them no `CLAUDE.md`, skill,
+/// agent, command or MCP server from the user or the worktree. One word with `=`, since a
+/// control command's words travel as `ShortText`, which is never empty.
+pub const SETTING_SOURCES_NONE: &str = "--setting-sources=";
 const CLAUDE_BANNER_SUFFIX: &str = "(Claude Code)";
 const HTTP_TOO_MANY_REQUESTS: u64 = 429;
 const HTTP_UNAUTHORIZED: u64 = 401;
 const HTTP_FORBIDDEN: u64 = 403;
 /// System subtypes the pinned CLI emits that a worker does not act on.
-const SYSTEM_OTHER: [&str; 9] = [
+const SYSTEM_OTHER: [&str; 10] = [
     "hook_started",
     "hook_progress",
     "hook_response",
@@ -27,6 +33,7 @@ const SYSTEM_OTHER: [&str; 9] = [
     "status",
     "compact_boundary",
     "api_retry",
+    "ui_invalidate",
 ];
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -256,6 +263,7 @@ impl WorkerVendor for ClaudeWorker {
             task.session_id.as_str(),
             "--settings",
             task.settings.as_str(),
+            SETTING_SOURCES_NONE,
         ]
         .iter()
         .map(ToString::to_string)
@@ -327,7 +335,8 @@ mod tests {
     use std::num::NonZeroU16;
     use std::path::PathBuf;
 
-    /// Captured from the pinned CLI under a subscription login; paths and lists trimmed.
+    /// Captured from the pinned CLI with the worker's command line and a session token, in a
+    /// fresh home; paths and lists trimmed.
     const SUCCESS: &str = include_str!("../fixtures/claude-worker-success.jsonl");
     const MAX_TURNS: &str = include_str!("../fixtures/claude-worker-max-turns.jsonl");
     const BARE: &str = include_str!("../fixtures/claude-worker-bare.jsonl");
@@ -365,8 +374,9 @@ mod tests {
             "/opt/claude/claude -p --output-format stream-json --verbose --model haiku \
              --effort low --permission-mode acceptEdits --permission-prompts none \
              --session-id 3f0c6c1e-6b1a-4a51-9a0e-2a8c5d0c1a10 \
-             --settings {\"sandbox\":{\"enabled\":true}} --max-turns 6"
+             --settings {\"sandbox\":{\"enabled\":true}} --setting-sources= --max-turns 6"
         );
+        assert!(words.iter().all(|word| !word.is_empty()));
         assert!(!words.iter().any(|word| word == "--bare"));
         let uncapped = ClaudeWorker.command(Path::new("/c"), &task(None)).unwrap();
         assert!(!uncapped.iter().any(|word| word == "--max-turns"));
@@ -376,7 +386,7 @@ mod tests {
     fn the_version_banner_is_checked_against_the_pin() {
         let worker = ClaudeWorker;
         assert_eq!(
-            worker.version("2.1.280 (Claude Code)\n"),
+            worker.version("2.1.295 (Claude Code)\n"),
             VersionState::Pinned
         );
         assert_eq!(
@@ -385,7 +395,7 @@ mod tests {
         );
         assert!(matches!(worker.version(""), VersionState::Unrecognised(_)));
         assert!(matches!(
-            worker.version("2.1.280"),
+            worker.version("2.1.295"),
             VersionState::Unrecognised(_)
         ));
     }
@@ -397,20 +407,40 @@ mod tests {
         assert!(stream.started);
         assert_eq!(stream.refusal, None);
         assert_eq!(stream.unrecognised, 0);
-        assert_eq!(stream.events, 19);
-        assert_eq!(stream.context_tokens, Some(8 + 33_089 + 293));
+        assert_eq!(stream.events, 6);
+        assert_eq!(stream.context_tokens, Some(2 + 16_595 + 193));
         assert_eq!(
             stream.usage,
             Usage {
-                input_tokens: 26 + 33_382 + 65_799,
-                output_tokens: 439,
-                cost_micro_dollars: 75_565,
+                input_tokens: 4 + 6_449 + 26_934,
+                output_tokens: 238,
+                cost_micro_dollars: 1_679,
             }
         );
         assert_eq!(
             stream.resume_handle.as_deref(),
             Some("3f0c6c1e-6b1a-4a51-9a0e-2a8c5d0c1a10")
         );
+    }
+
+    /// Every event the pinned CLI wrote in the captures has a decoding, so a pin bump that
+    /// adds an event shows here before a worker counts it as unrecognised.
+    #[test]
+    fn every_captured_event_of_the_pinned_cli_is_recognised() {
+        for (name, sample) in [
+            ("success", SUCCESS),
+            ("max turns", MAX_TURNS),
+            ("bare", BARE),
+            ("login", LOGIN),
+        ] {
+            let stream = fold(sample);
+            assert_eq!(stream.unrecognised, 0, "{name}");
+            assert_eq!(
+                usize::try_from(stream.events).unwrap(),
+                sample.lines().count(),
+                "{name}"
+            );
+        }
     }
 
     #[test]

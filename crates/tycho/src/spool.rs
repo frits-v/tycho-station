@@ -193,17 +193,46 @@ pub fn decode_ack(outcome: Outcome) -> Ack {
 pub trait Ingress {
     fn deliver(&self, awaitable: &AwaitableId, resolution: &Resolution) -> Ack;
 
-    /// Sends `body` to `/<service>/<session>/heartbeat/send` with its idempotency key.
+    /// Sends `body` to `/<service>/<session>/heartbeat` with its idempotency key, as a
+    /// send or as a call (`HeartbeatSend::completion`).
     fn heartbeat(&self, call: &HeartbeatSend<'_>) -> Ack;
 }
 
-/// One heartbeat send: the target, the key and the JSON body, which carries the secret.
+/// When the ingress answers a heartbeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeartbeatCompletion {
+    /// Once the invocation is queued (`/heartbeat/send`): beats while the vendor runs.
+    Enqueued,
+    /// Once the handler has run (`/heartbeat`): the beat after the vendor exits, so the
+    /// session holds the final context size before the result resolves the awaitable. The
+    /// session's `status` is a shared handler and does not wait behind a queued heartbeat.
+    Applied,
+}
+
+/// One heartbeat: the target, the key, the JSON body, which carries the secret, and when the
+/// ingress answers.
 #[derive(Debug)]
 pub struct HeartbeatSend<'a> {
     pub service: &'a str,
     pub session: &'a SessionName,
     pub idempotency_key: &'a IdempotencyKey,
     pub body: String,
+    pub completion: HeartbeatCompletion,
+}
+
+impl HeartbeatSend<'_> {
+    /// The ingress path for the call.
+    #[must_use]
+    pub fn path(&self) -> String {
+        let suffix = match self.completion {
+            HeartbeatCompletion::Enqueued => "/send",
+            HeartbeatCompletion::Applied => "",
+        };
+        format!(
+            "/{}/{}/{SESSION_HEARTBEAT}{suffix}",
+            self.service, self.session
+        )
+    }
 }
 
 /// The core's ingress over HTTP, at the ports the launcher was handed.
@@ -226,10 +255,7 @@ impl Ingress for CoreIngress {
     }
 
     fn heartbeat(&self, call: &HeartbeatSend<'_>) -> Ack {
-        let url = self.ports.ingress_url(&format!(
-            "/{}/{}/{SESSION_HEARTBEAT}/send",
-            call.service, call.session
-        ));
+        let url = self.ports.ingress_url(&call.path());
         let headers = [("idempotency-key", call.idempotency_key.as_str())];
         decode_ack(
             self.http
@@ -421,6 +447,27 @@ mod tests {
         fn heartbeat(&self, _call: &HeartbeatSend<'_>) -> Ack {
             Ack::Acknowledged
         }
+    }
+
+    #[test]
+    fn a_heartbeat_is_sent_while_the_vendor_runs_and_called_after_it_exits() {
+        let session = SessionName::parse(SESSION).unwrap();
+        let key = IdempotencyKey::new(&session, 7).unwrap();
+        let call = |completion| HeartbeatSend {
+            service: "Session",
+            session: &session,
+            idempotency_key: &key,
+            body: String::new(),
+            completion,
+        };
+        assert_eq!(
+            call(HeartbeatCompletion::Enqueued).path(),
+            format!("/Session/{SESSION}/heartbeat/send")
+        );
+        assert_eq!(
+            call(HeartbeatCompletion::Applied).path(),
+            format!("/Session/{SESSION}/heartbeat")
+        );
     }
 
     fn record(state: ExitState) -> SpoolRecord {

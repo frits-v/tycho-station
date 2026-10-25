@@ -95,7 +95,7 @@ The suites that start real processes are ignored tests, run by their mise tasks 
 | `kill-tests`, `spine-tests`, `launcher-tests`, `chaos-tests` | the mise tools; they run at the same time, each test core on its own port slot |
 | `worker-tests` | a Claude token in the core's store (`tycho credentials set claude`), which the suite copies into its test core and hands its worker, and `graph-plugin`; never beside `control-tests` |
 | `control-tests` | a Claude token in the core's store, which the suite copies into its test core and hands each control session; never beside `worker-tests` |
-| `vendor-sandbox-tests` | a Claude token in the core's store; five short `claude -p` turns through the session proxy and the trampoline; never beside `worker-tests` or `control-tests` |
+| `vendor-sandbox-tests` | a Claude token in the core's store; six short `claude -p` turns through the session proxy and the trampoline; never beside `worker-tests` or `control-tests` |
 | `graph-tests` | `mise run graph-plugin` |
 | `boundary-tests` | a terminal, the provisioned agent user and the sudoers rule: sudo asks for the developer's password on the terminal to run each probe as `tycho-agent` |
 | `attach-tests` | a Ghostty terminal and the agent user: sudo once, again at teardown past its five-minute cache; up to two Automation dialogs (the suite's terminal, `osascript`) |
@@ -109,8 +109,9 @@ status, and decodes to one of four states: denied (permission denied, not permit
 write refused, or connection refused, named), succeeded (the boundary is open; the line
 shows what the agent reached), could not run (sudo refused, the user or the target is
 missing, a timeout), or unrecognised, which includes a probe that ran under any uid but the
-agent's. Only a denial passes, except the agent's settings write, a listed gap whose outcome
-is printed as a measurement. The run ends with the number of boundaries examined and the
+agent's. Only a denial passes, except the agent's write to its Claude settings file, whose
+outcome is printed as a measurement: the file stays writable, and no station session reads
+it (design section 6, setting sources). The run ends with the number of boundaries examined and the
 count of each disposition; zero examined fails. The agent's walk to the canonical
 repository names the first directory it cannot search, with `ls`'s line saying whether that
 directory refused it or was absent. Two more boundaries are the shared zmx log: the agent puts a
@@ -200,7 +201,10 @@ re-runs, before it merges: `mise run vendor-sandbox-tests`, `mise run launcher-t
 `mise run worker-tests` and `mise run control-tests`, the probes recorded on
 [the nono issue](https://github.com/frits-v/tycho-station/issues/124) that the change
 touches (Codex's destinations and the kill path among them), and the system-path test
-above. A nono bump also diffs the release's `data/policy.json` groups against
+above. A `claude` bump also recaptures the worker streams in `crates/tycho/src/fixtures`
+from the new binary with the worker's command line: the decoder tests check each capture's
+version against the pin and refuse any event in it the decoder does not map. A nono bump
+also diffs the release's `data/policy.json` groups against
 `config/sandbox.cue` and records what changed. A host the vendor newly tries goes into
 `docs/vendor-surfaces.md` (Evidence) and onto the allowlist only by a ruling; until then it
 stays refused.
@@ -413,7 +417,7 @@ or a group the agent is in, search it.
 
   ```sh
   sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent PATH=/usr/bin:/bin /usr/bin/git config --global credential.helper ""
-  sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent USER=tycho-agent LOGNAME=tycho-agent PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise /Users/Shared/tycho/bin/xtask setup
+  sudo -u tycho-agent -H /usr/bin/env -i HOME=/Users/tycho-agent USER=tycho-agent LOGNAME=tycho-agent PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.295:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise /Users/Shared/tycho/bin/xtask setup
   ```
 
   The empty credential helper clears every helper git reads, Apple's osxkeychain included.
@@ -431,7 +435,7 @@ subscription and the Codex plan, stores them once, from a terminal, with the pre
 binaries:
 
 ```sh
-/Users/Shared/tycho/mise/installs/claude/2.1.280/claude setup-token
+/Users/Shared/tycho/mise/installs/claude/2.1.295/claude setup-token
 /Users/Shared/tycho/bin/tycho credentials set claude
 /Users/Shared/tycho/mise/installs/codex/0.160.1/bin/codex login -c 'cli_auth_credentials_store="file"'
 /Users/Shared/tycho/bin/tycho credentials set codex < ~/.codex/auth.json

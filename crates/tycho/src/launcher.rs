@@ -50,8 +50,8 @@ use crate::sandbox::{EXIT_SANDBOX_REFUSED, PLAN_ENV, SANDBOX_REFUSED, SandboxVen
 use crate::session_proxy::SessionProxy;
 use crate::session_sandbox::{self, SessionPaths};
 use crate::spool::{
-    Ack, Delivery, HeartbeatSend, Ingress, SPOOL_FILE, SPOOL_SCHEMA_VERSION, SpoolRecord,
-    spool_then_deliver, write_spool,
+    Ack, Delivery, HeartbeatCompletion, HeartbeatSend, Ingress, SPOOL_FILE, SPOOL_SCHEMA_VERSION,
+    SpoolRecord, spool_then_deliver, write_spool,
 };
 use crate::vendors::claude_control::socket_of_pid;
 use crate::zmx::Zmx;
@@ -471,7 +471,7 @@ impl<I: Ingress> Run<'_, I> {
         if stop == Stop::None && end != ChildEnd::NotStarted {
             // The vendor's last progress, its final context size included, reaches the
             // session before the result does; a run shorter than one interval has no other beat.
-            self.beat();
+            self.beat(HeartbeatCompletion::Applied);
         }
         let result = read_result_file(&self.files.result);
         if let ResultFile::Report(ResultReport {
@@ -716,7 +716,7 @@ impl<I: Ingress> Run<'_, I> {
                 return (self.terminate(child), Stop::OutputTooLarge);
             }
             if last_beat.is_none_or(|beat| beat.elapsed() >= HEARTBEAT_INTERVAL) {
-                self.beat();
+                self.beat(HeartbeatCompletion::Enqueued);
                 last_beat = Some(Instant::now());
             }
             polls = polls.wrapping_add(1);
@@ -770,9 +770,9 @@ impl<I: Ingress> Run<'_, I> {
     }
 
     /// Renews the lease and sends one heartbeat; a failure is logged and never stops the vendor.
-    fn beat(&mut self) {
+    fn beat(&mut self, completion: HeartbeatCompletion) {
         self.renew_lease();
-        let outcome = self.heartbeat();
+        let outcome = self.heartbeat(completion);
         match outcome {
             Ok(Ack::Acknowledged) => {}
             Ok(other) => self.log.line(&format!("heartbeat not accepted: {other:?}")),
@@ -780,7 +780,7 @@ impl<I: Ingress> Run<'_, I> {
         }
     }
 
-    fn heartbeat(&self) -> Result<Ack, String> {
+    fn heartbeat(&self, completion: HeartbeatCompletion) -> Result<Ack, String> {
         let env = &self.settings.env;
         let sequence = next_sequence(&self.files.sequence).map_err(|error| error.to_string())?;
         let key =
@@ -801,6 +801,7 @@ impl<I: Ingress> Run<'_, I> {
             session: &env.session_name,
             idempotency_key: &key,
             body,
+            completion,
         }))
     }
 
@@ -976,6 +977,7 @@ mod tests {
         files: SessionFiles,
         events: RefCell<Vec<String>>,
         context_tokens: RefCell<Vec<u64>>,
+        completions: RefCell<Vec<HeartbeatCompletion>>,
     }
 
     impl Ingress for Recorder {
@@ -1001,6 +1003,7 @@ mod tests {
                 body.sequence,
                 self.files.lease.exists()
             ));
+            self.completions.borrow_mut().push(call.completion);
             Ack::Acknowledged
         }
     }
@@ -1024,6 +1027,7 @@ mod tests {
             files: files.clone(),
             events: RefCell::new(Vec::new()),
             context_tokens: RefCell::new(Vec::new()),
+            completions: RefCell::new(Vec::new()),
         }
     }
 
@@ -1104,6 +1108,13 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(recorder.context_tokens.borrow().last(), Some(&33_390));
+        // The beat after the exit is answered once the session has applied it: the result
+        // that follows wakes a reader of the session's shared status, which does not wait
+        // behind a queued heartbeat.
+        assert_eq!(
+            *recorder.completions.borrow(),
+            [HeartbeatCompletion::Enqueued, HeartbeatCompletion::Applied]
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

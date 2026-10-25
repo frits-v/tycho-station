@@ -455,7 +455,7 @@ fn boundaries(agent: &Agent, admin: &str, canonical: &Path) -> Vec<Boundary> {
         Boundary {
             name: format!("write {}", settings.display()),
             expectation: Expectation::Measured {
-                gap: "the agent's settings are not yet core-owned (clause 7.1, section 14)",
+                gap: "the agent can write its Claude settings file, which no station session reads (--setting-sources=, section 6)",
             },
             script: WRITE_SETTINGS,
             arguments: vec![settings.display().to_string()],
