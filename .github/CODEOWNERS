@@ -1,2 +1,3 @@
-# The mandate changes only with the operator's review.
+# This file and the mandate change only with the operator's review.
+.github/CODEOWNERS @frits-v
 docs/mandate.md @frits-v

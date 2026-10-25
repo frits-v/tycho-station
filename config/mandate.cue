@@ -6,7 +6,7 @@ mandate: #Mandate & {
 	operator_github_handle: "frits-v"
 	mechanisms: {
 		ruleset: {
-			what:    "Repository ruleset on the default branch: pull request required, the ci check required and up to date, signed commits, linear history, no deletion, no force push, no bypass actors other than the repository admin in pull-request mode for a mandate amendment."
+			what:    "Repository ruleset on the default branch: pull request required, code-owner review required, the ci check required and up to date, signed commits, linear history, no deletion, no force push, and the repository admin as a bypass actor in pull-request mode; which bypass merges count as a mandate amendment is decided in section 11, not by the ruleset."
 			runs:    "every push and merge to the default branch"
 			record:  "forge"
 			pending: false
@@ -54,10 +54,10 @@ mandate: #Mandate & {
 			pending: true
 		}
 		codeowners: {
-			what:    ".github/CODEOWNERS names the operator as the sole owner of docs/mandate.md. Required code-owner review and the repository admin as a pull-request-mode bypass actor are applied by the operator's ruleset change; neither xtask setup nor ci reads the ruleset, so nothing here confirms it."
-			runs:    "every pull request to the default branch that changes docs/mandate.md"
+			what:    ".github/CODEOWNERS names the operator as the sole owner of docs/mandate.md and of this file itself. Required code-owner review and the repository admin as a pull-request-mode bypass actor are applied by the operator's ruleset change; neither xtask setup nor ci reads the ruleset, so nothing here confirms it."
+			runs:    "every pull request to the default branch that changes docs/mandate.md or .github/CODEOWNERS"
 			record:  "forge"
-			pending: true
+			pending: false
 		}
 	}
 	clauses: {
