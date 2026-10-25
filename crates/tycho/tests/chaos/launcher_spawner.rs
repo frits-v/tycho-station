@@ -83,7 +83,11 @@ impl LauncherSpawner {
                 fs::remove_dir_all(dir).unwrap();
             }
         }
-        let fixture = core_home.join("vendor.sh");
+        // The fixture's own directory is the vendor's working directory, which the session's
+        // sandbox grants; nothing else of the core home is.
+        let fixture_dir = core_home.join("vendor-fixture");
+        fs::create_dir(&fixture_dir).unwrap();
+        let fixture = fixture_dir.join("vendor.sh");
         fs::write(&fixture, VENDOR_SCRIPT).unwrap();
         let prefix = scratch_prefix(&prefix_root, &mise_which("zmx"));
         Self {
@@ -177,6 +181,7 @@ impl LauncherSpawner {
     ) -> Result<SpawnOutcome, SpawnerError> {
         let user_home = PathBuf::from(env::var_os("HOME").unwrap());
         let vendor = self.vendor(&environment.session_name);
+        let fixture_dir = self.inner.fixture.parent().map(Path::to_path_buf);
         spawn_session(&SpawnRequest {
             zmx: &self.inner.zmx,
             dirs: &self.inner.dirs,
@@ -188,7 +193,7 @@ impl LauncherSpawner {
             agent_uid: current_uid(),
             tier,
             terminal: VendorTerminal::Files,
-            vendor_dir: None,
+            vendor_dir: fixture_dir.as_deref(),
             ports: self.inner.core_ports,
             tool_prefix: &self.inner.prefix,
             // The chaos vendor is a script; the hand-off is the launcher suite's.

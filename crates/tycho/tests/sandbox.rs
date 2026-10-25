@@ -73,8 +73,13 @@ fn plan(proxy_port: u16, core_port: u16, granted: &Path) -> SandboxPlan {
 }
 
 fn run(plan: Option<&SandboxPlan>, words: &[&str]) -> Output {
+    run_through("session-leader", plan, words)
+}
+
+/// Runs the words through one of the two trampolines the launcher uses.
+fn run_through(trampoline: &str, plan: Option<&SandboxPlan>, words: &[&str]) -> Output {
     let mut command = Command::new(TYCHO);
-    command.arg("session-leader").arg("--").args(words);
+    command.arg(trampoline).arg("--").args(words);
     command.env_remove(PLAN_ENV);
     if let Some(plan) = plan {
         command.env(PLAN_ENV, plan.to_json().unwrap());
@@ -84,12 +89,19 @@ fn run(plan: Option<&SandboxPlan>, words: &[&str]) -> Output {
 
 #[test]
 fn the_sandboxed_vendor_reaches_only_the_proxy_and_its_grants() {
-    let scratch = Scratch::new("probes");
+    for trampoline in ["session-leader", "group-leader"] {
+        probe_through(trampoline);
+    }
+}
+
+fn probe_through(trampoline: &str) {
+    let scratch = Scratch::new(trampoline);
     let core = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let proxy = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let core_port = core.local_addr().unwrap().port();
     let proxy_port = proxy.local_addr().unwrap().port();
-    let output = run(
+    let output = run_through(
+        trampoline,
         Some(&plan(proxy_port, core_port, &scratch.granted)),
         &[
             BASH,
@@ -119,7 +131,7 @@ fn the_sandboxed_vendor_reaches_only_the_proxy_and_its_grants() {
             "outside=refused",
             "plan=absent"
         ],
-        "{}",
+        "{trampoline}: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(!scratch.outside.join("outside").exists());

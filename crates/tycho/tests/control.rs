@@ -558,6 +558,17 @@ impl Harness {
 
     fn kill(&self, control: &Control) {
         let core_ports = self.config.ports;
+        // The interactive vendor runs through `tycho group-leader`, sandboxed behind its proxy.
+        let log = fs::read_to_string(SessionFiles::new(&self.spawner.dirs, &control.name).log)
+            .unwrap_or_default();
+        let proxy: Vec<&str> = log.lines().filter(|line| line.contains(" proxy")).collect();
+        println!("evidence: {} launcher log: {proxy:?}", control.name);
+        assert!(
+            proxy
+                .iter()
+                .any(|line| line.contains("proxy on 127.0.0.1:")),
+            "the control session started without its proxy and sandbox"
+        );
         let answer = ingress_json(
             core_ports,
             "/ControlDriver/kill",
@@ -1092,7 +1103,7 @@ fn a_killed_session_resumes_under_its_id_with_the_settings_passed_again() {
     println!("evidence: resumed command line {command}");
     assert!(command.contains(&format!("--resume {}", resumed.vendor_session.as_str())));
     assert!(command.contains("\"crossSessionInbound\":\"accept\""));
-    assert!(command.contains("\"failIfUnavailable\":true"));
+    assert!(command.contains("\"sandbox\":{\"enabled\":false}"));
     let record = instruct(
         core_ports,
         &resumed,
