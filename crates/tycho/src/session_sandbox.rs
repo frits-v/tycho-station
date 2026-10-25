@@ -235,7 +235,7 @@ mod tests {
         let codex_home = dir.join("codex-home");
         let plan = session_plan(&codex_paths(&codex_home, &home, &vendor_files), 40_000).unwrap();
         assert!(plan.grants.contains(&Grant {
-            path: vendor_files.clone(),
+            path: vendor_files,
             access: Access::ReadWrite,
         }));
         let absent: Vec<PathBuf> = GIT_CONFIG_FILES
@@ -284,11 +284,11 @@ mod tests {
             plan.grants,
             [
                 Grant {
-                    path: vendor_files.clone(),
+                    path: vendor_files,
                     access: Access::ReadWrite,
                 },
                 Grant {
-                    path: codex_home.clone(),
+                    path: codex_home,
                     access: Access::ReadWrite,
                 },
             ]
