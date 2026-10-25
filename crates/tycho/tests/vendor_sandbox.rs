@@ -34,6 +34,7 @@ use tycho::session_sandbox::{self, SessionPaths};
 use tycho::spawn::CLAUDE_SANDBOX_OFF;
 use tycho::vendors::claude_worker::ClaudeWorker;
 use tycho::vendors::worker::{ModelName, VendorSessionId, WorkerTask, WorkerVendor};
+use tycho::vendors::worker_process::worker_settings;
 use tycho_types::git_environment::{git_command, hook_environment_refusal};
 use tycho_types::task_packet::Effort;
 
@@ -182,8 +183,10 @@ fn spec_grants(scratch: &Scratch, claude: &Path) -> Vec<Grant> {
     grants
 }
 
-/// The worker's command line for `claude`, with Bash available to the probe's prompt.
+/// The worker's command line for `claude`, with the settings the worker derives from the
+/// launcher's: the escalation directory and the Bash allow rule added.
 fn worker_words(claude: &Path, scratch: &Scratch, settings: &str) -> Vec<String> {
+    let settings = worker_settings(settings, &scratch.root.join("vendor/escalation")).unwrap();
     let task = WorkerTask {
         worktree: scratch.worktree(),
         model: ModelName::parse("haiku").unwrap(),
@@ -191,12 +194,10 @@ fn worker_words(claude: &Path, scratch: &Scratch, settings: &str) -> Vec<String>
         max_turns: NonZeroU16::new(4),
         requires_commit: false,
         session_id: VendorSessionId::parse(&uuid_like()).unwrap(),
-        settings: settings.to_string(),
+        settings,
         output_schema: scratch.root.join("vendor/schema.json"),
     };
-    let mut words = ClaudeWorker.command(claude, &task).unwrap();
-    words.extend(["--allowedTools".to_string(), "Bash".to_string()]);
-    words
+    ClaudeWorker.command(claude, &task).unwrap()
 }
 
 fn run_claude_as(scratch: &Scratch, settings: &str, prompt: &str, mode: Mode) -> Run {

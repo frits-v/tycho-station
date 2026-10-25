@@ -1349,6 +1349,21 @@ mod group_leader {
         assert!(ended.is_ok());
     }
 
+    /// The reap program, the plan included, fits the line zmx types for it as the agent.
+    #[test]
+    fn the_reap_program_with_its_plan_fits_the_typed_line() {
+        let tycho = "/Users/Shared/tycho/bin/tycho";
+        let mut words = vec!["exec".to_string()];
+        words.extend(group_leader_words(tycho, "600"));
+        let typed: usize = words.iter().map(|word| word.len() + 3).sum::<usize>()
+            + "; echo ZMX_TASK_COMPLETED:0000:$?".len();
+        assert!(
+            typed < tycho::spawn::TYPED_LINE_MAX_BYTES,
+            "the reap line is {typed} bytes"
+        );
+        assert!(tycho::sandbox::SandboxPlan::from_json(words.last().unwrap()).is_ok());
+    }
+
     /// Lines `script` may print before the shell's own, its echo of the command included.
     const LEADER_LINES_MAX: usize = 16;
 

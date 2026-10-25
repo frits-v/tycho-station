@@ -3,7 +3,9 @@
 // the `system_read_*` and `system_write_*` groups of nono-cli 0.80.0's `data/policy.json`,
 // less the entries absent on macOS 26 (`/usr/local/lib`, `/private/var/db/dyld`,
 // `/var/db/dyld`, `/run`, `/nix`) and the `$TMPDIR` variable, which `/private/var/folders`
-// covers. A nono or macOS update re-runs the existence test (docs/process.md, the session
+// covers. Linux drops `/dev/stdin`, `/dev/stdout` and `/dev/stderr`: they resolve through the
+// process's own descriptors to `pipe:[N]` when a stream is a pipe, which no grant can name, and
+// `/dev/fd` covers them. A nono or macOS update re-runs the existence test (docs/process.md, the session
 // sandbox).
 package config
 
@@ -22,7 +24,7 @@ _linux_read: [
 	"/etc/nsswitch.conf", "/etc/group", "/etc/passwd", "/etc/ssl", "/etc/ld.so.cache",
 	"/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/localtime", "/etc/alternatives",
 	"/etc/os-release", "/etc/services", "/dev/null", "/dev/zero", "/dev/random",
-	"/dev/urandom", "/dev/full", "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/fd",
+	"/dev/urandom", "/dev/full", "/dev/fd",
 	"/dev/pts", "/proc/self", "/proc/cpuinfo", "/proc/meminfo", "/proc/stat", "/proc/loadavg",
 	"/proc/version", "/proc/filesystems", "/run", "/var/run", "/sys", "/tmp",
 ]
@@ -39,7 +41,7 @@ _linux_read_optional: [
 ]
 _linux_x86_64: ["/lib/x86_64-linux-gnu", "/usr/lib/x86_64-linux-gnu"]
 _linux_aarch64: ["/lib/aarch64-linux-gnu", "/usr/lib/aarch64-linux-gnu"]
-_linux_write: ["/tmp", "/dev/null", "/dev/zero", "/dev/full", "/dev/stdout", "/dev/stderr", "/dev/fd", "/dev/pts", "/proc/self/fd"]
+_linux_write: ["/tmp", "/dev/null", "/dev/zero", "/dev/full", "/dev/fd", "/dev/pts", "/proc/self/fd"]
 _linux_write_optional: ["/dev/tty"]
 
 sandbox: #Sandbox & {

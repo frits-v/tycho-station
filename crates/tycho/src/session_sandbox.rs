@@ -95,6 +95,17 @@ fn ensure_state_dir(path: &Path, uid: u32) -> Result<(), PrepareError> {
     Ok(())
 }
 
+/// Makes each missing level of `relative` under `home` as `ensure_state_dir` does, one level
+/// at a time, so a home without `Library/Caches` still gets the vendor's cache directory.
+fn ensure_state_path(home: &Path, relative: &str, uid: u32) -> Result<PathBuf, PrepareError> {
+    let mut path = home.to_path_buf();
+    for level in Path::new(relative).components() {
+        path.push(level);
+        ensure_state_dir(&path, uid)?;
+    }
+    Ok(path)
+}
+
 /// The vendor's socket directories in the order Claude Code tries them: a shared one of
 /// another user is passed over, and the first one usable is made when missing.
 fn claude_socket_dirs(uid: u32) -> Result<Vec<PathBuf>, PrepareError> {
@@ -143,11 +154,8 @@ pub fn session_plan(
     let mut state_files = Vec::new();
     match paths.vendor {
         SandboxVendor::Claude => {
-            let config = paths.home.join(CLAUDE_CONFIG_DIR_NAME);
-            let cache = paths.home.join(CLAUDE_CACHE_DIR);
-            for dir in [&config, &cache] {
-                ensure_state_dir(dir, paths.uid)?;
-            }
+            let config = ensure_state_path(paths.home, CLAUDE_CONFIG_DIR_NAME, paths.uid)?;
+            let cache = ensure_state_path(paths.home, CLAUDE_CACHE_DIR, paths.uid)?;
             grants.push(read_write(config));
             grants.push(read_write(cache));
             state_files.push(nono::try_canonicalize(paths.home).join(CLAUDE_STATE_FILE));
@@ -180,4 +188,33 @@ pub fn prepare(paths: &SessionPaths<'_>) -> Result<Prepared, PrepareError> {
     capability_set(&plan, &config).map_err(PrepareError::Sandbox)?;
     let plan = plan.to_json().map_err(PrepareError::Sandbox)?;
     Ok(Prepared { proxy, plan })
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "fixtures live in scratch directories no other user can write"
+)]
+mod tests {
+    use super::*;
+    use crate::agent_files::current_uid;
+
+    #[test]
+    fn a_home_without_its_cache_levels_gets_each_made_and_a_link_among_them_is_refused() {
+        let home = std::env::temp_dir().join(format!("tycho-state-{}", std::process::id()));
+        if home.exists() {
+            std::fs::remove_dir_all(&home).unwrap();
+        }
+        std::fs::create_dir_all(&home).unwrap();
+        let cache =
+            ensure_state_path(&home, "Library/Caches/claude-cli-nodejs", current_uid()).unwrap();
+        assert!(cache.is_dir());
+        assert_eq!(cache, home.join("Library/Caches/claude-cli-nodejs"));
+        std::os::unix::fs::symlink(&home, home.join("linked")).unwrap();
+        assert!(matches!(
+            ensure_state_path(&home, "linked/claude", current_uid()),
+            Err(PrepareError::State(..))
+        ));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
 }

@@ -343,24 +343,6 @@
             "optional": false
         },
         {
-            "path": "/dev/stdin",
-            "access": "read",
-            "platform": "linux",
-            "optional": false
-        },
-        {
-            "path": "/dev/stdout",
-            "access": "read",
-            "platform": "linux",
-            "optional": false
-        },
-        {
-            "path": "/dev/stderr",
-            "access": "read",
-            "platform": "linux",
-            "optional": false
-        },
-        {
             "path": "/dev/fd",
             "access": "read",
             "platform": "linux",
@@ -666,18 +648,6 @@
         },
         {
             "path": "/dev/full",
-            "access": "write",
-            "platform": "linux",
-            "optional": false
-        },
-        {
-            "path": "/dev/stdout",
-            "access": "write",
-            "platform": "linux",
-            "optional": false
-        },
-        {
-            "path": "/dev/stderr",
             "access": "write",
             "platform": "linux",
             "optional": false
