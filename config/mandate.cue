@@ -3,15 +3,16 @@
 package config
 
 mandate: #Mandate & {
+	operator_github_handle: "frits-v"
 	mechanisms: {
 		ruleset: {
-			what:    "Repository ruleset on the default branch: pull request required, the ci check required and up to date, signed commits, linear history, no deletion, no force push, no bypass actors."
+			what:    "Repository ruleset on the default branch: pull request required, the ci check required and up to date, signed commits, linear history, no deletion, no force push, no bypass actors other than the repository admin in pull-request mode for a mandate amendment."
 			runs:    "every push and merge to the default branch"
 			record:  "forge"
 			pending: false
 		}
 		ci: {
-			what:    "xtask ci in the ci workflow: formatting, clippy with the workspace lints, tests, zizmor and jactionlint at pedantic, the opengrep rules after their fixtures, and the xtask checks; every step runs even after one fails. clippy, the workflow audits, opengrep, check-names, check-comments, check-rules, check-credentials, check-figures and check-config count what they examined and fail at zero. check-pr-title passes when no title is available. A code-scanning job uploads the SARIF."
+			what:    "xtask ci in the ci workflow: formatting, clippy with the workspace lints, tests, zizmor and jactionlint at pedantic, the opengrep rules after their fixtures, and the xtask checks; every step runs even after one fails. clippy, the workflow audits, opengrep, check-names, check-comments, check-rules, check-credentials, check-figures, check-config and check-codeowners count what they examined and fail at zero. check-pr-title passes when no title is available. A code-scanning job uploads the SARIF."
 			runs:    "every pull request and push to the default branch"
 			record:  "forge"
 			pending: false
@@ -50,6 +51,12 @@ mandate: #Mandate & {
 			what:    "Epic reserve and settle are exclusive and private to service calls; reserve answers budget_exhausted past a ledger's limit, seat and metered ledgers are separate, and settlement charges the larger of reservation and usage. Session heartbeat and handoff check the session secret in constant time; handoff validates and caps the note; spawn, nudge, kill and expire are private; kill goes by the recorded pid and saves scrollback when asked."
 			runs:    "every call to the Epic and Session objects"
 			record:  "journal"
+			pending: true
+		}
+		codeowners: {
+			what:    ".github/CODEOWNERS names the operator as the sole owner of docs/mandate.md. Required code-owner review and the repository admin as a pull-request-mode bypass actor are applied by the operator's ruleset change; neither xtask setup nor ci reads the ruleset, so nothing here confirms it."
+			runs:    "every pull request to the default branch that changes docs/mandate.md"
+			record:  "forge"
 			pending: true
 		}
 	}
@@ -350,8 +357,8 @@ mandate: #Mandate & {
 		}
 		"13.1": {
 			requires: "Only the operator amends the mandate, by pull request, effective for work units started after the merge."
-			mechanisms: ["ruleset"]
-			coverage: "ruleset: every change to the default branch, the mandate included, goes through a pull request"
+			mechanisms: ["ruleset", "codeowners"]
+			coverage: "ruleset: every change to the default branch, the mandate included, goes through a pull request; codeowners: a CODEOWNERS entry names the operator as docs/mandate.md's owner; code-owner review and the bypass actor await the operator's ruleset change"
 			partial:  true
 			slices: ["one"]
 		}
