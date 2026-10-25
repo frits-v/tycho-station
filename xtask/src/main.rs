@@ -18,6 +18,7 @@ mod app_token;
 mod checkout;
 mod clippy;
 mod code_scanning;
+mod codeowners;
 mod codeql;
 mod config;
 mod credentials;
@@ -55,7 +56,7 @@ const SOURCE_DIRS: [&str; 2] = ["xtask", "crates"];
 const DOC_DIRS: [&str; 1] = ["docs"];
 const RULES_DIR: &str = ".claude/rules";
 const RULE_MAX_LINES: usize = 24;
-const COMMANDS: [(&str, &str); 27] = [
+const COMMANDS: [(&str, &str); 28] = [
     (
         "ci",
         "format check, clippy, tests, workflow audits, opengrep, repository checks, PR title",
@@ -121,6 +122,10 @@ const COMMANDS: [(&str, &str); 27] = [
     (
         "check-config",
         "cue vet, then a fresh export compared with config/export",
+    ),
+    (
+        "check-codeowners",
+        "the mandate has a CODEOWNERS rule naming at least one owner",
     ),
     (
         "config-export",
@@ -397,7 +402,7 @@ fn ci() -> i32 {
         ),
         ("opengrep", step(opengrep::opengrep() == 0)),
     ];
-    let checks: [(&str, Check); 7] = [
+    let checks: [(&str, Check); 8] = [
         ("check-names", check_names),
         ("check-comments", check_comments),
         ("check-rules", check_rules),
@@ -405,6 +410,7 @@ fn ci() -> i32 {
         ("check-credentials", credentials::check_credentials),
         ("check-figures", figures::check_figures),
         ("check-config", config::check_config),
+        ("check-codeowners", codeowners::check_codeowners),
     ];
     for (name, check) in checks {
         steps.push((name, step(check() == 0)));
@@ -979,6 +985,7 @@ fn main() {
         Some("render-figures") => figures::render_figures(),
         Some("check-figures") => figures::check_figures(),
         Some("check-config") => config::check_config(),
+        Some("check-codeowners") => codeowners::check_codeowners(),
         Some("config-export") => config::config_export(),
         Some("release-pr") => match args.get(1).map(String::as_str) {
             None => release::release_pr(false),
