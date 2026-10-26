@@ -875,10 +875,22 @@ pub const RAW_RESULT_INVALID: &str = "result_envelope_invalid";
 
 /// The launcher resolves with the result envelope and its last heartbeat
 /// (`spool::ResultResolution`); only a result from this attempt's session counts.
+///
+/// A launcher built before the resolution carried the beat resolves with the bare envelope,
+/// which reads as `not_recorded`: the run records no context size and names the state. A
+/// body naming `envelope` or `last_beat` is a resolution and must decode as one, unknown
+/// fields refused, so no other shape is taken for a bare envelope.
 pub fn result_from_resolution(
     value: &serde_json::Value,
     session: &SessionName,
 ) -> Result<(ResultPayload, FinalBeat), String> {
+    let names_a_resolution_field = ["envelope", "last_beat"]
+        .iter()
+        .any(|field| value.get(field).is_some());
+    if !names_a_resolution_field {
+        return result_from_envelope(value, session)
+            .map(|result| (result, FinalBeat::NOT_RECORDED));
+    }
     let resolution: ResultResolution =
         serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
     let result = result_from_envelope(&resolution.envelope, session)?;
@@ -1041,9 +1053,34 @@ mod tests {
         let other = SessionName::parse("cf7a.wu03.wrk.claude.b2c4").unwrap();
         assert!(result_from_resolution(&body(&envelope), &other).is_err());
         assert!(result_from_resolution(&body(&envelope["payload"]), &session).is_err());
+        // A launcher built before the resolution carried the beat sends the bare envelope:
+        // its result counts, with no context size and the state named.
+        let (bare, bare_beat) = result_from_resolution(&envelope, &session).unwrap();
+        assert_eq!(bare.outcome, Outcome::Done);
+        assert_eq!(bare_beat, FinalBeat::NOT_RECORDED);
+        assert_eq!(bare_beat.confirmed_context_tokens(), None);
+        assert!(result_from_resolution(&envelope, &other).is_err());
+        let mut extra = body(&envelope);
+        extra["context_tokens"] = serde_json::json!(5);
         assert!(
-            result_from_resolution(&envelope, &session).is_err(),
-            "a bare envelope carries no last beat"
+            result_from_resolution(&extra, &session).is_err(),
+            "an unknown field beside the resolution's is refused"
+        );
+        let mut half = serde_json::json!({"envelope": envelope});
+        assert!(
+            result_from_resolution(&half, &session).is_err(),
+            "no last beat"
+        );
+        half = serde_json::json!({"last_beat": applied});
+        assert!(
+            result_from_resolution(&half, &session).is_err(),
+            "no envelope"
+        );
+        let mut bare_extra = envelope.clone();
+        bare_extra["last_beat"] = serde_json::json!(applied);
+        assert!(
+            result_from_resolution(&bare_extra, &session).is_err(),
+            "an envelope with a beat beside its fields is neither shape"
         );
         // The launcher's own constructor gives the shape this decodes.
         let wire = crate::spool::result_resolution(&envelope, &session, applied).unwrap();
