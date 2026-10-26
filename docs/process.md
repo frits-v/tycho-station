@@ -132,8 +132,8 @@ hand-off; from inside the session it requires the test core's admin port refused
 answers the developer, `github.com` refused at the proxy and named as a firing in the
 session's audit file, the model endpoint answered by Anthropic through the route, and the
 vendor's `CLAUDE_CODE_OAUTH_TOKEN` equal to `NONO_PROXY_TOKEN` and no variable holding the
-test token. It runs the prefix's `tycho`, so it tests the build `provision-agent` last
-installed. All three print whether a uid is the agent's, never the uid. If either fails on
+test token. It runs the prefix's `tycho`, so it first requires the prefix's `station.json` to
+name this checkout's commit, built from a clean tree, and fails as a stale prefix otherwise. All three print whether a uid is the agent's, never the uid. If either fails on
 connecting to the agent's socket, check `id` in the shell that runs the suite: a login session
 that began before the developer joined `tycho-zmx` does not list the group, while
 `id <developer>` and `dseditgroup` do; log out and in, then run the suite again.

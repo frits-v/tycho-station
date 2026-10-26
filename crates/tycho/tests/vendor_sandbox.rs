@@ -602,9 +602,6 @@ fn turn_completed(stream: &str) -> bool {
         .any(|event| event["type"] == "turn.completed")
 }
 
-/// One `codex exec` turn as a worker runs it, through the station's proxy, with its Codex home
-/// in the session's directory holding the core's `auth.json`; under the trampoline when
-/// `mode` says so.
 /// The proxy and plan for a Codex session: the worktree and Codex's install in the spec, and
 /// the Codex home the launcher adds.
 fn codex_prepared(scratch: &Scratch, codex: &Path, codex_home: &Path) -> session_sandbox::Prepared {
@@ -648,6 +645,9 @@ fn codex_words(scratch: &Scratch, codex: &Path, schema: PathBuf) -> Vec<String> 
     CodexWorker.command(codex, &task).unwrap()
 }
 
+/// One `codex exec` turn as a worker runs it, through the station's proxy, with its Codex home
+/// in the session's directory holding the core's `auth.json`; under the trampoline when
+/// `mode` says so.
 fn run_codex(scratch: &Scratch, mode: Mode) -> CodexRun {
     let codex = mise_which("codex");
     let codex_home = codex_home_with_auth(scratch);

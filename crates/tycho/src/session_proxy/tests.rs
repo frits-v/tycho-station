@@ -268,12 +268,14 @@ fn route_request(bearer: &str) -> String {
     )
 }
 
-/// Another account's key a vendor might add beside the phantom.
+/// Another account's key a vendor may add beside the phantom.
 const OTHER_KEY: &str = "sk-ant-api03-another-account";
 
-/// The route swaps the phantom for the handed token on its way upstream, drops any other
-/// credential header the vendor added, and forwards nothing for a bearer that is not the
-/// phantom.
+/// The route swaps the phantom for the handed token on its way upstream and forwards nothing
+/// for a bearer that is not the phantom. It passes an `x-api-key` the vendor added through
+/// unchanged: nono-proxy 0.80.0 strips only the injected header and hop-by-hop headers, and
+/// offers no hook to strip more, so another account's key rides along (design section 7,
+/// residuals).
 #[test]
 fn the_route_sends_the_handed_token_upstream_in_place_of_the_phantom() {
     let (port, heads) = upstream();
@@ -306,6 +308,11 @@ fn the_route_sends_the_handed_token_upstream_in_place_of_the_phantom() {
     assert!(
         !head.contains(&phantom),
         "the phantom went upstream: {head}"
+    );
+    assert!(
+        head.lines()
+            .any(|line| line.eq_ignore_ascii_case(&format!("x-api-key: {OTHER_KEY}"))),
+        "the route now drops x-api-key; strike the residual in design section 7: {head}"
     );
     let record = proxy.stop();
     assert_eq!(record.denied, 2, "{record}");

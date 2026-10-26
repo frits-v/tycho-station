@@ -7,6 +7,7 @@
 //! unrecognised, never as a decision.
 
 use std::fmt;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -14,7 +15,7 @@ use nono::undo::{NetworkAuditDecision, NetworkAuditEvent};
 use serde::{Deserialize, Serialize};
 use tycho_types::session::SessionName;
 
-use crate::agent_files::{read_checked, write_new_mode};
+use crate::agent_files::{read_checked, write_durable_mode};
 use crate::config::AgentDirs;
 use crate::session_proxy::AUDIT_EVENTS_MAX;
 
@@ -22,9 +23,16 @@ use crate::session_proxy::AUDIT_EVENTS_MAX;
 pub const AUDIT_FILE_SUFFIX: &str = "proxy-audit.jsonl";
 /// The core reads the agent's file through the shared group.
 pub const AUDIT_FILE_MODE: u32 = 0o640;
+/// The bounds of the text fields as JSON writes them, escapes included: a `"` or `\` the
+/// vendor puts in a host name takes two bytes, so a bound on the raw text would not bound the
+/// line.
 pub const TARGET_MAX_BYTES: usize = 253;
 pub const REASON_MAX_BYTES: usize = 256;
-/// One line at its longest: the fields above with JSON's quoting, well under this.
+pub const PATH_MAX_BYTES: usize = 32;
+/// Ends a field that was cut to its bound.
+pub const CUT_MARKER: char = '\u{2026}';
+/// One line at its longest: the three text fields at their escaped bounds and the fixed
+/// fields at their widest come to under 700 bytes.
 pub const AUDIT_LINE_MAX_BYTES: usize = 1024;
 /// The proxy's cap of events plus the one line that says it was reached.
 pub const AUDIT_LINES_MAX: usize = AUDIT_EVENTS_MAX + 1;
@@ -66,18 +74,38 @@ pub struct AuditLine {
     pub reason: Option<String>,
 }
 
+/// The bytes JSON writes for a character the cut keeps; control characters are dropped.
+const fn escaped_len(character: char) -> usize {
+    if matches!(character, '"' | '\\') {
+        2
+    } else {
+        character.len_utf8()
+    }
+}
+
+/// The text without control characters, within `max` bytes as JSON writes it; a text that
+/// does not fit is cut and ends with `CUT_MARKER`.
 fn cut(text: &str, max: usize) -> String {
-    let mut kept = String::new();
-    for character in text.chars() {
-        if character.is_control() {
-            continue;
-        }
-        if kept.len().saturating_add(character.len_utf8()) > max {
+    let kept: Vec<char> = text
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    let whole: usize = kept.iter().map(|character| escaped_len(*character)).sum();
+    if whole <= max {
+        return kept.into_iter().collect();
+    }
+    let budget = max.saturating_sub(escaped_len(CUT_MARKER));
+    let mut used = 0_usize;
+    let mut cut = String::new();
+    for character in kept {
+        used = used.saturating_add(escaped_len(character));
+        if used > budget {
             break;
         }
-        kept.push(character);
+        cut.push(character);
     }
-    kept
+    cut.push(CUT_MARKER);
+    cut
 }
 
 impl AuditLine {
@@ -95,7 +123,7 @@ impl AuditLine {
         Self {
             unix_ms: event.timestamp_unix_ms,
             decision,
-            path,
+            path: cut(&path, PATH_MAX_BYTES),
             target: cut(&event.target, TARGET_MAX_BYTES),
             port: event.port,
             reason: event
@@ -129,10 +157,22 @@ pub fn encode(events: &[NetworkAuditEvent]) -> Result<Vec<u8>, serde_json::Error
     Ok(bytes)
 }
 
-/// Writes the file new, never through a link; a file already there is an error.
+/// Writes the file under a staging name and renames it into place, so the core reads the
+/// whole file or none; a file already there is an error, and nothing is written through a
+/// link.
 pub fn write(path: &Path, events: &[NetworkAuditEvent]) -> io::Result<usize> {
     let bytes = encode(events).map_err(io::Error::other)?;
-    write_new_mode(path, &bytes, AUDIT_FILE_MODE)?;
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} already exists", path.display()),
+            ));
+        }
+        Err(error) => return Err(error),
+    }
+    write_durable_mode(path, &bytes, AUDIT_FILE_MODE)?;
     Ok(events.len().min(AUDIT_EVENTS_MAX))
 }
 

@@ -709,9 +709,10 @@ fn launch_spools_resolves_and_ends_its_session() {
 }
 
 /// From inside the session a host off the allowlist is refused at the proxy and recorded in
-/// the session's audit as a firing, and the model endpoint answers through the route: the
-/// handed test token reaches Anthropic in place of the phantom, which refuses it with its own
-/// authentication error, never the proxy's.
+/// the session's audit as a firing, and a request with the phantom to the route's base URL
+/// reaches Anthropic, whose own authentication error, not the proxy's 401, answers the test
+/// token. That the token replaced the phantom on the way is shown by the route's unit test,
+/// `the_route_sends_the_handed_token_upstream_in_place_of_the_phantom`.
 fn assert_network_from_inside(harness: &Harness, name: &SessionName) {
     let github = fs::read_to_string(harness.marker(name, ".github")).unwrap();
     let model = fs::read_to_string(harness.marker(name, ".model")).unwrap();

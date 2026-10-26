@@ -205,3 +205,56 @@ fn a_target_and_reason_are_cut_to_their_bounds_without_control_characters() {
     assert_eq!(newlines(&bytes), 1);
     assert!(bytes.len() <= AUDIT_LINE_MAX_BYTES + 1);
 }
+
+/// A refusal is a firing whatever the vendor put in the host name: a name of quotes or
+/// backslashes doubles under JSON's escaping, and nono's reason repeats it, so the bound is
+/// taken on the escaped text and a cut field ends with the marker.
+#[test]
+fn a_quote_or_backslash_heavy_host_still_decodes_as_a_firing() {
+    let mut examined = 0_usize;
+    for heavy in ["\"", "\\", "\"\\", "\u{e9}\""] {
+        let host = heavy.repeat(400);
+        let mut forged = event("deny", "connect", &host);
+        forged.reason = Some(format!("host {host}:443 is not in the allowlist"));
+        let bytes = encode(&[forged]).unwrap();
+        let line = std::str::from_utf8(&bytes).unwrap().trim_end();
+        assert!(
+            line.len() <= AUDIT_LINE_MAX_BYTES,
+            "{heavy:?}: a line of {} bytes",
+            line.len()
+        );
+        let audit = decode(&session(), &bytes);
+        assert_eq!(
+            (audit.firing_count, audit.unrecognised),
+            (1, 0),
+            "{heavy:?}: {audit}"
+        );
+        let firing = &audit.firings[0];
+        assert!(firing.subject.contains(CUT_MARKER), "{}", firing.subject);
+        assert!(
+            firing
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.ends_with(CUT_MARKER))
+        );
+        examined += 1;
+    }
+    assert_eq!(examined, 4);
+}
+
+/// Every field at its widest, each text field all quotes, still fits the line bound.
+#[test]
+fn the_widest_line_fits_its_bound() {
+    let widest = AuditLine {
+        unix_ms: u64::MAX,
+        decision: LineDecision::CapReached,
+        path: "\"".repeat(PATH_MAX_BYTES / 2),
+        target: "\"".repeat(TARGET_MAX_BYTES / 2),
+        port: Some(u16::MAX),
+        reason: Some("\"".repeat(REASON_MAX_BYTES / 2)),
+    };
+    let line = serde_json::to_string(&widest).unwrap();
+    assert!(line.len() <= AUDIT_LINE_MAX_BYTES, "{}", line.len());
+    let short = cut(&"\"".repeat(TARGET_MAX_BYTES), TARGET_MAX_BYTES);
+    assert!(serde_json::to_string(&short).unwrap().len() - 2 <= TARGET_MAX_BYTES);
+}

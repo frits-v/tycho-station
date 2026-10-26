@@ -600,6 +600,21 @@ impl Harness {
             )
             .then_some(())
         });
+        // The launcher writes the audit on its stop path; a read before it landed is retried.
+        let status = format!("/Session/{}/status", control.name);
+        let audit = wait_until(
+            "the killed session's proxy audit to read",
+            WAIT_LIMIT,
+            || {
+                let view: serde_json::Value =
+                    serde_json::from_str(&ingress_json(core_ports, &status, "")?).ok()?;
+                (view["proxy_audit"]["state"] == "read").then(|| view["proxy_audit"].clone())
+            },
+        );
+        println!(
+            "evidence: {} proxy audit on the killed session's view: {} examinations, {} firings",
+            control.name, audit["examinations"], audit["firing_count"]
+        );
     }
 
     fn file(&self, name: &str) -> PathBuf {

@@ -669,7 +669,12 @@ impl<I: Ingress> Run<'_, I> {
             "proxy: {}",
             crate::session_proxy::ProxyRecord::of(&events)
         ));
-        drop(proxy.stop_with_events());
+        let late = proxy.stop_with_events().len();
+        if late > 0 {
+            self.log.line(&format!(
+                "proxy: {late} events between the audit and the stop, not in the audit"
+            ));
+        }
     }
 
     /// Zeroes and removes the session's `auth.json`, then the Codex home, never through a link.

@@ -904,8 +904,9 @@ const SESSION_VENDOR_SCRIPT: &str = r#"#!/bin/sh
 /usr/bin/curl -s -o "$1.model-body" -w '%{http_code}' --max-time 20 -H "Authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" -H 'anthropic-version: 2023-06-01' "$ANTHROPIC_BASE_URL/v1/models" > "$1.model" 2>/dev/null
 echo done > "$1.done"
 "#;
-/// The shape of a long-lived Claude token; Anthropic refuses it, which shows the route
-/// reached Anthropic with the token the proxy holds.
+/// The shape of a long-lived Claude token, which Anthropic refuses: its authentication error
+/// shows the route reached Anthropic. The swap of the phantom for this token is shown by the
+/// route's unit test, not here.
 const SESSION_TEST_TOKEN: &str = "sk-ant-oat01-boundary-suite-test-credential-0123456789";
 const SHARED_GROUP: &str = "tycho-zmx";
 
@@ -951,13 +952,16 @@ impl Drop for SessionFixture {
 
 /// A session launched as the agent, as the spawner launches a vendor, is held at its
 /// boundaries from inside: the core's admin port refused while it answers the developer, a host
-/// off the allowlist refused at the proxy and recorded as a firing in the session's audit, the
-/// model endpoint reached through the route, and the handed token in no variable of the
-/// vendor's. The bare probes of `the_agent_user_is_refused_at_every_boundary` run outside any
-/// session sandbox and stay measurements of the agent user alone.
+/// off the allowlist refused at the proxy and recorded as a firing in the session's audit,
+/// Anthropic answering a request to the route's base URL with its own authentication error,
+/// and the handed token in no variable of the vendor's. It runs the prefix's `tycho`, so a
+/// prefix built from another commit, or from a dirty tree, fails first as stale. The bare
+/// probes of `the_agent_user_is_refused_at_every_boundary` run outside any session sandbox and
+/// stay measurements of the agent user alone.
 #[test]
 #[ignore = "launches a session as the agent through the sudoers rule against a test core; run with mise run boundary-tests"]
 fn a_session_launched_as_the_agent_is_held_at_its_boundaries() {
+    require_a_prefix_built_from_this_checkout();
     require_the_narrow_rule();
     let agent = nix::unistd::User::from_name(AGENT_USER_DEFAULT)
         .unwrap()
@@ -1007,6 +1011,36 @@ fn a_session_launched_as_the_agent_is_held_at_its_boundaries() {
         "{outcome:?}"
     );
     assert_held_from_inside(&fixture, ended, audit);
+}
+
+/// The prefix's `station.json` must name this checkout's commit, built from a clean tree:
+/// the launched session runs the prefix's `tycho`, so an older build would fail later on a
+/// property this checkout's code holds, and say nothing about the build.
+fn require_a_prefix_built_from_this_checkout() {
+    let manifest = Path::new(TOOL_PREFIX_DEFAULT).join("station.json");
+    let text = fs::read_to_string(&manifest)
+        .unwrap_or_else(|error| panic!("boundary: {}: {error}", manifest.display()));
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("boundary: {}: {error}", manifest.display()));
+    let built = value["station"]["commit"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let clean = value["station"]["clean"].as_bool() == Some(true);
+    let head = git(
+        Path::new(env!("CARGO_MANIFEST_DIR")),
+        &["rev-parse", "HEAD"],
+    );
+    println!(
+        "boundary: the prefix's tycho was built from {built} (clean {clean}); this checkout is at {head}"
+    );
+    assert!(
+        clean && built == head.trim(),
+        "boundary: stale prefix: {} records commit {built:?} (clean {clean}), this checkout is \
+         at {}; run `mise run provision-agent` from this checkout first",
+        manifest.display(),
+        head.trim()
+    );
 }
 
 /// What a launch as the agent needs: the agent's zmx and directories, the prefix it starts
