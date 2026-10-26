@@ -645,6 +645,18 @@ fn codex_words(scratch: &Scratch, codex: &Path, schema: PathBuf) -> Vec<String> 
     CodexWorker.command(codex, &task).unwrap()
 }
 
+/// A run refused with `refresh_token_reused` says the core's stored login is spent, which
+/// says nothing about the sandbox: each run refreshes in its copy and the copy is removed.
+fn assert_login_not_spent(run: &CodexRun) {
+    assert!(
+        !run.output.contains("refresh_token_reused"),
+        "the core's stored Codex login was refreshed elsewhere and its refresh token is spent; \
+         log in again (`codex login`) and store the new auth.json with `tycho credentials set \
+         codex`: {}",
+        run.output
+    );
+}
+
 /// One `codex exec` turn as a worker runs it, through the station's proxy, with its Codex home
 /// in the session's directory holding the core's `auth.json`; under the trampoline when
 /// `mode` says so.
@@ -717,13 +729,7 @@ fn codex_runs_a_turn_under_the_sandbox_with_its_home_in_the_session() {
         "evidence: codex through the proxy, unsandboxed: turn completed {}; proxy {}",
         control.completed, control.proxy
     );
-    assert!(
-        !control.output.contains("refresh_token_reused"),
-        "the core's stored Codex login was refreshed elsewhere and its refresh token is spent; \
-         log in again (`codex login`) and store the new auth.json with `tycho credentials set \
-         codex`: {}",
-        control.output
-    );
+    assert_login_not_spent(&control);
     assert!(
         control.completed,
         "the positive control failed: {}",
@@ -734,6 +740,7 @@ fn codex_runs_a_turn_under_the_sandbox_with_its_home_in_the_session() {
         "evidence: codex under the sandbox: turn completed {}; proxy {}",
         sandboxed.completed, sandboxed.proxy
     );
+    assert_login_not_spent(&sandboxed);
     assert!(sandboxed.completed, "{}", sandboxed.output);
     assert!(sandboxed.proxy.allowed >= 1, "{}", sandboxed.proxy);
 }

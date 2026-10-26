@@ -364,3 +364,53 @@ fn the_capture_backend_answers_only_the_route_s_credential() {
     assert!(backend.capture(request("codex")).is_err());
     assert!(backend.capture(request("")).is_err());
 }
+
+/// Every request the proxy answered up to its stop is in what `close` hands back: a client
+/// keeps sending refused CONNECTs while the proxy closes, and each 403 it saw has its decision
+/// in the events, including the ones answered after an earlier take of the buffer.
+#[test]
+fn every_decision_up_to_the_close_is_in_its_events() {
+    let proxy = SessionProxy::start(&hosts(&["api.anthropic.com"]), None).unwrap();
+    let (port, token) = (proxy.port(), proxy.handle.token.to_string());
+    let early = status_of(port, &connect_head("github.com:443", Some(&token)));
+    assert!(early.contains(" 403 "), "{early}");
+    let taken_early = proxy.handle.snapshot_audit_events().len();
+    let client = std::thread::spawn(move || {
+        let mut refused = 0_usize;
+        for _ in 0..CLOSE_RACE_REQUESTS_MAX {
+            let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) else {
+                break;
+            };
+            stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+            if stream
+                .write_all(connect_head("github.com:443", Some(&token)).as_bytes())
+                .is_err()
+            {
+                break;
+            }
+            let mut answer = Vec::new();
+            drop(stream.take(RESPONSE_MAX_BYTES).read_to_end(&mut answer));
+            if String::from_utf8_lossy(&answer).contains(" 403 ") {
+                refused += 1;
+            }
+        }
+        refused
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    let events = proxy.close(STOP_GRACE);
+    let refused_while_open = client.join().unwrap();
+    let denied = ProxyRecord::of(&events).denied;
+    assert_eq!(taken_early, 1);
+    assert!(
+        refused_while_open >= 1,
+        "the client got no answer before the close"
+    );
+    assert_eq!(
+        denied,
+        1 + refused_while_open,
+        "a request answered before the close is missing from its events"
+    );
+}
+
+/// Bounds the client of the close race; it stops sooner, when the proxy stops accepting.
+const CLOSE_RACE_REQUESTS_MAX: usize = 10_000;

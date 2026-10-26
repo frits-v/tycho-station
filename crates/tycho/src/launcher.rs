@@ -550,7 +550,7 @@ impl<I: Ingress> Run<'_, I> {
                  sandbox, and its reason is in stderr.log"
             ));
         }
-        self.stop_proxy();
+        self.stop_proxy(crate::session_proxy::SHUTDOWN_GRACE);
         self.remove_codex_home();
         self.log
             .line(&format!("vendor ended: {end:?}, stop: {stop:?}"));
@@ -645,15 +645,15 @@ impl<I: Ingress> Run<'_, I> {
         Ok(Some(environment))
     }
 
-    /// Writes the proxy's decisions to the session's audit file for the core, logs what it
-    /// allowed and refused, then stops it; the file comes first, since at a stop zmx kills
-    /// the launcher half a second after its hangup. Once stopped, the proxy admits nothing, so
-    /// the file holds every decision of the session.
-    fn stop_proxy(&mut self) {
+    /// Stops the proxy, then writes every decision it made to the session's audit file for
+    /// the core and logs what it allowed and refused. The proxy stops accepting before its
+    /// events are taken, so the file is the session's whole record; `grace` bounds the wait for
+    /// its tasks, short at a stop, when zmx kills the launcher half a second after its hangup.
+    fn stop_proxy(&mut self, grace: Duration) {
         let Some(proxy) = self.proxy.take() else {
             return;
         };
-        let events = proxy.drain_events();
+        let events = proxy.close(grace);
         let path = proxy_audit::audit_path(&self.settings.dirs, &self.settings.env.session_name);
         match proxy_audit::write(&path, &events) {
             Ok(lines) => self.log.line(&format!(
@@ -669,12 +669,6 @@ impl<I: Ingress> Run<'_, I> {
             "proxy: {}",
             crate::session_proxy::ProxyRecord::of(&events)
         ));
-        let late = proxy.stop_with_events().len();
-        if late > 0 {
-            self.log.line(&format!(
-                "proxy: {late} events between the audit and the stop, not in the audit"
-            ));
-        }
     }
 
     /// Zeroes and removes the session's `auth.json`, then the Codex home, never through a link.
@@ -834,7 +828,7 @@ impl<I: Ingress> Run<'_, I> {
                 // longer than that.
                 self.spool_early(ExitState::Cancelled);
                 self.remove_codex_home();
-                self.stop_proxy();
+                self.stop_proxy(crate::session_proxy::STOP_GRACE);
                 return (self.terminate(child), Stop::Cancelled);
             }
             if self.output_too_large() {

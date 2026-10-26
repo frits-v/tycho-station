@@ -34,7 +34,10 @@ pub const ANTHROPIC_BASE_URL_ENV: &str = "ANTHROPIC_BASE_URL";
 /// Worker threads of the proxy's runtime; one session's vendor is its only client.
 const PROXY_THREADS: usize = 2;
 /// How long stopping waits for the proxy's tasks before it drops them.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// The grace at a stop, when zmx kills the launcher half a second after its hangup and the
+/// audit must be written before that.
+pub const STOP_GRACE: Duration = Duration::from_millis(200);
 
 #[derive(Debug)]
 pub enum ProxyError {
@@ -322,43 +325,36 @@ impl SessionProxy {
             .collect()
     }
 
-    /// Takes the decisions recorded so far.
+    /// Stops accepting, shuts the runtime down within `grace`, then takes every decision
+    /// recorded, so nothing the proxy decided after the take is missing from it.
+    ///
+    /// The handle keeps its event buffer after shutdown. A connection task the shutdown
+    /// cancels sends no answer and records no decision; one still inside a single poll when
+    /// `grace` runs out could record after the take, which needs a poll longer than the grace,
+    /// since tokio cancels a task at its next await.
     #[must_use]
-    pub fn drain(&self) -> ProxyRecord {
-        ProxyRecord::of(&self.handle.drain_audit_events())
-    }
-
-    /// Takes the recorded events themselves, for the session's audit file.
-    #[must_use]
-    pub fn drain_events(&self) -> Vec<NetworkAuditEvent> {
+    pub fn close(mut self, grace: Duration) -> Vec<NetworkAuditEvent> {
+        self.shut_down(grace);
         self.handle.drain_audit_events()
     }
 
-    /// Stops accepting, then gives the runtime a bounded time to finish.
-    pub fn stop(mut self) -> ProxyRecord {
-        let record = self.drain();
-        self.shut_down();
-        record
+    /// `close` with the default grace, counted.
+    #[must_use]
+    pub fn stop(self) -> ProxyRecord {
+        ProxyRecord::of(&self.close(SHUTDOWN_GRACE))
     }
 
-    /// Stops accepting and hands back the events not yet drained.
-    pub fn stop_with_events(mut self) -> Vec<NetworkAuditEvent> {
-        let events = self.drain_events();
-        self.shut_down();
-        events
-    }
-
-    fn shut_down(&mut self) {
+    fn shut_down(&mut self, grace: Duration) {
         self.handle.shutdown();
         if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_timeout(SHUTDOWN_GRACE);
+            runtime.shutdown_timeout(grace);
         }
     }
 }
 
 impl Drop for SessionProxy {
     fn drop(&mut self) {
-        self.shut_down();
+        self.shut_down(SHUTDOWN_GRACE);
     }
 }
 
