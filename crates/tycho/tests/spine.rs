@@ -820,14 +820,18 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     assert_eq!(state["metered"]["charged"], 0);
     assert_eq!(state["worker_slots"]["used"], 0);
     assert_status_read_follows_each_result(core_ports);
+    assert_forget_asks_the_session_for_its_audit(core_ports);
 }
 
-/// Each `WorkerRun` journal, entry by entry, from Restate's introspection.
-fn worker_run_journals(core_ports: CorePorts) -> Vec<serde_json::Value> {
+/// Each journal of `service`'s invocations, entry by entry, from Restate's introspection.
+fn service_journals(core_ports: CorePorts, service: &str) -> Vec<serde_json::Value> {
     let body = serde_json::json!({
-        "query": "SELECT j.id AS id, j.index AS index, j.entry_type AS entry_type, \
-                  j.entry_json AS entry_json FROM sys_journal j JOIN sys_invocation i ON j.id = i.id \
-                  WHERE i.target_service_name = 'WorkerRun' ORDER BY j.id, j.index"
+        "query": format!(
+            "SELECT j.id AS id, j.index AS index, j.entry_type AS entry_type, \
+             j.entry_json AS entry_json, i.target_handler_name AS handler FROM sys_journal j \
+             JOIN sys_invocation i ON j.id = i.id WHERE i.target_service_name = '{service}' \
+             ORDER BY j.id, j.index"
+        )
     })
     .to_string();
     let text = client()
@@ -846,18 +850,34 @@ fn worker_run_journals(core_ports: CorePorts) -> Vec<serde_json::Value> {
         .clone()
 }
 
-/// A completed result is followed in the `WorkerRun` journal by a call to the session's
-/// `status`, as earlier builds journaled it, so a run they journaled replays on this one.
+/// The call or one-way call a journal entry makes, as its kind, service and handler.
+fn call_target(row: &serde_json::Value) -> Option<(String, String, String)> {
+    let entry: serde_json::Value = serde_json::from_str(row["entry_json"].as_str()?).ok()?;
+    let command = entry["Command"].as_object()?;
+    let (kind, body) = command.iter().next()?;
+    let target = &body["request"]["invocation_target"];
+    let object = target
+        .get("VirtualObject")
+        .or_else(|| target.get("Service"))
+        .or_else(|| target.get("Workflow"))?;
+    Some((
+        kind.clone(),
+        object["name"].as_str()?.to_string(),
+        object["handler"].as_str()?.to_string(),
+    ))
+}
+
+/// After a completed result, `WorkerRun` journals exactly the steps earlier builds journaled,
+/// so a run they journaled replays on this one: the one-way `Reconciler/forget`, the call to the
+/// session's `status`, then the call to `Epic/settle`, with no other call or send between.
 fn assert_status_read_follows_each_result(core_ports: CorePorts) {
-    let rows = worker_run_journals(core_ports);
-    let target = |row: &serde_json::Value| -> Option<(String, String)> {
-        let entry: serde_json::Value = serde_json::from_str(row["entry_json"].as_str()?).ok()?;
-        let object = &entry["Command"]["Call"]["request"]["invocation_target"]["VirtualObject"];
-        Some((
-            object["name"].as_str()?.to_string(),
-            object["handler"].as_str()?.to_string(),
-        ))
-    };
+    let rows = service_journals(core_ports, "WorkerRun");
+    let expected = [
+        ("OneWayCall", "Reconciler", "forget"),
+        ("Call", "Session", "status"),
+        ("Call", "Epic", "settle"),
+    ]
+    .map(|(kind, service, handler)| (kind.to_string(), service.to_string(), handler.to_string()));
     let mut results = 0_u32;
     let mut ids: Vec<&str> = rows.iter().filter_map(|row| row["id"].as_str()).collect();
     ids.dedup();
@@ -870,20 +890,53 @@ fn assert_status_read_follows_each_result(core_ports: CorePorts) {
             continue;
         };
         results = results.saturating_add(1);
-        let next_call = journal[signal..]
+        let calls: Vec<(String, String, String)> = journal[signal..]
             .iter()
-            .find(|row| row["entry_type"] == "Command: Call")
-            .and_then(|row| target(row));
-        println!("evidence: {id}: the first call after the result is {next_call:?}");
-        assert_eq!(
-            next_call,
-            Some(("Session".to_string(), "status".to_string())),
-            "{id}"
-        );
+            .filter_map(|row| call_target(row))
+            .take(expected.len())
+            .collect();
+        println!("evidence: {id}: the calls after the result are {calls:?}");
+        assert_eq!(calls, expected, "{id}");
     }
     assert!(
         results > 0,
         "no WorkerRun journal holds a result: {} entries",
+        rows.len()
+    );
+}
+
+/// Each `Reconciler/forget` sends the session's `record_proxy_audit` once, one-way: the step
+/// that moved out of `WorkerRun` lives in this short invocation.
+fn assert_forget_asks_the_session_for_its_audit(core_ports: CorePorts) {
+    let rows = service_journals(core_ports, "Reconciler");
+    let mut forgets = 0_u32;
+    let mut ids: Vec<&str> = rows
+        .iter()
+        .filter(|row| row["handler"] == "forget")
+        .filter_map(|row| row["id"].as_str())
+        .collect();
+    ids.dedup();
+    for id in &ids {
+        let calls: Vec<(String, String, String)> = rows
+            .iter()
+            .filter(|row| row["id"] == *id)
+            .filter_map(call_target)
+            .collect();
+        println!("evidence: Reconciler/forget {id}: {calls:?}");
+        assert_eq!(
+            calls,
+            [(
+                "OneWayCall".to_string(),
+                "Session".to_string(),
+                "record_proxy_audit".to_string()
+            )],
+            "{id}"
+        );
+        forgets = forgets.saturating_add(1);
+    }
+    assert!(
+        forgets > 0,
+        "no Reconciler/forget journal: {} entries",
         rows.len()
     );
 }
