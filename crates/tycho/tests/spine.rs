@@ -35,6 +35,7 @@ use tycho::config::{
 };
 use tycho::config_store::FactoryConfig;
 use tycho::endpoint;
+use tycho::proxy_audit::{self, AuditRead, Firing, SessionAudit};
 use tycho::services::doubles::{DOUBLE_SOCKET, FixedGate, RecordingSpawner, RecordingVendor};
 use tycho::services::merge_gate::{GateVerdict, MergeGate, NoGate};
 use tycho::services::operator::read_secret_file;
@@ -456,6 +457,7 @@ fn session_and_reconciler_refuse_agents_outside_their_scope() {
         handler::SESSION_NUDGE,
         handler::SESSION_EXPIRE,
         handler::SESSION_REAP,
+        handler::SESSION_RECORD_PROXY_AUDIT,
     ];
     assert_private(core_ports, Service::Session, &session_handlers, name);
     let reconciler_handlers = [
@@ -709,6 +711,62 @@ fn assert_unit_handlers_private(core_ports: CorePorts) {
     );
 }
 
+/// The unit's one verify carries the claims of both its tasks.
+fn assert_one_verify_with_every_claim(gate: &FixedGate) {
+    let requests = gate.requests();
+    assert_eq!(requests.len(), 1, "one verify");
+    let tasks: Vec<&str> = requests[0]
+        .claims
+        .iter()
+        .map(|claim| claim.task.as_str())
+        .collect();
+    assert_eq!(
+        tasks,
+        ["wu01-t1", "wu01-t2"],
+        "every claim reaches the gate"
+    );
+}
+
+/// Once a session's awaitable completes, the session reads its proxy's decisions through the
+/// port and keeps them as firings and examinations on its view.
+fn assert_proxy_audit_recorded(core_ports: CorePorts, session: &str) {
+    let path = format!("/Session/{session}/status");
+    let mut view = serde_json::Value::Null;
+    for _ in 0..PROXY_AUDIT_POLLS_MAX {
+        let (_, body) = call(core_ports, &path, "", None);
+        view = serde_json::from_str(&body).unwrap();
+        if !view["proxy_audit"].is_null() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let audit = &view["proxy_audit"];
+    assert_eq!(audit["state"], "read", "{view}");
+    assert_eq!(audit["examinations"], 2, "{view}");
+    assert_eq!(audit["firing_count"], 1, "{view}");
+    assert_eq!(audit["firings"][0]["mechanism"], "session_proxy", "{view}");
+    assert_eq!(audit["firings"][0]["subject"], "github.com:443", "{view}");
+}
+
+const PROXY_AUDIT_POLLS_MAX: u32 = 50;
+
+/// An audit with two admissions and one refusal, as a launcher leaves it.
+fn one_firing() -> AuditRead {
+    AuditRead::Read(SessionAudit {
+        examinations: 2,
+        firing_count: 1,
+        firings: vec![Firing {
+            mechanism: proxy_audit::MECHANISM.to_string(),
+            session: SessionName::parse("cf7a.wu01.wrk.claude.a1").unwrap(),
+            subject: "github.com:443".to_string(),
+            unix_ms: 1,
+            reason: None,
+        }],
+        unrecognised: 0,
+        at_cap: false,
+    })
+}
+
 #[test]
 #[ignore = "starts real processes; run with mise run spine-tests"]
 fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
@@ -721,6 +779,7 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     let gate = FixedGate::new(GateVerdict::Merged {
         default_sha: CommitSha::parse(DEFAULT_SHA).unwrap(),
     });
+    spawner.set_default_proxy_audit(one_firing());
     let (core, _doubles, ports) =
         start_core_with(claim, &spawner, Arc::new(gate.clone()), test_timing());
     assert_unit_handlers_private(core_ports);
@@ -743,18 +802,7 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     assert_eq!(view["head_sha"], DEFAULT_SHA);
     assert_started_with(&view, &ports);
     assert_dispatch_refuses_bad_routes(&core);
-    let requests = gate.requests();
-    assert_eq!(requests.len(), 1, "one verify");
-    let tasks: Vec<&str> = requests[0]
-        .claims
-        .iter()
-        .map(|claim| claim.task.as_str())
-        .collect();
-    assert_eq!(
-        tasks,
-        ["wu01-t1", "wu01-t2"],
-        "every claim reaches the gate"
-    );
+    assert_one_verify_with_every_claim(&gate);
     let log = spawner.log();
     assert_eq!(log.spawned.len(), 2, "one session per task: {log:?}");
     let session = &log.spawned[0].0;
@@ -762,6 +810,7 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     for hidden in ["sign_", "secret", "awaitable"] {
         assert!(!session_view.contains(hidden), "{hidden} in {session_view}");
     }
+    assert_proxy_audit_recorded(core_ports, session);
     let state = epic_status(core_ports);
     assert_eq!(state["reservations"], serde_json::json!({}));
     assert_eq!(
@@ -771,14 +820,18 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     assert_eq!(state["metered"]["charged"], 0);
     assert_eq!(state["worker_slots"]["used"], 0);
     assert_status_read_follows_each_result(core_ports);
+    assert_forget_asks_the_session_for_its_audit(core_ports);
 }
 
-/// Each `WorkerRun` journal, entry by entry, from Restate's introspection.
-fn worker_run_journals(core_ports: CorePorts) -> Vec<serde_json::Value> {
+/// Each journal of `service`'s invocations, entry by entry, from Restate's introspection.
+fn service_journals(core_ports: CorePorts, service: &str) -> Vec<serde_json::Value> {
     let body = serde_json::json!({
-        "query": "SELECT j.id AS id, j.index AS index, j.entry_type AS entry_type, \
-                  j.entry_json AS entry_json FROM sys_journal j JOIN sys_invocation i ON j.id = i.id \
-                  WHERE i.target_service_name = 'WorkerRun' ORDER BY j.id, j.index"
+        "query": format!(
+            "SELECT j.id AS id, j.index AS index, j.entry_type AS entry_type, \
+             j.entry_json AS entry_json, i.target_handler_name AS handler FROM sys_journal j \
+             JOIN sys_invocation i ON j.id = i.id WHERE i.target_service_name = '{service}' \
+             ORDER BY j.id, j.index"
+        )
     })
     .to_string();
     let text = client()
@@ -797,18 +850,34 @@ fn worker_run_journals(core_ports: CorePorts) -> Vec<serde_json::Value> {
         .clone()
 }
 
-/// A completed result is followed in the `WorkerRun` journal by a call to the session's
-/// `status`, as earlier builds journaled it, so a run they journaled replays on this one.
+/// The call or one-way call a journal entry makes, as its kind, service and handler.
+fn call_target(row: &serde_json::Value) -> Option<(String, String, String)> {
+    let entry: serde_json::Value = serde_json::from_str(row["entry_json"].as_str()?).ok()?;
+    let command = entry["Command"].as_object()?;
+    let (kind, body) = command.iter().next()?;
+    let target = &body["request"]["invocation_target"];
+    let object = target
+        .get("VirtualObject")
+        .or_else(|| target.get("Service"))
+        .or_else(|| target.get("Workflow"))?;
+    Some((
+        kind.clone(),
+        object["name"].as_str()?.to_string(),
+        object["handler"].as_str()?.to_string(),
+    ))
+}
+
+/// After a completed result, `WorkerRun` journals exactly the steps earlier builds journaled,
+/// so a run they journaled replays on this one: the one-way `Reconciler/forget`, the call to the
+/// session's `status`, then the call to `Epic/settle`, with no other call or send between.
 fn assert_status_read_follows_each_result(core_ports: CorePorts) {
-    let rows = worker_run_journals(core_ports);
-    let target = |row: &serde_json::Value| -> Option<(String, String)> {
-        let entry: serde_json::Value = serde_json::from_str(row["entry_json"].as_str()?).ok()?;
-        let object = &entry["Command"]["Call"]["request"]["invocation_target"]["VirtualObject"];
-        Some((
-            object["name"].as_str()?.to_string(),
-            object["handler"].as_str()?.to_string(),
-        ))
-    };
+    let rows = service_journals(core_ports, "WorkerRun");
+    let expected = [
+        ("OneWayCall", "Reconciler", "forget"),
+        ("Call", "Session", "status"),
+        ("Call", "Epic", "settle"),
+    ]
+    .map(|(kind, service, handler)| (kind.to_string(), service.to_string(), handler.to_string()));
     let mut results = 0_u32;
     let mut ids: Vec<&str> = rows.iter().filter_map(|row| row["id"].as_str()).collect();
     ids.dedup();
@@ -821,20 +890,93 @@ fn assert_status_read_follows_each_result(core_ports: CorePorts) {
             continue;
         };
         results = results.saturating_add(1);
-        let next_call = journal[signal..]
+        let calls: Vec<(String, String, String)> = journal[signal..]
             .iter()
-            .find(|row| row["entry_type"] == "Command: Call")
-            .and_then(|row| target(row));
-        println!("evidence: {id}: the first call after the result is {next_call:?}");
-        assert_eq!(
-            next_call,
-            Some(("Session".to_string(), "status".to_string())),
-            "{id}"
-        );
+            .filter_map(|row| call_target(row))
+            .take(expected.len())
+            .collect();
+        println!("evidence: {id}: the calls after the result are {calls:?}");
+        assert_eq!(calls, expected, "{id}");
     }
     assert!(
         results > 0,
         "no WorkerRun journal holds a result: {} entries",
+        rows.len()
+    );
+}
+
+/// The journaled steps of each invocation of `Session/<handler>`: each `run` by its name, each
+/// call and one-way call by its target, in journal order.
+fn session_steps(core_ports: CorePorts, handler: &str) -> Vec<Vec<String>> {
+    let rows = service_journals(core_ports, "Session");
+    let mut ids: Vec<&str> = rows
+        .iter()
+        .filter(|row| row["handler"] == handler)
+        .filter_map(|row| row["id"].as_str())
+        .collect();
+    ids.dedup();
+    ids.iter()
+        .map(|id| {
+            rows.iter()
+                .filter(|row| row["id"] == *id)
+                .filter_map(|row| {
+                    if let Some((kind, service, target)) = call_target(row) {
+                        return Some(format!("{kind} {service}/{target}"));
+                    }
+                    let entry: serde_json::Value =
+                        serde_json::from_str(row["entry_json"].as_str()?).ok()?;
+                    let name = entry["Command"]["Run"]["name"].as_str()?;
+                    Some(format!("Run {name}"))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Every invocation of `Session/<handler>` journals exactly `expected`: the steps earlier builds
+/// journaled, in order, with any new step only at the end, so one in flight across an upgrade
+/// replays.
+fn assert_session_steps(core_ports: CorePorts, handler: &str, expected: &[&str]) {
+    let journals = session_steps(core_ports, handler);
+    for steps in &journals {
+        println!("evidence: Session/{handler} journals {steps:?}");
+        assert_eq!(steps, expected, "Session/{handler}");
+    }
+    assert!(!journals.is_empty(), "no Session/{handler} journal");
+}
+
+/// Each `Reconciler/forget` sends the session's `record_proxy_audit` once, one-way: the step
+/// that moved out of `WorkerRun` lives in this short invocation.
+fn assert_forget_asks_the_session_for_its_audit(core_ports: CorePorts) {
+    let rows = service_journals(core_ports, "Reconciler");
+    let mut forgets = 0_u32;
+    let mut ids: Vec<&str> = rows
+        .iter()
+        .filter(|row| row["handler"] == "forget")
+        .filter_map(|row| row["id"].as_str())
+        .collect();
+    ids.dedup();
+    for id in &ids {
+        let calls: Vec<(String, String, String)> = rows
+            .iter()
+            .filter(|row| row["id"] == *id)
+            .filter_map(call_target)
+            .collect();
+        println!("evidence: Reconciler/forget {id}: {calls:?}");
+        assert_eq!(
+            calls,
+            [(
+                "OneWayCall".to_string(),
+                "Session".to_string(),
+                "record_proxy_audit".to_string()
+            )],
+            "{id}"
+        );
+        forgets = forgets.saturating_add(1);
+    }
+    assert!(
+        forgets > 0,
+        "no Reconciler/forget journal: {} entries",
         rows.len()
     );
 }
@@ -890,6 +1032,18 @@ fn a_silent_worker_is_nudged_at_t1_killed_at_t2_and_requeued_as_attempt_two() {
         epic_status(core_ports)["worker_slots"]["used"],
         0,
         "both attempts settled"
+    );
+    // The kill journals the steps earlier builds wrote and nothing more; the reconciler's
+    // forget, which it already sent, asks the session to read its audit.
+    assert_session_steps(
+        core_ports,
+        "kill",
+        &[
+            "Run save scrollback",
+            "Run kill",
+            "Run release",
+            "OneWayCall Reconciler/forget",
+        ],
     );
 }
 
@@ -958,6 +1112,15 @@ fn a_cancel_during_spawn_kills_settles_and_starts_no_second_attempt() {
         call(core_ports, &status_path, "", None)
             .1
             .contains("\"phase\":\"lost\"")
+    );
+    assert_session_steps(
+        core_ports,
+        "reap",
+        &[
+            "Run reap",
+            "Run release",
+            "OneWayCall Session/record_proxy_audit",
+        ],
     );
     assert_eq!(
         epic_status(core_ports)["worker_slots"]["used"],

@@ -278,9 +278,15 @@ impl Reconciler {
         object_context: ObjectContext<'_>,
         session: Json<SessionName>,
     ) -> HandlerResult<bool> {
+        let session = session.into_inner();
         let mut expected = load_expected(&object_context).await?;
-        let removed = expected.remove(&session.into_inner().to_string()).is_some();
+        let removed = expected.remove(&session.to_string()).is_some();
         object_context.set(EXPECTED_KEY, Json(expected));
+        // The session's awaitable completed, so its launcher has written the proxy's audit.
+        object_context
+            .object_client::<SessionClient>(session.to_string())
+            .record_proxy_audit()
+            .send();
         Ok(removed)
     }
 

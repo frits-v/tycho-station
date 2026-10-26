@@ -76,6 +76,7 @@ pub mod handler {
     pub const SESSION_KILL: &str = "kill";
     pub const SESSION_EXPIRE: &str = "expire";
     pub const SESSION_REAP: &str = "reap";
+    pub const SESSION_RECORD_PROXY_AUDIT: &str = "record_proxy_audit";
     pub const SESSION_STATUS: &str = "status";
     pub const RECONCILER_START: &str = "start";
     pub const RECONCILER_EXPECT: &str = "expect";

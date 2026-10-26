@@ -95,9 +95,9 @@ The suites that start real processes are ignored tests, run by their mise tasks 
 | `kill-tests`, `spine-tests`, `launcher-tests`, `chaos-tests` | the mise tools; they run at the same time, each test core on its own port slot |
 | `worker-tests` | a Claude token in the core's store (`tycho credentials set claude`), which the suite copies into its test core and hands its worker, and `graph-plugin`; never beside `control-tests` |
 | `control-tests` | a Claude token in the core's store, which the suite copies into its test core and hands each control session; never beside `worker-tests` |
-| `vendor-sandbox-tests` | a Claude token in the core's store; six short `claude -p` turns through the session proxy and the trampoline; never beside `worker-tests` or `control-tests` |
+| `vendor-sandbox-tests` | a Claude token and a Codex `auth.json` in the core's store; six short `claude -p` turns and two `codex exec` turns through the session proxy and the trampoline; never beside `worker-tests` or `control-tests` |
 | `graph-tests` | `mise run graph-plugin` |
-| `boundary-tests` | a terminal, the provisioned agent user and the sudoers rule: sudo asks for the developer's password on the terminal to run each probe as `tycho-agent` |
+| `boundary-tests` | a terminal, the provisioned agent user, the sudoers rule, and the prefix's `tycho` built from the branch under test (`mise run provision-agent` installs it): sudo asks for the developer's password on the terminal to run each probe as `tycho-agent` |
 | `attach-tests` | a Ghostty terminal and the agent user: sudo once, again at teardown past its five-minute cache; up to two Automation dialogs (the suite's terminal, `osascript`) |
 
 The boundary suite refuses to start when stdin is not a terminal, and unless the sudoers
@@ -117,7 +117,7 @@ repository names the first directory it cannot search, with `ls`'s line saying w
 directory refused it or was absent. Two more boundaries are the shared zmx log: the agent puts a
 link at `logs/zmx.log` and renames `logs`, both of which must be refused, and the developer's
 `zmx list` must then succeed with the link's target unchanged and the log still the
-developer's regular file. Two more ignored tests need no terminal. One starts a session
+developer's regular file. Three more ignored tests need no terminal. One starts a session
 through the rule with `Zmx::agent_as` running `/bin/sleep`, requires the pid `zmx list`
 reports to be the agent's and to run that program, and the session socket to be the agent's
 at 0770, then kills it by name as the developer and requires it gone. The other starts
@@ -125,7 +125,15 @@ at 0770, then kills it by name as the developer and requires it gone. The other 
 shell whose `$!` it prints, since the shell zmx starts already leads the pty's session and
 `setsid` refuses a session leader; it requires that child to be the agent's and to lead its
 own group, then the kill path's delivery through the rule, a `reap.<pid>.<random>` session
-typing `exec /bin/kill -KILL -- -<group>`, to end the group. Both print whether a uid is the agent's, never the uid. If either fails on
+typing `exec /bin/kill -KILL -- -<group>`, to end the group. A third launches a session as
+the agent the way the spawner does, against a test core, with a fake vendor in a 2770
+directory of the developer's in the shared group and a test Claude token through the
+hand-off; from inside the session it requires the test core's admin port refused while it
+answers the developer, `github.com` refused at the proxy and named as a firing in the
+session's audit file, the model endpoint answered by Anthropic through the route, and the
+vendor's `CLAUDE_CODE_OAUTH_TOKEN` equal to `NONO_PROXY_TOKEN` and no variable holding the
+test token. It runs the prefix's `tycho`, so it first requires the prefix's `station.json` to
+name this checkout's commit, built from a clean tree, and fails as a stale prefix otherwise. All three print whether a uid is the agent's, never the uid. If either fails on
 connecting to the agent's socket, check `id` in the shell that runs the suite: a login session
 that began before the developer joined `tycho-zmx` does not list the group, while
 `id <developer>` and `dseditgroup` do; log out and in, then run the suite again.
@@ -191,10 +199,13 @@ places, both re-proved when something under them moves.
   every entry for this host to exist; a missing macOS entry fails every session start, so
   the test is the warning. It runs in `ci` on the Linux runner and on every developer run of
   the tests on macOS.
-- The vendors' own behaviour under it: which hosts they reach, whether a nested vendor
-  sandbox starts, which settings layer decides it, and whether Claude's configuration saves
-  land. `mise run vendor-sandbox-tests` measures the last three; `mise run worker-tests`
-  prints each session's proxy line with what it refused.
+- The vendors' own behaviour under it: which hosts they reach, which path Claude's model
+  traffic takes (the `anthropic` route, never a tunnel), whether a nested vendor sandbox
+  starts, which settings layer decides it, whether Claude's configuration saves land, and
+  whether a Codex turn completes with its trust bundle. `mise run vendor-sandbox-tests`
+  measures all but the first; `mise run worker-tests` prints each session's proxy line with
+  what it refused, and `mise run launcher-tests` checks from inside a session that a host
+  off the allowlist is refused and lands in the session's audit file.
 
 A bump of the `nono` or `nono-proxy` pin, of the `claude` or `codex` pin, or a macOS update
 re-runs, before it merges: `mise run vendor-sandbox-tests`, `mise run launcher-tests`,

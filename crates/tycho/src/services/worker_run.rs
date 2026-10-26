@@ -944,6 +944,8 @@ fn nudge(workflow_context: &WorkflowContext<'_>, session: &SessionName) {
 }
 
 /// The awaitable completed, resolved or rejected: the reconciler stops expecting the session.
+/// The journaled steps here are the ones earlier builds wrote, so a run they journaled replays;
+/// the reconciler, not this workflow, asks the session to read its proxy audit.
 fn forget(workflow_context: &WorkflowContext<'_>, session: &SessionName) {
     workflow_context
         .object_client::<ReconcilerClient>(RECONCILER_KEY)
@@ -1041,6 +1043,7 @@ mod tests {
             awaiting_reap: false,
             last_instruction: None,
             release_error: None,
+            proxy_audit: None,
         }
     }
 

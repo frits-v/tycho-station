@@ -8,6 +8,7 @@ use tycho_types::envelope::ShortText;
 use tycho_types::session::{SessionName, Vendor};
 
 use crate::launch_spec::VendorTerminal;
+use crate::proxy_audit::AuditRead;
 use crate::services::merge_gate::{GateError, GateVerdict, MergeGate, VerifyRequest};
 use crate::services::spawner::{LeaseRead, SpawnSpec, Spawner, SpawnerError};
 use crate::vendors::control::{
@@ -31,6 +32,8 @@ pub struct SpawnerLog {
 struct Inner {
     log: SpawnerLog,
     leases: BTreeMap<String, LeaseRead>,
+    audits: BTreeMap<String, AuditRead>,
+    default_audit: Option<AuditRead>,
     next_pid: u32,
 }
 
@@ -61,6 +64,17 @@ impl RecordingSpawner {
             inner: Arc::default(),
             on_spawn: Some(hook),
         }
+    }
+
+    pub fn set_proxy_audit(&self, session: &SessionName, audit: AuditRead) {
+        self.with(|inner| {
+            inner.audits.insert(session.to_string(), audit);
+        });
+    }
+
+    /// What a proxy audit read answers for a session with none of its own.
+    pub fn set_default_proxy_audit(&self, audit: AuditRead) {
+        self.with(|inner| inner.default_audit = Some(audit));
     }
 
     pub fn set_lease(&self, session: &SessionName, lease: LeaseRead) {
@@ -128,6 +142,17 @@ impl Spawner for RecordingSpawner {
                 .get(&session.to_string())
                 .cloned()
                 .unwrap_or(LeaseRead::Absent)
+        })
+    }
+
+    fn read_proxy_audit(&self, session: &SessionName) -> AuditRead {
+        self.with(|inner| {
+            inner
+                .audits
+                .get(&session.to_string())
+                .or(inner.default_audit.as_ref())
+                .cloned()
+                .unwrap_or(AuditRead::Absent)
         })
     }
 }

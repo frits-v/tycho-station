@@ -580,14 +580,19 @@ fn spool_record(core: &Core, session: &str) -> Value {
     for line in log.lines().filter(|line| line.contains(" proxy")) {
         println!("evidence: {session} {line}");
     }
+    let audit =
+        tycho::proxy_audit::read(&dirs, &SessionName::parse(session).unwrap(), current_uid());
+    println!("evidence: {session} proxy audit as the core reads it: {audit:?}");
     record
 }
 
-/// The one worker session the launcher spooled for, from the agent spool directory.
+/// The one worker session the launcher spooled for, from the agent spool directory, whose
+/// files beside the session directories (the proxy audits) are no sessions.
 fn only_worker_session(core: &Core) -> String {
     let names: Vec<String> = fs::read_dir(core.agent.join("spool"))
         .unwrap()
         .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .filter_map(|entry| entry.file_name().into_string().ok())
         .collect();
     assert_eq!(names.len(), 1, "{names:?}");
@@ -600,6 +605,7 @@ fn spooled_records(core: &Core) -> Vec<(String, Value)> {
     let mut names: Vec<String> = fs::read_dir(core.agent.join("spool"))
         .unwrap()
         .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .filter_map(|entry| entry.file_name().into_string().ok())
         .collect();
     // The suffix ends in `a<attempt>`, so the name order is the attempt order below ten.

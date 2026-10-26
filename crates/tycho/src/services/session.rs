@@ -16,6 +16,7 @@ use tycho_types::session::{SessionName, Vendor};
 use tycho_types::task_packet::AbsolutePath;
 
 use crate::config::spine;
+use crate::proxy_audit::AuditRead;
 use crate::services::reconciler::{ExpectRequest, ReconcilerClient, fingerprint};
 use crate::services::spawner::{LeaseRead, SpawnSpec, SpawnTerminal, Spawner};
 use crate::services::{
@@ -65,6 +66,14 @@ pub struct SessionState {
     /// Why the vendor port could not remove what it kept for the session once it ended.
     #[serde(default)]
     pub release_error: Option<String>,
+    /// The session proxy's decisions as firings and examinations, read once the session
+    /// was killed or reaped.
+    #[serde(default)]
+    pub proxy_audit: Option<AuditRead>,
+    /// How many times the audit was read; an absent file is read again up to
+    /// `PROXY_AUDIT_READS_MAX` times, since a killed launcher may still be writing it.
+    #[serde(default)]
+    pub proxy_audit_reads: u32,
 }
 
 /// Which way an instruction reached the session.
@@ -176,6 +185,8 @@ pub struct SessionView {
     pub last_instruction: Option<InstructionRecord>,
     #[serde(default)]
     pub release_error: Option<String>,
+    #[serde(default)]
+    pub proxy_audit: Option<AuditRead>,
 }
 
 impl From<&SessionState> for SessionView {
@@ -196,6 +207,7 @@ impl From<&SessionState> for SessionView {
             awaiting_reap: state.awaiting_reap,
             last_instruction: state.instructions.last().cloned(),
             release_error: state.release_error.clone(),
+            proxy_audit: state.proxy_audit.clone(),
         }
     }
 }
@@ -210,6 +222,31 @@ pub fn expire(state: &SessionState) -> Option<SessionState> {
     next.phase = SessionPhase::Lost;
     next.awaiting_reap = true;
     Some(next)
+}
+
+/// Reads of a session's proxy audit while the file is absent; the launcher writes it within a
+/// second of its vendor's end or its stop, so five reads two seconds apart cover a slow one.
+pub const PROXY_AUDIT_READS_MAX: u32 = 5;
+pub const PROXY_AUDIT_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether the session's proxy audit is still to be read: never read, or read absent fewer
+/// than `PROXY_AUDIT_READS_MAX` times. A file read or unreadable is kept as it is.
+#[must_use]
+pub const fn wants_proxy_audit(state: &SessionState) -> bool {
+    match &state.proxy_audit {
+        None => true,
+        Some(AuditRead::Absent) => state.proxy_audit_reads < PROXY_AUDIT_READS_MAX,
+        Some(AuditRead::Read(_) | AuditRead::Unreadable { .. }) => false,
+    }
+}
+
+/// Keeps a read of the audit on the state; true when the file was absent and another read is
+/// due.
+pub fn keep_proxy_audit(state: &mut SessionState, read: AuditRead) -> bool {
+    state.proxy_audit_reads = state.proxy_audit_reads.saturating_add(1);
+    let absent = read == AuditRead::Absent;
+    state.proxy_audit = Some(read);
+    absent && state.proxy_audit_reads < PROXY_AUDIT_READS_MAX
 }
 
 /// A lost session awaiting its reap stops awaiting it; any other state stays as it is.
@@ -582,7 +619,9 @@ impl Session {
         Ok(u64::try_from(length).unwrap_or(u64::MAX))
     }
 
-    /// Saves scrollback when asked, kills by the recorded pid, and drops the expectation.
+    /// Saves scrollback when asked, kills by the recorded pid, and drops the expectation. The
+    /// journaled steps are the ones earlier builds wrote; the reconciler's `forget` asks this
+    /// session to read its proxy audit afterwards.
     #[handler(ingress_private)]
     async fn kill(
         &self,
@@ -617,6 +656,26 @@ impl Session {
         Ok(Json(KillOutcome::Killed { scrollback }))
     }
 
+    /// The session's awaitable completed, or it was killed or reaped, so its launcher has
+    /// written the proxy's decisions or will not: reads them as the firings and examinations of
+    /// the session proxy, and again later while the file is absent, within
+    /// `PROXY_AUDIT_READS_MAX` reads. `Reconciler/forget` and `reap` send it as their last step.
+    #[handler(ingress_private)]
+    async fn record_proxy_audit(&self, object_context: ObjectContext<'_>) -> HandlerResult<bool> {
+        let name = parse_key(object_context.key()).map_err(|error| terminal(&error))?;
+        let Some(state) = object_context.get::<Json<SessionState>>(STATE_KEY).await? else {
+            return Ok(false);
+        };
+        let mut state = state.into_inner();
+        if !wants_proxy_audit(&state) {
+            return Ok(false);
+        }
+        self.take_proxy_audit(&object_context, &name, &mut state)
+            .await?;
+        object_context.set(STATE_KEY, Json(state));
+        Ok(true)
+    }
+
     /// The reconciler's verdict: rejects the awaitable with the exit state, trusts no pid after.
     #[handler(ingress_private)]
     async fn expire(
@@ -641,7 +700,8 @@ impl Session {
         Ok(true)
     }
 
-    /// Kills a lost session by its zmx name through the port, once.
+    /// Kills a lost session by its zmx name through the port, once, then asks itself to read
+    /// the proxy audit.
     #[handler(ingress_private)]
     async fn reap(&self, object_context: ObjectContext<'_>) -> HandlerResult<bool> {
         let name = parse_key(object_context.key()).map_err(|error| terminal(&error))?;
@@ -660,6 +720,12 @@ impl Session {
             .await?;
         next.release_error = self.release(&object_context, &name).await?;
         object_context.set(STATE_KEY, Json(next));
+        // Appended after every step earlier builds journaled, so a reap in flight across an
+        // upgrade replays them and then sends this.
+        object_context
+            .object_client::<SessionClient>(object_context.key())
+            .record_proxy_audit()
+            .send();
         Ok(true)
     }
 
@@ -777,6 +843,44 @@ impl Session {
         Ok(released.into_inner())
     }
 
+    /// Reads the audit when the state still wants it and keeps the answer; an absent file
+    /// schedules this session's `record_proxy_audit` again after `PROXY_AUDIT_RETRY`.
+    async fn take_proxy_audit(
+        &self,
+        object_context: &ObjectContext<'_>,
+        name: &SessionName,
+        state: &mut SessionState,
+    ) -> Result<(), HandlerError> {
+        if !wants_proxy_audit(state) {
+            return Ok(());
+        }
+        let read = self.read_proxy_audit(object_context, name).await?;
+        if keep_proxy_audit(state, read) {
+            object_context
+                .object_client::<SessionClient>(name.to_string())
+                .record_proxy_audit()
+                .send_after(PROXY_AUDIT_RETRY);
+        }
+        Ok(())
+    }
+
+    /// Reads the proxy's decisions the launcher left; a file that cannot be read is kept as
+    /// unreadable, never as no decisions.
+    async fn read_proxy_audit(
+        &self,
+        object_context: &ObjectContext<'_>,
+        name: &SessionName,
+    ) -> Result<AuditRead, HandlerError> {
+        let spawner = Arc::clone(&self.spawner);
+        let target = name.clone();
+        let audit = object_context
+            .run(|| blocking(move || Ok(Json(spawner.read_proxy_audit(&target)))))
+            .name("proxy audit")
+            .retry_policy(self.timing.port_retry())
+            .await?;
+        Ok(audit.into_inner())
+    }
+
     async fn save_scrollback(
         &self,
         object_context: &ObjectContext<'_>,
@@ -827,6 +931,8 @@ pub fn spawn_record(
         awaiting_reap: false,
         instructions: Vec::new(),
         release_error: None,
+        proxy_audit: None,
+        proxy_audit_reads: 0,
     };
     let expectation = ExpectRequest {
         session: name.clone(),
@@ -905,7 +1011,35 @@ mod tests {
             awaiting_reap: false,
             instructions: Vec::new(),
             release_error: None,
+            proxy_audit: None,
+            proxy_audit_reads: 0,
         }
+    }
+
+    /// An absent audit is read again up to the bound and then kept; a read or unreadable file
+    /// is kept at once.
+    #[test]
+    fn an_absent_proxy_audit_is_read_again_within_its_bound() {
+        let mut state = running();
+        let mut retries = 0_u32;
+        for _ in 0..PROXY_AUDIT_READS_MAX + 2 {
+            if !wants_proxy_audit(&state) {
+                break;
+            }
+            if keep_proxy_audit(&mut state, AuditRead::Absent) {
+                retries += 1;
+            }
+        }
+        assert_eq!(state.proxy_audit_reads, PROXY_AUDIT_READS_MAX);
+        assert_eq!(retries, PROXY_AUDIT_READS_MAX - 1);
+        assert!(!wants_proxy_audit(&state));
+        let mut late = running();
+        assert!(keep_proxy_audit(&mut late, AuditRead::Absent));
+        let read = AuditRead::Unreadable {
+            reason: "a FIFO".to_string(),
+        };
+        assert!(!keep_proxy_audit(&mut late, read));
+        assert!(!wants_proxy_audit(&late));
     }
 
     fn the_secret() -> String {

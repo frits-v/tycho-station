@@ -89,6 +89,12 @@ pub fn check_replaceable(path: &Path) -> io::Result<()> {
 
 /// Replaces the file atomically: stage new, sync, rename onto a checked target, sync the directory.
 pub fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_durable_mode(path, bytes, PRIVATE_FILE_MODE)
+}
+
+/// `write_durable` with a caller's mode, for a file another user of the group reads, who then
+/// sees the whole file or none of it.
+pub fn write_durable_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -98,7 +104,7 @@ pub fn write_durable(path: &Path, bytes: &[u8]) -> io::Result<()> {
         ".{file_name}.staging-{}-{count}",
         std::process::id()
     ));
-    let mut file = create_new(&staging)?;
+    let mut file = create_new_mode(&staging, mode)?;
     let written = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
     let renamed = written

@@ -227,6 +227,10 @@ impl Spawner for LauncherSpawner {
     fn read_lease(&self, session: &SessionName) -> LeaseRead {
         read_lease(&self.dirs, session, current_uid())
     }
+
+    fn read_proxy_audit(&self, session: &SessionName) -> tycho::proxy_audit::AuditRead {
+        tycho::proxy_audit::read(&self.dirs, session, current_uid())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -596,6 +600,21 @@ impl Harness {
             )
             .then_some(())
         });
+        // The launcher writes the audit on its stop path; a read before it landed is retried.
+        let status = format!("/Session/{}/status", control.name);
+        let audit = wait_until(
+            "the killed session's proxy audit to read",
+            WAIT_LIMIT,
+            || {
+                let view: serde_json::Value =
+                    serde_json::from_str(&ingress_empty(core_ports, &status)?).ok()?;
+                (view["proxy_audit"]["state"] == "read").then(|| view["proxy_audit"].clone())
+            },
+        );
+        println!(
+            "evidence: {} proxy audit on the killed session's view: {} examinations, {} firings",
+            control.name, audit["examinations"], audit["firing_count"]
+        );
     }
 
     fn file(&self, name: &str) -> PathBuf {
@@ -688,6 +707,24 @@ fn wait_until<T>(what: &str, limit: Duration, mut probe: impl FnMut() -> Option<
         thread::sleep(Duration::from_millis(250));
     }
     panic!("{what} did not happen within {limit:?}");
+}
+
+/// A call to a handler that takes no input, which Restate's ingress wants with no body and
+/// no content type.
+fn ingress_empty(core_ports: CorePorts, path: &str) -> Option<String> {
+    let response = reqwest::blocking::Client::new()
+        .post(core_ports.ingress_url(path))
+        .timeout(Duration::from_mins(1))
+        .send()
+        .ok()?;
+    let status = response.status();
+    let text = response.text().ok()?;
+    if status.is_success() {
+        Some(text)
+    } else {
+        println!("evidence: POST {path} -> {status} {text}");
+        None
+    }
 }
 
 fn ingress_json(core_ports: CorePorts, path: &str, body: &str) -> Option<String> {

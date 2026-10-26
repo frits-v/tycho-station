@@ -28,6 +28,7 @@ pub mod packets;
 pub mod private_dir;
 pub mod probe;
 pub mod process;
+pub mod proxy_audit;
 pub mod relay;
 pub mod repositories;
 pub mod sandbox;

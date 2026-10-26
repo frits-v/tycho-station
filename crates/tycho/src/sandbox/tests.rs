@@ -308,3 +308,33 @@ fn a_state_file_rule_covers_its_siblings_and_nothing_else() {
         );
     }
 }
+
+/// On Linux only Landlock's "no fallback" is an applied set: a seccomp fallback the station
+/// does not run, and an error, are refusals.
+#[cfg(target_os = "linux")]
+#[test]
+fn only_no_seccomp_fallback_counts_as_applied_on_linux() {
+    use nono::sandbox::SeccompNetFallback;
+    assert!(landlock_applied::<String>(Ok(SeccompNetFallback::None)).is_ok());
+    let fallbacks = [
+        SeccompNetFallback::BlockAll,
+        SeccompNetFallback::ProxyOnly {
+            proxy_port: 40_000,
+            bind_ports: Vec::new(),
+        },
+    ];
+    let mut examined = 0_usize;
+    for fallback in fallbacks {
+        let refused = landlock_applied::<String>(Ok(fallback.clone()));
+        assert!(
+            matches!(&refused, Err(SandboxError::Apply(reason)) if reason.contains("seccomp")),
+            "{fallback:?}: {refused:?}"
+        );
+        examined += 1;
+    }
+    assert_eq!(examined, 2);
+    assert!(matches!(
+        landlock_applied(Err("Landlock is not supported by this kernel")),
+        Err(SandboxError::Apply(reason)) if reason.contains("not supported")
+    ));
+}

@@ -3700,6 +3700,7 @@ dependencies = [
  "tokio",
  "tycho-harness",
  "tycho-types",
+ "zeroize",
 ]
 
 [[package]]

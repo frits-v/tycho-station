@@ -352,6 +352,10 @@ impl Spawner for LauncherSpawner {
     fn read_lease(&self, session: &SessionName) -> LeaseRead {
         read_lease(&self.inner.dirs, session, current_uid())
     }
+
+    fn read_proxy_audit(&self, session: &SessionName) -> tycho::proxy_audit::AuditRead {
+        tycho::proxy_audit::read(&self.inner.dirs, session, current_uid())
+    }
 }
 
 /// Runs the spawner's teardown when a case ends, before the core stops.
