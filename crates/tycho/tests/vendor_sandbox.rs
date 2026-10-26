@@ -718,6 +718,13 @@ fn codex_runs_a_turn_under_the_sandbox_with_its_home_in_the_session() {
         control.completed, control.proxy
     );
     assert!(
+        !control.output.contains("refresh_token_reused"),
+        "the core's stored Codex login was refreshed elsewhere and its refresh token is spent; \
+         log in again (`codex login`) and store the new auth.json with `tycho credentials set \
+         codex`: {}",
+        control.output
+    );
+    assert!(
         control.completed,
         "the positive control failed: {}",
         control.output
