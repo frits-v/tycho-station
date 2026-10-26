@@ -2,6 +2,7 @@ use super::*;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
+use std::time::Instant;
 
 use crate::credentials::tests::CLAUDE_TOKEN;
 
@@ -367,7 +368,9 @@ fn the_capture_backend_answers_only_the_route_s_credential() {
 
 /// Every request the proxy answered up to its stop is in what `close` hands back: a client
 /// keeps sending refused CONNECTs while the proxy closes, and each 403 it saw has its decision
-/// in the events, including the ones answered after an earlier take of the buffer.
+/// in the events, including the ones answered after an earlier look at the buffer. The close
+/// begins once the proxy has recorded `CLOSE_RACE_ANSWERS_BEFORE` of the client's requests,
+/// so requests are in flight when it stops; a drain taken before the stop misses those.
 #[test]
 fn every_decision_up_to_the_close_is_in_its_events() {
     let proxy = SessionProxy::start(&hosts(&["api.anthropic.com"]), None).unwrap();
@@ -381,10 +384,12 @@ fn every_decision_up_to_the_close_is_in_its_events() {
             let Ok(mut stream) = TcpStream::connect((Ipv4Addr::LOCALHOST, port)) else {
                 break;
             };
-            stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
-            if stream
-                .write_all(connect_head("github.com:443", Some(&token)).as_bytes())
-                .is_err()
+            // On macOS a socket the closing proxy already reset refuses its options with
+            // `EINVAL`; like a refused connect or write, that is the proxy having stopped.
+            if stream.set_read_timeout(Some(IO_TIMEOUT)).is_err()
+                || stream
+                    .write_all(connect_head("github.com:443", Some(&token)).as_bytes())
+                    .is_err()
             {
                 break;
             }
@@ -396,14 +401,23 @@ fn every_decision_up_to_the_close_is_in_its_events() {
         }
         refused
     });
-    std::thread::sleep(Duration::from_millis(150));
+    let recorded = |count: usize| proxy.handle.snapshot_audit_events().len() >= count;
+    let deadline = Instant::now() + CLOSE_RACE_DEADLINE;
+    while !recorded(taken_early + CLOSE_RACE_ANSWERS_BEFORE) {
+        assert!(
+            Instant::now() < deadline,
+            "the proxy recorded fewer than {CLOSE_RACE_ANSWERS_BEFORE} of the client's requests \
+             within {CLOSE_RACE_DEADLINE:?}"
+        );
+        std::thread::yield_now();
+    }
     let events = proxy.close(STOP_GRACE);
     let refused_while_open = client.join().unwrap();
     let denied = ProxyRecord::of(&events).denied;
     assert_eq!(taken_early, 1);
     assert!(
-        refused_while_open >= 1,
-        "the client got no answer before the close"
+        refused_while_open >= CLOSE_RACE_ANSWERS_BEFORE,
+        "{refused_while_open}"
     );
     assert_eq!(
         denied,
@@ -414,3 +428,9 @@ fn every_decision_up_to_the_close_is_in_its_events() {
 
 /// Bounds the client of the close race; it stops sooner, when the proxy stops accepting.
 const CLOSE_RACE_REQUESTS_MAX: usize = 10_000;
+/// The client's requests the proxy has recorded when the close begins: enough that the client
+/// is in full flow, so a drain taken before the stop misses a request in eight of eight runs,
+/// where twenty missed none.
+const CLOSE_RACE_ANSWERS_BEFORE: usize = 1500;
+/// Bounds the wait for those requests on a loaded runner; it fails the test, never closes early.
+const CLOSE_RACE_DEADLINE: Duration = Duration::from_mins(1);
