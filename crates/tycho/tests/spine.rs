@@ -40,7 +40,7 @@ use tycho::services::merge_gate::{GateVerdict, MergeGate, NoGate};
 use tycho::services::operator::read_secret_file;
 use tycho::services::spawner::{SpawnSpec, Spawner};
 use tycho::services::{Ports, Timing};
-use tycho::spool::check_result_envelope;
+use tycho::spool::{BeatState, FinalBeat, result_resolution};
 use tycho::vendors::control::NoVendor;
 use tycho::zmx::Zmx;
 use tycho_types::envelope::{
@@ -496,7 +496,8 @@ fn session_and_reconciler_refuse_agents_outside_their_scope() {
 const HEAD_SHA: &str = "1111111111111111111111111111111111111111";
 const DEFAULT_SHA: &str = "2222222222222222222222222222222222222222";
 
-/// The result envelope a launcher resolves with, checked by the launcher's own spool check.
+/// What a launcher resolves with: the result envelope and an applied last beat, built by the
+/// launcher's own constructor.
 fn result_json(session: &str, branch: &str) -> String {
     let envelope = serde_json::json!({
         "schema_version": 1, "id": "01J9Z3K7Q8R2W5X6Y7Z8A9B0C1", "type": "result",
@@ -507,7 +508,11 @@ fn result_json(session: &str, branch: &str) -> String {
                     "usage": {"input_tokens": 1200, "output_tokens": 300,
                               "cost_micro_dollars": 42000}}
     });
-    check_result_envelope(&envelope, &SessionName::parse(session).unwrap()).unwrap()
+    let last_beat = FinalBeat {
+        state: BeatState::Applied,
+        context_tokens: Some(33_390),
+    };
+    result_resolution(&envelope, &SessionName::parse(session).unwrap(), last_beat).unwrap()
 }
 
 /// What the launcher double does with a spawned session's awaitable.

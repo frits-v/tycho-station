@@ -448,6 +448,39 @@ mod tests {
         }
     }
 
+    /// Whether a `system/init` line names any memory field.
+    fn init_names_memory(line: &str) -> bool {
+        serde_json::from_str::<Value>(line)
+            .ok()
+            .is_some_and(|event| {
+                event["subtype"] == "init"
+                    && event
+                        .as_object()
+                        .is_some_and(|fields| fields.keys().any(|key| key.contains("memory")))
+            })
+    }
+
+    /// The captures were taken with the worker's settings, auto memory off, so no init names
+    /// a memory field. The init 2.1.295 wrote with auto memory on is the positive control.
+    #[test]
+    fn no_captured_init_names_a_memory_directory() {
+        let auto_memory_on = r#"{"type":"system","subtype":"init","claude_code_version":"2.1.295","memory_paths":{"auto":"/home/agent/.claude/projects/-work-repo/memory/"}}"#;
+        assert!(init_names_memory(auto_memory_on));
+        for (name, sample) in [
+            ("success", SUCCESS),
+            ("max turns", MAX_TURNS),
+            ("bare", BARE),
+            ("login", LOGIN),
+        ] {
+            let inits = sample
+                .lines()
+                .filter(|line| line.contains(r#""subtype":"init""#))
+                .count();
+            assert_eq!(inits, 1, "{name}");
+            assert!(!sample.lines().any(init_names_memory), "{name}");
+        }
+    }
+
     #[test]
     fn a_captured_turn_cap_is_too_large() {
         let stream = fold(MAX_TURNS);

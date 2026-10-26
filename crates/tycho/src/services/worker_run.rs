@@ -33,6 +33,7 @@ use crate::services::{
     CODE_BAD_REQUEST, CODE_CANCELLED, CODE_INTERNAL, Ports, Timing, blocking, refuse, secret,
     wall_clock_unix_ms,
 };
+use crate::spool::{FinalBeat, ResultResolution};
 use crate::vendors::worker::VendorSessionId;
 
 const VIEW_KEY: &str = "view";
@@ -403,6 +404,8 @@ type WakeFuture<'run> = Pin<Box<dyn DurableFuture<Output = Wake> + Send + 'run>>
 struct AttemptEnd {
     exit: ExitState,
     result: Option<ResultPayload>,
+    /// The last heartbeat a completed result's resolution reported.
+    last_beat: Option<FinalBeat>,
     /// The certified question an `escalated` rejection carried.
     question: Question,
     evidence: Option<WorkerEvidence>,
@@ -416,6 +419,7 @@ impl AttemptEnd {
         Self {
             exit,
             result: None,
+            last_beat: None,
             question: Question::Absent,
             evidence: None,
             stop: None,
@@ -684,7 +688,7 @@ impl WorkerRun {
                 if watched.is_err() {
                     kill(workflow_context, session, false).await;
                 }
-                with_evidence(workflow_context, session, resume_handle, watched?).await
+                Ok(with_evidence(session, resume_handle, watched?))
             }
             Ok(SpawnOutcome::Requeue { .. }) => Ok(AttemptEnd::exit(ExitState::Failed, false)),
             Err(error) => match spawn_refusal(error.code()) {
@@ -772,9 +776,9 @@ impl WorkerRun {
             if let Wake::Result(completion) = woke {
                 forget(workflow_context, session);
                 return Ok(match completion {
-                    Ok(value) => result_from_envelope(&value.into_inner(), session).map_or_else(
+                    Ok(value) => result_from_resolution(&value.into_inner(), session).map_or_else(
                         |_| AttemptEnd::exit(ExitState::from_wire(RAW_RESULT_INVALID), true),
-                        completed,
+                        |(result, last_beat)| completed(result, last_beat),
                     ),
                     Err(rejected) => rejection(rejected.message()),
                 });
@@ -822,31 +826,35 @@ impl WorkerRun {
     }
 }
 
-/// A completed attempt reads the session's last context size, which the launcher's final
-/// heartbeat wrote before it delivered the result.
-async fn with_evidence(
-    workflow_context: &WorkflowContext<'_>,
+/// A completed attempt's evidence: the final context size comes from the result's
+/// resolution, and counts only when the session applied the beat that carried it.
+fn with_evidence(
     session: &SessionName,
     resume_handle: Option<ShortText>,
     end: AttemptEnd,
-) -> Result<AttemptEnd, TerminalError> {
-    if end.result.is_none() {
-        return Ok(end);
-    }
-    let view = workflow_context
-        .object_client::<SessionClient>(session.to_string())
-        .status()
-        .call()
-        .await?
-        .into_inner();
-    Ok(AttemptEnd {
-        evidence: Some(WorkerEvidence {
-            session: session.clone(),
-            resume_handle: resume_handle.map(|handle| handle.as_str().to_string()),
-            context_tokens: view.map(|view| view.context_tokens),
-        }),
+) -> AttemptEnd {
+    let (Some(_), Some(last_beat)) = (&end.result, end.last_beat) else {
+        return end;
+    };
+    AttemptEnd {
+        evidence: Some(evidence_of(session, resume_handle, last_beat)),
         ..end
-    })
+    }
+}
+
+/// The evidence a completed result carries; no context size unless the beat was applied.
+#[must_use]
+pub fn evidence_of(
+    session: &SessionName,
+    resume_handle: Option<ShortText>,
+    last_beat: FinalBeat,
+) -> WorkerEvidence {
+    WorkerEvidence {
+        session: session.clone(),
+        resume_handle: resume_handle.map(|handle| handle.as_str().to_string()),
+        context_tokens: last_beat.confirmed_context_tokens(),
+        last_beat: last_beat.state,
+    }
 }
 
 fn timer<'run>(workflow_context: &'run WorkflowContext<'_>, wait: Duration) -> WakeFuture<'run> {
@@ -865,9 +873,20 @@ fn rejection(message: &str) -> AttemptEnd {
 /// result envelope; it decodes as unrecognised and blocks in the inbox.
 pub const RAW_RESULT_INVALID: &str = "result_envelope_invalid";
 
-/// The launcher resolves with the result envelope; only a result from this attempt's
-/// session counts.
-pub fn result_from_envelope(
+/// The launcher resolves with the result envelope and its last heartbeat
+/// (`spool::ResultResolution`); only a result from this attempt's session counts.
+pub fn result_from_resolution(
+    value: &serde_json::Value,
+    session: &SessionName,
+) -> Result<(ResultPayload, FinalBeat), String> {
+    let resolution: ResultResolution =
+        serde_json::from_value(value.clone()).map_err(|error| error.to_string())?;
+    let result = result_from_envelope(&resolution.envelope, session)?;
+    Ok((result, resolution.last_beat))
+}
+
+/// Only a result envelope from this attempt's session counts.
+fn result_from_envelope(
     value: &serde_json::Value,
     session: &SessionName,
 ) -> Result<ResultPayload, String> {
@@ -882,10 +901,11 @@ pub fn result_from_envelope(
     }
 }
 
-const fn completed(result: ResultPayload) -> AttemptEnd {
+const fn completed(result: ResultPayload, last_beat: FinalBeat) -> AttemptEnd {
     AttemptEnd {
         exit: decode_result(&result),
         result: Some(result),
+        last_beat: Some(last_beat),
         question: Question::Absent,
         evidence: None,
         stop: None,
@@ -955,6 +975,7 @@ async fn settle(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spool::BeatState;
     use tycho_types::envelope::{BranchName, CommitSha, Usage};
     use tycho_types::task_packet::Effort;
 
@@ -1009,15 +1030,55 @@ mod tests {
     fn only_a_result_envelope_from_the_attempts_session_resolves() {
         let session = SessionName::parse(crate::exit_decode::tests::SESSION).unwrap();
         let envelope = crate::exit_decode::tests::envelope(crate::exit_decode::tests::SESSION);
-        let result = result_from_envelope(&envelope, &session).unwrap();
+        let applied = FinalBeat {
+            state: BeatState::Applied,
+            context_tokens: Some(33_390),
+        };
+        let body = |envelope: &serde_json::Value| serde_json::json!({"envelope": envelope, "last_beat": applied});
+        let (result, beat) = result_from_resolution(&body(&envelope), &session).unwrap();
         assert_eq!(result.outcome, Outcome::Done);
+        assert_eq!(beat, applied);
         let other = SessionName::parse("cf7a.wu03.wrk.claude.b2c4").unwrap();
-        assert!(result_from_envelope(&envelope, &other).is_err());
-        assert!(result_from_envelope(&envelope["payload"], &session).is_err());
+        assert!(result_from_resolution(&body(&envelope), &other).is_err());
+        assert!(result_from_resolution(&body(&envelope["payload"]), &session).is_err());
+        assert!(
+            result_from_resolution(&envelope, &session).is_err(),
+            "a bare envelope carries no last beat"
+        );
+        // The launcher's own constructor gives the shape this decodes.
+        let wire = crate::spool::result_resolution(&envelope, &session, applied).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&wire).unwrap();
+        assert_eq!(result_from_resolution(&value, &session).unwrap().1, applied);
         assert_eq!(
             ExitState::from_wire(RAW_RESULT_INVALID).disposition(),
             Disposition::Inbox
         );
+    }
+
+    /// The context size a completed result reports counts only when the session applied the
+    /// beat that carried it; the evidence names the beat's state either way.
+    #[test]
+    fn evidence_records_a_context_size_only_from_an_applied_last_beat() {
+        let session = SessionName::parse("cf7a.wu03.wrk.claude.a1f3").unwrap();
+        for (state, recorded) in [
+            (BeatState::Applied, Some(33_390)),
+            (BeatState::Unknown, None),
+            (BeatState::Refused, None),
+            (BeatState::NotSent, None),
+            (BeatState::NotRecorded, None),
+            (BeatState::Unrecognised, None),
+        ] {
+            let evidence = evidence_of(
+                &session,
+                None,
+                FinalBeat {
+                    state,
+                    context_tokens: Some(33_390),
+                },
+            );
+            assert_eq!(evidence.context_tokens, recorded, "{state:?}");
+            assert_eq!(evidence.last_beat, state);
+        }
     }
 
     #[test]
@@ -1042,6 +1103,7 @@ mod tests {
             session: SessionName::parse("cf7a.wu03.wrk.claude.a1f3").unwrap(),
             resume_handle: Some("3f0c6c1e-6b1a-4a51-9a0e-2a8c5d0c1a10".to_string()),
             context_tokens: Some(33_390),
+            last_beat: BeatState::Applied,
         };
         assert_eq!(
             attach(

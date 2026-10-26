@@ -1257,6 +1257,52 @@ fn gate_failure(error: GateError) -> HandlerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::services::worker_run::evidence_of;
+    use crate::spool::{BeatState, FinalBeat};
+    use tycho_types::envelope::{BranchName, Outcome, Usage};
+
+    /// A checkpoint records the context size only when the last beat was applied; the
+    /// evidence it was built from names the state.
+    #[test]
+    fn a_checkpoint_records_a_context_size_only_from_an_applied_last_beat() {
+        let placement = WorkerPlacement {
+            worktree: Worktree {
+                path: PathBuf::from("/agent/worktrees/cf7a/wu03/a1"),
+                branch: BranchName::parse("wu03/a1").unwrap(),
+                base: CommitSha::parse(&"b".repeat(40)).unwrap(),
+            },
+            control: SessionName::parse("cf7a.wu03.ctl.claude").unwrap(),
+        };
+        let result = ResultPayload {
+            outcome: Outcome::Done,
+            branch: BranchName::parse("wu03/a1").unwrap(),
+            head_sha: CommitSha::parse(&"a".repeat(40)).unwrap(),
+            criteria: Vec::new(),
+            usage: Usage::default(),
+        };
+        let session = SessionName::parse("cf7a.wu03.wrk.claude.a1f3").unwrap();
+        for (state, recorded) in [
+            (BeatState::Applied, Some(33_390)),
+            (BeatState::Unknown, None),
+        ] {
+            let evidence = evidence_of(
+                &session,
+                None,
+                FinalBeat {
+                    state,
+                    context_tokens: Some(33_390),
+                },
+            );
+            let checkpoint = Checkpointed {
+                placement: &placement,
+                result: &result,
+                evidence: Some(&evidence),
+            }
+            .record(1, "refs/tycho/pin".to_string());
+            assert_eq!(checkpoint.context_tokens, recorded, "{state:?}");
+            assert_eq!(evidence.last_beat, state);
+        }
+    }
 
     /// The figure's arrows plus the worker give-up arrow; terminal failure is checked apart.
     const EDGES: [(Lifecycle, Event, Lifecycle); 16] = [
