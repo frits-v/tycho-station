@@ -100,8 +100,9 @@ import (
 }
 
 // unscheduled: no slice in docs/slices.md closes it; the operator assigns one.
-#Slice:  "zero" | "one" | "two" | "unscheduled"
-#Record: "store" | "journal" | "forge" | "not_recorded"
+#Slice:       "zero" | "one" | "two" | "unscheduled"
+#Record:      "store" | "journal" | "forge" | "not_recorded"
+#GitHubLogin: string & =~"^[A-Za-z0-9][A-Za-z0-9-]{0,38}$"
 #Mechanism: {
 	what!:    string & strings.MinRunes(1) & strings.MaxRunes(512)
 	runs!:    string & strings.MinRunes(1) & strings.MaxRunes(256)
@@ -135,9 +136,12 @@ import (
 ]
 
 #MechanismId: "ruleset" | "ci" | "lefthook" | "post_edit_hook" | "core_directory_check" |
-	"setup" | "credential_handoff" | "spine_services"
+	"setup" | "credential_handoff" | "spine_services" | "codeowners"
 
 #Mandate: {
+	// The GitHub login CODEOWNERS names as the mandate's sole owner; xtask check-codeowners
+	// reads it back from the export so the owner it requires is never hardcoded in Rust.
+	operator_github_handle!: #GitHubLogin
 	mechanisms!: {[#MechanismId]: #Mechanism}
 	mechanisms: struct.MaxFields(16)
 	// Each numbered clause of docs/mandate.md is required by its id, and no other id is allowed;

@@ -1,13 +1,14 @@
 {
+    "operator_github_handle": "frits-v",
     "mechanisms": {
         "ruleset": {
-            "what": "Repository ruleset on the default branch: pull request required, the ci check required and up to date, signed commits, linear history, no deletion, no force push, no bypass actors.",
+            "what": "Repository ruleset on the default branch: pull request required, code-owner review required, the ci check required and up to date, signed commits, linear history, no deletion, no force push, and the repository admin as a bypass actor in pull-request mode; which bypass merges count as a mandate amendment is decided in section 11, not by the ruleset.",
             "runs": "every push and merge to the default branch",
             "record": "forge",
             "pending": false
         },
         "ci": {
-            "what": "xtask ci in the ci workflow: formatting, clippy with the workspace lints, tests, zizmor and jactionlint at pedantic, the opengrep rules after their fixtures, and the xtask checks; every step runs even after one fails. clippy, the workflow audits, opengrep, check-names, check-comments, check-rules, check-credentials, check-figures and check-config count what they examined and fail at zero. check-pr-title passes when no title is available. A code-scanning job uploads the SARIF.",
+            "what": "xtask ci in the ci workflow: formatting, clippy with the workspace lints, tests, zizmor and jactionlint at pedantic, the opengrep rules after their fixtures, and the xtask checks; every step runs even after one fails. clippy, the workflow audits, opengrep, check-names, check-comments, check-rules, check-credentials, check-figures, check-config and check-codeowners count what they examined and fail at zero. check-pr-title passes when no title is available. A code-scanning job uploads the SARIF.",
             "runs": "every pull request and push to the default branch",
             "record": "forge",
             "pending": false
@@ -47,6 +48,12 @@
             "runs": "every call to the Epic and Session objects",
             "record": "journal",
             "pending": true
+        },
+        "codeowners": {
+            "what": ".github/CODEOWNERS names the operator as the sole owner of docs/mandate.md and of this file itself. Required code-owner review and the repository admin as a pull-request-mode bypass actor are applied by the operator's ruleset change; neither xtask setup nor ci reads the ruleset, so nothing here confirms it.",
+            "runs": "every pull request to the default branch that changes docs/mandate.md or .github/CODEOWNERS",
+            "record": "forge",
+            "pending": false
         }
     },
     "clauses": {
@@ -466,9 +473,10 @@
         "13.1": {
             "requires": "Only the operator amends the mandate, by pull request, effective for work units started after the merge.",
             "mechanisms": [
-                "ruleset"
+                "ruleset",
+                "codeowners"
             ],
-            "coverage": "ruleset: every change to the default branch, the mandate included, goes through a pull request",
+            "coverage": "ruleset: every change to the default branch, the mandate included, goes through a pull request; codeowners: a CODEOWNERS entry names the operator as docs/mandate.md's owner; code-owner review and the bypass actor await the operator's ruleset change",
             "partial": true,
             "slices": [
                 "one"
@@ -777,6 +785,7 @@
         },
         "13.1": {
             "records": [
+                "forge",
                 "forge"
             ],
             "status": "partial"

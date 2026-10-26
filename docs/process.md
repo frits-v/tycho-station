@@ -21,7 +21,7 @@ is a defect.
 | Layer | Location | Runs |
 |---|---|---|
 | Lints | `Cargo.toml` `[workspace.lints]`, `clippy.toml` | every build, ci, post-edit hook |
-| Repository checks | `xtask` (`check-names`, `check-comments`, `check-rules`, `check-ledger`, `check-credentials`, `check-figures`, `check-config`, `check-commit-msg`, `check-pr-title`, `opengrep`, `workflows`, `codeql`) | ci, post-edit hook, lefthook |
+| Repository checks | `xtask` (`check-names`, `check-comments`, `check-rules`, `check-ledger`, `check-credentials`, `check-figures`, `check-config`, `check-codeowners`, `check-commit-msg`, `check-pr-title`, `opengrep`, `workflows`, `codeql`) | ci, post-edit hook, lefthook |
 | Source rules | `opengrep/rust.yml`, each rule with fixture lines in `opengrep/rust.rs` | `xtask opengrep` in ci and in lefthook pre-push when Rust or a rule changes |
 | Workflow rules | `.github/workflow-policy.cue`; zizmor, jactionlint; CodeQL's Actions queries | `xtask workflows` in ci and pre-push; `xtask codeql` in pre-push when `.github` changes; code scanning on every pull request |
 | Git hooks | `lefthook.json`, each command `cargo run -q -p xtask -- <command>` | commit-msg, pre-commit, pre-push |
