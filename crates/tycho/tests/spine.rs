@@ -711,6 +711,22 @@ fn assert_unit_handlers_private(core_ports: CorePorts) {
     );
 }
 
+/// The unit's one verify carries the claims of both its tasks.
+fn assert_one_verify_with_every_claim(gate: &FixedGate) {
+    let requests = gate.requests();
+    assert_eq!(requests.len(), 1, "one verify");
+    let tasks: Vec<&str> = requests[0]
+        .claims
+        .iter()
+        .map(|claim| claim.task.as_str())
+        .collect();
+    assert_eq!(
+        tasks,
+        ["wu01-t1", "wu01-t2"],
+        "every claim reaches the gate"
+    );
+}
+
 /// Once a session's awaitable completes, the session reads its proxy's decisions through the
 /// port and keeps them as firings and examinations on its view.
 fn assert_proxy_audit_recorded(core_ports: CorePorts, session: &str) {
@@ -786,18 +802,7 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     assert_eq!(view["head_sha"], DEFAULT_SHA);
     assert_started_with(&view, &ports);
     assert_dispatch_refuses_bad_routes(&core);
-    let requests = gate.requests();
-    assert_eq!(requests.len(), 1, "one verify");
-    let tasks: Vec<&str> = requests[0]
-        .claims
-        .iter()
-        .map(|claim| claim.task.as_str())
-        .collect();
-    assert_eq!(
-        tasks,
-        ["wu01-t1", "wu01-t2"],
-        "every claim reaches the gate"
-    );
+    assert_one_verify_with_every_claim(&gate);
     let log = spawner.log();
     assert_eq!(log.spawned.len(), 2, "one session per task: {log:?}");
     let session = &log.spawned[0].0;
