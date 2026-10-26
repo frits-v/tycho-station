@@ -688,7 +688,7 @@ impl WorkerRun {
                 if watched.is_err() {
                     kill(workflow_context, session, false).await;
                 }
-                Ok(with_evidence(session, resume_handle, watched?))
+                with_evidence(workflow_context, session, resume_handle, watched?).await
             }
             Ok(SpawnOutcome::Requeue { .. }) => Ok(AttemptEnd::exit(ExitState::Failed, false)),
             Err(error) => match spawn_refusal(error.code()) {
@@ -828,18 +828,27 @@ impl WorkerRun {
 
 /// A completed attempt's evidence: the final context size comes from the result's
 /// resolution, and counts only when the session applied the beat that carried it.
-fn with_evidence(
+async fn with_evidence(
+    workflow_context: &WorkflowContext<'_>,
     session: &SessionName,
     resume_handle: Option<ShortText>,
     end: AttemptEnd,
-) -> AttemptEnd {
-    let (Some(_), Some(last_beat)) = (&end.result, end.last_beat) else {
-        return end;
-    };
-    AttemptEnd {
+) -> Result<AttemptEnd, TerminalError> {
+    if end.result.is_none() {
+        return Ok(end);
+    }
+    // Kept so a run journaled by an earlier build replays this step after an upgrade; the
+    // context size comes from the resolution, not from this answer.
+    workflow_context
+        .object_client::<SessionClient>(session.to_string())
+        .status()
+        .call()
+        .await?;
+    let last_beat = end.last_beat.unwrap_or(FinalBeat::NOT_RECORDED);
+    Ok(AttemptEnd {
         evidence: Some(evidence_of(session, resume_handle, last_beat)),
         ..end
-    }
+    })
 }
 
 /// The evidence a completed result carries; no context size unless the beat was applied.

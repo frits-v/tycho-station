@@ -770,6 +770,73 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     );
     assert_eq!(state["metered"]["charged"], 0);
     assert_eq!(state["worker_slots"]["used"], 0);
+    assert_status_read_follows_each_result(core_ports);
+}
+
+/// Each `WorkerRun` journal, entry by entry, from Restate's introspection.
+fn worker_run_journals(core_ports: CorePorts) -> Vec<serde_json::Value> {
+    let body = serde_json::json!({
+        "query": "SELECT j.id AS id, j.index AS index, j.entry_type AS entry_type, \
+                  j.entry_json AS entry_json FROM sys_journal j JOIN sys_invocation i ON j.id = i.id \
+                  WHERE i.target_service_name = 'WorkerRun' ORDER BY j.id, j.index"
+    })
+    .to_string();
+    let text = client()
+        .post(core_ports.admin_url("/query"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
+        .body(body)
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    value["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("admin query refused: {text}"))
+        .clone()
+}
+
+/// A completed result is followed in the `WorkerRun` journal by a call to the session's
+/// `status`, as earlier builds journaled it, so a run they journaled replays on this one.
+fn assert_status_read_follows_each_result(core_ports: CorePorts) {
+    let rows = worker_run_journals(core_ports);
+    let target = |row: &serde_json::Value| -> Option<(String, String)> {
+        let entry: serde_json::Value = serde_json::from_str(row["entry_json"].as_str()?).ok()?;
+        let object = &entry["Command"]["Call"]["request"]["invocation_target"]["VirtualObject"];
+        Some((
+            object["name"].as_str()?.to_string(),
+            object["handler"].as_str()?.to_string(),
+        ))
+    };
+    let mut results = 0_u32;
+    let mut ids: Vec<&str> = rows.iter().filter_map(|row| row["id"].as_str()).collect();
+    ids.dedup();
+    for id in &ids {
+        let journal: Vec<&serde_json::Value> = rows.iter().filter(|row| row["id"] == *id).collect();
+        let Some(signal) = journal
+            .iter()
+            .position(|row| row["entry_type"] == "Notification: Signal")
+        else {
+            continue;
+        };
+        results = results.saturating_add(1);
+        let next_call = journal[signal..]
+            .iter()
+            .find(|row| row["entry_type"] == "Command: Call")
+            .and_then(|row| target(row));
+        println!("evidence: {id}: the first call after the result is {next_call:?}");
+        assert_eq!(
+            next_call,
+            Some(("Session".to_string(), "status".to_string())),
+            "{id}"
+        );
+    }
+    assert!(
+        results > 0,
+        "no WorkerRun journal holds a result: {} entries",
+        rows.len()
+    );
 }
 
 #[test]
