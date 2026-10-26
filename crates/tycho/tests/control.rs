@@ -607,7 +607,7 @@ impl Harness {
             WAIT_LIMIT,
             || {
                 let view: serde_json::Value =
-                    serde_json::from_str(&ingress_json(core_ports, &status, "")?).ok()?;
+                    serde_json::from_str(&ingress_empty(core_ports, &status)?).ok()?;
                 (view["proxy_audit"]["state"] == "read").then(|| view["proxy_audit"].clone())
             },
         );
@@ -707,6 +707,24 @@ fn wait_until<T>(what: &str, limit: Duration, mut probe: impl FnMut() -> Option<
         thread::sleep(Duration::from_millis(250));
     }
     panic!("{what} did not happen within {limit:?}");
+}
+
+/// A call to a handler that takes no input, which Restate's ingress wants with no body and
+/// no content type.
+fn ingress_empty(core_ports: CorePorts, path: &str) -> Option<String> {
+    let response = reqwest::blocking::Client::new()
+        .post(core_ports.ingress_url(path))
+        .timeout(Duration::from_mins(1))
+        .send()
+        .ok()?;
+    let status = response.status();
+    let text = response.text().ok()?;
+    if status.is_success() {
+        Some(text)
+    } else {
+        println!("evidence: POST {path} -> {status} {text}");
+        None
+    }
 }
 
 fn ingress_json(core_ports: CorePorts, path: &str, body: &str) -> Option<String> {
