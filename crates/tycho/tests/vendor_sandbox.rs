@@ -360,11 +360,30 @@ fn a_worktree_cannot_turn_claude_s_sandbox_back_on_under_the_launcher_s_settings
         ("the same files, read without the flag", &files_read),
         ("launcher on", &launcher_on),
     ];
+    assert_settings_cells(&cells);
+}
+
+/// Every cell reached its init and its result; the outcomes and the offered tools match the
+/// layer each cell's settings came from.
+fn assert_settings_cells(cells: &[(&str, &Run); 4]) {
     let outcomes: Vec<BashOutcome> = cells
         .iter()
         .map(|(name, run)| {
             let outcome = decode_bash(&run.stream);
-            println!("evidence: {name}: {outcome:?}; proxy: {}", run.proxy);
+            let tools = init_tools(&run.stream);
+            println!(
+                "evidence: {name}: {outcome:?}; Bash offered: {:?}; result event: {}; proxy: {}",
+                tools
+                    .as_ref()
+                    .map(|tools| tools.iter().any(|tool| tool == "Bash")),
+                has_result(&run.stream),
+                run.proxy
+            );
+            // A run that never reached its init or its result shows nothing about settings.
+            assert!(
+                tools.is_some() && has_result(&run.stream),
+                "{name}: the run did not complete"
+            );
             if !matches!(outcome, BashOutcome::Ran | BashOutcome::VendorSandboxFailed) {
                 println!(
                     "stderr: {}",
@@ -382,11 +401,72 @@ fn a_worktree_cannot_turn_claude_s_sandbox_back_on_under_the_launcher_s_settings
             &BashOutcome::VendorSandboxFailed
         ]
     );
+    // The flagless cell is told apart by the session's own tool list: the files' deny rule
+    // takes Bash out of it, which a run that never started cannot show.
+    let offered: Vec<bool> = cells
+        .iter()
+        .map(|(_, run)| {
+            init_tools(&run.stream)
+                .unwrap_or_default()
+                .iter()
+                .any(|tool| tool == "Bash")
+        })
+        .collect();
+    assert_eq!(
+        offered,
+        [true, true, false, true],
+        "the planted files were not read without the flag, so the second cell shows nothing"
+    );
     assert!(
         matches!(outcomes[2], BashOutcome::Denied | BashOutcome::NoToolResult),
-        "the planted files were not read without the flag, so the second cell shows nothing: {:?}",
+        "{:?}",
         outcomes[2]
     );
+    // The launcher's object turns auto memory off in every cell, so `system/init` names no
+    // memory directory, which with auto memory on lies in the agent-writable home.
+    for (name, run) in cells {
+        assert!(!init_names_memory(&run.stream), "{name}: auto memory is on");
+    }
+}
+
+/// Whether `system/init` names a memory directory.
+fn init_names_memory(stream: &str) -> bool {
+    stream
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|event| {
+            event["subtype"] == "init"
+                && event["memory_paths"]
+                    .as_object()
+                    .is_some_and(|paths| !paths.is_empty())
+        })
+}
+
+/// The tools `system/init` offers the session; `None` when the stream has no init event.
+fn init_tools(stream: &str) -> Option<Vec<String>> {
+    stream
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find(|event| event["type"] == "system" && event["subtype"] == "init")
+        .map(|event| {
+            event["tools"]
+                .as_array()
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(|tool| tool.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+}
+
+/// Whether the stream ends its turn with a `result` event.
+fn has_result(stream: &str) -> bool {
+    stream
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|event| event["type"] == "result")
 }
 
 /// The keys of Claude's global configuration in the scratch home and their values.

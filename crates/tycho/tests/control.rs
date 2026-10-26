@@ -56,6 +56,7 @@ use tycho::spawn::{
     send_line, spawn_session,
 };
 use tycho::vendors::claude_control::{ClaudeControl, RelayMode};
+use tycho::vendors::claude_worker::SETTING_SOURCES_NONE;
 use tycho::vendors::control::{
     AddressTarget, ContextReport, ControlCommand, ControlLaunch, Delivery, Observation,
     PermissionMode, SessionVendor, VendorError, VendorSessionId, WaitingFor,
@@ -365,6 +366,9 @@ struct Harness {
     controls: Vec<Control>,
     /// The settings the core hands the adapter for the next spawn.
     sandbox_settings: String,
+    /// The setting sources word the next spawn carries; the adapter's, except in a positive
+    /// control.
+    setting_sources: &'static str,
     /// Held until the core is stopped, after the teardown in `drop`.
     _port_claim: PortClaim,
 }
@@ -428,6 +432,7 @@ impl Harness {
             work,
             controls: Vec::new(),
             sandbox_settings: CLAUDE_SANDBOX_OFF.to_string(),
+            setting_sources: SETTING_SOURCES_NONE,
         };
         harness.start()
     }
@@ -492,10 +497,19 @@ impl Harness {
                 resume,
             })
             .unwrap();
-        println!("evidence: control command {:?}", command.argv);
-        command
+        let argv: Vec<&str> = command
             .argv
             .iter()
+            .map(|word| {
+                if word == SETTING_SOURCES_NONE {
+                    self.setting_sources
+                } else {
+                    word.as_str()
+                }
+            })
+            .collect();
+        println!("evidence: control command {argv:?}");
+        argv.into_iter()
             .map(|word| ShortText::parse(word).unwrap())
             .collect()
     }
@@ -1004,6 +1018,24 @@ fn plant_worktree_settings(harness: &Harness) -> PathBuf {
     marker
 }
 
+/// The positive control of the worktree cell: the same files, read by a `dontAsk` session
+/// started with only the project and local sources, run their `SessionStart` hook. The user's
+/// sources stay out, so the developer's own hooks and plugins do not run in the suite.
+fn worktree_files_apply_without_the_flag(harness: &mut Harness, marker: &Path) {
+    let reading = new_control("d2");
+    harness.setting_sources = "--setting-sources=project,local";
+    harness.spawn(&reading, PermissionMode::DontAsk, false);
+    harness.setting_sources = SETTING_SOURCES_NONE;
+    wait_until("the worktree's SessionStart hook", WAIT_LIMIT, || {
+        marker.exists().then_some(())
+    });
+    println!(
+        "evidence: with the project and local sources the worktree's hook marker exists: {}",
+        marker.exists()
+    );
+    harness.kill(&reading);
+}
+
 /// The same write in `dontAsk` is decided without a prompt: the session never waits. The
 /// worktree's settings files are not read: their `SessionStart` hook never runs, so neither
 /// their sandbox nor any other key applies to a control session. The same hook in the
@@ -1065,6 +1097,7 @@ fn dont_ask_never_waits(harness: &mut Harness) {
         "a control session read the worktree's settings files"
     );
     harness.kill(&dont_ask);
+    worktree_files_apply_without_the_flag(harness, &marker);
 }
 
 #[test]
@@ -1147,8 +1180,9 @@ fn a_killed_session_resumes_under_its_id_with_the_settings_passed_again() {
     assert!(command.contains(&format!("--resume {}", resumed.vendor_session.as_str())));
     assert!(command.contains("\"crossSessionInbound\":\"accept\""));
     assert!(command.contains("\"sandbox\":{\"enabled\":false}"));
+    assert!(command.contains("\"autoMemoryEnabled\":false"));
     assert_eq!(command.matches("--setting-sources").count(), 1, "{command}");
-    assert!(command.contains(" --setting-sources="), "{command}");
+    assert!(command.ends_with(" --setting-sources="), "{command}");
     let record = instruct(
         core_ports,
         &resumed,

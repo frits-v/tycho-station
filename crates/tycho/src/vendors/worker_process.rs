@@ -584,7 +584,8 @@ fn push_permission(settings: &mut Value, key: &str, value: Value) -> Result<(), 
 ///
 /// The escalation directory joins the session's directories, so the vendor's permission
 /// rules let it write the question there, and nothing else of the spool does; the station's
-/// sandbox already grants that directory. Bash is allowed (`WORKER_ALLOWED_TOOLS`).
+/// sandbox already grants that directory. Bash is allowed (`WORKER_ALLOWED_TOOLS`), and auto
+/// memory is off (`AUTO_MEMORY_KEY`).
 pub fn worker_settings(base: &str, escalation_dir: &Path) -> Result<String, String> {
     let mut settings: Value =
         serde_json::from_str(base).map_err(|error| format!("sandbox settings: {error}"))?;
@@ -596,6 +597,13 @@ pub fn worker_settings(base: &str, escalation_dir: &Path) -> Result<String, Stri
     for tool in WORKER_ALLOWED_TOOLS {
         push_permission(&mut settings, "allow", Value::String(tool.to_string()))?;
     }
+    settings
+        .as_object_mut()
+        .ok_or_else(|| "sandbox settings: not an object".to_string())?
+        .insert(
+            crate::vendors::claude_worker::AUTO_MEMORY_KEY.to_string(),
+            Value::Bool(false),
+        );
     serde_json::to_string(&settings).map_err(|error| error.to_string())
 }
 
@@ -992,6 +1000,7 @@ pub mod tests {
         );
         assert_eq!(settings["permissions"]["allow"], json!(["Bash"]));
         assert_eq!(settings["sandbox"], json!({"enabled": false}));
+        assert_eq!(settings["autoMemoryEnabled"], json!(false));
         let text = settings.to_string();
         assert!(
             !text.contains("result.json") && !text.contains("progress.json"),

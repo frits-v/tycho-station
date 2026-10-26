@@ -18,6 +18,11 @@ pub const CLAUDE_PINNED_VERSION: &str = "2.1.295";
 /// agent, command or MCP server from the user or the worktree. One word with `=`, since a
 /// control command's words travel as `ShortText`, which is never empty.
 pub const SETTING_SOURCES_NONE: &str = "--setting-sources=";
+/// The settings key for auto memory, which every station session has off.
+///
+/// The memory files live in the agent's home, the agent writes them, and with auto memory on
+/// a session reads them under `--setting-sources=` too.
+pub const AUTO_MEMORY_KEY: &str = "autoMemoryEnabled";
 const CLAUDE_BANNER_SUFFIX: &str = "(Claude Code)";
 const HTTP_TOO_MANY_REQUESTS: u64 = 429;
 const HTTP_UNAUTHORIZED: u64 = 401;
@@ -408,13 +413,13 @@ mod tests {
         assert_eq!(stream.refusal, None);
         assert_eq!(stream.unrecognised, 0);
         assert_eq!(stream.events, 6);
-        assert_eq!(stream.context_tokens, Some(2 + 16_595 + 193));
+        assert_eq!(stream.context_tokens, Some(2 + 15_779 + 195));
         assert_eq!(
             stream.usage,
             Usage {
-                input_tokens: 4 + 6_449 + 26_934,
-                output_tokens: 238,
-                cost_micro_dollars: 1_679,
+                input_tokens: 4 + 4_062 + 27_691,
+                output_tokens: 242,
+                cost_micro_dollars: 1_211,
             }
         );
         assert_eq!(
