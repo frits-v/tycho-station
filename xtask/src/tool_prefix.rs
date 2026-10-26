@@ -1232,12 +1232,12 @@ mod tests {
 
     #[test]
     fn the_agent_pins_come_from_the_repository_mise_toml() {
-        assert_eq!(pinned_version(AgentTool::Claude), Ok("2.1.280".to_string()));
+        assert_eq!(pinned_version(AgentTool::Claude), Ok("2.1.295".to_string()));
         assert_eq!(pinned_version(AgentTool::Codex), Ok("0.160.1".to_string()));
         assert_eq!(pinned_version(AgentTool::Zmx), Ok("0.8.1".to_string()));
         assert_eq!(
             global_config(),
-            Ok("[tools]\nclaude = \"2.1.280\"\ncodex = \"0.160.1\"\nzmx = \"0.8.1\"\n".to_string())
+            Ok("[tools]\nclaude = \"2.1.295\"\ncodex = \"0.160.1\"\nzmx = \"0.8.1\"\n".to_string())
         );
     }
 
@@ -1261,7 +1261,7 @@ mod tests {
         }
     }
 
-    const AGENT_WORDS: &str = "PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise";
+    const AGENT_WORDS: &str = "PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.295:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin MISE_DATA_DIR=/Users/Shared/tycho/mise MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml MISE_CACHE_DIR=/Users/Shared/tycho/cache MISE_OVERRIDE_CONFIG_FILENAMES=/Users/Shared/tycho/no-project-config MISE_OVERRIDE_TOOL_VERSIONS_FILENAMES=none MISE_OFFLINE=1 MISE_AUTO_INSTALL=false MISE_STATE_DIR=/Users/tycho-agent/.local/state/mise";
 
     #[test]
     fn the_agent_environment_puts_the_pinned_installs_on_path_and_no_shim() {
@@ -1276,8 +1276,8 @@ mod tests {
             PathBuf::from("/Users/Shared/tycho/mise/installs/codex/0.160.1/bin/codex")
         );
         assert_eq!(
-            prefix.tool_binary(AgentTool::Claude, "2.1.280"),
-            PathBuf::from("/Users/Shared/tycho/mise/installs/claude/2.1.280/claude")
+            prefix.tool_binary(AgentTool::Claude, "2.1.295"),
+            PathBuf::from("/Users/Shared/tycho/mise/installs/claude/2.1.295/claude")
         );
     }
 
@@ -1481,8 +1481,8 @@ mod tests {
     fn link_targets_resolve_by_their_components() {
         let link = Path::new("/p/mise/installs/claude/latest");
         assert_eq!(
-            lexical_target(link, Path::new("./2.1.280")),
-            Some(PathBuf::from("/p/mise/installs/claude/2.1.280"))
+            lexical_target(link, Path::new("./2.1.295")),
+            Some(PathBuf::from("/p/mise/installs/claude/2.1.295"))
         );
         assert_eq!(
             lexical_target(link, Path::new("../../../../x")),
@@ -1504,8 +1504,8 @@ mod tests {
         assert_eq!(decode_mise_version("mise WARN something\n"), None);
         assert_eq!(decode_mise_version(""), None);
         assert_eq!(
-            decode_which(true, "/p/mise/installs/claude/2.1.280/claude\n", ""),
-            Which::Path(PathBuf::from("/p/mise/installs/claude/2.1.280/claude"))
+            decode_which(true, "/p/mise/installs/claude/2.1.295/claude\n", ""),
+            Which::Path(PathBuf::from("/p/mise/installs/claude/2.1.295/claude"))
         );
         assert!(matches!(
             decode_which(true, "claude\n", ""),
@@ -1670,7 +1670,7 @@ mod tests {
                 &environment,
                 &ManifestRead::Absent,
                 AgentTool::Claude,
-                "2.1.280"
+                "2.1.295"
             ),
             ToolState::Absent
         );

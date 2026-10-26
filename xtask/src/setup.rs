@@ -3475,7 +3475,7 @@ mod tests {
     fn login_probes_stop_before_exec_unless_the_tool_is_installed() {
         let ls = MiseLs::Json(
             r#"{
-                "claude": [{"version": "2.1.280", "installed": false, "active": true}],
+                "claude": [{"version": "2.1.295", "installed": false, "active": true}],
                 "entire": [{"version": "0.11.4", "installed": true, "active": true}]
             }"#
             .to_string(),
@@ -3672,10 +3672,10 @@ mod tests {
         assert_eq!(decode_entire_version("entire 0.11.4\n"), None);
 
         assert_eq!(
-            decode_claude_version("2.1.280 (Claude Code)\n"),
-            Some("2.1.280".to_string())
+            decode_claude_version("2.1.295 (Claude Code)\n"),
+            Some("2.1.295".to_string())
         );
-        assert_eq!(decode_claude_version("2.1.280\n"), None);
+        assert_eq!(decode_claude_version("2.1.295\n"), None);
 
         assert_eq!(
             decode_codex_version("codex-cli 0.160.1\n"),

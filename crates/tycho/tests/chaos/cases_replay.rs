@@ -15,7 +15,7 @@ use tycho::entire_graph::EntireGraph;
 use tycho::services::doubles::{FixedGate, RecordingSpawner};
 use tycho::services::merge_gate::GateVerdict;
 use tycho::services::spawner::SpawnSpec;
-use tycho::spool::check_result_envelope;
+use tycho::spool::{BeatState, FinalBeat, result_resolution};
 use tycho_harness::verify::{VerifyOptions, unit_passed, verify_unit};
 use tycho_types::envelope::CommitSha;
 use tycho_types::service::WorkUnitId;
@@ -36,7 +36,11 @@ type Acks = Arc<Mutex<Vec<(Instant, u16)>>>;
 /// The wire bytes a launcher resolves with, checked the way the launcher checks its spool.
 fn result_json(spec: &SpawnSpec, head: &str) -> String {
     let envelope = result_envelope(&spec.session, &branch_of(spec), head);
-    check_result_envelope(&envelope, &spec.session).unwrap()
+    let last_beat = FinalBeat {
+        state: BeatState::Applied,
+        context_tokens: Some(33_390),
+    };
+    result_resolution(&envelope, &spec.session, last_beat).unwrap()
 }
 
 /// Resolves the awaitable through ingress after a delay, as a launcher's exit trap would.

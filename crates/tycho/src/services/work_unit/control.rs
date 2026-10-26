@@ -176,7 +176,11 @@ mod tests {
     fn the_control_plan_is_the_vendor_argv_and_its_resume_handle() {
         let vendor = ClaudeControl::new(PathBuf::from("/opt/claude"), PathBuf::from("/c"), 501);
         let control_plan = plan(&vendor, &launch()).unwrap();
-        assert_eq!(control_plan.argv.len(), 13);
+        assert_eq!(control_plan.argv.len(), 14);
+        assert_eq!(
+            control_plan.argv.last().map(ShortText::as_str),
+            Some("--setting-sources=")
+        );
         assert_eq!(
             control_plan.resume_handle.as_str(),
             "56736586-cf23-4aaa-955f-7ea9c1fb1e15"

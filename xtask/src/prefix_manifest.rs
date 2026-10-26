@@ -310,8 +310,8 @@ mod tests {
             tools: BTreeMap::from([(
                 "claude".to_string(),
                 ToolRecord {
-                    version: "2.1.280".to_string(),
-                    path: PathBuf::from("/p/mise/installs/claude/2.1.280/claude"),
+                    version: "2.1.295".to_string(),
+                    path: PathBuf::from("/p/mise/installs/claude/2.1.295/claude"),
                     install_sha256: "d".repeat(64),
                 },
             )]),

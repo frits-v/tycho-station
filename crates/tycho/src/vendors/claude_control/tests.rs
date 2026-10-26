@@ -29,8 +29,7 @@ const REGISTRY_NO_STATUS: &str = include_str!("../../fixtures/claude-registry-no
 const TRANSCRIPT_TAIL: &str = include_str!("../../fixtures/claude-transcript-tail.jsonl");
 const SESSION_ID: &str = "56736586-cf23-4aaa-955f-7ea9c1fb1e15";
 // serde_json keeps insertion order (`preserve_order`): the core's settings, then the adapter's.
-const SETTINGS: &str =
-    r#"{"sandbox":{"enabled":false},"crossSessionInbound":"accept","autoCompactWindow":1000000}"#;
+const SETTINGS: &str = r#"{"sandbox":{"enabled":false},"crossSessionInbound":"accept","autoCompactWindow":1000000,"autoMemoryEnabled":false}"#;
 
 fn scratch(test: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("tcc-{test}-{}", std::process::id()));
@@ -88,7 +87,7 @@ fn go(control: &ClaudeControl) -> Delivery {
 }
 
 #[test]
-fn the_command_line_is_exact_and_resume_re_passes_the_settings() {
+fn the_command_line_is_exact_and_resume_re_passes_the_settings_and_no_setting_sources() {
     let command = adapter(Path::new("/c"))
         .control_command(&launch(false))
         .unwrap();
@@ -106,6 +105,7 @@ fn the_command_line_is_exact_and_resume_re_passes_the_settings() {
         SESSION_ID,
         "--settings",
         SETTINGS,
+        "--setting-sources=",
     ];
     assert_eq!(command.argv, expected);
     assert_eq!(command.terminal, VendorTerminal::Inherit);
@@ -119,12 +119,14 @@ fn the_command_line_is_exact_and_resume_re_passes_the_settings() {
     let mut expected_resume = expected.map(str::to_string).to_vec();
     expected_resume[9] = "--resume".to_string();
     assert_eq!(resumed.argv, expected_resume);
-    assert!(
-        command
-            .argv
+    for argv in [&command.argv, &resumed.argv] {
+        assert!(argv.iter().all(|word| ShortText::parse(word).is_ok()));
+        let sources: Vec<&String> = argv
             .iter()
-            .all(|word| ShortText::parse(word).is_ok())
-    );
+            .filter(|word| word.starts_with("--setting-sources"))
+            .collect();
+        assert_eq!(sources, ["--setting-sources="], "{argv:?}");
+    }
 }
 
 #[test]
@@ -151,11 +153,11 @@ fn effort_model_and_sandbox_are_checked() {
     assert!(settings_json(r#"{"sandbox":true}"#).is_err());
     let wide = format!(r#"{{"sandbox":{{"x":"{}"}}}}"#, "y".repeat(TEXT_MAX_BYTES));
     assert!(settings_json(&wide).is_err(), "over the argument bound");
-    let loose =
-        r#"{"sandbox":{"enabled":true},"crossSessionInbound":"refuse","autoCompactWindow":100000}"#;
+    let loose = r#"{"sandbox":{"enabled":true},"crossSessionInbound":"refuse","autoCompactWindow":100000,"autoMemoryEnabled":true}"#;
     let settings: Value = serde_json::from_str(&settings_json(loose).unwrap()).unwrap();
     assert_eq!(settings["crossSessionInbound"], "accept");
     assert_eq!(settings["autoCompactWindow"], AUTO_COMPACT_WINDOW_MAX);
+    assert_eq!(settings["autoMemoryEnabled"], false);
 }
 
 #[test]

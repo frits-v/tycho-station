@@ -14,6 +14,7 @@ use tycho_types::task_packet::Effort;
 
 use crate::code_graph::{BuildReport, Checkout, CodeGraph, GraphError, StepKey};
 use crate::repositories::{ProjectName, Repositories, Worktree};
+use crate::spool::BeatState;
 use crate::vendors::worker::{ModelName, VendorSessionId, WorkerArgs};
 
 /// The headless worker side of the ports; absent, worker runs take the request's argv as is.
@@ -129,8 +130,16 @@ pub struct WorkerTaskRequest {
 pub struct WorkerEvidence {
     pub session: SessionName,
     pub resume_handle: Option<String>,
-    /// `None` when the session has no view to read it from.
+    /// The final context size, only when the session applied the last heartbeat that
+    /// carried it (`FinalBeat::confirmed_context_tokens`); `None` otherwise.
     pub context_tokens: Option<u64>,
+    /// What became of that heartbeat, as the result's resolution reported it.
+    #[serde(default = "beat_not_recorded")]
+    pub last_beat: BeatState,
+}
+
+const fn beat_not_recorded() -> BeatState {
+    BeatState::NotRecorded
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

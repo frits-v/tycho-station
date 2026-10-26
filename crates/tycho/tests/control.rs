@@ -56,6 +56,7 @@ use tycho::spawn::{
     send_line, spawn_session,
 };
 use tycho::vendors::claude_control::{ClaudeControl, RelayMode};
+use tycho::vendors::claude_worker::SETTING_SOURCES_NONE;
 use tycho::vendors::control::{
     AddressTarget, ContextReport, ControlCommand, ControlLaunch, Delivery, Observation,
     PermissionMode, SessionVendor, VendorError, VendorSessionId, WaitingFor,
@@ -72,9 +73,11 @@ const WAIT_LIMIT: Duration = Duration::from_mins(2);
 const TURN_LIMIT: Duration = Duration::from_secs(150);
 const MODEL: &str = "haiku";
 const TRUST_DIALOG: &str = "Quick safety check";
-// Keeps the developer's own hooks and plugins out of the test sessions; the agent user's
-// settings are core-owned, so the adapter itself never passes this.
-const TEST_SETTING_SOURCES: [&str; 2] = ["--setting-sources", "project,local"];
+/// Claude's own sandbox on, as a worktree could ask for it.
+const WORKTREE_SANDBOX_ON: &str =
+    r#"{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false}}"#;
+const WORKTREE_HOOK_MARKER: &str = "worktree-hook.marker";
+const LAUNCHER_HOOK_MARKER: &str = "launcher-hook.marker";
 
 fn mise_which(tool: &str) -> PathBuf {
     let output = Command::new("mise")
@@ -361,6 +364,11 @@ struct Harness {
     force_relay: Arc<AtomicBool>,
     work: PathBuf,
     controls: Vec<Control>,
+    /// The settings the core hands the adapter for the next spawn.
+    sandbox_settings: String,
+    /// The setting sources word the next spawn carries; the adapter's, except in a positive
+    /// control.
+    setting_sources: &'static str,
     /// Held until the core is stopped, after the teardown in `drop`.
     _port_claim: PortClaim,
 }
@@ -372,7 +380,9 @@ impl Harness {
         let claim = claim_ports(&home);
         let agent = user_home().join(format!(".tcc-{tag}-{pid}"));
         let prefix_root = user_home().join(format!(".tcp-{tag}-{pid}"));
-        remove_stale(&[&home, &agent, &prefix_root]);
+        // No pid in the name, so the vendor's per-directory entries stay one per case.
+        let work = user_home().join(format!(".tycho-test-control-work-{tag}"));
+        remove_stale(&[&home, &agent, &prefix_root, &work]);
         let zmx_binary = mise_which("zmx");
         let restate_server = mise_which("restate-server");
         let prefix = scratch_prefix(&prefix_root, &zmx_binary);
@@ -384,11 +394,6 @@ impl Harness {
         )
         .unwrap()
         .with_port_offset(claim.ports.offset);
-        // No pid in the name, so the vendor's per-directory entries stay one per case.
-        let work = user_home().join(format!(".tycho-test-control-work-{tag}"));
-        if work.exists() {
-            fs::remove_dir_all(&work).unwrap();
-        }
         let dirs = AgentDirs::new(agent.clone()).unwrap();
         let claude = ClaudeControl::new(
             prefix.tool("claude").unwrap().to_path_buf(),
@@ -426,6 +431,8 @@ impl Harness {
             config,
             work,
             controls: Vec::new(),
+            sandbox_settings: CLAUDE_SANDBOX_OFF.to_string(),
+            setting_sources: SETTING_SOURCES_NONE,
         };
         harness.start()
     }
@@ -485,17 +492,24 @@ impl Harness {
                 model: MODEL.to_string(),
                 effort: Effort::Low,
                 permission,
-                sandbox_settings: CLAUDE_SANDBOX_OFF.to_string(),
+                sandbox_settings: self.sandbox_settings.clone(),
                 working_dir: AbsolutePath::parse(&self.work.display().to_string()).unwrap(),
                 resume,
             })
             .unwrap();
-        println!("evidence: control command {:?}", command.argv);
-        command
+        let argv: Vec<&str> = command
             .argv
             .iter()
-            .map(String::as_str)
-            .chain(TEST_SETTING_SOURCES)
+            .map(|word| {
+                if word == SETTING_SOURCES_NONE {
+                    self.setting_sources
+                } else {
+                    word.as_str()
+                }
+            })
+            .collect();
+        println!("evidence: control command {argv:?}");
+        argv.into_iter()
             .map(|word| ShortText::parse(word).unwrap())
             .collect()
     }
@@ -983,11 +997,59 @@ fn relay_reaches_the_session(harness: &Harness, control: &Control) {
     assert!(posted.contains("\"state\":\"posted\""), "{posted}");
 }
 
-/// The same write in `dontAsk` is decided without a prompt: the session never waits.
+/// A `SessionStart` hook that touches `marker`.
+fn touch_hook(marker: &Path) -> serde_json::Value {
+    serde_json::json!({"SessionStart": [{"hooks": [{
+        "type": "command",
+        "command": format!("/usr/bin/touch {}", marker.display()),
+    }]}]})
+}
+
+/// A worktree settings file that turns Claude's sandbox on and runs a `SessionStart` hook.
+fn plant_worktree_settings(harness: &Harness) -> PathBuf {
+    let marker = harness.file(WORKTREE_HOOK_MARKER);
+    let mut settings: serde_json::Value = serde_json::from_str(WORKTREE_SANDBOX_ON).unwrap();
+    settings["hooks"] = touch_hook(&marker);
+    let dir = harness.file(".claude");
+    fs::create_dir_all(&dir).unwrap();
+    for name in ["settings.json", "settings.local.json"] {
+        fs::write(dir.join(name), settings.to_string()).unwrap();
+    }
+    marker
+}
+
+/// The positive control of the worktree cell: the same files, read by a `dontAsk` session
+/// started with only the project and local sources, run their `SessionStart` hook. The user's
+/// sources stay out, so the developer's own hooks and plugins do not run in the suite.
+fn worktree_files_apply_without_the_flag(harness: &mut Harness, marker: &Path) {
+    let reading = new_control("d2");
+    harness.setting_sources = "--setting-sources=project,local";
+    harness.spawn(&reading, PermissionMode::DontAsk, false);
+    harness.setting_sources = SETTING_SOURCES_NONE;
+    wait_until("the worktree's SessionStart hook", WAIT_LIMIT, || {
+        marker.exists().then_some(())
+    });
+    println!(
+        "evidence: with the project and local sources the worktree's hook marker exists: {}",
+        marker.exists()
+    );
+    harness.kill(&reading);
+}
+
+/// The same write in `dontAsk` is decided without a prompt: the session never waits. The
+/// worktree's settings files are not read: their `SessionStart` hook never runs, so neither
+/// their sandbox nor any other key applies to a control session. The same hook in the
+/// launcher's settings object runs, which shows the session ran its start hooks.
 fn dont_ask_never_waits(harness: &mut Harness) {
     let core_ports = harness.config.ports;
     let dont_ask = new_control("d1");
+    let marker = plant_worktree_settings(harness);
+    let launcher_marker = harness.file(LAUNCHER_HOOK_MARKER);
+    let mut settings: serde_json::Value = serde_json::from_str(CLAUDE_SANDBOX_OFF).unwrap();
+    settings["hooks"] = touch_hook(&launcher_marker);
+    harness.sandbox_settings = settings.to_string();
     harness.spawn(&dont_ask, PermissionMode::DontAsk, false);
+    harness.sandbox_settings = CLAUDE_SANDBOX_OFF.to_string();
     instruct(
         core_ports,
         &dont_ask,
@@ -1021,7 +1083,21 @@ fn dont_ask_never_waits(harness: &mut Harness) {
             .any(|seen| matches!(seen, Observation::Waiting { .. }))
     );
     assert!(matches!(observed.last(), Some(Observation::Idle { .. })));
+    println!(
+        "evidence: after the turn the launcher's hook marker exists: {}; the worktree's: {}",
+        launcher_marker.exists(),
+        marker.exists()
+    );
+    assert!(
+        launcher_marker.exists(),
+        "the launcher's SessionStart hook did not run, so the worktree's absence shows nothing"
+    );
+    assert!(
+        !marker.exists(),
+        "a control session read the worktree's settings files"
+    );
     harness.kill(&dont_ask);
+    worktree_files_apply_without_the_flag(harness, &marker);
 }
 
 #[test]
@@ -1104,6 +1180,9 @@ fn a_killed_session_resumes_under_its_id_with_the_settings_passed_again() {
     assert!(command.contains(&format!("--resume {}", resumed.vendor_session.as_str())));
     assert!(command.contains("\"crossSessionInbound\":\"accept\""));
     assert!(command.contains("\"sandbox\":{\"enabled\":false}"));
+    assert!(command.contains("\"autoMemoryEnabled\":false"));
+    assert_eq!(command.matches("--setting-sources").count(), 1, "{command}");
+    assert!(command.ends_with(" --setting-sources="), "{command}");
     let record = instruct(
         core_ports,
         &resumed,

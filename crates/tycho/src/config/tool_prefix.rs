@@ -208,7 +208,7 @@ pub mod tests {
     pub const MANIFEST_TEXT: &str = r#"{
   "schema_version": 2,
   "tools": {
-    "claude": {"version": "2.1.280", "path": "/Users/Shared/tycho/mise/installs/claude/2.1.280/claude", "install_sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+    "claude": {"version": "2.1.295", "path": "/Users/Shared/tycho/mise/installs/claude/2.1.295/claude", "install_sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
     "codex": {"version": "0.160.1", "path": "/Users/Shared/tycho/mise/installs/codex/0.160.1/bin/codex", "install_sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
     "zmx": {"version": "0.8.1", "path": "/Users/Shared/tycho/mise/installs/zmx/0.8.1/zmx", "install_sha256": "0000000000000000000000000000000000000000000000000000000000000000"}
   }
@@ -262,7 +262,7 @@ pub mod tests {
         assert_eq!(
             prefix.install_dir("claude"),
             Some(PathBuf::from(
-                "/Users/Shared/tycho/mise/installs/claude/2.1.280"
+                "/Users/Shared/tycho/mise/installs/claude/2.1.295"
             ))
         );
         assert_eq!(prefix.install_dir("entire"), None);
@@ -273,13 +273,13 @@ pub mod tests {
         let prefix = production();
         assert_eq!(
             prefix.path(),
-            "/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin:/usr/sbin:/sbin"
+            "/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.295:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin:/usr/sbin:/sbin"
         );
         assert!(!prefix.path().contains("shims"));
         assert_eq!(
             prefix.tool("claude"),
             Some(Path::new(
-                "/Users/Shared/tycho/mise/installs/claude/2.1.280/claude"
+                "/Users/Shared/tycho/mise/installs/claude/2.1.295/claude"
             ))
         );
         let scratch = ToolPrefix::new(PathBuf::from("/tmp/prefix")).unwrap();
@@ -294,11 +294,11 @@ pub mod tests {
         let base = || ToolPrefix::new(PathBuf::from(TOOL_PREFIX_DEFAULT)).unwrap();
         for (from, to) in [
             (
-                "/Users/Shared/tycho/mise/installs/claude/2.1.280/claude",
+                "/Users/Shared/tycho/mise/installs/claude/2.1.295/claude",
                 "/Users/Shared/tycho/mise/shims/claude",
             ),
             (
-                "/Users/Shared/tycho/mise/installs/claude/2.1.280/claude",
+                "/Users/Shared/tycho/mise/installs/claude/2.1.295/claude",
                 "/Users/Shared/tycho/mise/installs/claude/../../../../evil/claude",
             ),
             (
@@ -307,7 +307,7 @@ pub mod tests {
             ),
             (
                 "/Users/Shared/tycho/mise/installs/codex/0.160.1/bin/codex",
-                "/Users/Shared/tycho/mise/installs/claude/2.1.280/codex",
+                "/Users/Shared/tycho/mise/installs/claude/2.1.295/codex",
             ),
         ] {
             let text = MANIFEST_TEXT.replace(from, to);

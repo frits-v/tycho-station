@@ -40,7 +40,7 @@ use tycho::services::merge_gate::{GateVerdict, MergeGate, NoGate};
 use tycho::services::operator::read_secret_file;
 use tycho::services::spawner::{SpawnSpec, Spawner};
 use tycho::services::{Ports, Timing};
-use tycho::spool::check_result_envelope;
+use tycho::spool::{BeatState, FinalBeat, result_resolution};
 use tycho::vendors::control::NoVendor;
 use tycho::zmx::Zmx;
 use tycho_types::envelope::{
@@ -496,7 +496,8 @@ fn session_and_reconciler_refuse_agents_outside_their_scope() {
 const HEAD_SHA: &str = "1111111111111111111111111111111111111111";
 const DEFAULT_SHA: &str = "2222222222222222222222222222222222222222";
 
-/// The result envelope a launcher resolves with, checked by the launcher's own spool check.
+/// What a launcher resolves with: the result envelope and an applied last beat, built by the
+/// launcher's own constructor.
 fn result_json(session: &str, branch: &str) -> String {
     let envelope = serde_json::json!({
         "schema_version": 1, "id": "01J9Z3K7Q8R2W5X6Y7Z8A9B0C1", "type": "result",
@@ -507,7 +508,11 @@ fn result_json(session: &str, branch: &str) -> String {
                     "usage": {"input_tokens": 1200, "output_tokens": 300,
                               "cost_micro_dollars": 42000}}
     });
-    check_result_envelope(&envelope, &SessionName::parse(session).unwrap()).unwrap()
+    let last_beat = FinalBeat {
+        state: BeatState::Applied,
+        context_tokens: Some(33_390),
+    };
+    result_resolution(&envelope, &SessionName::parse(session).unwrap(), last_beat).unwrap()
 }
 
 /// What the launcher double does with a spawned session's awaitable.
@@ -765,6 +770,73 @@ fn a_dispatched_unit_runs_both_tasks_to_the_verify_stub() {
     );
     assert_eq!(state["metered"]["charged"], 0);
     assert_eq!(state["worker_slots"]["used"], 0);
+    assert_status_read_follows_each_result(core_ports);
+}
+
+/// Each `WorkerRun` journal, entry by entry, from Restate's introspection.
+fn worker_run_journals(core_ports: CorePorts) -> Vec<serde_json::Value> {
+    let body = serde_json::json!({
+        "query": "SELECT j.id AS id, j.index AS index, j.entry_type AS entry_type, \
+                  j.entry_json AS entry_json FROM sys_journal j JOIN sys_invocation i ON j.id = i.id \
+                  WHERE i.target_service_name = 'WorkerRun' ORDER BY j.id, j.index"
+    })
+    .to_string();
+    let text = client()
+        .post(core_ports.admin_url("/query"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
+        .body(body)
+        .send()
+        .unwrap()
+        .text()
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    value["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("admin query refused: {text}"))
+        .clone()
+}
+
+/// A completed result is followed in the `WorkerRun` journal by a call to the session's
+/// `status`, as earlier builds journaled it, so a run they journaled replays on this one.
+fn assert_status_read_follows_each_result(core_ports: CorePorts) {
+    let rows = worker_run_journals(core_ports);
+    let target = |row: &serde_json::Value| -> Option<(String, String)> {
+        let entry: serde_json::Value = serde_json::from_str(row["entry_json"].as_str()?).ok()?;
+        let object = &entry["Command"]["Call"]["request"]["invocation_target"]["VirtualObject"];
+        Some((
+            object["name"].as_str()?.to_string(),
+            object["handler"].as_str()?.to_string(),
+        ))
+    };
+    let mut results = 0_u32;
+    let mut ids: Vec<&str> = rows.iter().filter_map(|row| row["id"].as_str()).collect();
+    ids.dedup();
+    for id in &ids {
+        let journal: Vec<&serde_json::Value> = rows.iter().filter(|row| row["id"] == *id).collect();
+        let Some(signal) = journal
+            .iter()
+            .position(|row| row["entry_type"] == "Notification: Signal")
+        else {
+            continue;
+        };
+        results = results.saturating_add(1);
+        let next_call = journal[signal..]
+            .iter()
+            .find(|row| row["entry_type"] == "Command: Call")
+            .and_then(|row| target(row));
+        println!("evidence: {id}: the first call after the result is {next_call:?}");
+        assert_eq!(
+            next_call,
+            Some(("Session".to_string(), "status".to_string())),
+            "{id}"
+        );
+    }
+    assert!(
+        results > 0,
+        "no WorkerRun journal holds a result: {} entries",
+        rows.len()
+    );
 }
 
 #[test]

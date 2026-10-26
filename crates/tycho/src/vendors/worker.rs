@@ -457,7 +457,7 @@ mod tests {
     pub fn args() -> WorkerArgs {
         WorkerArgs {
             vendor: Vendor::Claude,
-            binary: PathBuf::from("/opt/claude/2.1.280/claude"),
+            binary: PathBuf::from("/opt/claude/2.1.295/claude"),
             brief: PathBuf::from("/agent/worktrees/briefs/cf7a.wu03.wrk.claude.a1f3.md"),
             worktree: PathBuf::from("/agent/worktrees/cf7a/wu03/a1"),
             model: ModelName::parse("haiku").unwrap(),
@@ -475,7 +475,7 @@ mod tests {
         let argv = args().to_argv(Path::new("/opt/tycho/bin/tycho"));
         assert_eq!(
             argv.join(" "),
-            "/opt/tycho/bin/tycho worker --vendor claude --binary /opt/claude/2.1.280/claude \
+            "/opt/tycho/bin/tycho worker --vendor claude --binary /opt/claude/2.1.295/claude \
              --brief /agent/worktrees/briefs/cf7a.wu03.wrk.claude.a1f3.md \
              --worktree /agent/worktrees/cf7a/wu03/a1 --model haiku --effort low \
              --session-id 3f0c6c1e-6b1a-4a51-9a0e-2a8c5d0c1a10 --to cf7a.wu03.ctl.claude \

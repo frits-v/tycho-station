@@ -859,9 +859,10 @@ fn scratch_prefix(root: &Path, zmx: &Path) -> ToolPrefix {
     .unwrap();
     let prefix = ToolPrefix::load(root.to_path_buf()).unwrap();
     println!(
-        "evidence: sessions start from {} under zmx {}",
+        "evidence: sessions start from {} under zmx {} with claude {}",
         prefix.tycho().display(),
-        prefix.tool("zmx").unwrap().display()
+        prefix.tool("zmx").unwrap().display(),
+        mise_which("claude").display()
     );
     prefix
 }

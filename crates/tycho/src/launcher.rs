@@ -50,8 +50,8 @@ use crate::sandbox::{EXIT_SANDBOX_REFUSED, PLAN_ENV, SANDBOX_REFUSED, SandboxVen
 use crate::session_proxy::SessionProxy;
 use crate::session_sandbox::{self, SessionPaths};
 use crate::spool::{
-    Ack, Delivery, HeartbeatSend, Ingress, SPOOL_FILE, SPOOL_SCHEMA_VERSION, SpoolRecord,
-    spool_then_deliver, write_spool,
+    Ack, BeatState, Delivery, FinalBeat, HeartbeatCompletion, HeartbeatSend, Ingress, SPOOL_FILE,
+    SPOOL_SCHEMA_VERSION, SpoolRecord, spool_then_deliver, write_spool,
 };
 use crate::vendors::claude_control::socket_of_pid;
 use crate::zmx::Zmx;
@@ -245,6 +245,71 @@ pub struct LaunchEnd {
     pub state: String,
     pub delivery: Result<Delivery, String>,
     pub spool_error: Option<String>,
+    /// The beat after the vendor exited; `None` when the vendor never ran or was stopped.
+    pub last_beat: Option<LastBeat>,
+}
+
+/// What became of the heartbeat after the vendor exited, which carries its final context size.
+///
+/// Every state delivers the result: the result is the run's outcome, and withholding it would
+/// leave the unit waiting on a session that has ended. A state other than `Applied` is named
+/// in the log and in the launcher's report, since the session may then hold an earlier size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LastBeat {
+    /// The session applied it, on the first call or on the repeat under the same key.
+    Applied {
+        attempts: u32,
+    },
+    /// The session answered 4xx, so it did not apply it and holds the earlier size.
+    Refused {
+        status: u16,
+        body: String,
+    },
+    /// Both calls under the one key timed out, could not connect or answered 5xx. A call
+    /// that timed out may still be applied after the result, so the session may hold
+    /// either size.
+    Unknown {
+        reason: String,
+    },
+    /// The launcher could not build the beat (its sequence or progress file), so it sent none.
+    NotSent {
+        reason: String,
+    },
+    Unrecognised {
+        reason: String,
+    },
+}
+
+impl fmt::Display for LastBeat {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Applied { attempts } => write!(formatter, "applied after {attempts} call(s)"),
+            Self::Refused { status, body } => {
+                write!(formatter, "refused with status {status}: {body}")
+            }
+            Self::Unknown { reason } => write!(
+                formatter,
+                "unknown, the result is delivered without knowing whether the session \
+                 holds the final context size: {reason}"
+            ),
+            Self::NotSent { reason } => write!(formatter, "not sent: {reason}"),
+            Self::Unrecognised { reason } => write!(formatter, "unrecognised: {reason}"),
+        }
+    }
+}
+
+impl LastBeat {
+    /// The state the result's resolution reports.
+    #[must_use]
+    pub const fn state(&self) -> BeatState {
+        match self {
+            Self::Applied { .. } => BeatState::Applied,
+            Self::Refused { .. } => BeatState::Refused,
+            Self::Unknown { .. } => BeatState::Unknown,
+            Self::NotSent { .. } => BeatState::NotSent,
+            Self::Unrecognised { .. } => BeatState::Unrecognised,
+        }
+    }
 }
 
 impl LaunchEnd {
@@ -269,6 +334,11 @@ impl fmt::Display for LaunchEnd {
         }
         if let Some(error) = &self.spool_error {
             write!(formatter, "; spool: {error}")?;
+        }
+        if let Some(beat) = &self.last_beat
+            && !matches!(beat, LastBeat::Applied { .. })
+        {
+            write!(formatter, "; last heartbeat {beat}")?;
         }
         Ok(())
     }
@@ -323,6 +393,9 @@ struct Run<'a, I: Ingress> {
     codex_home: Option<PathBuf>,
     /// The session's proxy, stopped when the vendor stops.
     proxy: Option<SessionProxy>,
+    /// The beat after the vendor exited and the context size it carried, reported with the
+    /// launch's end and in the result's resolution.
+    last_beat: Option<(LastBeat, Option<u64>)>,
 }
 
 /// Asks the core for the session's credential when the spec names a hand-off socket.
@@ -402,6 +475,7 @@ pub fn launch_with_stop(
         credential,
         codex_home: None,
         proxy: None,
+        last_beat: None,
     };
     let decoded = match spool_ready
         .map_err(|error| error.to_string())
@@ -422,6 +496,16 @@ pub fn launch_with_stop(
     let end = run.finish(decoded);
     run.end_own_session();
     Ok(end)
+}
+
+/// The last beat's state from an answer that is not a retry.
+fn last_beat_of(answer: Ack, attempts: u32) -> LastBeat {
+    match answer {
+        Ack::Acknowledged => LastBeat::Applied { attempts },
+        Ack::Refused(status, body) => LastBeat::Refused { status, body },
+        Ack::Retry(reason) => LastBeat::Unknown { reason },
+        Ack::Unrecognised(reason) => LastBeat::Unrecognised { reason },
+    }
 }
 
 impl<I: Ingress> Run<'_, I> {
@@ -471,7 +555,9 @@ impl<I: Ingress> Run<'_, I> {
         if stop == Stop::None && end != ChildEnd::NotStarted {
             // The vendor's last progress, its final context size included, reaches the
             // session before the result does; a run shorter than one interval has no other beat.
-            self.beat();
+            let (beat, context_tokens) = self.last_beat();
+            self.log.line(&format!("last heartbeat {beat}"));
+            self.last_beat = Some((beat, context_tokens));
         }
         let result = read_result_file(&self.files.result);
         if let ResultFile::Report(ResultReport {
@@ -772,15 +858,58 @@ impl<I: Ingress> Run<'_, I> {
     /// Renews the lease and sends one heartbeat; a failure is logged and never stops the vendor.
     fn beat(&mut self) {
         self.renew_lease();
-        let outcome = self.heartbeat();
-        match outcome {
-            Ok(Ack::Acknowledged) => {}
-            Ok(other) => self.log.line(&format!("heartbeat not accepted: {other:?}")),
+        match self.heartbeat_body() {
+            Ok((key, body, _)) => {
+                match self.send_heartbeat(&key, &body, HeartbeatCompletion::Enqueued) {
+                    Ack::Acknowledged => {}
+                    other => self.log.line(&format!("heartbeat not queued: {other:?}")),
+                }
+            }
             Err(error) => self.log.line(&format!("heartbeat not sent: {error}")),
         }
     }
 
-    fn heartbeat(&self) -> Result<Ack, String> {
+    /// The beat after the vendor exited, as a call. A call that timed out may have been
+    /// accepted, so a timeout, a refused connect or a 5xx is called once more under the
+    /// same key and body. The session ignores a sequence at or below the last one it
+    /// recorded, so a repeat of an applied beat changes nothing.
+    fn last_beat(&mut self) -> (LastBeat, Option<u64>) {
+        self.renew_lease();
+        let (key, body, context_tokens) = match self.heartbeat_body() {
+            Ok(built) => built,
+            Err(reason) => return (LastBeat::NotSent { reason }, None),
+        };
+        let first = match self.send_heartbeat(&key, &body, HeartbeatCompletion::Applied) {
+            Ack::Retry(reason) => reason,
+            answer => return (last_beat_of(answer, 1), Some(context_tokens)),
+        };
+        let beat = match self.send_heartbeat(&key, &body, HeartbeatCompletion::Applied) {
+            Ack::Retry(second) => LastBeat::Unknown {
+                reason: format!("first call: {first}; second call: {second}"),
+            },
+            answer => last_beat_of(answer, 2),
+        };
+        (beat, Some(context_tokens))
+    }
+
+    fn send_heartbeat(
+        &self,
+        key: &IdempotencyKey,
+        body: &str,
+        completion: HeartbeatCompletion,
+    ) -> Ack {
+        self.ingress.heartbeat(&HeartbeatSend {
+            service: self.settings.heartbeat.service(),
+            session: &self.settings.env.session_name,
+            idempotency_key: key,
+            body: body.to_string(),
+            completion,
+        })
+    }
+
+    /// The next sequence's key, the body from the progress file as it is now, and the context
+    /// size the body carries.
+    fn heartbeat_body(&self) -> Result<(IdempotencyKey, String, u64), String> {
         let env = &self.settings.env;
         let sequence = next_sequence(&self.files.sequence).map_err(|error| error.to_string())?;
         let key =
@@ -789,19 +918,15 @@ impl<I: Ingress> Run<'_, I> {
             &read_progress(&self.files.progress),
             self.lease.started_unix_ms(),
         )?;
+        let context_tokens = context_tokens.min(CONTEXT_TOKENS_MAX);
         let body = HeartbeatCall {
             secret: env.session_secret.expose().to_string(),
             sequence,
             status,
-            context_tokens: context_tokens.min(CONTEXT_TOKENS_MAX),
+            context_tokens,
         };
         let body = serde_json::to_string(&body).map_err(|error| error.to_string())?;
-        Ok(self.ingress.heartbeat(&HeartbeatSend {
-            service: self.settings.heartbeat.service(),
-            session: &env.session_name,
-            idempotency_key: &key,
-            body,
-        }))
+        Ok((key, body, context_tokens))
     }
 
     fn record(&self, state: ExitState, envelope: Option<serde_json::Value>) -> SpoolRecord {
@@ -811,6 +936,13 @@ impl<I: Ingress> Run<'_, I> {
             awaitable_id: self.settings.env.awaitable_id.clone(),
             state,
             envelope,
+            last_beat: self
+                .last_beat
+                .as_ref()
+                .map(|(beat, context_tokens)| FinalBeat {
+                    state: beat.state(),
+                    context_tokens: *context_tokens,
+                }),
         }
     }
 
@@ -846,6 +978,7 @@ impl<I: Ingress> Run<'_, I> {
             state,
             delivery,
             spool_error,
+            last_beat: self.last_beat.take().map(|(beat, _)| beat),
         }
     }
 
@@ -976,12 +1109,20 @@ mod tests {
         files: SessionFiles,
         events: RefCell<Vec<String>>,
         context_tokens: RefCell<Vec<u64>>,
+        completions: RefCell<Vec<HeartbeatCompletion>>,
+        /// Answers to the heartbeats in order; acknowledged once they run out.
+        heartbeat_answers: RefCell<Vec<Ack>>,
+        /// The body of each resolve.
+        resolved: RefCell<Vec<String>>,
     }
 
     impl Ingress for Recorder {
         fn deliver(&self, awaitable: &AwaitableId, resolution: &Resolution) -> Ack {
             let kind = match resolution {
-                Resolution::Resolve(_) => "resolve",
+                Resolution::Resolve(body) => {
+                    self.resolved.borrow_mut().push(body.clone());
+                    "resolve"
+                }
                 Resolution::Reject(reason) => reason.as_str(),
             };
             self.events.borrow_mut().push(format!(
@@ -1001,7 +1142,13 @@ mod tests {
                 body.sequence,
                 self.files.lease.exists()
             ));
-            Ack::Acknowledged
+            self.completions.borrow_mut().push(call.completion);
+            let mut answers = self.heartbeat_answers.borrow_mut();
+            if answers.is_empty() {
+                Ack::Acknowledged
+            } else {
+                answers.remove(0)
+            }
         }
     }
 
@@ -1024,6 +1171,9 @@ mod tests {
             files: files.clone(),
             events: RefCell::new(Vec::new()),
             context_tokens: RefCell::new(Vec::new()),
+            completions: RefCell::new(Vec::new()),
+            heartbeat_answers: RefCell::new(Vec::new()),
+            resolved: RefCell::new(Vec::new()),
         }
     }
 
@@ -1079,20 +1229,157 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A vendor that ends only once the supervise loop's first heartbeat has taken its
+    /// sequence number, so the beat after the exit is the second whatever the spawn costs.
+    fn after_first_beat(files: &SessionFiles) -> Vec<String> {
+        after_first_beat_with(files, r#"{"state":"failed","envelope":null}"#)
+    }
+
+    /// The same vendor, writing `result` as its result file.
+    fn after_first_beat_with(files: &SessionFiles, result: &str) -> Vec<String> {
+        let script = r#"i=0; while [ ! -f "$1" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; printf '{"context_tokens":33390}' > "$TYCHO_PROGRESS_FILE"; printf '%s' "$2" > "$TYCHO_RESULT_FILE""#;
+        let mut vendor = sh(script);
+        vendor.push("vendor".to_string());
+        vendor.push(files.sequence.display().to_string());
+        vendor.push(result.to_string());
+        vendor
+    }
+
+    /// A completed result resolves with the last beat's state and the size it carried, so
+    /// the run that waits on it can tell an applied size from one that may not have landed.
+    #[test]
+    fn a_completed_result_carries_the_last_beats_state_and_context_size() {
+        let timed_out = || Ack::Retry(format!("{} after 5 s", crate::http::TIMED_OUT));
+        let result = serde_json::json!({
+            "state": "completed",
+            "envelope": crate::exit_decode::tests::envelope(NAME),
+        })
+        .to_string();
+        for (index, (answers, state)) in [
+            (vec![Ack::Acknowledged], crate::spool::BeatState::Applied),
+            (
+                vec![timed_out(), timed_out()],
+                crate::spool::BeatState::Unknown,
+            ),
+            (
+                vec![Ack::Refused(409, "stale".to_string())],
+                crate::spool::BeatState::Refused,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let dir = scratch(&format!("completed-beat-{index}"));
+            let settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
+            let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
+            let recorder = recorder(&files);
+            *recorder.heartbeat_answers.borrow_mut() =
+                std::iter::once(Ack::Acknowledged).chain(answers).collect();
+            let end = launch(
+                &settings,
+                &after_first_beat_with(&files, &result),
+                &recorder,
+            )
+            .unwrap();
+            assert_eq!(end.state, "completed");
+            let resolved = recorder.resolved.borrow();
+            let body: crate::spool::ResultResolution =
+                serde_json::from_str(resolved.last().unwrap()).unwrap();
+            assert_eq!(
+                body.last_beat,
+                FinalBeat {
+                    state,
+                    context_tokens: Some(33_390)
+                },
+                "case {index}"
+            );
+            assert_eq!(body.envelope, crate::exit_decode::tests::envelope(NAME));
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    fn beat_word(beat: Option<&LastBeat>) -> &'static str {
+        match beat {
+            Some(LastBeat::Applied { attempts: 2 }) => "applied",
+            Some(LastBeat::Unknown { .. }) => "unknown",
+            Some(LastBeat::Refused { status: 409, .. }) => "refused",
+            Some(LastBeat::Unrecognised { .. }) => "unrecognised",
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A last beat that may have been accepted is called once more under its key and body;
+    /// every outcome delivers the result and names the beat's state.
+    #[test]
+    fn a_last_heartbeat_that_times_out_is_repeated_under_its_key_and_its_state_is_named() {
+        let timed_out = || Ack::Retry(format!("{} after 5 s", crate::http::TIMED_OUT));
+        let cases = [
+            (vec![timed_out(), Ack::Acknowledged], 3, "applied"),
+            (vec![timed_out(), timed_out()], 3, "unknown"),
+            (
+                vec![Ack::Retry("status 503".to_string()), timed_out()],
+                3,
+                "unknown",
+            ),
+            (
+                vec![Ack::Refused(409, "stale sequence".to_string())],
+                2,
+                "refused",
+            ),
+            (
+                vec![Ack::Unrecognised("status 302".to_string())],
+                2,
+                "unrecognised",
+            ),
+        ];
+        for (index, (answers, beats, state)) in cases.into_iter().enumerate() {
+            let dir = scratch(&format!("last-beat-answer-{index}"));
+            let settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
+            let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
+            let recorder = recorder(&files);
+            // The supervise loop's beat is answered first, then the last beat's calls.
+            *recorder.heartbeat_answers.borrow_mut() =
+                std::iter::once(Ack::Acknowledged).chain(answers).collect();
+            let end = launch(&settings, &after_first_beat(&files), &recorder).unwrap();
+            assert_eq!(beat_word(end.last_beat.as_ref()), state, "case {index}");
+            let events = recorder.events.borrow();
+            let heartbeats: Vec<&String> = events
+                .iter()
+                .filter(|event| event.starts_with("heartbeat"))
+                .collect();
+            assert_eq!(heartbeats.len(), beats, "case {index}: {events:?}");
+            if beats == 3 {
+                assert_eq!(
+                    heartbeats[1], heartbeats[2],
+                    "the repeat keeps key and sequence"
+                );
+            }
+            assert_eq!(
+                events.last().map(String::as_str),
+                Some("deliver sign_1abc failed spooled=true"),
+                "case {index}: every state delivers the result"
+            );
+            let log = fs::read_to_string(&files.log).unwrap();
+            assert!(log.contains(&format!("last heartbeat {state}")), "{log}");
+            let report = end.to_string();
+            assert_eq!(
+                report.contains("last heartbeat"),
+                state != "applied",
+                "{report}"
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
     #[test]
     fn a_last_heartbeat_carries_the_final_context_size_before_the_result() {
         let dir = scratch("last-beat");
         let settings = LauncherSettings::from_map(&environment(&dir)).unwrap();
         let files = SessionFiles::new(&settings.dirs, &settings.env.session_name);
-        // The vendor ends only once the supervise loop's first heartbeat has taken its
-        // sequence number, so the beat after the exit is the second whatever the spawn costs.
-        let script = r#"i=0; while [ ! -f "$1" ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; printf '{"context_tokens":33390}' > "$TYCHO_PROGRESS_FILE"; printf '{"state":"failed","envelope":null}' > "$TYCHO_RESULT_FILE""#;
         let recorder = recorder(&files);
-        let mut vendor = sh(script);
-        vendor.push("vendor".to_string());
-        vendor.push(files.sequence.display().to_string());
-        let end = launch(&settings, &vendor, &recorder).unwrap();
+        let end = launch(&settings, &after_first_beat(&files), &recorder).unwrap();
         assert_eq!(end.state, "failed");
+        assert_eq!(end.last_beat, Some(LastBeat::Applied { attempts: 1 }));
         let events = recorder.events.borrow();
         let beats = events
             .iter()
@@ -1104,6 +1391,13 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(recorder.context_tokens.borrow().last(), Some(&33_390));
+        // The beat after the exit is answered once the session has applied it: the result
+        // that follows wakes a reader of the session's shared status, which does not wait
+        // behind a queued heartbeat.
+        assert_eq!(
+            *recorder.completions.borrow(),
+            [HeartbeatCompletion::Enqueued, HeartbeatCompletion::Applied]
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -45,8 +45,9 @@ use crate::zmx::{Presence, Zmx, prepare_shared_log, presence};
 ///
 /// The station's sandbox, which the session leader applies to the vendor's whole process
 /// tree, is the only layer. A vendor sandbox nested inside it cannot apply its profile, and
-/// Claude then reruns the refused command outside its sandbox. `--settings` wins over the
-/// worktree's `.claude/settings.json`.
+/// Claude then reruns the refused command outside its sandbox. Every Claude start and resume
+/// also passes `--setting-sources=`, so no user, project or local settings file can turn it
+/// back on.
 pub const CLAUDE_SANDBOX_OFF: &str = r#"{"sandbox":{"enabled":false}}"#;
 pub const SCROLLBACK_MAX_BYTES: usize = 4 * 1024 * 1024;
 const OTHER_BITS: u32 = 0o007;
@@ -754,7 +755,7 @@ mod tests {
 
     const WORKTREE: &str = "/Users/Shared/tycho-agent-zmx/worktrees/cf7a/wu03/a1";
     const BRIEF: &str = "/Users/Shared/tycho-agent-zmx/worktrees/cf7a/wu03.brief.md";
-    const CLAUDE_INSTALL: &str = "/Users/Shared/tycho/mise/installs/claude/2.1.280";
+    const CLAUDE_INSTALL: &str = "/Users/Shared/tycho/mise/installs/claude/2.1.295";
     const PREFIX_TYCHO: &str = "/Users/Shared/tycho/bin/tycho";
 
     fn read(path: &str) -> Grant {
@@ -1018,7 +1019,7 @@ mod tests {
             environment,
             [
                 "HOME=/Users/agent",
-                "PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.280:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin:/usr/sbin:/sbin",
+                "PATH=/Users/Shared/tycho/bin:/Users/Shared/tycho/mise/installs/claude/2.1.295:/Users/Shared/tycho/mise/installs/codex/0.160.1/bin:/Users/Shared/tycho/mise/installs/zmx/0.8.1:/usr/bin:/bin:/usr/sbin:/sbin",
                 "MISE_DATA_DIR=/Users/Shared/tycho/mise",
                 "MISE_GLOBAL_CONFIG_FILE=/Users/Shared/tycho/mise.toml",
                 "MISE_CACHE_DIR=/Users/Shared/tycho/cache",

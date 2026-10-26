@@ -27,6 +27,7 @@ use crate::agent_files::{current_uid, read_checked};
 use crate::config::AgentDirs;
 use crate::launch_spec::VendorTerminal;
 use crate::relay::{remove_relay_dir, write_instruction};
+use crate::vendors::claude_worker::{AUTO_MEMORY_KEY, SETTING_SOURCES_NONE};
 use crate::vendors::control::{
     AddressTarget, ContextReport, ControlCommand, ControlLaunch, Delivery, MODEL_NAME_MAX_BYTES,
     Observation, PermissionMode, SessionVendor, VendorError, VendorSessionId, WaitingFor, bounded,
@@ -159,7 +160,8 @@ pub const fn permission_word(mode: PermissionMode) -> &'static str {
     }
 }
 
-/// The one `--settings` object: sandbox, inbound accepted, widest auto-compact window.
+/// The one `--settings` object: sandbox, inbound accepted, widest auto-compact window, auto
+/// memory off. It is the only settings layer a session reads (`SETTING_SOURCES_NONE`).
 pub fn settings_json(sandbox_settings: &str) -> Result<String, VendorError> {
     // Passed on every start and resume: the vendor does not keep it with the session.
     let mut settings: Map<String, Value> = serde_json::from_str(sandbox_settings)
@@ -174,6 +176,7 @@ pub fn settings_json(sandbox_settings: &str) -> Result<String, VendorError> {
         "autoCompactWindow".to_string(),
         json!(AUTO_COMPACT_WINDOW_MAX),
     );
+    settings.insert(AUTO_MEMORY_KEY.to_string(), json!(false));
     let text = Value::Object(settings).to_string();
     if text.len() > TEXT_MAX_BYTES {
         return Err(VendorError::Argument(format!(
@@ -846,6 +849,7 @@ impl SessionVendor for ClaudeControl {
             launch.vendor_session.as_str(),
             "--settings",
             &settings_json(&launch.sandbox_settings)?,
+            SETTING_SOURCES_NONE,
         ]
         .map(str::to_string)
         .to_vec();

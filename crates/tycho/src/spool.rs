@@ -38,6 +38,84 @@ pub struct SpoolRecord {
     pub state: ExitState,
     /// Present only with `completed`: the result envelope the awaitable resolves with.
     pub envelope: Option<serde_json::Value>,
+    /// The heartbeat after the vendor exited; absent in a record spooled before the vendor
+    /// ended or by a launcher that did not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_beat: Option<FinalBeat>,
+}
+
+/// What became of the heartbeat after the vendor exited, as the result reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BeatState {
+    /// The session applied it: it holds the size the beat carried.
+    Applied,
+    /// The session answered 4xx and holds an earlier size.
+    Refused,
+    /// Both calls failed in a way that may still apply the beat later.
+    Unknown,
+    NotSent,
+    /// The record carries no beat: spooled before the vendor ended, or by a launcher that
+    /// did not record one.
+    NotRecorded,
+    /// Any word this build does not know; it is never taken as applied.
+    #[serde(other)]
+    Unrecognised,
+}
+
+/// The last heartbeat's state and the context size it carried, read from the progress file
+/// after the vendor exited.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalBeat {
+    pub state: BeatState,
+    pub context_tokens: Option<u64>,
+}
+
+impl FinalBeat {
+    pub const NOT_RECORDED: Self = Self {
+        state: BeatState::NotRecorded,
+        context_tokens: None,
+    };
+
+    /// The context size a run may record as measured: only one the session applied.
+    #[must_use]
+    pub const fn confirmed_context_tokens(&self) -> Option<u64> {
+        match self.state {
+            BeatState::Applied => self.context_tokens,
+            BeatState::Refused
+            | BeatState::Unknown
+            | BeatState::NotSent
+            | BeatState::NotRecorded
+            | BeatState::Unrecognised => None,
+        }
+    }
+}
+
+/// The body a completed result resolves its awaitable with: the envelope and the last beat.
+///
+/// The run takes the final context size from the result rather than from the session's
+/// view, which a heartbeat still queued would leave behind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResultResolution {
+    pub envelope: serde_json::Value,
+    pub last_beat: FinalBeat,
+}
+
+/// The resolve body for this session's result envelope: the envelope is checked as
+/// `check_result_envelope` checks it, then sent with the last beat.
+pub fn result_resolution(
+    envelope: &serde_json::Value,
+    session: &SessionName,
+    last_beat: FinalBeat,
+) -> Result<String, String> {
+    check_result_envelope(envelope, session)?;
+    serde_json::to_string(&ResultResolution {
+        envelope: envelope.clone(),
+        last_beat,
+    })
+    .map_err(|error| error.to_string())
 }
 
 /// What a spool record asks of the ingress.
@@ -120,11 +198,13 @@ impl SpoolRecord {
             return Err(SpoolError::SchemaVersion(self.schema_version));
         }
         match (&self.state, &self.envelope) {
-            (ExitState::Completed, Some(envelope)) => {
-                check_result_envelope(envelope, &self.session)
-                    .map(Resolution::Resolve)
-                    .map_err(SpoolError::Inconsistent)
-            }
+            (ExitState::Completed, Some(envelope)) => result_resolution(
+                envelope,
+                &self.session,
+                self.last_beat.unwrap_or(FinalBeat::NOT_RECORDED),
+            )
+            .map(Resolution::Resolve)
+            .map_err(SpoolError::Inconsistent),
             (ExitState::Completed, None) => Err(SpoolError::Inconsistent(
                 "completed without an envelope".to_string(),
             )),
@@ -193,17 +273,46 @@ pub fn decode_ack(outcome: Outcome) -> Ack {
 pub trait Ingress {
     fn deliver(&self, awaitable: &AwaitableId, resolution: &Resolution) -> Ack;
 
-    /// Sends `body` to `/<service>/<session>/heartbeat/send` with its idempotency key.
+    /// Sends `body` to `/<service>/<session>/heartbeat` with its idempotency key, as a
+    /// send or as a call (`HeartbeatSend::completion`).
     fn heartbeat(&self, call: &HeartbeatSend<'_>) -> Ack;
 }
 
-/// One heartbeat send: the target, the key and the JSON body, which carries the secret.
+/// When the ingress answers a heartbeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeartbeatCompletion {
+    /// Once the invocation is queued (`/heartbeat/send`): beats while the vendor runs.
+    Enqueued,
+    /// Once the handler has run (`/heartbeat`): the beat after the vendor exits, so the
+    /// session holds the final context size before the result resolves the awaitable. The
+    /// session's `status` is a shared handler and does not wait behind a queued heartbeat.
+    Applied,
+}
+
+/// One heartbeat: the target, the key, the JSON body, which carries the secret, and when the
+/// ingress answers.
 #[derive(Debug)]
 pub struct HeartbeatSend<'a> {
     pub service: &'a str,
     pub session: &'a SessionName,
     pub idempotency_key: &'a IdempotencyKey,
     pub body: String,
+    pub completion: HeartbeatCompletion,
+}
+
+impl HeartbeatSend<'_> {
+    /// The ingress path for the call.
+    #[must_use]
+    pub fn path(&self) -> String {
+        let suffix = match self.completion {
+            HeartbeatCompletion::Enqueued => "/send",
+            HeartbeatCompletion::Applied => "",
+        };
+        format!(
+            "/{}/{}/{SESSION_HEARTBEAT}{suffix}",
+            self.service, self.session
+        )
+    }
 }
 
 /// The core's ingress over HTTP, at the ports the launcher was handed.
@@ -226,10 +335,7 @@ impl Ingress for CoreIngress {
     }
 
     fn heartbeat(&self, call: &HeartbeatSend<'_>) -> Ack {
-        let url = self.ports.ingress_url(&format!(
-            "/{}/{}/{SESSION_HEARTBEAT}/send",
-            call.service, call.session
-        ));
+        let url = self.ports.ingress_url(&call.path());
         let headers = [("idempotency-key", call.idempotency_key.as_str())];
         decode_ack(
             self.http
@@ -423,6 +529,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_heartbeat_is_sent_while_the_vendor_runs_and_called_after_it_exits() {
+        let session = SessionName::parse(SESSION).unwrap();
+        let key = IdempotencyKey::new(&session, 7).unwrap();
+        let call = |completion| HeartbeatSend {
+            service: "Session",
+            session: &session,
+            idempotency_key: &key,
+            body: String::new(),
+            completion,
+        };
+        assert_eq!(
+            call(HeartbeatCompletion::Enqueued).path(),
+            format!("/Session/{SESSION}/heartbeat/send")
+        );
+        assert_eq!(
+            call(HeartbeatCompletion::Applied).path(),
+            format!("/Session/{SESSION}/heartbeat")
+        );
+    }
+
     fn record(state: ExitState) -> SpoolRecord {
         SpoolRecord {
             schema_version: SPOOL_SCHEMA_VERSION,
@@ -430,7 +557,49 @@ mod tests {
             awaitable_id: AwaitableId::parse("sign_1abc").unwrap(),
             state,
             envelope: None,
+            last_beat: None,
         }
+    }
+
+    /// A completed result resolves with its envelope and the last beat; a record without one
+    /// says so, and only an applied beat's size counts as measured.
+    #[test]
+    fn a_completed_result_resolves_with_its_envelope_and_the_last_beat() {
+        let mut completed = record(ExitState::Completed);
+        completed.envelope = Some(crate::exit_decode::tests::envelope(SESSION));
+        let body = |record: &SpoolRecord| match record.resolution().unwrap() {
+            Resolution::Resolve(body) => serde_json::from_str::<ResultResolution>(&body).unwrap(),
+            Resolution::Reject(reason) => panic!("rejected: {reason}"),
+        };
+        assert_eq!(body(&completed).last_beat, FinalBeat::NOT_RECORDED);
+        assert_eq!(
+            body(&completed).envelope,
+            completed.envelope.clone().unwrap()
+        );
+        for (state, confirmed) in [
+            (BeatState::Applied, Some(33_390)),
+            (BeatState::Unknown, None),
+            (BeatState::Refused, None),
+            (BeatState::NotSent, None),
+        ] {
+            completed.last_beat = Some(FinalBeat {
+                state,
+                context_tokens: Some(33_390),
+            });
+            let beat = body(&completed).last_beat;
+            assert_eq!(beat.state, state);
+            assert_eq!(beat.context_tokens, Some(33_390));
+            assert_eq!(beat.confirmed_context_tokens(), confirmed, "{state:?}");
+        }
+        let unknown: FinalBeat =
+            serde_json::from_str(r#"{"state":"applied_later","context_tokens":5}"#).unwrap();
+        assert_eq!(unknown.state, BeatState::Unrecognised);
+        assert_eq!(unknown.confirmed_context_tokens(), None);
+        let earlier: SpoolRecord = serde_json::from_str(
+            r#"{"schema_version":1,"session":"cf7a.wu03.wrk.claude.a1f3","awaitable_id":"sign_1abc","state":"failed","envelope":null}"#,
+        )
+        .unwrap();
+        assert_eq!(earlier.last_beat, None);
     }
 
     fn scratch(test: &str) -> PathBuf {
