@@ -619,7 +619,9 @@ impl Session {
         Ok(u64::try_from(length).unwrap_or(u64::MAX))
     }
 
-    /// Saves scrollback when asked, kills by the recorded pid, and drops the expectation.
+    /// Saves scrollback when asked, kills by the recorded pid, and drops the expectation. The
+    /// journaled steps are the ones earlier builds wrote; the reconciler's `forget` asks this
+    /// session to read its proxy audit afterwards.
     #[handler(ingress_private)]
     async fn kill(
         &self,
@@ -643,8 +645,6 @@ impl Session {
             .name("kill")
             .retry_policy(self.timing.port_retry())
             .await?;
-        self.take_proxy_audit(&object_context, &name, &mut state)
-            .await?;
         state.release_error = self.release(&object_context, &name).await?;
         state.phase = SessionPhase::Killed;
         state.scrollback.clone_from(&scrollback);
@@ -656,9 +656,10 @@ impl Session {
         Ok(Json(KillOutcome::Killed { scrollback }))
     }
 
-    /// The session's awaitable completed, so its launcher has written the proxy's decisions:
-    /// reads them as the firings and examinations of the session proxy, and again later while
-    /// the file is absent, within `PROXY_AUDIT_READS_MAX` reads.
+    /// The session's awaitable completed, or it was killed or reaped, so its launcher has
+    /// written the proxy's decisions or will not: reads them as the firings and examinations of
+    /// the session proxy, and again later while the file is absent, within
+    /// `PROXY_AUDIT_READS_MAX` reads. `Reconciler/forget` and `reap` send it as their last step.
     #[handler(ingress_private)]
     async fn record_proxy_audit(&self, object_context: ObjectContext<'_>) -> HandlerResult<bool> {
         let name = parse_key(object_context.key()).map_err(|error| terminal(&error))?;
@@ -699,7 +700,8 @@ impl Session {
         Ok(true)
     }
 
-    /// Kills a lost session by its zmx name through the port, once.
+    /// Kills a lost session by its zmx name through the port, once, then asks itself to read
+    /// the proxy audit.
     #[handler(ingress_private)]
     async fn reap(&self, object_context: ObjectContext<'_>) -> HandlerResult<bool> {
         let name = parse_key(object_context.key()).map_err(|error| terminal(&error))?;
@@ -716,10 +718,14 @@ impl Session {
             .name("reap")
             .retry_policy(self.timing.port_retry())
             .await?;
-        self.take_proxy_audit(&object_context, &name, &mut next)
-            .await?;
         next.release_error = self.release(&object_context, &name).await?;
         object_context.set(STATE_KEY, Json(next));
+        // Appended after every step earlier builds journaled, so a reap in flight across an
+        // upgrade replays them and then sends this.
+        object_context
+            .object_client::<SessionClient>(object_context.key())
+            .record_proxy_audit()
+            .send();
         Ok(true)
     }
 

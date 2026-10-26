@@ -905,6 +905,46 @@ fn assert_status_read_follows_each_result(core_ports: CorePorts) {
     );
 }
 
+/// The journaled steps of each invocation of `Session/<handler>`: each `run` by its name, each
+/// call and one-way call by its target, in journal order.
+fn session_steps(core_ports: CorePorts, handler: &str) -> Vec<Vec<String>> {
+    let rows = service_journals(core_ports, "Session");
+    let mut ids: Vec<&str> = rows
+        .iter()
+        .filter(|row| row["handler"] == handler)
+        .filter_map(|row| row["id"].as_str())
+        .collect();
+    ids.dedup();
+    ids.iter()
+        .map(|id| {
+            rows.iter()
+                .filter(|row| row["id"] == *id)
+                .filter_map(|row| {
+                    if let Some((kind, service, target)) = call_target(row) {
+                        return Some(format!("{kind} {service}/{target}"));
+                    }
+                    let entry: serde_json::Value =
+                        serde_json::from_str(row["entry_json"].as_str()?).ok()?;
+                    let name = entry["Command"]["Run"]["name"].as_str()?;
+                    Some(format!("Run {name}"))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Every invocation of `Session/<handler>` journals exactly `expected`: the steps earlier builds
+/// journaled, in order, with any new step only at the end, so one in flight across an upgrade
+/// replays.
+fn assert_session_steps(core_ports: CorePorts, handler: &str, expected: &[&str]) {
+    let journals = session_steps(core_ports, handler);
+    for steps in &journals {
+        println!("evidence: Session/{handler} journals {steps:?}");
+        assert_eq!(steps, expected, "Session/{handler}");
+    }
+    assert!(!journals.is_empty(), "no Session/{handler} journal");
+}
+
 /// Each `Reconciler/forget` sends the session's `record_proxy_audit` once, one-way: the step
 /// that moved out of `WorkerRun` lives in this short invocation.
 fn assert_forget_asks_the_session_for_its_audit(core_ports: CorePorts) {
@@ -993,6 +1033,18 @@ fn a_silent_worker_is_nudged_at_t1_killed_at_t2_and_requeued_as_attempt_two() {
         0,
         "both attempts settled"
     );
+    // The kill journals the steps earlier builds wrote and nothing more; the reconciler's
+    // forget, which it already sent, asks the session to read its audit.
+    assert_session_steps(
+        core_ports,
+        "kill",
+        &[
+            "Run save scrollback",
+            "Run kill",
+            "Run release",
+            "OneWayCall Reconciler/forget",
+        ],
+    );
 }
 
 #[test]
@@ -1060,6 +1112,15 @@ fn a_cancel_during_spawn_kills_settles_and_starts_no_second_attempt() {
         call(core_ports, &status_path, "", None)
             .1
             .contains("\"phase\":\"lost\"")
+    );
+    assert_session_steps(
+        core_ports,
+        "reap",
+        &[
+            "Run reap",
+            "Run release",
+            "OneWayCall Session/record_proxy_audit",
+        ],
     );
     assert_eq!(
         epic_status(core_ports)["worker_slots"]["used"],
