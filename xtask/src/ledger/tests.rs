@@ -398,8 +398,9 @@ fn remove_scratch(root: &Path, files: &[(&str, &str)]) {
 fn no_archive_file_is_a_failure_not_a_clean_pass() {
     let files = [(LEDGER, "# Ledger\n"), (ELSEWHERE, "")];
     let root = scratch_root("no-archive", &files);
-    let refusal = read_sources(&root).unwrap_err();
+    let read = read_sources(&root);
     remove_scratch(&root, &files);
+    let refusal = read.unwrap_err();
     assert!(refusal.contains("examined 0 archive files"), "{refusal}");
 }
 
@@ -417,9 +418,37 @@ fn ledger_files_that_cite_no_name_are_a_failure_not_a_clean_pass() {
         (ELSEWHERE, ""),
     ];
     let root = scratch_root("no-names", &files);
-    let (digest, archives, _) = read_sources(&root).unwrap();
+    let read = read_sources(&root);
     remove_scratch(&root, &files);
+    let (digest, archives, _) = read.unwrap();
     assert_eq!(archives.len(), 1);
     let refusal = citations(&digest, &archives).unwrap_err();
     assert!(refusal.contains("examined 0 cited names"), "{refusal}");
+}
+
+#[test]
+fn an_enforcement_name_counts_only_in_a_linked_enforced_by_cell_and_as_whole_segments() {
+    let renamed = "| 2026-10-09 | A pid is a hint: the core runs `zmx kill` by name. | `terminate::tests::each_failed_check_is_its_own_refusal` |\n";
+    let rows = "| 2026-10-09 | A pid is a hint. | `kill` tests | [A pid is][2026-10] |\n";
+    let (defects, _) = pairing_defects(&digest(rows, &["2026-10"]), &[archive("2026-10", renamed)]);
+    assert_eq!(defects.len(), 1, "{:?}", rules_of(&defects));
+    assert_eq!(defects[0].rule, "check-ledger/enforcement");
+    assert!(defects[0].message.contains("`kill`"));
+
+    let kept = renamed.replace("terminate::", "kill::");
+    let (defects, _) = pairing_defects(&digest(rows, &["2026-10"]), &[archive("2026-10", &kept)]);
+    assert!(defects.is_empty(), "{:?}", rules_of(&defects));
+
+    assert!(span_holds(
+        "services::work_unit::ruling_promise",
+        "work_unit::ruling_promise"
+    ));
+    assert!(span_holds("xtask check-rules", "xtask check-rules"));
+    assert!(span_holds("kill::tests::a_name", "kill"));
+    assert!(!span_holds("verification::tests::a_name", "verify"));
+    assert!(!span_holds(
+        "services::session::keep_proxy_audit",
+        "session::keep"
+    ));
+    assert!(!span_holds("kill", "kill::tests"));
 }

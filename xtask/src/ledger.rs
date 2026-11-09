@@ -7,7 +7,8 @@
 //! that file and ends at a word boundary there. Every archive row is the target of exactly one
 //! link, the first link of a digest row targets a row of the digest row's date, and every
 //! archive row is dated in its file's month. Every backticked span of a digest row's Enforced
-//! by cell appears in a full row it links, so a rename corrected in the full row cannot leave
+//! by cell is a span, or a whole run of `::` segments of a span, in the Enforced by cell of a
+//! full row it links, so a rename corrected in the full row cannot leave
 //! the digest naming what is gone. What the check cannot see is whether the digest's
 //! rule says what the full row says; that is for review. The digest is refused past
 //! `DIGEST_MAX_BYTES`, so it stays a digest.
@@ -201,8 +202,6 @@ pub fn name_defects(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row<'a> {
     pub line: usize,
-    /// The whole line.
-    pub text: &'a str,
     pub date: &'a str,
     /// The cells after the date.
     pub cells: Vec<&'a str>,
@@ -255,7 +254,6 @@ pub fn table_line(index: usize, line: &str, columns: usize) -> TableLine<'_> {
         Some((&"Date", _)) => TableLine::Header,
         Some((date, rest)) if is_date(date) => TableLine::Row(Row {
             line: index.saturating_add(1),
-            text: line,
             date,
             cells: rest.to_vec(),
         }),
@@ -449,7 +447,7 @@ fn digest_links(
                     let target = months
                         .get(key.0.as_str())
                         .and_then(|archive| archive.rows.get(key.1));
-                    targets.extend(target.map(|target| target.text));
+                    targets.extend(target.and_then(|target| target.cells.get(1).copied()));
                     let target_date = target.map(|target| target.date);
                     if position == 0 && target_date != Some(row.date) {
                         defects.push(link_defect(
@@ -474,21 +472,44 @@ fn digest_links(
     (linked, defects)
 }
 
-/// A backticked span of a digest row's Enforced by cell that none of the full rows it links
-/// holds: a renamed or removed mechanism the full row was corrected for and the digest was not.
+/// The backticked spans of a cell.
+fn spans(cell: &str) -> impl Iterator<Item = &str> {
+    cell.split('`').skip(1).step_by(2)
+}
+
+/// Whether a full row's span holds a digest span: the same span, or its `::` segments as a
+/// whole run of the full span's segments (`work_unit::ruling_promise` in
+/// `services::work_unit::ruling_promise`, `kill` in `kill::tests::...`, never `verify` in
+/// `verification`).
+#[must_use]
+pub fn span_holds(full: &str, digest: &str) -> bool {
+    let full: Vec<&str> = full.split("::").collect();
+    let digest: Vec<&str> = digest.split("::").collect();
+    !digest.is_empty()
+        && full
+            .windows(digest.len())
+            .any(|run| run == digest.as_slice())
+}
+
+/// A backticked span of a digest row's Enforced by cell that no span of the Enforced by cells
+/// of the full rows it links holds: a renamed or removed mechanism the full row was corrected
+/// for and the digest was not.
 fn enforcement_defects(digest: &Source, row: &Row<'_>, targets: &[&str]) -> Vec<Finding> {
     let cell = row.cells.get(1).copied().unwrap_or("");
-    cell.split('`')
-        .skip(1)
-        .step_by(2)
-        .filter(|span| !targets.iter().any(|target| target.contains(*span)))
+    spans(cell)
+        .filter(|span| {
+            !targets
+                .iter()
+                .flat_map(|target| spans(target))
+                .any(|full| span_holds(full, span))
+        })
         .map(|span| {
             Finding::at(
                 Path::new(&digest.path),
                 row.line,
                 1,
                 "check-ledger/enforcement",
-                format!("`{span}` is in no full row this digest row links"),
+                format!("`{span}` is in no Enforced by cell of a full row this digest row links"),
             )
         })
         .collect()

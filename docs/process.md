@@ -25,8 +25,8 @@ A ledger row names its mechanism, or says `none` with the reason. A row without 
 is a defect. `xtask check-ledger` checks that every name a row cites exists, that each link
 text starts exactly one full row of its month, that a digest row's first link starts a row
 of its own date, that every full row is linked exactly once, that every backticked span in
-a digest row's Enforced by cell appears in a full row it links, and that the digest stays
-within its byte bound. Any file in `notes/ledger/` not named `<year>-<month>.md` fails the
+a digest row's Enforced by cell is a span, or a whole run of a span's `::` segments, in the
+Enforced by cell of a full row it links, and that the digest stays within its byte bound. Any file in `notes/ledger/` not named `<year>-<month>.md` fails the
 check, a `.DS_Store` or an editor swap file included.
 
 A full row's Rule cell is never reworded. When a test or function it cites is renamed, the

@@ -26,14 +26,14 @@ One row per rule; full rows are in [`notes/ledger/`](ledger/), one file per mont
 | 2026-10-09 | A JSON Schema from cue is validated against real fixtures before it is trusted. | `envelope` schema tests; `xtask check-config` | [A JSON Schema generated][2026-10] |
 | 2026-10-09 | A ruling resolves only while the unit is escalated in that attempt. | `work_unit::ruling_promise` | [A ruling resolves][2026-10] |
 | 2026-10-09 | A vendor gets `USER` and `LOGNAME` from the password database, never the inherited environment. | `launch_spec`, `worker_process` tests | [A headless vendor][2026-10], [The vendor environment][2026-10] |
-| 2026-10-09 | A vendor under zmx leads its own session with no controlling terminal. | `tycho session-leader`; `mise run worker-tests` | [A vendor under][2026-10] |
+| 2026-10-09 | A vendor under zmx leads its own session with no controlling terminal. | `tests/worker_session.rs`; `mise run worker-tests` | [A vendor under][2026-10] |
 | 2026-10-09 | A test double emits the real wire shape through the real component's constructor or check. | `spool::check_result_envelope` | [A test double emits][2026-10] |
 | 2026-10-09 | Text typed through `zmx send` ends with a carriage return. | `spawn` test | [Text typed into][2026-10] |
 | 2026-10-09 | A Claude session resumes only after its first turn wrote the transcript. | control suite resume test | [A Claude session][2026-10] |
 | 2026-10-09 | A decoder of a directory other tool versions share requires only the fields it keys on. | `claude_control` registry test | [A decoder of][2026-10] |
 | 2026-10-09 | A file the core leaves for another user is checked by descriptor and content; cleanup only unlinks. | `relay` tests | [A file the core][2026-10] |
 | 2026-10-09 | A test that attaches a zmx client removes `ZMX_SESSION` from its environment. | `tycho::zmx::Zmx` | [A test that attaches][2026-10] |
-| 2026-10-09 | A registry path is checked before connecting, and the peer uid before writing. | `claude_control` tests | [A path read][2026-10] |
+| 2026-10-09 | A registry path is checked before connecting, and the peer uid before writing. | `crates/tycho/src/vendors/claude_control/tests.rs` | [A path read][2026-10] |
 | 2026-10-09 | The core never follows a symlink or runs git under an agent-writable directory. | clippy `disallowed_methods`; `agent_tree` tests | [The core never][2026-10] |
 | 2026-10-09 | An owner and mode check on a file in a directory the checked user owns cannot show the file is protected from that user. | none (needs core-owned locations) | [An owner and][2026-10] |
 | 2026-10-09 | A git setting is checked over every file git reads, with `--show-scope`. | `setup` tests | [A check of a git][2026-10] |
