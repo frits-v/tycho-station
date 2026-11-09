@@ -6,7 +6,12 @@ A mistake that costs a turn, a check that was wrong, a gate that let something t
 three things happen in the same change.
 
 1. Fix the immediate issue.
-2. Add a row to `notes/ledger.md`: date, the rule as a sentence, what enforces it.
+2. Add a full row to the current month's archive, `notes/ledger/<year>-<month>.md`: the
+   date, the rule as a sentence with what happened, and what enforces it. Add a digest row
+   to `notes/ledger.md`, which every session loads: the date, the rule in one sentence, the
+   mechanism by name, and a link `[<opening words of the full row's rule>][<year>-<month>]`;
+   a new month also gets its `[<year>-<month>]: ledger/<year>-<month>.md` definition at the
+   end of the digest.
 3. Add the prevention at the lowest layer that can catch it, in this order of preference:
    a compiler or clippy lint (`Cargo.toml` lints, `clippy.toml`); an `xtask check-*`
    command, which then runs in `ci` and in the post-edit hook; a lefthook hook; the
@@ -14,7 +19,11 @@ three things happen in the same change.
    last resort and only for what no mechanism can see.
 
 A ledger row names its mechanism, or says `none` with the reason. A row without either
-is a defect.
+is a defect. `xtask check-ledger` checks that every name a row cites exists, that each link
+text opens exactly one full row of its month and that row's date is the digest row's, that
+every full row is linked exactly once, and that the digest stays within its byte bound.
+When the digest nears the bound, digest rows that state one rule become one row linking each
+full row; full rows are never reworded.
 
 ## Mechanisms and where they live
 

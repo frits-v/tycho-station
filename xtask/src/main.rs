@@ -105,7 +105,7 @@ const COMMANDS: [(&str, &str); 28] = [
     ),
     (
         "check-ledger",
-        "every function a ledger row cites as enforcement exists in the sources",
+        "the digest links every archive row once, stays under its bound, and every cited name exists",
     ),
     (
         "check-credentials",
@@ -194,7 +194,7 @@ const COMMENTS_RULES: [Rule<'static>; 2] = [
         description: "A Rust comment names a ticket or issue number",
     },
 ];
-const LEDGER_RULES: [Rule<'static>; 2] = [
+const LEDGER_RULES: [Rule<'static>; 6] = [
     Rule {
         id: "check-ledger/undefined",
         description: "A ledger row cites a function or module nothing in the sources defines",
@@ -202,6 +202,22 @@ const LEDGER_RULES: [Rule<'static>; 2] = [
     Rule {
         id: "check-ledger/stale-exception",
         description: "A name listed as defined elsewhere is no longer cited, or is defined here",
+    },
+    Rule {
+        id: "check-ledger/unlinked",
+        description: "An archive row has no digest row in notes/ledger.md",
+    },
+    Rule {
+        id: "check-ledger/link",
+        description: "A digest link opens no archive row, several, one of another date, or one already linked",
+    },
+    Rule {
+        id: "check-ledger/shape",
+        description: "A ledger table line, archive file name or link definition is not in the ledger's form",
+    },
+    Rule {
+        id: "check-ledger/size",
+        description: "The digest is larger than its byte bound",
     },
 ];
 const RULES_RULES: [Rule<'static>; 2] = [
@@ -831,18 +847,41 @@ fn read_bounded_text(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))
 }
 
+/// The digest, every archive file and the names-elsewhere list, each read whole.
+fn ledger_sources() -> Result<(ledger::Source, Vec<ledger::Source>, String), String> {
+    let read = |path: &str| {
+        read_bounded_text(Path::new(path)).map(|text| ledger::Source {
+            path: path.to_string(),
+            text,
+        })
+    };
+    let digest = read(ledger::LEDGER)?;
+    let archives = ledger::archive_paths(Path::new(ledger::ARCHIVE_DIR))?
+        .iter()
+        .map(|path| read(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    if archives.is_empty() {
+        return Err(format!(
+            "examined 0 archive files in {}; a check over nothing is a failure",
+            ledger::ARCHIVE_DIR
+        ));
+    }
+    let listed = read_bounded_text(Path::new(ledger::ELSEWHERE))?;
+    Ok((digest, archives, listed))
+}
+
 fn check_ledger() -> i32 {
-    let texts = read_bounded_text(Path::new(ledger::LEDGER)).and_then(|ledger_text| {
-        read_bounded_text(Path::new(ledger::ELSEWHERE)).map(|listed| (ledger_text, listed))
-    });
-    let (ledger_text, listed) = match texts {
-        Ok(texts) => texts,
+    let (digest, archives, listed) = match ledger_sources() {
+        Ok(sources) => sources,
         Err(why) => {
             eprintln!("xtask check-ledger: {why}");
             return 1;
         }
     };
-    let cited = ledger::cited_names(&ledger_text);
+    let cited: Vec<ledger::Citation> = std::iter::once(&digest)
+        .chain(&archives)
+        .flat_map(ledger::cited_names)
+        .collect();
     if cited.is_empty() {
         eprintln!("xtask check-ledger: examined 0 cited names; a check over nothing is a failure");
         return 1;
@@ -857,8 +896,17 @@ fn check_ledger() -> i32 {
             defined.extend(ledger::defined_names(&text));
         }
     }
-    let defects = ledger::ledger_defects(&cited, &defined, &ledger::elsewhere_names(&listed));
-    let note = format!(" for {} cited names", cited.len());
+    let (mut defects, examined) = ledger::pairing_defects(&digest, &archives);
+    defects.extend(ledger::name_defects(
+        &cited,
+        &defined,
+        &ledger::elsewhere_names(&listed),
+    ));
+    let per_file: Vec<String> = examined
+        .iter()
+        .map(|file| format!("{} ({} rows, {} names)", file.path, file.rows, file.names))
+        .collect();
+    let note = format!(" for {}", per_file.join(", "));
     finish_findings(
         "check-ledger",
         &LEDGER_RULES,

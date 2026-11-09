@@ -15,7 +15,7 @@ and the tests that cover it. Check whether the failure scenario can actually hap
 code at the head commit: a guard elsewhere, a type that rules the input out, a caller that
 never passes it, or a test that shows the behaviour is intended each refute it. A finding in
 the repository-rule category stands only when the rule it cites exists in `CLAUDE.md`,
-`notes/ledger.md` or `docs/process.md` and the change breaks it.
+`notes/ledger.md`, `notes/ledger/` or `docs/process.md` and the change breaks it.
 
 Answer `confirmed` only when you traced the failure scenario through the actual code and it
 holds; answer `refuted` otherwise, including when you could not settle it. `reasoning` is one
