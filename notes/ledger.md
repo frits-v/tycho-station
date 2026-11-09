@@ -2,6 +2,8 @@
 
 One row per rule; full rows are in [`notes/ledger/`](ledger/), one file per month. A new mistake gets a full row in the current month's file and a row here linking it.
 
+[2026-10]: ledger/2026-10.md
+
 | Date | Rule | Enforced by | Archive |
 |---|---|---|---|
 | 2026-10-08 | The git hook judges each chain segment by the directory it moved to; `.worktrees/` paths are worktrees. | `~/.claude/hooks/git_hygiene.py` | [A git command][2026-10] |
@@ -131,5 +133,3 @@ One row per rule; full rows are in [`notes/ledger/`](ledger/), one file per mont
 | 2026-10-25 | A read that finds nothing while the writer may still write is read again, bounded. | `session::keep_proxy_audit` | [A read that][2026-10] |
 | 2026-10-25 | A vendor credential handed out as a copy is checked for whether the vendor rewrites it. | Codex sandbox test; fix: none yet | [A vendor credential][2026-10] |
 | 2026-10-26 | A record of a server's decisions is taken after it stops deciding. | `SessionProxy::close` | [A record of][2026-10] |
-
-[2026-10]: ledger/2026-10.md
