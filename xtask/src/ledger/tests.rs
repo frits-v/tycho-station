@@ -73,7 +73,7 @@ fn a_digest_row_with_no_archive_link_or_an_unknown_month_is_a_defect() {
     let rows = "| 2026-10-09 | A kill-path test fails without the kill. | `kill` tests | [A test of a][2026-10] |\n| 2026-10-12 | Git spawns drop the hook environment. | `git_environment` | [A test that spawns][2026-10] |\n| 2026-10-13 | A row with no archive. | none |  |\n";
     let (defects, _) = pairing_defects(&digest(rows, &["2026-10"]), &[archive("2026-10", OCTOBER)]);
     assert_eq!(defects.len(), 1, "{:?}", rules_of(&defects));
-    assert!(defects[0].message.contains("links no archive row"));
+    assert!(defects[0].message.contains("is not 1 to 16 links"));
 
     let rows = "| 2026-10-09 | A kill-path test fails without the kill. | `kill` tests | [A test of a][2026-09] |\n| 2026-10-12 | Git spawns drop the hook environment. | `git_environment` | [A test that spawns][2026-10] |\n";
     let (defects, _) = pairing_defects(&digest(rows, &["2026-10"]), &[archive("2026-10", OCTOBER)]);
@@ -493,5 +493,34 @@ fn an_archive_directory_past_its_entry_bound_is_refused_not_truncated() {
     assert!(
         refusal.contains(&format!("holds more than {ARCHIVE_ENTRIES_MAX} entries")),
         "{refusal}"
+    );
+}
+
+#[test]
+fn an_archive_cell_past_its_link_bound_is_refused_not_cut() {
+    let cell = |count: usize| {
+        (0..count)
+            .map(|index| format!("[Rule {index}][2026-10]"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    assert_eq!(
+        links(&cell(LINKS_MAX)).map(|found| found.len()),
+        Some(LINKS_MAX)
+    );
+    assert_eq!(links(&cell(LINKS_MAX.saturating_add(1))), None);
+
+    let row = format!(
+        "| 2026-10-09 | Too many links. | `kill` tests | {} |\n",
+        cell(LINKS_MAX.saturating_add(1))
+    );
+    let (defects, _) = pairing_defects(&digest(&row, &["2026-10"]), &[archive("2026-10", OCTOBER)]);
+    let found = rules_of(&defects);
+    assert!(
+        found
+            .iter()
+            .any(|(rule, message)| *rule == "check-ledger/link"
+                && message.contains("is not 1 to 16 links")),
+        "{found:?}"
     );
 }

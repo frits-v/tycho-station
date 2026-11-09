@@ -436,7 +436,9 @@ fn digest_links(
             defects.push(link_defect(
                 &digest.path,
                 row.line,
-                "a digest row that links no archive row as `[text][<year>-<month>]`".to_string(),
+                format!(
+                    "an Archive cell that is not 1 to {LINKS_MAX} links `[text][<year>-<month>]`"
+                ),
             ));
             continue;
         };
