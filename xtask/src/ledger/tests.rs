@@ -452,3 +452,46 @@ fn an_enforcement_name_counts_only_in_a_linked_enforced_by_cell_and_as_whole_seg
     ));
     assert!(!span_holds("kill", "kill::tests"));
 }
+
+#[test]
+fn an_archive_with_no_rows_is_a_shape_defect_not_a_clean_pass() {
+    let rows = "| 2026-10-09 | A kill-path test fails without the kill. | `kill` tests | [A test of a][2026-10] |\n| 2026-10-12 | Git spawns drop the hook environment. | `git_environment` | [A test that spawns][2026-10] |\n";
+    let (defects, examined) = pairing_defects(
+        &digest(rows, &["2026-10", "2026-11"]),
+        &[archive("2026-10", OCTOBER), archive("2026-11", "")],
+    );
+    let found = rules_of(&defects);
+    assert!(
+        found.contains(&("check-ledger/shape", "an archive with no rows")),
+        "{found:?}"
+    );
+    assert_eq!(examined.last().map(|file| file.rows), Some(0));
+}
+
+#[test]
+fn an_archive_directory_past_its_entry_bound_is_refused_not_truncated() {
+    let dir = std::env::temp_dir().join(format!("xtask-ledger-{}-entries", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let names: Vec<String> = (0..=ARCHIVE_ENTRIES_MAX)
+        .map(|index| format!("{index:04}.md"))
+        .collect();
+    let (at_bound, past_bound) = names.split_at(ARCHIVE_ENTRIES_MAX);
+    for name in at_bound {
+        std::fs::write(dir.join(name), "").unwrap();
+    }
+    let listed_at_bound = archive_names(&dir);
+    for name in past_bound {
+        std::fs::write(dir.join(name), "").unwrap();
+    }
+    let listed_past_bound = archive_names(&dir);
+    for name in &names {
+        std::fs::remove_file(dir.join(name)).unwrap();
+    }
+    std::fs::remove_dir(&dir).unwrap();
+    assert_eq!(listed_at_bound.unwrap().len(), ARCHIVE_ENTRIES_MAX);
+    let refusal = listed_past_bound.unwrap_err();
+    assert!(
+        refusal.contains(&format!("holds more than {ARCHIVE_ENTRIES_MAX} entries")),
+        "{refusal}"
+    );
+}
