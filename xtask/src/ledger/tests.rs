@@ -350,22 +350,76 @@ fn a_listed_exception_covers_a_name_and_a_stale_one_is_a_defect() {
 
 #[test]
 fn the_committed_digest_links_every_archived_row_once_within_its_bound() {
-    let root = crate::setup::workspace_root();
-    let read = |path: &str| source(path, &std::fs::read_to_string(root.join(path)).unwrap());
-    let digest = read(LEDGER);
-    let archives: Vec<Source> = archive_paths(&root.join(ARCHIVE_DIR))
-        .unwrap()
-        .iter()
-        .map(|path| {
-            let relative = Path::new(path).strip_prefix(root).unwrap();
-            read(&relative.display().to_string())
-        })
-        .collect();
-    assert!(!archives.is_empty());
+    let (digest, archives, _) = read_sources(crate::setup::workspace_root()).unwrap();
     let (defects, examined) = pairing_defects(&digest, &archives);
     assert!(defects.is_empty(), "{:?}", rules_of(&defects));
     let rows_archived: usize = examined.iter().skip(1).map(|file| file.rows).sum();
     assert!(rows_archived > 100, "{examined:?}");
-    let cited: usize = examined.iter().map(|file| file.names).sum();
-    assert!(cited > 100, "{examined:?}");
+    assert!(citations(&digest, &archives).unwrap().len() > 100);
+}
+
+#[test]
+fn a_digest_enforcement_name_no_linked_full_row_holds_is_a_defect() {
+    let rows = "| 2026-10-09 | A kill-path test fails without the kill. | `kill`, `kill::renamed_away` | [A test of a][2026-10] |\n| 2026-10-12 | Git spawns drop the hook environment. | `kill` | [A test that spawns][2026-10] |\n";
+    let (defects, _) = pairing_defects(&digest(rows, &["2026-10"]), &[archive("2026-10", OCTOBER)]);
+    let found = rules_of(&defects);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(
+        found
+            .iter()
+            .all(|(rule, _)| *rule == "check-ledger/enforcement")
+    );
+    assert!(found[0].1.contains("`kill::renamed_away`"), "{found:?}");
+    assert_eq!((defects[0].line, defects[1].line), (7, 8));
+}
+
+/// A scratch repository root holding the given ledger files; `remove_scratch` removes it.
+fn scratch_root(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("xtask-ledger-{}-{name}", std::process::id()));
+    for dir in ["", "notes", ARCHIVE_DIR] {
+        std::fs::create_dir(root.join(dir)).unwrap();
+    }
+    for (path, text) in files {
+        std::fs::write(root.join(path), text).unwrap();
+    }
+    root
+}
+
+fn remove_scratch(root: &Path, files: &[(&str, &str)]) {
+    for (path, _) in files {
+        std::fs::remove_file(root.join(path)).unwrap();
+    }
+    for dir in [ARCHIVE_DIR, "notes", ""] {
+        std::fs::remove_dir(root.join(dir)).unwrap();
+    }
+}
+
+#[test]
+fn no_archive_file_is_a_failure_not_a_clean_pass() {
+    let files = [(LEDGER, "# Ledger\n"), (ELSEWHERE, "")];
+    let root = scratch_root("no-archive", &files);
+    let refusal = read_sources(&root).unwrap_err();
+    remove_scratch(&root, &files);
+    assert!(refusal.contains("examined 0 archive files"), "{refusal}");
+}
+
+#[test]
+fn ledger_files_that_cite_no_name_are_a_failure_not_a_clean_pass() {
+    let files = [
+        (
+            LEDGER,
+            "| 2026-10-09 | A rule. | `kill` | [A rule][2026-10] |\n",
+        ),
+        (
+            "notes/ledger/2026-10.md",
+            "| 2026-10-09 | A rule. | `kill` tests |\n",
+        ),
+        (ELSEWHERE, ""),
+    ];
+    let root = scratch_root("no-names", &files);
+    let (digest, archives, _) = read_sources(&root).unwrap();
+    remove_scratch(&root, &files);
+    assert_eq!(archives.len(), 1);
+    let refusal = citations(&digest, &archives).unwrap_err();
+    assert!(refusal.contains("examined 0 cited names"), "{refusal}");
 }

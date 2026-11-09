@@ -9,9 +9,12 @@ three things happen in the same change.
 2. Add a full row to the current month's archive, `notes/ledger/<year>-<month>.md`: the
    date, the rule as a sentence with what happened, and what enforces it. Add a digest row
    to `notes/ledger.md`, which every session loads: the date, the rule in one sentence, the
-   mechanism by name, and a link `[<opening words of the full row's rule>][<year>-<month>]`;
-   a new month also gets its `[<year>-<month>]: ledger/<year>-<month>.md` definition above
-   the digest's table. Both tables end with their last row, so rows are appended at the end.
+   mechanism by name, and a link `[<text>][<year>-<month>]`. The link text is any start of
+   the full row's Rule cell that ends at a word boundary and starts no other row of that
+   month's file; when a new row makes an existing link start two rows, the new row's author
+   lengthens the existing link. A new month also gets its
+   `[<year>-<month>]: ledger/<year>-<month>.md` definition above the digest's table. Both
+   tables end with their last row, so rows are appended at the end.
 3. Add the prevention at the lowest layer that can catch it, in this order of preference:
    a compiler or clippy lint (`Cargo.toml` lints, `clippy.toml`); an `xtask check-*`
    command, which then runs in `ci` and in the post-edit hook; a lefthook hook; the
@@ -20,10 +23,20 @@ three things happen in the same change.
 
 A ledger row names its mechanism, or says `none` with the reason. A row without either
 is a defect. `xtask check-ledger` checks that every name a row cites exists, that each link
-text opens exactly one full row of its month, that a digest row's first link opens a row of
-its own date, that every full row is linked exactly once, and that the digest stays within
-its byte bound. When the digest nears the bound, digest rows that state one rule become one
-row linking each full row; full rows are never reworded.
+text starts exactly one full row of its month, that a digest row's first link starts a row
+of its own date, that every full row is linked exactly once, that every backticked span in
+a digest row's Enforced by cell appears in a full row it links, and that the digest stays
+within its byte bound. Any file in `notes/ledger/` not named `<year>-<month>.md` fails the
+check, a `.DS_Store` or an editor swap file included.
+
+A full row's Rule cell is never reworded. When a test or function it cites is renamed, the
+full row's Enforced by cell follows the new name, or the old name is listed with its reason
+in `notes/ledger-names-elsewhere.txt`, and a digest row naming it follows too.
+
+When the digest nears its bound (24 KiB, about 28 rows above its size when it was split),
+digest rows that state one rule are merged first, each merged row linking every full row it
+stands for and stating the rule whole. When nothing is left to merge, the operator rules on
+raising the bound or shortening the row format; neither happens inside a mistake's fix.
 
 ## Mechanisms and where they live
 

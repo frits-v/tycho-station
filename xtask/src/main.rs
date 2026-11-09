@@ -194,7 +194,7 @@ const COMMENTS_RULES: [Rule<'static>; 2] = [
         description: "A Rust comment names a ticket or issue number",
     },
 ];
-const LEDGER_RULES: [Rule<'static>; 6] = [
+const LEDGER_RULES: [Rule<'static>; 7] = [
     Rule {
         id: "check-ledger/undefined",
         description: "A ledger row cites a function or module nothing in the sources defines",
@@ -214,6 +214,10 @@ const LEDGER_RULES: [Rule<'static>; 6] = [
     Rule {
         id: "check-ledger/shape",
         description: "A ledger table line, archive file name or link definition is not in the ledger's form",
+    },
+    Rule {
+        id: "check-ledger/enforcement",
+        description: "A digest row's Enforced by cell names what no full row it links holds",
     },
     Rule {
         id: "check-ledger/size",
@@ -832,60 +836,17 @@ fn check_rules() -> i32 {
     finish_findings("check-rules", &RULES_RULES, files.len(), "", &defects)
 }
 
-/// Reads a file the check needs whole, refusing one over the bound rather than reading part.
-fn read_bounded_text(path: &Path) -> Result<String, String> {
-    let size = fs::metadata(path)
-        .map_err(|error| format!("{}: {error}", path.display()))?
-        .len();
-    if size > ledger::LEDGER_MAX_BYTES {
-        return Err(format!(
-            "{} is {size} bytes; the limit is {}",
-            path.display(),
-            ledger::LEDGER_MAX_BYTES
-        ));
-    }
-    fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))
-}
-
-/// The digest, every archive file and the names-elsewhere list, each read whole.
-fn ledger_sources() -> Result<(ledger::Source, Vec<ledger::Source>, String), String> {
-    let read = |path: &str| {
-        read_bounded_text(Path::new(path)).map(|text| ledger::Source {
-            path: path.to_string(),
-            text,
-        })
-    };
-    let digest = read(ledger::LEDGER)?;
-    let archives = ledger::archive_paths(Path::new(ledger::ARCHIVE_DIR))?
-        .iter()
-        .map(|path| read(path))
-        .collect::<Result<Vec<_>, _>>()?;
-    if archives.is_empty() {
-        return Err(format!(
-            "examined 0 archive files in {}; a check over nothing is a failure",
-            ledger::ARCHIVE_DIR
-        ));
-    }
-    let listed = read_bounded_text(Path::new(ledger::ELSEWHERE))?;
-    Ok((digest, archives, listed))
-}
-
 fn check_ledger() -> i32 {
-    let (digest, archives, listed) = match ledger_sources() {
-        Ok(sources) => sources,
+    let read = ledger::read_sources(Path::new(".")).and_then(|(digest, archives, listed)| {
+        ledger::citations(&digest, &archives).map(|cited| (digest, archives, listed, cited))
+    });
+    let (digest, archives, listed, cited) = match read {
+        Ok(read) => read,
         Err(why) => {
             eprintln!("xtask check-ledger: {why}");
             return 1;
         }
     };
-    let cited: Vec<ledger::Citation> = std::iter::once(&digest)
-        .chain(&archives)
-        .flat_map(ledger::cited_names)
-        .collect();
-    if cited.is_empty() {
-        eprintln!("xtask check-ledger: examined 0 cited names; a check over nothing is a failure");
-        return 1;
-    }
     let sources = walk(&SOURCE_DIRS, "rs");
     let mut defined = std::collections::BTreeSet::new();
     for path in &sources {

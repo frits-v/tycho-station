@@ -6,7 +6,9 @@
 //! to that month's file, and resolves when its text opens the Rule cell of exactly one row of
 //! that file and ends at a word boundary there. Every archive row is the target of exactly one
 //! link, the first link of a digest row targets a row of the digest row's date, and every
-//! archive row is dated in its file's month. What the check cannot see is whether the digest's
+//! archive row is dated in its file's month. Every backticked span of a digest row's Enforced
+//! by cell appears in a full row it links, so a rename corrected in the full row cannot leave
+//! the digest naming what no longer exists. What the check cannot see is whether the digest's
 //! rule says what the full row says; that is for review. The digest is refused past
 //! `DIGEST_MAX_BYTES`, so it stays a digest.
 //!
@@ -199,6 +201,8 @@ pub fn name_defects(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row<'a> {
     pub line: usize,
+    /// The whole line.
+    pub text: &'a str,
     pub date: &'a str,
     /// The cells after the date.
     pub cells: Vec<&'a str>,
@@ -251,6 +255,7 @@ pub fn table_line(index: usize, line: &str, columns: usize) -> TableLine<'_> {
         Some((&"Date", _)) => TableLine::Header,
         Some((date, rest)) if is_date(date) => TableLine::Row(Row {
             line: index.saturating_add(1),
+            text: line,
             date,
             cells: rest.to_vec(),
         }),
@@ -437,13 +442,15 @@ fn digest_links(
             ));
             continue;
         };
+        let mut targets = Vec::new();
         for (position, link) in found.iter().enumerate() {
             match resolve(digest, row, link, months) {
                 Ok(key) => {
-                    let target_date = months
+                    let target = months
                         .get(key.0.as_str())
-                        .and_then(|archive| archive.rows.get(key.1))
-                        .map(|target| target.date);
+                        .and_then(|archive| archive.rows.get(key.1));
+                    targets.extend(target.map(|target| target.text));
+                    let target_date = target.map(|target| target.date);
                     if position == 0 && target_date != Some(row.date) {
                         defects.push(link_defect(
                             &digest.path,
@@ -460,8 +467,31 @@ fn digest_links(
                 Err(defect) => defects.push(defect),
             }
         }
+        if !targets.is_empty() {
+            defects.extend(enforcement_defects(digest, row, &targets));
+        }
     }
     (linked, defects)
+}
+
+/// A backticked span of a digest row's Enforced by cell that none of the full rows it links
+/// holds: a renamed or removed mechanism the full row was corrected for and the digest was not.
+fn enforcement_defects(digest: &Source, row: &Row<'_>, targets: &[&str]) -> Vec<Finding> {
+    let cell = row.cells.get(1).copied().unwrap_or("");
+    cell.split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|span| !targets.iter().any(|target| target.contains(*span)))
+        .map(|span| {
+            Finding::at(
+                Path::new(&digest.path),
+                row.line,
+                1,
+                "check-ledger/enforcement",
+                format!("`{span}` is in no full row this digest row links"),
+            )
+        })
+        .collect()
 }
 
 fn coverage_defects(months: &BTreeMap<&str, Archive<'_>>, linked: &Linked) -> Vec<Finding> {
@@ -560,27 +590,83 @@ pub fn pairing_defects(digest: &Source, archives: &[Source]) -> (Vec<Finding>, V
     (defects, examined)
 }
 
-/// The paths of the entries in the archive directory, sorted; more than
+/// The names of the entries in the archive directory, sorted; more than
 /// `ARCHIVE_ENTRIES_MAX` is an error.
 ///
 /// # Errors
 ///
 /// When the directory cannot be read or holds too many entries.
-pub fn archive_paths(dir: &Path) -> Result<Vec<String>, String> {
+pub fn archive_names(dir: &Path) -> Result<Vec<String>, String> {
     let entries = fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
-    let mut paths = Vec::new();
+    let mut names = Vec::new();
     for entry in entries.take(ARCHIVE_ENTRIES_MAX.saturating_add(1)) {
         let entry = entry.map_err(|error| format!("{}: {error}", dir.display()))?;
-        if paths.len() >= ARCHIVE_ENTRIES_MAX {
+        if names.len() >= ARCHIVE_ENTRIES_MAX {
             return Err(format!(
                 "{} holds more than {ARCHIVE_ENTRIES_MAX} entries",
                 dir.display()
             ));
         }
-        paths.push(dir.join(entry.file_name()).display().to_string());
+        names.push(entry.file_name().to_string_lossy().into_owned());
     }
-    paths.sort();
-    Ok(paths)
+    names.sort();
+    Ok(names)
+}
+
+/// Reads a ledger file under `root` whole, refusing one over `LEDGER_MAX_BYTES` rather than
+/// reading part; the source keeps `path` as its name.
+fn read_source(root: &Path, path: &str) -> Result<Source, String> {
+    let full = root.join(path);
+    let size = fs::metadata(&full)
+        .map_err(|error| format!("{path}: {error}"))?
+        .len();
+    if size > LEDGER_MAX_BYTES {
+        return Err(format!(
+            "{path} is {size} bytes; the limit is {LEDGER_MAX_BYTES}"
+        ));
+    }
+    let text = fs::read_to_string(&full).map_err(|error| format!("{path}: {error}"))?;
+    Ok(Source {
+        path: path.to_string(),
+        text,
+    })
+}
+
+/// The digest, every archive file and the names-elsewhere list under `root`, each read whole.
+///
+/// # Errors
+///
+/// When a file cannot be read whole, or the archive directory holds no file: a check over
+/// no archive is a failure.
+pub fn read_sources(root: &Path) -> Result<(Source, Vec<Source>, String), String> {
+    let digest = read_source(root, LEDGER)?;
+    let archives = archive_names(&root.join(ARCHIVE_DIR))?
+        .iter()
+        .map(|name| read_source(root, &format!("{ARCHIVE_DIR}/{name}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    if archives.is_empty() {
+        return Err(format!(
+            "examined 0 archive files in {ARCHIVE_DIR}; a check over nothing is a failure"
+        ));
+    }
+    let listed = read_source(root, ELSEWHERE)?.text;
+    Ok((digest, archives, listed))
+}
+
+/// Every name the digest and the archives cite.
+///
+/// # Errors
+///
+/// When they cite none: a check over no name is a failure.
+pub fn citations(digest: &Source, archives: &[Source]) -> Result<Vec<Citation>, String> {
+    let cited: Vec<Citation> = std::iter::once(digest)
+        .chain(archives)
+        .flat_map(cited_names)
+        .collect();
+    if cited.is_empty() {
+        return Err("examined 0 cited names; a check over nothing is a failure".to_string());
+    }
+    Ok(cited)
 }
 
 #[cfg(test)]
