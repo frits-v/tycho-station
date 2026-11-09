@@ -7,7 +7,8 @@ it. You can read, search and list files inside the working directory and in
 `{{files}}`, which holds the review's own files, and nothing else.
 
 Read `CLAUDE.md`, `notes/ledger.md` and the sections of `docs/process.md` that bear on the
-change: they are the repository's rules, and the ledger lists mistakes already made once.
+change: they are the repository's rules, and the ledger lists mistakes already made once,
+one row per rule, with the full rows in `notes/ledger/`.
 
 Report a finding only when the change introduces or exposes one of these:
 

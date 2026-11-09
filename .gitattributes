@@ -1,3 +1,4 @@
-# The ledger is an append-only table: every branch adds rows at its end, so a merge keeps
-# both sides' rows instead of conflicting on the same last line.
+# The ledger's digest and its monthly archives are append-only tables: every branch adds rows
+# at their end, so a merge keeps both sides' rows instead of conflicting on the same last line.
 notes/ledger.md merge=union
+notes/ledger/*.md merge=union
