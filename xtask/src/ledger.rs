@@ -8,7 +8,7 @@
 //! link, the first link of a digest row targets a row of the digest row's date, and every
 //! archive row is dated in its file's month. Every backticked span of a digest row's Enforced
 //! by cell appears in a full row it links, so a rename corrected in the full row cannot leave
-//! the digest naming what no longer exists. What the check cannot see is whether the digest's
+//! the digest naming what is gone. What the check cannot see is whether the digest's
 //! rule says what the full row says; that is for review. The digest is refused past
 //! `DIGEST_MAX_BYTES`, so it stays a digest.
 //!
